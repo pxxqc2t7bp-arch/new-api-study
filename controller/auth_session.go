@@ -3,9 +3,12 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -13,6 +16,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
+
+const authPresenceHeartbeatInterval = 20 * time.Second
 
 func RefreshAuth(c *gin.Context) {
 	setAuthNoStore(c)
@@ -41,6 +46,51 @@ func RefreshAuth(c *gin.Context) {
 			"user":              buildSelfUserData(user),
 			"session":           bundle.Session,
 		},
+	})
+}
+
+func AuthPresence(c *gin.Context) {
+	setAuthNoStore(c)
+	rawRefreshToken, err := c.Cookie(service.RefreshCookieName)
+	if err != nil || rawRefreshToken == "" {
+		writeAuthSessionError(c, service.ErrRefreshTokenInvalid)
+		return
+	}
+	if err := service.TouchLoginSessionPresence(rawRefreshToken); err != nil {
+		if errors.Is(err, service.ErrRefreshTokenInvalid) || errors.Is(err, service.ErrLoginSessionRevoked) {
+			service.ClearRefreshCookie(c)
+		}
+		writeAuthSessionError(c, err)
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	ticker := time.NewTicker(authPresenceHeartbeatInterval)
+	defer ticker.Stop()
+	lastTouch := time.Now()
+	touchInterval := time.Duration(common.UserSessionIdleTimeoutSeconds) * time.Second / 3
+	if touchInterval > 10*time.Minute {
+		touchInterval = 10 * time.Minute
+	}
+	if touchInterval < authPresenceHeartbeatInterval {
+		touchInterval = authPresenceHeartbeatInterval
+	}
+	c.Stream(func(w io.Writer) bool {
+		select {
+		case <-c.Request.Context().Done():
+			return false
+		case now := <-ticker.C:
+			if now.Sub(lastTouch) >= touchInterval {
+				if err := service.TouchLoginSessionPresence(rawRefreshToken); err != nil {
+					return false
+				}
+				lastTouch = now
+			}
+			c.SSEvent("heartbeat", now.Unix())
+			return true
+		}
 	})
 }
 

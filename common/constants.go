@@ -43,6 +43,7 @@ const (
 	DefaultUserSessionIssuanceWindowSeconds = 24 * 60 * 60
 	DefaultUserSessionRevokedRetentionDays  = 7
 	DefaultUserSessionHourlyAlertThreshold  = 5000
+	DefaultUserSessionIdleTimeoutSeconds    = 30 * 24 * 60 * 60
 )
 
 var (
@@ -51,6 +52,7 @@ var (
 	UserSessionIssuanceWindowSeconds = int64(DefaultUserSessionIssuanceWindowSeconds)
 	UserSessionRevokedRetentionDays  = DefaultUserSessionRevokedRetentionDays
 	UserSessionHourlyAlertThreshold  = DefaultUserSessionHourlyAlertThreshold
+	UserSessionIdleTimeoutSeconds    = int64(DefaultUserSessionIdleTimeoutSeconds)
 )
 
 var OptionMap map[string]string
