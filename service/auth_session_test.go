@@ -27,6 +27,7 @@ func setupAuthSessionTestDB(t *testing.T) *model.User {
 	previousIssuanceWindow := common.UserSessionIssuanceWindowSeconds
 	previousRevokedRetention := common.UserSessionRevokedRetentionDays
 	previousAlertThreshold := common.UserSessionHourlyAlertThreshold
+	previousIdleTimeout := common.UserSessionIdleTimeoutSeconds
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	sqlDB, err := db.DB()
@@ -40,6 +41,7 @@ func setupAuthSessionTestDB(t *testing.T) *model.User {
 	common.UserSessionIssuanceWindowSeconds = int64(common.DefaultUserSessionIssuanceWindowSeconds)
 	common.UserSessionRevokedRetentionDays = common.DefaultUserSessionRevokedRetentionDays
 	common.UserSessionHourlyAlertThreshold = common.DefaultUserSessionHourlyAlertThreshold
+	common.UserSessionIdleTimeoutSeconds = int64(common.DefaultUserSessionIdleTimeoutSeconds)
 	t.Cleanup(func() {
 		model.DB = previousDB
 		common.RedisEnabled = previousRedis
@@ -48,6 +50,7 @@ func setupAuthSessionTestDB(t *testing.T) *model.User {
 		common.UserSessionIssuanceWindowSeconds = previousIssuanceWindow
 		common.UserSessionRevokedRetentionDays = previousRevokedRetention
 		common.UserSessionHourlyAlertThreshold = previousAlertThreshold
+		common.UserSessionIdleTimeoutSeconds = previousIdleTimeout
 		_ = sqlDB.Close()
 	})
 	user := &model.User{
@@ -327,9 +330,11 @@ func TestCleanupAuthArtifactsContinuesWithRevokedCleanupAfterExpiredBatchFailure
 func TestLoginSessionCreateRefreshAndRevoke(t *testing.T) {
 	useTestSessionSecret(t)
 	user := setupAuthSessionTestDB(t)
+	common.UserSessionIdleTimeoutSeconds = 1800
 
 	bundle, err := CreateLoginSession(user.Id, "password", "127.0.0.1", "test-agent")
 	require.NoError(t, err)
+	assert.InDelta(t, time.Now().Unix()+1800, bundle.Session.ExpiresAt, 2)
 	assert.NotEmpty(t, bundle.RefreshToken)
 	identity, err := ParseAccessToken(bundle.AccessToken)
 	require.NoError(t, err)
@@ -342,6 +347,7 @@ func TestLoginSessionCreateRefreshAndRevoke(t *testing.T) {
 
 	refreshed, _, err := RefreshLoginSession(bundle.RefreshToken, bundle.Session.SID, "127.0.0.2", "test-agent-2")
 	require.NoError(t, err)
+	assert.InDelta(t, time.Now().Unix()+1800, refreshed.Session.ExpiresAt, 2)
 	assert.NotEqual(t, bundle.RefreshToken, refreshed.RefreshToken)
 	recovered, _, err := RefreshLoginSession(bundle.RefreshToken, bundle.Session.SID, "127.0.0.2", "test-agent-2")
 	require.NoError(t, err)

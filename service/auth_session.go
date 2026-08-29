@@ -95,7 +95,7 @@ func createLoginSession(userID int, expectedAuthVersion int64, loginMethod, ip, 
 		UserAgent:       truncateAuthMetadata(userAgent, 512),
 		CreatedAt:       now,
 		LastActiveAt:    now,
-		ExpiresAt:       time.Unix(now, 0).Add(LoginSessionTTL).Unix(),
+		ExpiresAt:       now + common.UserSessionIdleTimeoutSeconds,
 	}
 	if session.LoginMethod == "" {
 		session.LoginMethod = "unknown"
@@ -230,7 +230,8 @@ func RefreshLoginSession(rawRefreshToken, expectedSID, ip, userAgent string) (*A
 		return nil, nil, ErrLoginSessionRevoked
 	}
 	nextSecret := deriveNextRefreshSecret(sid, secret)
-	rotated, err := model.RotateUserSessionRefresh(session.UserID, sid, hashRefreshSecret(secret), hashRefreshSecret(nextSecret), time.Now().Unix(), RefreshReplayWindow)
+	now := time.Now().Unix()
+	rotated, err := model.RotateUserSessionRefresh(session.UserID, sid, hashRefreshSecret(secret), hashRefreshSecret(nextSecret), now, now+common.UserSessionIdleTimeoutSeconds, RefreshReplayWindow)
 	if err != nil {
 		if errors.Is(err, model.ErrUserSessionRefreshRace) && rotated != nil &&
 			hashRefreshSecret(nextSecret) == rotated.RefreshHash {
@@ -290,12 +291,7 @@ func ListLoginSessions(userID int, currentSID string) ([]LoginSessionView, error
 }
 
 func WriteRefreshCookie(c *gin.Context, rawToken string) {
-	expiresAt := time.Now().Add(LoginSessionTTL)
-	if sid, _, ok := splitRefreshToken(rawToken); ok {
-		if session, err := model.GetUserSessionCached(sid); err == nil && session.ExpiresAt > time.Now().Unix() {
-			expiresAt = time.Unix(session.ExpiresAt, 0)
-		}
-	}
+	expiresAt := time.Now().Add(RefreshCookieTTL)
 	maxAge := int(time.Until(expiresAt) / time.Second)
 	if maxAge < 1 {
 		maxAge = 1
@@ -310,6 +306,22 @@ func WriteRefreshCookie(c *gin.Context, rawToken string) {
 		Secure:   common.SessionCookieSecure,
 		SameSite: http.SameSiteStrictMode,
 	})
+}
+
+func TouchLoginSessionPresence(rawRefreshToken string) error {
+	sid, secret, ok := splitRefreshToken(rawRefreshToken)
+	if !ok {
+		return ErrRefreshTokenInvalid
+	}
+	now := time.Now().Unix()
+	err := model.TouchUserSessionPresence(sid, hashRefreshSecret(secret), now, now+common.UserSessionIdleTimeoutSeconds)
+	if errors.Is(err, model.ErrUserSessionInactive) {
+		return ErrLoginSessionRevoked
+	}
+	if errors.Is(err, model.ErrUserSessionRefreshInvalid) {
+		return ErrRefreshTokenInvalid
+	}
+	return err
 }
 
 func ClearRefreshCookie(c *gin.Context) {
