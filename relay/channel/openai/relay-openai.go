@@ -133,6 +133,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			}
 		}
 		if len(data) > 0 {
+			captureSmartRouterStreamModel(info, data)
 			// 对音频模型，保存倒数第二个stream data
 			if isAudioModel && lastStreamData != "" {
 				secondLastStreamData = lastStreamData
@@ -252,6 +253,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	if oaiError := simpleResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
+	info.CaptureActualUpstreamModelName(simpleResponse.Model)
 
 	for _, choice := range simpleResponse.Choices {
 		if choice.FinishReason == constant.FinishReasonContentFilter {
@@ -334,4 +336,14 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 
 	return &simpleResponse.Usage, nil
+}
+
+func captureSmartRouterStreamModel(info *relaycommon.RelayInfo, data string) {
+	if info == nil || info.OriginModelName != "doubao-smart-router-250928" {
+		return
+	}
+	var response dto.ChatCompletionsStreamResponse
+	if err := common.UnmarshalJsonStr(data, &response); err == nil {
+		info.CaptureActualUpstreamModelName(response.Model)
+	}
 }

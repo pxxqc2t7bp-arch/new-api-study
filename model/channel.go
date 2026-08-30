@@ -315,6 +315,23 @@ func (channel *Channel) GetOtherInfo() map[string]interface{} {
 	return otherInfo
 }
 
+func (channel *Channel) GetDisabledUntil() int64 {
+	value, ok := channel.GetOtherInfo()["disabled_until"]
+	if !ok {
+		return 0
+	}
+	switch typed := value.(type) {
+	case float64:
+		return int64(typed)
+	case int64:
+		return typed
+	case int:
+		return int64(typed)
+	default:
+		return 0
+	}
+}
+
 func (channel *Channel) SetOtherInfo(otherInfo map[string]interface{}) {
 	otherInfoBytes, err := json.Marshal(otherInfo)
 	if err != nil {
@@ -793,6 +810,24 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 		}
 	}
 	return true
+}
+
+func MergeChannelStatusMetadata(channelId int, updates map[string]interface{}) error {
+	channel, err := GetChannelById(channelId, true)
+	if err != nil {
+		return err
+	}
+	info := channel.GetOtherInfo()
+	for key, value := range updates {
+		if value == nil {
+			delete(info, key)
+			continue
+		}
+		info[key] = value
+	}
+	channel.SetOtherInfo(info)
+	return DB.Model(&Channel{}).Where("id = ?", channelId).
+		Update("other_info", channel.OtherInfo).Error
 }
 
 func EnableChannelByTag(tag string) error {

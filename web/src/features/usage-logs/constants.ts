@@ -196,6 +196,7 @@ export const TASK_STATUS = {
   IN_PROGRESS: 'IN_PROGRESS', // 执行中
   SUCCESS: 'SUCCESS', // 成功
   FAILURE: 'FAILURE', // 失败
+  CANCELLED: 'CANCELLED', // 已取消
   QUEUED: 'QUEUED', // 排队中
   UNKNOWN: 'UNKNOWN', // 未知
 } as const
@@ -311,6 +312,7 @@ export const TASK_STATUS_MAPPINGS: Record<string, StatusMapping> = {
   [TASK_STATUS.SUBMITTED]: { label: 'Queued', variant: 'yellow' },
   [TASK_STATUS.IN_PROGRESS]: { label: 'In Progress', variant: 'blue' },
   [TASK_STATUS.FAILURE]: { label: 'Failed', variant: 'red' },
+  [TASK_STATUS.CANCELLED]: { label: 'Cancelled', variant: 'neutral' },
   [TASK_STATUS.QUEUED]: { label: 'Queued', variant: 'orange' },
   [TASK_STATUS.UNKNOWN]: { label: 'Unknown', variant: 'neutral' },
 }

@@ -125,6 +125,9 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.POST("/embeddings", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatEmbedding)
 		})
+		httpRouter.POST("/embeddings/multimodal", func(c *gin.Context) {
+			controller.Relay(c, types.RelayFormatEmbedding)
+		})
 
 		// audio related routes
 		httpRouter.POST("/audio/transcriptions", func(c *gin.Context) {

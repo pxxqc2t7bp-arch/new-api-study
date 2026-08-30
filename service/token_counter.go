@@ -276,7 +276,9 @@ func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *rela
 	for i, file := range meta.Files {
 		switch file.FileType {
 		case types.FileTypeImage:
-			if common.IsOpenAITextModel(model) {
+			if strings.HasPrefix(model, "doubao-embedding-vision-") {
+				tkm += maxArkEmbeddingImageTokens
+			} else if common.IsOpenAITextModel(model) {
 				token, err := getImageToken(c, file, model, info.IsStream)
 				if err != nil {
 					return 0, fmt.Errorf("error counting image token, media index[%d], identifier[%s], err: %v", i, file.GetIdentifier(), err)
@@ -288,7 +290,11 @@ func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *rela
 		case types.FileTypeAudio:
 			tkm += 256
 		case types.FileTypeVideo:
-			tkm += 4096 * 2
+			if strings.HasPrefix(model, "doubao-embedding-vision-") {
+				tkm += maxArkEmbeddingVideoTokens
+			} else {
+				tkm += 4096 * 2
+			}
 		case types.FileTypeFile:
 			tkm += 4096
 		default:

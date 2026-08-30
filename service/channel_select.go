@@ -10,12 +10,15 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const MaxAdaptiveChannelAttempts = 4
+
 type RetryParam struct {
 	Ctx          *gin.Context
 	TokenGroup   string
 	ModelName    string
 	RequestPath  string
 	Retry        *int
+	PriorityPath []int64
 	resetNextTry bool
 }
 
@@ -43,6 +46,38 @@ func (p *RetryParam) IncreaseRetry() {
 
 func (p *RetryParam) ResetRetryNextTry() {
 	p.resetNextTry = true
+}
+
+// AdaptiveRetryTimes returns the number of retries needed to visit each
+// eligible priority level once, capped to keep request latency bounded.
+func AdaptiveRetryTimes(param *RetryParam) int {
+	if param == nil {
+		return 0
+	}
+	if param.TokenGroup == "auto" {
+		return min(common.RetryTimes, MaxAdaptiveChannelAttempts-1)
+	}
+	priorities, err := model.ListSatisfiedChannelPriorities(
+		param.TokenGroup,
+		param.ModelName,
+		param.RequestPath,
+	)
+	if err != nil || len(priorities) <= 1 {
+		return 0
+	}
+	if param.Ctx != nil {
+		if _, exists := param.Ctx.Get("channel_priority"); exists {
+			initialPriority := param.Ctx.GetInt64("channel_priority")
+			for index, priority := range priorities {
+				if priority == initialPriority {
+					priorities = priorities[index:]
+					break
+				}
+			}
+		}
+	}
+	param.PriorityPath = priorities
+	return min(len(priorities)-1, MaxAdaptiveChannelAttempts-1)
 }
 
 // CacheGetRandomSatisfiedChannel tries to get a random channel that satisfies the requirements.
@@ -153,7 +188,23 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			break
 		}
 	} else {
-		channel, err = model.GetRandomSatisfiedChannel(param.TokenGroup, param.ModelName, param.GetRetry(), param.RequestPath)
+		if len(param.PriorityPath) == 0 {
+			param.PriorityPath, err = model.ListSatisfiedChannelPriorities(
+				param.TokenGroup, param.ModelName, param.RequestPath,
+			)
+			if err != nil {
+				return nil, param.TokenGroup, err
+			}
+		}
+		if param.GetRetry() >= len(param.PriorityPath) {
+			return nil, param.TokenGroup, nil
+		}
+		channel, err = model.GetRandomSatisfiedChannelAtPriority(
+			param.TokenGroup,
+			param.ModelName,
+			param.PriorityPath[param.GetRetry()],
+			param.RequestPath,
+		)
 		if err != nil {
 			return nil, param.TokenGroup, err
 		}

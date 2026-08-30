@@ -92,31 +92,33 @@ type RelayInfo struct {
 	FirstResponseTime time.Time
 	isFirstResponse   bool
 	//SendLastReasoningResponse bool
-	IsStream               bool
-	IsGeminiBatchEmbedding bool
-	IsPlayground           bool
-	UsePrice               bool
-	RelayMode              int
-	OriginModelName        string
-	RequestURLPath         string
-	RequestHeaders         map[string]string
-	ShouldIncludeUsage     bool
-	DisablePing            bool // 是否禁止向下游发送自定义 Ping
-	ClientWs               *websocket.Conn
-	TargetWs               *websocket.Conn
-	InputAudioFormat       string
-	OutputAudioFormat      string
-	RealtimeTools          []dto.RealTimeTool
-	IsFirstRequest         bool
-	AudioUsage             bool
-	ReasoningEffort        string
-	UserSetting            dto.UserSetting
-	UserEmail              string
-	UserQuota              int
-	RelayFormat            types.RelayFormat
-	SendResponseCount      int
-	ReceivedResponseCount  int
-	FinalPreConsumedQuota  int // 最终预消耗的配额
+	IsStream                bool
+	IsGeminiBatchEmbedding  bool
+	IsPlayground            bool
+	UsePrice                bool
+	RelayMode               int
+	OriginModelName         string
+	ActualUpstreamModelName string
+	ActualModelConflict     bool
+	RequestURLPath          string
+	RequestHeaders          map[string]string
+	ShouldIncludeUsage      bool
+	DisablePing             bool // 是否禁止向下游发送自定义 Ping
+	ClientWs                *websocket.Conn
+	TargetWs                *websocket.Conn
+	InputAudioFormat        string
+	OutputAudioFormat       string
+	RealtimeTools           []dto.RealTimeTool
+	IsFirstRequest          bool
+	AudioUsage              bool
+	ReasoningEffort         string
+	UserSetting             dto.UserSetting
+	UserEmail               string
+	UserQuota               int
+	RelayFormat             types.RelayFormat
+	SendResponseCount       int
+	ReceivedResponseCount   int
+	FinalPreConsumedQuota   int // 最终预消耗的配额
 	// ForcePreConsume 为 true 时禁用 BillingSession 的信任额度旁路，
 	// 强制预扣全额。用于异步任务（视频/音乐生成等），因为请求返回后任务仍在运行，
 	// 必须在提交前锁定全额。
@@ -183,6 +185,23 @@ type RelayInfo struct {
 	*ResponsesUsageInfo
 	*ChannelMeta
 	*TaskRelayInfo
+}
+
+func (info *RelayInfo) CaptureActualUpstreamModelName(modelName string) {
+	if info == nil || info.OriginModelName != "doubao-smart-router-250928" {
+		return
+	}
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" || modelName == info.OriginModelName {
+		return
+	}
+	if info.ActualUpstreamModelName == "" {
+		info.ActualUpstreamModelName = modelName
+		return
+	}
+	if info.ActualUpstreamModelName != modelName {
+		info.ActualModelConflict = true
+	}
 }
 
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
@@ -876,6 +895,10 @@ type TaskSubmitReq struct {
 	Seconds        string                 `json:"seconds,omitempty"`
 	InputReference string                 `json:"input_reference,omitempty"`
 	Metadata       map[string]interface{} `json:"metadata,omitempty"`
+	Content        []map[string]any       `json:"content,omitempty"`
+	Parameters     map[string]any         `json:"parameters,omitempty"`
+	Seed           *int                   `json:"seed,omitempty"`
+	CallbackURL    string                 `json:"callback_url,omitempty"`
 }
 
 func (t *TaskSubmitReq) GetPrompt() string {
@@ -883,7 +906,15 @@ func (t *TaskSubmitReq) GetPrompt() string {
 }
 
 func (t *TaskSubmitReq) HasImage() bool {
-	return len(t.Images) > 0
+	if len(t.Images) > 0 || strings.TrimSpace(t.Image) != "" {
+		return true
+	}
+	for _, item := range t.Content {
+		if item["type"] == "image_url" {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {

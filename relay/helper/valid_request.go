@@ -107,6 +107,12 @@ func GetAndValidateEmbeddingRequest(c *gin.Context, relayMode int) (*dto.Embeddi
 	if embeddingRequest.Input == nil {
 		return nil, fmt.Errorf("input is empty")
 	}
+	if strings.HasPrefix(embeddingRequest.Model, "doubao-embedding-vision-") ||
+		strings.HasSuffix(c.Request.URL.Path, "/embeddings/multimodal") {
+		if err := embeddingRequest.ValidateMultimodalInput(); err != nil {
+			return nil, err
+		}
+	}
 	if relayMode == relayconstant.RelayModeModerations && embeddingRequest.Model == "" {
 		embeddingRequest.Model = "omni-moderation-latest"
 	}

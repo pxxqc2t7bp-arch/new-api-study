@@ -288,15 +288,16 @@ func noteTaskQuotaClamp(info *relaycommon.RelayInfo, clamp *common.QuotaClamp) {
 }
 
 var fetchRespBuilders = map[int]func(c *gin.Context) (respBody []byte, taskResp *dto.TaskError){
-	relayconstant.RelayModeSunoFetchByID:  sunoFetchByIDRespBodyBuilder,
-	relayconstant.RelayModeSunoFetch:      sunoFetchRespBodyBuilder,
-	relayconstant.RelayModeVideoFetchByID: videoFetchByIDRespBodyBuilder,
+	relayconstant.RelayModeSunoFetchByID:   sunoFetchByIDRespBodyBuilder,
+	relayconstant.RelayModeSunoFetch:       sunoFetchRespBodyBuilder,
+	relayconstant.RelayModeVideoFetchByID:  videoFetchByIDRespBodyBuilder,
+	relayconstant.RelayModeThreeDFetchByID: threeDFetchByIDRespBodyBuilder,
 }
 
 func RelayTaskFetch(c *gin.Context, relayMode int) (taskResp *dto.TaskError) {
 	respBuilder, ok := fetchRespBuilders[relayMode]
 	if !ok {
-		taskResp = service.TaskErrorWrapperLocal(errors.New("invalid_relay_mode"), "invalid_relay_mode", http.StatusBadRequest)
+		return service.TaskErrorWrapperLocal(errors.New("invalid_relay_mode"), "invalid_relay_mode", http.StatusBadRequest)
 	}
 
 	respBody, taskErr := respBuilder(c)
@@ -314,6 +315,140 @@ func RelayTaskFetch(c *gin.Context, relayMode int) (taskResp *dto.TaskError) {
 		return
 	}
 	return
+}
+
+func threeDFetchByIDRespBodyBuilder(c *gin.Context) ([]byte, *dto.TaskError) {
+	taskID := c.Param("task_id")
+	task, exists, err := model.GetByTaskId(c.GetInt("id"), taskID)
+	if err != nil {
+		return nil, service.TaskErrorWrapper(err, "get_task_failed", http.StatusInternalServerError)
+	}
+	if !exists {
+		return nil, service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusNotFound)
+	}
+	response := buildThreeDResponse(task, c.GetBool("three_d_native_response"))
+	body, err := common.Marshal(response)
+	if err != nil {
+		return nil, service.TaskErrorWrapper(err, "marshal_response_failed", http.StatusInternalServerError)
+	}
+	return body, nil
+}
+
+func buildThreeDResponse(task *model.Task, native bool) any {
+	status := strings.ToLower(string(task.Status))
+	switch task.Status {
+	case model.TaskStatusNotStart, model.TaskStatusSubmitted, model.TaskStatusQueued:
+		status = "queued"
+	case model.TaskStatusInProgress:
+		status = "running"
+	case model.TaskStatusSuccess:
+		status = "succeeded"
+	case model.TaskStatusFailure:
+		status = "failed"
+	case model.TaskStatusCancelled:
+		status = "cancelled"
+	}
+	var stored struct {
+		Usage *dto.ThreeDUsage `json:"usage"`
+		Error *dto.ThreeDError `json:"error"`
+	}
+	_ = common.Unmarshal(task.Data, &stored)
+	response := dto.ThreeDGeneration{
+		ID:        task.TaskID,
+		Model:     task.Properties.OriginModelName,
+		Status:    status,
+		FileURL:   task.PrivateData.ResultURL,
+		Usage:     stored.Usage,
+		Error:     stored.Error,
+		CreatedAt: task.CreatedAt,
+		UpdatedAt: task.UpdatedAt,
+	}
+	if response.FileURL != "" {
+		response.ExpiresAt = task.UpdatedAt + 24*60*60
+	}
+	if !native {
+		response.Object = "3d.generation"
+		return response
+	}
+	return gin.H{
+		"id":         response.ID,
+		"model":      response.Model,
+		"status":     response.Status,
+		"content":    gin.H{"file_url": response.FileURL},
+		"usage":      response.Usage,
+		"error":      response.Error,
+		"created_at": response.CreatedAt,
+		"updated_at": response.UpdatedAt,
+	}
+}
+
+func RelayThreeDCancel(c *gin.Context) *dto.TaskError {
+	taskID := c.Param("task_id")
+	task, exists, err := model.GetByTaskId(c.GetInt("id"), taskID)
+	if err != nil {
+		return service.TaskErrorWrapper(err, "get_task_failed", http.StatusInternalServerError)
+	}
+	if !exists {
+		return service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusNotFound)
+	}
+	switch task.Status {
+	case model.TaskStatusNotStart, model.TaskStatusSubmitted, model.TaskStatusQueued:
+	default:
+		return service.TaskErrorWrapperLocal(
+			fmt.Errorf("task status %s cannot be cancelled", task.Status),
+			"task_not_cancellable",
+			http.StatusConflict,
+		)
+	}
+	channelModel, err := model.GetChannelById(task.ChannelId, true)
+	if err != nil {
+		return service.TaskErrorWrapper(err, "get_channel_failed", http.StatusInternalServerError)
+	}
+	adaptor := GetTaskAdaptor(task.Platform)
+	canceller, ok := adaptor.(channel.TaskCanceller)
+	if !ok {
+		return service.TaskErrorWrapperLocal(errors.New("cancel_not_supported"), "cancel_not_supported", http.StatusNotImplemented)
+	}
+	resp, err := canceller.CancelTask(
+		channelModel.GetBaseURL(),
+		channelModel.Key,
+		task.GetUpstreamTaskID(),
+		channelModel.GetSetting().Proxy,
+	)
+	if err != nil {
+		return service.TaskErrorWrapper(err, "cancel_task_failed", http.StatusBadGateway)
+	}
+	defer service.CloseResponseBodyGracefully(resp)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return service.TaskErrorWrapper(
+			fmt.Errorf("upstream cancel failed: %s", body),
+			"cancel_task_failed",
+			resp.StatusCode,
+		)
+	}
+	oldStatus := task.Status
+	task.Status = model.TaskStatusCancelled
+	task.Progress = taskcommon.ProgressComplete
+	task.FinishTime = common.GetTimestamp()
+	task.FailReason = "cancelled"
+	won, err := task.UpdateWithStatus(oldStatus)
+	if err != nil {
+		return service.TaskErrorWrapper(err, "update_task_failed", http.StatusInternalServerError)
+	}
+	if !won {
+		return service.TaskErrorWrapperLocal(errors.New("task status changed"), "task_state_conflict", http.StatusConflict)
+	}
+	if task.Quota != 0 && !service.RefundTaskQuota(c, task, "3D task cancelled") {
+		return service.TaskErrorWrapper(
+			errors.New("task cancelled but quota refund failed"),
+			"cancel_refund_failed",
+			http.StatusInternalServerError,
+		)
+	}
+	response := buildThreeDResponse(task, c.GetBool("three_d_native_response"))
+	c.JSON(http.StatusOK, response)
+	return nil
 }
 
 func sunoFetchRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *dto.TaskError) {

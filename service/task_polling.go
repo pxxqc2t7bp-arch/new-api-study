@@ -328,7 +328,9 @@ func taskNeedsUpdate(oldTask *model.Task, newTask taskdto.SunoDataResponse) bool
 		return true
 	}
 
-	if (oldTask.Status == model.TaskStatusFailure || oldTask.Status == model.TaskStatusSuccess) && oldTask.Progress != "100%" {
+	if (oldTask.Status == model.TaskStatusFailure ||
+		oldTask.Status == model.TaskStatusSuccess ||
+		oldTask.Status == model.TaskStatusCancelled) && oldTask.Progress != "100%" {
 		return true
 	}
 
@@ -563,6 +565,15 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		if quota != 0 {
 			shouldRefund = true
 		}
+	case model.TaskStatusCancelled:
+		task.Progress = taskcommon.ProgressComplete
+		if task.FinishTime == 0 {
+			task.FinishTime = now
+		}
+		task.FailReason = "cancelled"
+		if quota != 0 {
+			shouldRefund = true
+		}
 	default:
 		return fmt.Errorf("unknown task status %s for task %s", taskResult.Status, task.TaskID)
 	}
@@ -570,7 +581,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		task.Progress = taskResult.Progress
 	}
 
-	isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
+	isDone := task.Status == model.TaskStatusSuccess ||
+		task.Status == model.TaskStatusFailure ||
+		task.Status == model.TaskStatusCancelled
 	if isDone && snap.Status != task.Status {
 		won, err := task.UpdateWithStatus(snap.Status)
 		if err != nil {

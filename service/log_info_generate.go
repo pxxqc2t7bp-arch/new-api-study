@@ -69,6 +69,44 @@ func appendRequestPath(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, other
 	}
 }
 
+// AppendChannelFailoverAdminInfo records the selected priority path without
+// exposing channel topology to non-admin log consumers.
+func AppendChannelFailoverAdminInfo(ctx *gin.Context, adminInfo map[string]interface{}) {
+	if ctx == nil || adminInfo == nil {
+		return
+	}
+	channels := ctx.GetStringSlice("use_channel")
+	if len(channels) == 0 {
+		return
+	}
+	adminInfo["attempt_count"] = len(channels)
+	adminInfo["attempted_channels"] = channels
+	if value, ok := ctx.Get("channel_priority_path"); ok {
+		if priorities, valid := value.([]int64); valid && len(priorities) > 0 {
+			adminInfo["priority_path"] = priorities
+			adminInfo["final_tier"] = priorities[len(priorities)-1]
+		}
+	}
+	if reason := ctx.GetString("channel_fallback_reason"); reason != "" {
+		adminInfo["fallback_reason"] = reason
+	}
+	if billedModel := ctx.GetString("billed_model"); billedModel != "" {
+		adminInfo["billed_model"] = billedModel
+	}
+	for _, key := range []string{
+		"actual_model_missing",
+		"actual_model_conflict",
+		"actual_model_unpriced",
+		"actual_model_pricing_error",
+		"visual_usage_missing",
+		"visual_usage_estimated",
+	} {
+		if value, exists := ctx.Get(key); exists {
+			adminInfo[key] = value
+		}
+	}
+}
+
 func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, modelRatio, groupRatio, completionRatio float64,
 	cacheTokens int, cacheRatio float64, modelPrice float64, userGroupRatio float64) map[string]interface{} {
 	other := make(map[string]interface{})
@@ -107,6 +145,7 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	}
 
 	AppendChannelAffinityAdminInfo(ctx, adminInfo)
+	AppendChannelFailoverAdminInfo(ctx, adminInfo)
 
 	other["admin_info"] = adminInfo
 	appendRequestPath(ctx, relayInfo, other)

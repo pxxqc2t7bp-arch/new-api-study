@@ -164,6 +164,17 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
       models: 'Models',
     },
   },
+  61: {
+    id: 61,
+    name: CHANNEL_TYPES[61],
+    icon: 'Doubao',
+    defaultBaseUrl: 'https://ark.cn-beijing.volces.com',
+    hints: {
+      key: 'VolcEngine Ark API Key',
+      models: 'Seed3D, Hitem3D, Hyper3D model IDs',
+      baseUrl: 'Default: https://ark.cn-beijing.volces.com',
+    },
+  },
 }
 
 /**

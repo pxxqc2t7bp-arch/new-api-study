@@ -42,13 +42,28 @@ type testResult struct {
 	newAPIError *types.NewAPIError
 }
 
-func normalizeChannelTestEndpoint(channel *model.Channel, endpointType string) string {
+func normalizeChannelTestEndpoint(channel *model.Channel, testModel string, endpointType string) string {
 	normalized := strings.TrimSpace(endpointType)
 	if normalized != "" {
 		return normalized
 	}
 	if channel != nil && channel.Type == constant.ChannelTypeCodex {
 		return string(constant.EndpointTypeOpenAIResponse)
+	}
+	if channel != nil && channel.Type == constant.ChannelTypeAdvancedCustom {
+		config := channel.GetOtherSettings().AdvancedCustom
+		endpoints := config.SupportedEndpointTypesForModel(testModel)
+		for _, preferred := range []constant.EndpointType{
+			constant.EndpointTypeOpenAI,
+			constant.EndpointTypeAnthropic,
+			constant.EndpointTypeOpenAIResponse,
+			constant.EndpointTypeEmbeddings,
+			constant.EndpointTypeImageGeneration,
+		} {
+			if lo.Contains(endpoints, preferred) {
+				return string(preferred)
+			}
+		}
 	}
 	return normalized
 }
@@ -82,6 +97,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		constant.ChannelTypeKling,
 		constant.ChannelTypeJimeng,
 		constant.ChannelTypeDoubaoVideo,
+		constant.ChannelTypeVolcEngine3D,
 		constant.ChannelTypeVidu,
 	}
 	if lo.Contains(unsupportedTestChannelTypes, channel.Type) {
@@ -108,7 +124,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		}
 	}
 
-	endpointType = normalizeChannelTestEndpoint(channel, endpointType)
+	endpointType = normalizeChannelTestEndpoint(channel, testModel, endpointType)
 
 	requestPath := "/v1/chat/completions"
 
@@ -1102,6 +1118,8 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 
 func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*model.Channel {
 	selected := make([]*model.Channel, 0, len(channels))
+	selectedPlanDomains := make(map[string]struct{})
+	now := time.Now().Unix()
 	for _, channel := range channels {
 		if channel.Status == common.ChannelStatusManuallyDisabled {
 			continue
@@ -1111,6 +1129,18 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 		}
 		if mode == operation_setting.ChannelTestModePassiveRecovery && channel.Status != common.ChannelStatusAutoDisabled {
 			continue
+		}
+		if mode == operation_setting.ChannelTestModePassiveRecovery {
+			if disabledUntil := channel.GetDisabledUntil(); disabledUntil > now {
+				continue
+			}
+			tag := channel.GetTag()
+			if strings.HasPrefix(tag, "plan:") {
+				if _, exists := selectedPlanDomains[tag]; exists {
+					continue
+				}
+				selectedPlanDomains[tag] = struct{}{}
+			}
 		}
 		selected = append(selected, channel)
 	}

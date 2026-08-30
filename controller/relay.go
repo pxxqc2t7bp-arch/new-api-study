@@ -190,8 +190,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
+	maxRetries := service.AdaptiveRetryTimes(retryParam)
 
-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+	for ; retryParam.GetRetry() <= maxRetries; retryParam.IncreaseRetry() {
 		relayInfo.RetryIndex = retryParam.GetRetry()
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
@@ -199,7 +200,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = channelErr
 			break
 		}
-		addUsedChannel(c, channel.Id)
+		addUsedChannel(c, channel)
 		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
 			newAPIError = billingErr
 			break
@@ -237,8 +238,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.LastError = newAPIError
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+		c.Set("channel_fallback_reason", fmt.Sprintf("status_%d:%s", newAPIError.StatusCode, newAPIError.GetErrorCode()))
 
-		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
+		if !shouldRetry(c, newAPIError, maxRetries-retryParam.GetRetry()) {
 			break
 		}
 	}
@@ -262,10 +264,17 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-func addUsedChannel(c *gin.Context, channelId int) {
+func addUsedChannel(c *gin.Context, channel *model.Channel) {
+	if channel == nil {
+		return
+	}
 	useChannel := c.GetStringSlice("use_channel")
-	useChannel = append(useChannel, fmt.Sprintf("%d", channelId))
+	useChannel = append(useChannel, fmt.Sprintf("%d", channel.Id))
 	c.Set("use_channel", useChannel)
+	value, _ := c.Get("channel_priority_path")
+	priorityPath, _ := value.([]int64)
+	priorityPath = append(priorityPath, channel.GetPriority())
+	c.Set("channel_priority_path", priorityPath)
 }
 
 func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
@@ -301,14 +310,16 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 	if info.ChannelMeta == nil {
 		autoBan := c.GetBool("auto_ban")
 		autoBanInt := 1
+		priority := c.GetInt64("channel_priority")
 		if !autoBan {
 			autoBanInt = 0
 		}
 		return &model.Channel{
-			Id:      c.GetInt("channel_id"),
-			Type:    c.GetInt("channel_type"),
-			Name:    c.GetString("channel_name"),
-			AutoBan: &autoBanInt,
+			Id:       c.GetInt("channel_id"),
+			Type:     c.GetInt("channel_type"),
+			Name:     c.GetString("channel_name"),
+			Priority: &priority,
+			AutoBan:  &autoBanInt,
 		}, nil
 	}
 	channel, selectGroup, err := service.CacheGetRandomSatisfiedChannel(retryParam)
@@ -330,6 +341,9 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 
 func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
 	if openaiErr == nil {
+		return false
+	}
+	if c != nil && c.Writer != nil && c.Writer.Written() {
 		return false
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
@@ -396,6 +410,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			adminInfo["multi_key_index"] = common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex)
 		}
 		service.AppendChannelAffinityAdminInfo(c, adminInfo)
+		service.AppendChannelFailoverAdminInfo(c, adminInfo)
 		other["admin_info"] = adminInfo
 		startTime := common.GetContextKeyTime(c, constant.ContextKeyRequestStartTime)
 		if startTime.IsZero() {
@@ -489,6 +504,20 @@ func RelayTaskFetch(c *gin.Context) {
 	}
 }
 
+func RelayThreeDFetch(c *gin.Context) {
+	c.Set("relay_mode", relayconstant.RelayModeThreeDFetchByID)
+	if taskErr := relay.RelayTaskFetch(c, relayconstant.RelayModeThreeDFetchByID); taskErr != nil {
+		respondTaskError(c, taskErr)
+	}
+}
+
+func RelayThreeDCancel(c *gin.Context) {
+	c.Set("relay_mode", relayconstant.RelayModeThreeDCancelByID)
+	if taskErr := relay.RelayThreeDCancel(c); taskErr != nil {
+		respondTaskError(c, taskErr)
+	}
+}
+
 func RelayTask(c *gin.Context) {
 	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
 	if err != nil {
@@ -520,8 +549,12 @@ func RelayTask(c *gin.Context) {
 		RequestPath: c.Request.URL.Path,
 		Retry:       common.GetPointer(0),
 	}
+	maxTaskRetries := common.RetryTimes
+	if relayInfo.RelayMode == relayconstant.RelayModeThreeDSubmit {
+		maxTaskRetries = service.AdaptiveRetryTimes(retryParam)
+	}
 
-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+	for ; retryParam.GetRetry() <= maxTaskRetries; retryParam.IncreaseRetry() {
 		var channel *model.Channel
 
 		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
@@ -542,7 +575,7 @@ func RelayTask(c *gin.Context) {
 			}
 		}
 
-		addUsedChannel(c, channel.Id)
+		addUsedChannel(c, channel)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
 			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
@@ -566,7 +599,7 @@ func RelayTask(c *gin.Context) {
 				types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode))
 		}
 
-		if !shouldRetryTaskRelay(c, channel.Id, taskErr, common.RetryTimes-retryParam.GetRetry()) {
+		if !shouldRetryTaskRelay(c, channel.Id, taskErr, maxTaskRetries-retryParam.GetRetry()) {
 			break
 		}
 	}

@@ -42,6 +42,9 @@ const (
 
 	RelayModeVideoFetchByID
 	RelayModeVideoSubmit
+	RelayModeThreeDFetchByID
+	RelayModeThreeDSubmit
+	RelayModeThreeDCancelByID
 
 	RelayModeRerank
 
