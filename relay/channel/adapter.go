@@ -132,3 +132,7 @@ type TaskValidatedBillingProvider interface {
 type TaskValidatedUsageFactsProvider interface {
 	ExtractUsageFactsValidated(c *gin.Context, info *relaycommon.RelayInfo) (map[string]any, error)
 }
+
+type TaskCanceller interface {
+	CancelTask(baseURL, key, taskID, proxy string) (*http.Response, error)
+}

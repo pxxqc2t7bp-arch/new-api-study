@@ -37,6 +37,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/sub2api"
 	"github.com/QuantumNous/new-api/relay/channel/submodel"
 	jspluginadaptor "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
+	taskvolcengine3d "github.com/QuantumNous/new-api/relay/channel/task/volcengine3d"
 	"github.com/QuantumNous/new-api/relay/channel/tencent"
 	"github.com/QuantumNous/new-api/relay/channel/vertex"
 	"github.com/QuantumNous/new-api/relay/channel/volcengine"
@@ -186,6 +187,9 @@ func TaskPlatformUnavailableError(platform constant.TaskPlatform) (string, strin
 }
 
 func GetTaskAdaptor(platform constant.TaskPlatform) channel.TaskAdaptor {
+	if platform == constant.TaskPlatform(strconv.Itoa(constant.ChannelTypeVolcEngine3D)) {
+		return &taskvolcengine3d.TaskAdaptor{}
+	}
 	plugin, ok := ResolveTaskPluginForPlatform(pluginruntime.DefaultRegistry.Generation(), platform)
 	if !ok {
 		return nil
@@ -197,6 +201,9 @@ func GetTaskAdaptor(platform constant.TaskPlatform) channel.TaskAdaptor {
 // declarative or shared-endpoint router. Legacy task routes are pinned here
 // from one registry generation before the adaptor is returned.
 func getTaskAdaptorForRequest(c *gin.Context, platform constant.TaskPlatform) (constant.TaskPlatform, channel.TaskAdaptor) {
+	if platform == constant.TaskPlatform(strconv.Itoa(constant.ChannelTypeVolcEngine3D)) {
+		return platform, &taskvolcengine3d.TaskAdaptor{}
+	}
 	if c != nil {
 		if value, exists := c.Get(pluginruntime.ContextKeyPinnedPlugin); exists {
 			if pinned, ok := value.(pluginruntime.PinnedPlugin); ok && pinned.Plugin != nil {

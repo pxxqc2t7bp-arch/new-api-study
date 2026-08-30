@@ -266,6 +266,51 @@ func HasModelBillingConfig(modelName string) bool {
 	return ok && strings.TrimSpace(expr) != ""
 }
 
+// ApplySmartRouterActualModelPricing swaps the conservative pre-consume price
+// for the actual model reported by Ark. The original model name remains intact
+// for routing and user-visible logs.
+func ApplySmartRouterActualModelPricing(c *gin.Context, info *relaycommon.RelayInfo, promptTokens int, meta *types.TokenCountMeta) {
+	if info == nil || info.OriginModelName != "doubao-smart-router-250928" {
+		return
+	}
+	if info.ActualModelConflict {
+		c.Set("actual_model_conflict", true)
+		logger.LogError(c, "smart router reported conflicting actual model names")
+		return
+	}
+	actualModel := strings.TrimSpace(info.ActualUpstreamModelName)
+	if actualModel == "" {
+		c.Set("actual_model_missing", true)
+		logger.LogError(c, "smart router response did not report the actual model; keeping conservative pricing")
+		return
+	}
+	if !HasModelBillingConfig(actualModel) {
+		c.Set("actual_model_unpriced", actualModel)
+		logger.LogError(c, "smart router actual model is not priced: "+actualModel)
+		return
+	}
+	if meta == nil {
+		meta = &types.TokenCountMeta{}
+	}
+
+	pricingInfo := *info
+	pricingInfo.OriginModelName = actualModel
+	pricingInfo.PriceData = hosttypes.PriceData{}
+	pricingInfo.TieredBillingSnapshot = nil
+	pricingInfo.BillingRequestInput = nil
+	priceData, err := ModelPriceHelper(c, &pricingInfo, promptTokens, meta)
+	if err != nil {
+		c.Set("actual_model_pricing_error", err.Error())
+		logger.LogError(c, "failed to price smart router actual model: "+err.Error())
+		return
+	}
+
+	info.PriceData = priceData
+	info.TieredBillingSnapshot = pricingInfo.TieredBillingSnapshot
+	info.BillingRequestInput = pricingInfo.BillingRequestInput
+	c.Set("billed_model", actualModel)
+}
+
 func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptTokens int, meta *types.TokenCountMeta, groupRatioInfo hosttypes.GroupRatioInfo) (hosttypes.PriceData, error) {
 	exprStr, ok := billing_setting.GetBillingExpr(info.OriginModelName)
 	if !ok {

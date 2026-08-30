@@ -145,6 +145,7 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	}
 
 	usageDto := usage.(*dto.Usage)
+	helper.ApplySmartRouterActualModelPricing(c, info, info.GetEstimatePromptTokens(), request.GetTokenCountMeta())
 	if info.RelayMode == relayconstant.RelayModeResponsesCompact {
 		originModelName := info.OriginModelName
 		originPriceData := info.PriceData

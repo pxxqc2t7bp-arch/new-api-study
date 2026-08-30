@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -271,4 +272,38 @@ func TestModelPriceHelperRequestBillingRatiosOnlyApplyToFixedPrice(t *testing.T)
 	require.Equal(t, "QuotaFromFloat", clamp.Op)
 	require.Equal(t, common.QuotaClampOverflow, clamp.Kind)
 	require.Nil(t, info.Billing)
+}
+
+func TestApplySmartRouterActualModelPricing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	savedRatios := ratio_setting.ModelRatio2JSONString()
+	savedCompletion := ratio_setting.CompletionRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(savedRatios))
+		require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(savedCompletion))
+	})
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(
+		`{"actual-routed-model":0.5,"doubao-smart-router-250928":3}`,
+	))
+	require.NoError(t, ratio_setting.UpdateCompletionRatioByJSONString(
+		`{"actual-routed-model":4,"doubao-smart-router-250928":5}`,
+	))
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx.Set("group", "default")
+	info := &relaycommon.RelayInfo{
+		OriginModelName:         "doubao-smart-router-250928",
+		ActualUpstreamModelName: "actual-routed-model",
+		UserGroup:               "default",
+		UsingGroup:              "default",
+		PriceData:               hosttypes.PriceData{ModelRatio: 3, CompletionRatio: 5},
+	}
+
+	ApplySmartRouterActualModelPricing(ctx, info, 100, &types.TokenCountMeta{MaxTokens: 20})
+
+	require.Equal(t, 0.5, info.PriceData.ModelRatio)
+	require.Equal(t, 4.0, info.PriceData.CompletionRatio)
+	require.Equal(t, "actual-routed-model", ctx.GetString("billed_model"))
 }

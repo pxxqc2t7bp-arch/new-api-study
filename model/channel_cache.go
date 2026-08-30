@@ -120,59 +120,49 @@ func GetRandomSatisfiedChannel(
 	retry int,
 	filters []dto.ChannelFilter,
 ) (*Channel, error) {
-	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {
 		return GetChannel(group, model, retry, filters)
 	}
+	priorities, err := ListSatisfiedChannelPriorities(group, model, filters)
+	if err != nil || retry >= len(priorities) {
+		return nil, err
+	}
+	return GetRandomSatisfiedChannelAtPriority(group, model, priorities[retry], filters)
+}
 
+func cachedSatisfiedChannelIDs(group string, model string, filters []dto.ChannelFilter) []int {
 	channelSyncLock.RLock()
 	defer channelSyncLock.RUnlock()
 
-	// First, try to find channels with the exact model name.
 	channels, _ := filterCandidateIDs(group2model2channels[group][model], model, filters)
-
-	// If no channels found, try to find channels with the normalized model name.
 	if len(channels) == 0 {
 		normalizedModel := ratio_setting.FormatMatchingModelName(model)
 		channels, _ = filterCandidateIDs(group2model2channels[group][normalizedModel], model, filters)
 	}
+	return append([]int(nil), channels...)
+}
 
+func GetRandomSatisfiedChannelAtPriority(
+	group string,
+	model string,
+	priority int64,
+	filters []dto.ChannelFilter,
+) (*Channel, error) {
+	if !common.MemoryCacheEnabled {
+		return GetChannelAtPriority(group, model, priority, filters)
+	}
+	channels := cachedSatisfiedChannelIDs(group, model, filters)
 	if len(channels) == 0 {
 		return nil, nil
 	}
 
-	if len(channels) == 1 {
-		if channel, ok := channelsIDM[channels[0]]; ok {
-			return channel, nil
-		}
-		return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channels[0])
-	}
-
-	uniquePriorities := make(map[int]bool)
-	for _, channelId := range channels {
-		if channel, ok := channelsIDM[channelId]; ok {
-			uniquePriorities[int(channel.GetPriority())] = true
-		} else {
-			return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channelId)
-		}
-	}
-	var sortedUniquePriorities []int
-	for priority := range uniquePriorities {
-		sortedUniquePriorities = append(sortedUniquePriorities, priority)
-	}
-	sort.Sort(sort.Reverse(sort.IntSlice(sortedUniquePriorities)))
-
-	if retry >= len(uniquePriorities) {
-		retry = len(uniquePriorities) - 1
-	}
-	targetPriority := int64(sortedUniquePriorities[retry])
-
-	// get the priority for the given retry number
 	var sumWeight = 0
 	var targetChannels []*Channel
+	channelSyncLock.RLock()
+	defer channelSyncLock.RUnlock()
 	for _, channelId := range channels {
 		if channel, ok := channelsIDM[channelId]; ok {
-			if channel.GetPriority() == targetPriority {
+			if channel.GetPriority() == priority {
 				sumWeight += channel.GetWeight()
 				targetChannels = append(targetChannels, channel)
 			}
@@ -182,7 +172,7 @@ func GetRandomSatisfiedChannel(
 	}
 
 	if len(targetChannels) == 0 {
-		return nil, errors.New(fmt.Sprintf("no channel found, group: %s, model: %s, priority: %d", group, model, targetPriority))
+		return nil, nil
 	}
 
 	// smoothing factor and adjustment
@@ -216,6 +206,40 @@ func GetRandomSatisfiedChannel(
 	return nil, errors.New("channel not found")
 }
 
+func ListSatisfiedChannelPriorities(
+	group string,
+	model string,
+	filters []dto.ChannelFilter,
+) ([]int64, error) {
+	if !common.MemoryCacheEnabled {
+		return ListChannelPriorities(group, model, filters)
+	}
+	channels := cachedSatisfiedChannelIDs(group, model, filters)
+	priorities := make(map[int64]struct{})
+	channelSyncLock.RLock()
+	defer channelSyncLock.RUnlock()
+	for _, channelID := range channels {
+		channel, ok := channelsIDM[channelID]
+		if !ok {
+			return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channelID)
+		}
+		priorities[channel.GetPriority()] = struct{}{}
+	}
+	result := make([]int64, 0, len(priorities))
+	for priority := range priorities {
+		result = append(result, priority)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] > result[j] })
+	return result, nil
+}
+
+// CountSatisfiedChannelPriorities returns the number of distinct priority
+// levels that can serve a model and its request constraints. A retry consumes one level,
+// so channels at the same priority remain a load-balanced pool.
+func CountSatisfiedChannelPriorities(group string, model string, filters []dto.ChannelFilter) (int, error) {
+	priorities, err := ListSatisfiedChannelPriorities(group, model, filters)
+	return len(priorities), err
+}
 func CacheGetChannel(id int) (*Channel, error) {
 	if !common.MemoryCacheEnabled {
 		return GetChannelById(id, true)

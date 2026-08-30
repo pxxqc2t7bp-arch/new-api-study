@@ -3,11 +3,13 @@ package controller
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -15,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -95,6 +98,20 @@ func TestNewAPIChannelRegistration(t *testing.T) {
 	assert.Equal(t, "New API", constant.GetChannelTypeName(constant.ChannelTypeNewAPI))
 	require.Greater(t, len(constant.ChannelBaseURLs), constant.ChannelTypeNewAPI)
 	assert.Empty(t, constant.ChannelBaseURLs[constant.ChannelTypeNewAPI])
+}
+
+func TestVolcEngine3DChannelRegistration(t *testing.T) {
+	apiType, ok := common.ChannelType2APIType(constant.ChannelTypeVolcEngine3D)
+
+	require.True(t, ok)
+	assert.Equal(t, constant.APITypeVolcEngine, apiType)
+	assert.Equal(t, "VolcEngine3D", constant.GetChannelTypeName(constant.ChannelTypeVolcEngine3D))
+	require.Greater(t, len(constant.ChannelBaseURLs), constant.ChannelTypeVolcEngine3D)
+	assert.Equal(t, "https://ark.cn-beijing.volces.com", constant.ChannelBaseURLs[constant.ChannelTypeVolcEngine3D])
+	assert.Equal(t,
+		[]constant.EndpointType{constant.EndpointTypeThreeDGeneration},
+		common.GetEndpointTypesByChannelType(constant.ChannelTypeVolcEngine3D, "hyper3d-gen2-260112"),
+	)
 }
 
 func TestResponsesCompactChannelSupport(t *testing.T) {
@@ -297,16 +314,94 @@ func TestResolveChannelTestUserIDUsesRequestUser(t *testing.T) {
 }
 
 func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *testing.T) {
+	future := time.Now().Add(time.Hour).Unix()
+	planTag := "plan:support:coding"
+	deferred := &model.Channel{Id: 4, Status: common.ChannelStatusAutoDisabled, Tag: &planTag}
+	deferred.SetOtherInfo(map[string]any{"disabled_until": future})
 	channels := []*model.Channel{
 		{Id: 1, Status: common.ChannelStatusEnabled},
 		{Id: 2, Status: common.ChannelStatusAutoDisabled},
 		{Id: 3, Status: common.ChannelStatusManuallyDisabled},
+		deferred,
 	}
 
 	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModePassiveRecovery)
 
 	require.Len(t, selected, 1)
 	require.Equal(t, 2, selected[0].Id)
+}
+
+func TestSelectChannelsForAutomaticTestDeduplicatesDuePlanDomain(t *testing.T) {
+	past := time.Now().Add(-time.Minute).Unix()
+	codingTag := "plan:support:coding"
+	analysisTag := "plan:support:analysis"
+	ordinaryTag := "provider:support"
+	first := &model.Channel{Id: 11, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
+	first.SetOtherInfo(map[string]any{"disabled_until": past})
+	second := &model.Channel{Id: 12, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
+	second.SetOtherInfo(map[string]any{"disabled_until": past})
+	otherPlan := &model.Channel{Id: 13, Status: common.ChannelStatusAutoDisabled, Tag: &analysisTag}
+	otherPlan.SetOtherInfo(map[string]any{"disabled_until": past})
+	ordinary := &model.Channel{Id: 14, Status: common.ChannelStatusAutoDisabled, Tag: &ordinaryTag}
+	ordinary.SetOtherInfo(map[string]any{"disabled_until": past})
+
+	selected := selectChannelsForAutomaticTest(
+		[]*model.Channel{first, second, otherPlan, ordinary},
+		operation_setting.ChannelTestModePassiveRecovery,
+	)
+
+	require.Len(t, selected, 3)
+	assert.Equal(t, 11, selected[0].Id)
+	assert.Equal(t, 13, selected[1].Id)
+	assert.Equal(t, 14, selected[2].Id)
+}
+
+func TestSelectChannelsForAutomaticTestAlwaysSkipsManualDisabled(t *testing.T) {
+	autoBanEnabled := 1
+	manual := &model.Channel{
+		Id:      21,
+		Status:  common.ChannelStatusManuallyDisabled,
+		AutoBan: &autoBanEnabled,
+	}
+
+	for _, mode := range []string{
+		operation_setting.ChannelTestModeScheduledAll,
+		operation_setting.ChannelTestModeAutoBanOnly,
+		operation_setting.ChannelTestModePassiveRecovery,
+	} {
+		t.Run(mode, func(t *testing.T) {
+			selected := selectChannelsForAutomaticTest([]*model.Channel{manual}, mode)
+			assert.Empty(t, selected)
+		})
+	}
+}
+
+func TestNormalizeChannelTestEndpointUsesAdvancedCustomRoute(t *testing.T) {
+	channel := &model.Channel{
+		Type: constant.ChannelTypeAdvancedCustom,
+		OtherSettings: `{"advanced_custom":{"advanced_routes":[` +
+			`{"incoming_path":"/v1/messages","upstream_path":"/v1/messages","converter":"none"}` +
+			`]}}`,
+	}
+
+	endpoint := normalizeChannelTestEndpoint(channel, "glm-5.3", "")
+
+	assert.Equal(t, string(constant.EndpointTypeAnthropic), endpoint)
+}
+
+func TestShouldRetryStopsAfterResponseWasWritten(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Status(http.StatusOK)
+	ctx.Writer.WriteHeaderNow()
+	upstreamError := relaytypes.NewErrorWithStatusCode(
+		errors.New("upstream failed"),
+		relaytypes.ErrorCodeBadResponseStatusCode,
+		http.StatusBadGateway,
+	)
+
+	assert.False(t, shouldRetry(ctx, upstreamError, 3))
 }
 
 func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T) {
