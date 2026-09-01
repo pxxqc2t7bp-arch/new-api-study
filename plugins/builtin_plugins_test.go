@@ -62,6 +62,22 @@ func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing
 	}
 }
 
+func TestDoubaoPluginSupportsConfiguredProductionModels(t *testing.T) {
+	plugin, found := jsplugin.DefaultRegistry.Generation().Get("doubao")
+	require.True(t, found)
+
+	for _, model := range []string{
+		"doubao-seedance-2-5-260628",
+		"doubao-seedance-2-0-260128",
+		"doubao-seedance-2-0-mini-260615",
+		"doubao-seedance-2-0-fast-260128",
+		"doubao-seedance-1-0-pro-250528",
+		"doubao-seedance-1-0-pro-fast-251015",
+	} {
+		assert.Contains(t, plugin.Meta.Models, model)
+	}
+}
+
 func TestBuiltInTaskPluginResponsesAndUsageContracts(t *testing.T) {
 	expectedKeys := []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "vertex-ai", "vidu"}
 	generation := jsplugin.DefaultRegistry.Generation()
