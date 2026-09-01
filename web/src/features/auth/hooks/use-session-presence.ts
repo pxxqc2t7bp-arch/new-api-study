@@ -30,12 +30,12 @@ export function useSessionPresence() {
       source = new EventSource('/api/user/auth/presence', {
         withCredentials: true,
       })
-      source.onerror = () => {
+      source.addEventListener('error', () => {
         source?.close()
         if (!stopped) {
           reconnectTimer = window.setTimeout(connect, RECONNECT_DELAY_MS)
         }
-      }
+      })
     }
 
     connect()
