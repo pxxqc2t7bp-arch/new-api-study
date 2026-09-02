@@ -69,3 +69,27 @@ func TestRecordUpstreamRouteSuccess(t *testing.T) {
 	assert.Zero(t, updated.FailureWindowStart)
 	assert.Equal(t, int64(1250), updated.LastLatencyMS)
 }
+
+func TestRecordUpstreamRouteFailureRestartsOutsideWindow(t *testing.T) {
+	setupUpstreamRouteTest(t)
+	route := UpstreamManagedRoute{
+		SourceID:        2,
+		ExternalGroupID: "window-reset",
+		Platform:        "openai",
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       103,
+		State:           UpstreamRouteStateActive,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+
+	_, quarantined, err := RecordUpstreamRouteFailure(103, 1000, 300, 2, "first")
+	require.NoError(t, err)
+	assert.False(t, quarantined)
+
+	updated, quarantined, err := RecordUpstreamRouteFailure(103, 1301, 300, 2, "outside window")
+	require.NoError(t, err)
+	assert.False(t, quarantined)
+	assert.Equal(t, 1, updated.ConsecutiveFailures)
+	assert.Equal(t, int64(1301), updated.FailureWindowStart)
+	assert.Equal(t, UpstreamRouteStateActive, updated.State)
+}

@@ -1,6 +1,8 @@
 package service
 
 import (
+	"errors"
+	"net/http"
 	"testing"
 	"time"
 
@@ -8,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
@@ -207,6 +210,63 @@ func TestManagedTextModelFilter(t *testing.T) {
 	assert.False(t, isManagedTextModel("grok-imagine-video-1.5", "grok"))
 }
 
+func TestShouldRecordManagedRouteFailure(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		errorCode  relaytypes.ErrorCode
+		options    []relaytypes.NewAPIErrorOptions
+		expected   bool
+	}{
+		{name: "unauthorized", statusCode: http.StatusUnauthorized, errorCode: relaytypes.ErrorCodeBadResponseStatusCode, expected: true},
+		{name: "forbidden", statusCode: http.StatusForbidden, errorCode: relaytypes.ErrorCodeBadResponseStatusCode, expected: true},
+		{name: "rate limited", statusCode: http.StatusTooManyRequests, errorCode: relaytypes.ErrorCodeBadResponseStatusCode, expected: true},
+		{name: "server error", statusCode: http.StatusInternalServerError, errorCode: relaytypes.ErrorCodeBadResponseStatusCode, expected: true},
+		{name: "channel error", statusCode: http.StatusBadRequest, errorCode: relaytypes.ErrorCodeChannelNoAvailableKey, expected: true},
+		{name: "ordinary bad request", statusCode: http.StatusBadRequest, errorCode: relaytypes.ErrorCodeBadResponseStatusCode, expected: false},
+		{name: "ordinary not found", statusCode: http.StatusNotFound, errorCode: relaytypes.ErrorCodeBadResponseStatusCode, expected: false},
+		{
+			name:       "skip retry remains client attributable",
+			statusCode: http.StatusInternalServerError,
+			errorCode:  relaytypes.ErrorCodeBadResponseStatusCode,
+			options:    []relaytypes.NewAPIErrorOptions{relaytypes.ErrOptionWithSkipRetry()},
+			expected:   false,
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := relaytypes.NewOpenAIError(
+				errors.New(testCase.name),
+				testCase.errorCode,
+				testCase.statusCode,
+				testCase.options...,
+			)
+			assert.Equal(t, testCase.expected, ShouldRecordManagedRouteFailure(err))
+		})
+	}
+}
+
+func TestSelectUpstreamCandidateGroupsCapsAtFiveWithSourceDiversity(t *testing.T) {
+	candidates := []upstreamRouteCandidate{
+		{source: model.UpstreamSource{ID: 1, Key: "a"}, group: model.UpstreamGroup{SourceID: 1, ExternalID: "cheap", Platform: "openai", EffectiveMultiplier: 0.01}, models: []string{"gpt-test"}},
+		{source: model.UpstreamSource{ID: 1, Key: "a"}, group: model.UpstreamGroup{SourceID: 1, ExternalID: "duplicate", Platform: "openai", EffectiveMultiplier: 0.02}, models: []string{"gpt-test"}},
+		{source: model.UpstreamSource{ID: 2, Key: "b"}, group: model.UpstreamGroup{SourceID: 2, ExternalID: "b", Platform: "openai", EffectiveMultiplier: 0.03}, models: []string{"gpt-test"}},
+		{source: model.UpstreamSource{ID: 3, Key: "c"}, group: model.UpstreamGroup{SourceID: 3, ExternalID: "c", Platform: "openai", EffectiveMultiplier: 0.04}, models: []string{"gpt-test"}},
+		{source: model.UpstreamSource{ID: 4, Key: "d"}, group: model.UpstreamGroup{SourceID: 4, ExternalID: "d", Platform: "openai", EffectiveMultiplier: 0.05}, models: []string{"gpt-test"}},
+		{source: model.UpstreamSource{ID: 5, Key: "e"}, group: model.UpstreamGroup{SourceID: 5, ExternalID: "e", Platform: "openai", EffectiveMultiplier: 0.06}, models: []string{"gpt-test"}},
+		{source: model.UpstreamSource{ID: 6, Key: "f"}, group: model.UpstreamGroup{SourceID: 6, ExternalID: "f", Platform: "openai", EffectiveMultiplier: 0.07}, models: []string{"gpt-test"}},
+	}
+
+	selected := selectUpstreamCandidateGroups(candidates, 5)
+
+	require.Len(t, selected, 5)
+	sourceIDs := make(map[int64]struct{}, len(selected))
+	for _, candidate := range selected {
+		sourceIDs[candidate.source.ID] = struct{}{}
+	}
+	assert.Len(t, sourceIDs, 5)
+}
+
 func TestDesiredManagedRouteStatePromotesValidatedShadow(t *testing.T) {
 	now := time.Unix(1_788_320_000, 0)
 	setting := &operation_setting.UpstreamOrchestrationSetting{
@@ -236,6 +296,104 @@ func TestDesiredManagedRouteStatePromotesValidatedShadow(t *testing.T) {
 
 	assert.Equal(t, model.UpstreamRouteStateActive, state)
 	assert.Empty(t, reason)
+}
+
+func TestDesiredManagedRouteStateSafetyMatrix(t *testing.T) {
+	now := time.Unix(1_788_320_000, 0)
+	setting := &operation_setting.UpstreamOrchestrationSetting{
+		SyncIntervalHours:       4,
+		RedLongTermHours:        24,
+		ShadowSuccessesRequired: 3,
+	}
+	positiveBalance := 10.0
+	zeroBalance := 0.0
+	baseSource := model.UpstreamSource{
+		Enabled:        true,
+		Balance:        &positiveBalance,
+		LastSnapshotAt: now.Unix(),
+	}
+	tests := []struct {
+		name     string
+		route    model.UpstreamManagedRoute
+		source   model.UpstreamSource
+		group    model.UpstreamGroup
+		expected string
+	}{
+		{
+			name:     "degraded validated shadow activates",
+			route:    model.UpstreamManagedRoute{State: model.UpstreamRouteStateShadow, ConsecutiveSuccesses: 3},
+			source:   baseSource,
+			group:    model.UpstreamGroup{HealthStatus: model.UpstreamHealthDegraded, ObservedAt: now.Unix()},
+			expected: model.UpstreamRouteStateActive,
+		},
+		{
+			name:     "unknown remains shadow",
+			route:    model.UpstreamManagedRoute{State: model.UpstreamRouteStateShadow, ConsecutiveSuccesses: 3},
+			source:   baseSource,
+			group:    model.UpstreamGroup{HealthStatus: model.UpstreamHealthUnknown, ObservedAt: now.Unix()},
+			expected: model.UpstreamRouteStateShadow,
+		},
+		{
+			name:     "red quarantines",
+			route:    model.UpstreamManagedRoute{State: model.UpstreamRouteStateActive},
+			source:   baseSource,
+			group:    model.UpstreamGroup{HealthStatus: model.UpstreamHealthFailed, ObservedAt: now.Unix(), RedSince: now.Add(-time.Hour).Unix()},
+			expected: model.UpstreamRouteStateQuarantined,
+		},
+		{
+			name:     "red for 24 hours becomes long red",
+			route:    model.UpstreamManagedRoute{State: model.UpstreamRouteStateQuarantined},
+			source:   baseSource,
+			group:    model.UpstreamGroup{HealthStatus: model.UpstreamHealthFailed, ObservedAt: now.Unix(), RedSince: now.Add(-25 * time.Hour).Unix()},
+			expected: model.UpstreamRouteStateLongRed,
+		},
+		{
+			name:     "zero balance quarantines",
+			route:    model.UpstreamManagedRoute{State: model.UpstreamRouteStateActive},
+			source:   model.UpstreamSource{Enabled: true, Balance: &zeroBalance, LastSnapshotAt: now.Unix()},
+			group:    model.UpstreamGroup{HealthStatus: model.UpstreamHealthOperational, ObservedAt: now.Unix()},
+			expected: model.UpstreamRouteStateQuarantined,
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			state, _ := desiredManagedRouteState(
+				testCase.route,
+				testCase.source,
+				testCase.group,
+				now,
+				setting,
+			)
+			assert.Equal(t, testCase.expected, state)
+		})
+	}
+}
+
+func TestManagedRouteRecoveryBackoff(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	route := model.UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "recovery",
+		Platform:        "openai",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       1001,
+		State:           model.UpstreamRouteStateShadow,
+	}
+	require.NoError(t, model.DB.Create(&route).Error)
+	expectedDelays := []int64{300, 900, 3600, 14400, 0}
+	for attempt, expectedDelay := range expectedDelays {
+		before := common.GetTimestamp()
+		require.NoError(t, MarkManagedRouteProbeResult(route.ID, false, 10, "failed"))
+		var stored model.UpstreamManagedRoute
+		require.NoError(t, model.DB.First(&stored, route.ID).Error)
+		assert.Equal(t, attempt+1, stored.RecoveryAttempts)
+		if expectedDelay == 0 {
+			assert.Zero(t, stored.NextProbeAt)
+			continue
+		}
+		assert.GreaterOrEqual(t, stored.NextProbeAt, before+expectedDelay)
+		assert.LessOrEqual(t, stored.NextProbeAt, common.GetTimestamp()+expectedDelay)
+	}
 }
 
 func TestShadowProbeDoesNotEnableChannelBeforeOrchestration(t *testing.T) {

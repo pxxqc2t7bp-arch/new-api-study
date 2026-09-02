@@ -79,6 +79,29 @@ func invalidateManagedRouteAdminInfo(channelID int) {
 	managedRouteAdminCache.Delete(channelID)
 }
 
+func IsManagedChannel(channelID int) bool {
+	if channelID <= 0 || !operation_setting.GetUpstreamOrchestrationSetting().Enabled {
+		return false
+	}
+	_, err := model.GetUpstreamManagedRouteByChannelID(channelID)
+	return err == nil
+}
+
+func ShouldRecordManagedRouteFailure(err *types.NewAPIError) bool {
+	if err == nil || types.IsSkipRetryError(err) {
+		return false
+	}
+	if types.IsChannelError(err) {
+		return true
+	}
+	switch err.StatusCode {
+	case 401, 403, 429:
+		return true
+	default:
+		return err.StatusCode >= 500 && err.StatusCode <= 599
+	}
+}
+
 func RecordManagedChannelFailure(channelError types.ChannelError, reason string) (bool, bool, error) {
 	setting := operation_setting.GetUpstreamOrchestrationSetting()
 	if !setting.Enabled {
