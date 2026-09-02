@@ -484,6 +484,8 @@ func officialPricingColumnsForRows(rows [][]string) (int, officialPriceColumns, 
 				columns.cacheWrite = append(columns.cacheWrite, alignedColumn)
 			case strings.Contains(value, "cached") && strings.Contains(value, "input"):
 				columns.cachedRead = append(columns.cachedRead, alignedColumn)
+			case value == "cached":
+				columns.cachedRead = append(columns.cachedRead, alignedColumn)
 			case strings.Contains(value, "cache") && (strings.Contains(value, "read") || strings.Contains(value, "hit")):
 				columns.cachedRead = append(columns.cachedRead, alignedColumn)
 			case strings.Contains(value, "input"):

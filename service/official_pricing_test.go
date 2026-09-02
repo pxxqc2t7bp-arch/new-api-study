@@ -108,21 +108,30 @@ func TestParseOfficialPricingTables(t *testing.T) {
 			<table>
 				<tr><th>Model</th><th>Context</th><th>Short context</th><th>Long context</th></tr>
 				<tr><th>Input</th><th>Cached</th><th>Output</th><th>Input</th><th>Cached</th><th>Output</th></tr>
+				<tr><td>grok-4.5 Long context >= 200k tokens</td><td>256k</td><td>$1.50</td><td>$0.30</td><td>$4.50</td><td>$3.00</td><td>$0.60</td><td>$9.00</td></tr>
 				<tr><td>grok-4.6 Long context >= 200k tokens</td><td>500k</td><td>$2.00</td><td>$0.50</td><td>$6.00</td><td>$4.00</td><td>$1.00</td><td>$12.00</td></tr>
 			</table>`)
 		prices, err := parseOfficialPricingTables(
 			"xai",
 			"https://docs.x.ai/developers/pricing",
 			html,
-			map[string]string{"grok-4.6": "xai"},
+			map[string]string{"grok-4.5": "xai", "grok-4.6": "xai"},
 			nil,
 		)
 		require.NoError(t, err)
-		require.Len(t, prices, 1)
-		assert.Equal(t, "grok-4.6", prices[0].ModelName)
+		require.Len(t, prices, 2)
+		assert.Equal(t, "grok-4.5", prices[0].ModelName)
 		assert.Equal(t, int64(200000), prices[0].LongContextThreshold)
-		assert.Equal(t, 2.0, prices[0].InputPerM)
-		assert.Equal(t, 4.0, prices[0].LongInputPerM)
+		assert.Equal(t, 1.5, prices[0].InputPerM)
+		assert.Equal(t, 0.3, prices[0].CachedReadPerM)
+		assert.Equal(t, 3.0, prices[0].LongInputPerM)
+		assert.Equal(t, 0.6, prices[0].LongCachedReadPerM)
+		assert.Equal(t, "grok-4.6", prices[1].ModelName)
+		assert.Equal(t, int64(200000), prices[1].LongContextThreshold)
+		assert.Equal(t, 2.0, prices[1].InputPerM)
+		assert.Equal(t, 0.5, prices[1].CachedReadPerM)
+		assert.Equal(t, 4.0, prices[1].LongInputPerM)
+		assert.Equal(t, 1.0, prices[1].LongCachedReadPerM)
 	})
 
 	t.Run("uses separate Anthropic cache write prices", func(t *testing.T) {
