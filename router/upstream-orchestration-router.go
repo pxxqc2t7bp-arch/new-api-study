@@ -26,9 +26,9 @@ func registerUpstreamOrchestrationRoutes(apiRouter *gin.RouterGroup) {
 	}
 
 	device := apiRouter.Group("/upstream-orchestration/device")
-	device.Use(middleware.CriticalRateLimit(), middleware.DisableCache())
+	device.Use(middleware.DisableCache())
 	{
-		device.POST("/pair", controller.PairUpstreamDevice)
+		device.POST("/pair", middleware.CriticalRateLimit(), controller.PairUpstreamDevice)
 		device.GET("/commands", controller.ListUpstreamDeviceCommands)
 		device.POST("/snapshots", controller.IngestUpstreamSnapshot)
 		device.POST("/commands/:command_id/result", controller.CompleteUpstreamDeviceCommand)
