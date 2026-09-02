@@ -60,6 +60,24 @@ export function collectModelsByGroup(response) {
   return result
 }
 
+export function extractModelNames(response) {
+  const value = unwrap(response)
+  const models = Array.isArray(value)
+    ? value
+    : Array.isArray(value?.models)
+      ? value.models
+      : []
+  return normalizeModelNames(models.map((model) => model?.id ?? model?.name ?? model))
+}
+
+export function mergeModelsByGroup(primary, fallback) {
+  const result = new Map(primary)
+  for (const [groupId, models] of fallback) {
+    addModels(result, groupId, models)
+  }
+  return result
+}
+
 function addModels(result, groupId, models) {
   if (!groupId) return
   result.set(groupId, [...new Set([...(result.get(groupId) || []), ...models])])

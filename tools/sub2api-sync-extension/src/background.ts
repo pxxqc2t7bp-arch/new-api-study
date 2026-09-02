@@ -4,7 +4,9 @@ import {
   collectModelsByGroup,
   COMMAND_ALARM,
   DAILY_ALARM,
+  extractModelNames,
   finiteNumber,
+  mergeModelsByGroup,
   normalizeHealth,
   normalizeModelNames,
   normalizeURL,
@@ -153,17 +155,22 @@ async function collectSource(source) {
       request('/api/v1/keys?page=1&page_size=100&sort_by=created_at&sort_order=desc'),
       request('/api/v1/subscriptions/active').catch(() => null),
     ])
+  const keys = await normalizeKeys(keysResponse)
+  mergeSubscriptionUsage(keys, subscriptionsResponse)
+  const probeKey = firstUsableRawKey(keysResponse)
+  const endpointCandidates = extractEndpoints(settings)
+  const endpoints = await measureEndpoints(endpointCandidates, probeKey)
+  const discoveredModels = await discoverModelsByGroup(
+    endpoints.length > 0 ? endpoints : [{ name: 'console', url: source.origin }],
+    keysResponse
+  )
   const groups = normalizeGroups(
     source,
     groupsResponse,
     ratesResponse,
-    channelsResponse,
+    mergeModelsByGroup(collectModelsByGroup(channelsResponse), discoveredModels),
     monitorsResponse
   )
-  const keys = await normalizeKeys(keysResponse)
-  mergeSubscriptionUsage(keys, subscriptionsResponse)
-  const probeKey = firstUsableRawKey(keysResponse)
-  const endpoints = await measureEndpoints(extractEndpoints(settings), probeKey)
   return {
     key: source.key,
     name: source.name,
@@ -185,41 +192,85 @@ async function collectSource(source) {
 
 function firstUsableRawKey(keysResponse) {
   for (const key of asArray(unwrap(keysResponse))) {
-    const rawKey = String(key.key ?? key.api_key ?? '')
-    const status = String(key.status ?? '').toLowerCase()
-    if (rawKey && !['disabled', 'expired', 'revoked'].includes(status)) return rawKey
+    const rawKey = usableRawKey(key)
+    if (rawKey) return rawKey
   }
   return ''
 }
 
+function usableRawKey(key) {
+  const rawKey = String(key?.key ?? key?.api_key ?? '')
+  const status = String(key?.status ?? '').toLowerCase()
+  if (
+    !rawKey ||
+    rawKey.includes('...') ||
+    ['disabled', 'expired', 'revoked'].includes(status)
+  ) {
+    return ''
+  }
+  return rawKey
+}
+
 async function measureEndpoints(endpoints, apiKey) {
   if (!apiKey) return endpoints
-  return Promise.all(
-    endpoints.map(async (endpoint) => {
-      const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 5000)
-      const startedAt = performance.now()
-      try {
-        const response = await fetch(`${endpoint.url}/v1/models`, {
-          headers: { Authorization: `Bearer ${apiKey}` },
-          signal: controller.signal,
-        })
-        return {
-          ...endpoint,
-          healthy: response.ok,
-          latency_ms: Math.round(performance.now() - startedAt),
-        }
-      } catch {
-        return {
-          ...endpoint,
-          healthy: false,
-          latency_ms: Math.round(performance.now() - startedAt),
-        }
-      } finally {
-        clearTimeout(timeout)
-      }
+  const measured = []
+  for (const endpoint of endpoints) {
+    const result = await fetchModels(endpoint.url, apiKey)
+    measured.push({
+      ...endpoint,
+      healthy: result.healthy,
+      latency_ms: result.latencyMS,
     })
-  )
+  }
+  return measured
+}
+
+async function discoverModelsByGroup(endpoints, keysResponse) {
+  const groupKeys = new Map()
+  for (const key of asArray(unwrap(keysResponse))) {
+    const groupId = String(key.group_id ?? key.group?.id ?? '')
+    const rawKey = usableRawKey(key)
+    if (groupId && rawKey && !groupKeys.has(groupId)) {
+      groupKeys.set(groupId, rawKey)
+    }
+  }
+  const result = new Map()
+  for (const [groupId, apiKey] of groupKeys) {
+    for (const endpoint of endpoints) {
+      const probe = await fetchModels(endpoint.url, apiKey)
+      if (probe.models.length > 0) {
+        result.set(groupId, probe.models)
+        break
+      }
+    }
+  }
+  return result
+}
+
+async function fetchModels(baseURL, apiKey) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 5000)
+  const startedAt = performance.now()
+  try {
+    const response = await fetch(`${baseURL}/v1/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    })
+    const payload = response.ok ? await response.json().catch(() => null) : null
+    return {
+      healthy: response.ok,
+      latencyMS: Math.round(performance.now() - startedAt),
+      models: extractModelNames(payload),
+    }
+  } catch {
+    return {
+      healthy: false,
+      latencyMS: Math.round(performance.now() - startedAt),
+      models: [],
+    }
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 async function getSiteAuthToken(source) {
@@ -271,9 +322,8 @@ async function siteRequest(source, authToken, path, options = {}) {
   return payload
 }
 
-function normalizeGroups(source, groupsResponse, ratesResponse, channelsResponse, monitorsResponse) {
+function normalizeGroups(source, groupsResponse, ratesResponse, modelsByGroup, monitorsResponse) {
   const rates = collectGroupRates(ratesResponse)
-  const modelsByGroup = collectModelsByGroup(channelsResponse)
   const monitors = normalizeMonitors(monitorsResponse)
   return asArray(unwrap(groupsResponse))
     .map((group) => {

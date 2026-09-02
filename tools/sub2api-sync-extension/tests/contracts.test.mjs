@@ -5,7 +5,9 @@ import {
   asArray,
   collectGroupRates,
   collectModelsByGroup,
+  extractModelNames,
   finiteNumber,
+  mergeModelsByGroup,
   normalizeHealth,
   normalizeURL,
   sanitizeError,
@@ -83,4 +85,20 @@ test('keeps compatibility with legacy flat channel and rate arrays', () => {
     'claude-opus-5',
   ])
   assert.equal(rates.get('legacy').user_rate_multiplier, 0.2)
+})
+
+test('extracts standard v1 models and merges per-group discoveries', () => {
+  const discovered = new Map([
+    ['12', extractModelNames({ data: [{ id: 'gpt-5.5' }, { id: 'gpt-5.6' }] })],
+  ])
+  const merged = mergeModelsByGroup(
+    new Map([
+      ['12', ['gpt-5.5']],
+      ['13', ['claude-sonnet-5']],
+    ]),
+    discovered
+  )
+
+  assert.deepEqual(merged.get('12'), ['gpt-5.5', 'gpt-5.6'])
+  assert.deepEqual(merged.get('13'), ['claude-sonnet-5'])
 })
