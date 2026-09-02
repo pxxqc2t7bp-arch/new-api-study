@@ -406,6 +406,31 @@ func TestDesiredManagedRouteStatePromotesValidatedShadow(t *testing.T) {
 	assert.Empty(t, reason)
 }
 
+func TestManagedCandidateSelectionEvaluableRequiresFreshSnapshot(t *testing.T) {
+	now := time.Unix(1_788_320_000, 0)
+	setting := &operation_setting.UpstreamOrchestrationSetting{
+		SyncIntervalHours: 4,
+	}
+	source := model.UpstreamSource{
+		Enabled:          true,
+		SelectedEndpoint: "https://api.example.com",
+		LastSnapshotAt:   now.Unix(),
+	}
+	group := model.UpstreamGroup{
+		HealthStatus: model.UpstreamHealthOperational,
+		ObservedAt:   now.Unix(),
+	}
+
+	assert.True(t, managedCandidateSelectionEvaluable(source, group, now, setting))
+
+	source.LastSnapshotAt = now.Add(-6 * time.Hour).Unix()
+	assert.False(t, managedCandidateSelectionEvaluable(source, group, now, setting))
+
+	source.LastSnapshotAt = now.Unix()
+	group.ObservedAt = now.Add(-6 * time.Hour).Unix()
+	assert.False(t, managedCandidateSelectionEvaluable(source, group, now, setting))
+}
+
 func TestDesiredManagedRouteStateSafetyMatrix(t *testing.T) {
 	now := time.Unix(1_788_320_000, 0)
 	setting := &operation_setting.UpstreamOrchestrationSetting{

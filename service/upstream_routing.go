@@ -142,9 +142,11 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 			stateRoute.State = model.UpstreamRouteStateShadow
 		}
 		state, reason := desiredManagedRouteState(stateRoute, source, group, now, setting)
-		if _, selected := selectedGroups[identity]; !selected {
-			state = model.UpstreamRouteStateRetained
-			reason = "outside managed candidate limit"
+		if managedCandidateSelectionEvaluable(source, group, now, setting) {
+			if _, selected := selectedGroups[identity]; !selected {
+				state = model.UpstreamRouteStateRetained
+				reason = "outside managed candidate limit"
+			}
 		}
 		if state == route.State {
 			continue
@@ -226,6 +228,29 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 		}
 	}
 	return summary, nil
+}
+
+func managedCandidateSelectionEvaluable(
+	source model.UpstreamSource,
+	group model.UpstreamGroup,
+	now time.Time,
+	setting *operation_setting.UpstreamOrchestrationSetting,
+) bool {
+	if !source.Enabled || source.SelectedEndpoint == "" {
+		return false
+	}
+	maxAge := int64((setting.SyncIntervalHours + 1) * 3600)
+	if source.LastSnapshotAt == 0 || now.Unix()-source.LastSnapshotAt > maxAge {
+		return false
+	}
+	if group.ObservedAt == 0 || now.Unix()-group.ObservedAt > maxAge {
+		return false
+	}
+	if source.Balance != nil && *source.Balance <= 0 {
+		return false
+	}
+	return group.HealthStatus != model.UpstreamHealthFailed &&
+		group.HealthStatus != model.UpstreamHealthError
 }
 
 func desiredManagedRouteState(
