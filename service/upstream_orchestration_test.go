@@ -2,10 +2,14 @@ package service
 
 import (
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -25,6 +29,9 @@ func setupUpstreamOrchestrationTest(t *testing.T) {
 		&model.UpstreamMetricSnapshot{},
 		&model.UpstreamSyncDevice{},
 		&model.UpstreamSyncBatch{},
+		&model.UpstreamSyncCommand{},
+		&model.Vendor{},
+		&model.Model{},
 	))
 	model.DB = db
 	t.Cleanup(func() {
@@ -155,6 +162,159 @@ func TestIngestUpstreamSnapshot(t *testing.T) {
 		assert.Equal(t, "login required", stored.LastError)
 		assert.Equal(t, model.UpstreamHealthError, stored.Status)
 	})
+}
+
+func TestManagedAdvancedCustomConfigUsesUpstreamProtocol(t *testing.T) {
+	t.Run("OpenAI-compatible upstream", func(t *testing.T) {
+		payload := dto.UpstreamEnrollmentCommand{Platform: "openai"}
+
+		openAI := managedAdvancedCustomConfig(payload, model.UpstreamProtocolOpenAI)
+		require.Len(t, openAI.Routes, 2)
+		assert.Equal(t, "/v1/chat/completions", openAI.Routes[0].UpstreamPath)
+		assert.Equal(t, relayconvert.ConverterNone, openAI.Routes[0].Converter)
+		assert.Equal(t, "/v1/responses", openAI.Routes[1].UpstreamPath)
+		assert.Equal(t, relayconvert.ConverterNone, openAI.Routes[1].Converter)
+
+		anthropic := managedAdvancedCustomConfig(payload, model.UpstreamProtocolAnthropic)
+		require.Len(t, anthropic.Routes, 1)
+		assert.Equal(t, "/v1/chat/completions", anthropic.Routes[0].UpstreamPath)
+		assert.Equal(t, relayconvert.ConverterClaudeMessagesToOpenAIChat, anthropic.Routes[0].Converter)
+	})
+
+	t.Run("Anthropic upstream", func(t *testing.T) {
+		payload := dto.UpstreamEnrollmentCommand{Platform: "anthropic"}
+
+		openAI := managedAdvancedCustomConfig(payload, model.UpstreamProtocolOpenAI)
+		require.Len(t, openAI.Routes, 2)
+		assert.Equal(t, "/v1/messages", openAI.Routes[0].UpstreamPath)
+		assert.Equal(t, relayconvert.ConverterOpenAIChatToClaudeMessages, openAI.Routes[0].Converter)
+		assert.Equal(t, "/v1/chat/completions", openAI.Routes[1].UpstreamPath)
+		assert.Equal(t, relayconvert.ConverterOpenAIResponsesToOpenAIChat, openAI.Routes[1].Converter)
+
+		anthropic := managedAdvancedCustomConfig(payload, model.UpstreamProtocolAnthropic)
+		require.Len(t, anthropic.Routes, 1)
+		assert.Equal(t, "/v1/messages", anthropic.Routes[0].UpstreamPath)
+		assert.Equal(t, relayconvert.ConverterNone, anthropic.Routes[0].Converter)
+	})
+}
+
+func TestManagedTextModelFilter(t *testing.T) {
+	assert.True(t, isManagedTextModel("gpt-5.6-sol", "openai"))
+	assert.True(t, isManagedTextModel("claude-opus-5", "anthropic"))
+	assert.True(t, isManagedTextModel("grok-4.6", "grok"))
+	assert.False(t, isManagedTextModel("gpt-image-2", "openai"))
+	assert.False(t, isManagedTextModel("grok-imagine-video-1.5", "grok"))
+}
+
+func TestDesiredManagedRouteStatePromotesValidatedShadow(t *testing.T) {
+	now := time.Unix(1_788_320_000, 0)
+	setting := &operation_setting.UpstreamOrchestrationSetting{
+		SyncIntervalHours:       4,
+		ShadowSuccessesRequired: 3,
+	}
+	source := model.UpstreamSource{
+		Enabled:        true,
+		Status:         model.UpstreamHealthOperational,
+		LastSnapshotAt: now.Unix(),
+	}
+	group := model.UpstreamGroup{
+		HealthStatus: model.UpstreamHealthOperational,
+		ObservedAt:   now.Unix(),
+	}
+
+	state, reason := desiredManagedRouteState(
+		model.UpstreamManagedRoute{
+			State:                model.UpstreamRouteStateShadow,
+			ConsecutiveSuccesses: 3,
+		},
+		source,
+		group,
+		now,
+		setting,
+	)
+
+	assert.Equal(t, model.UpstreamRouteStateActive, state)
+	assert.Empty(t, reason)
+}
+
+func TestShadowProbeDoesNotEnableChannelBeforeOrchestration(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	original := *setting
+	setting.Enabled = false
+	setting.ShadowSuccessesRequired = 3
+	t.Cleanup(func() {
+		*setting = original
+	})
+
+	route := model.UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "20",
+		Platform:        "openai",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       999,
+		State:           model.UpstreamRouteStateShadow,
+		NextProbeAt:     common.GetTimestamp(),
+	}
+	require.NoError(t, model.DB.Create(&route).Error)
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		require.NoError(t, MarkManagedRouteProbeResult(route.ID, true, int64(attempt), ""))
+	}
+
+	var stored model.UpstreamManagedRoute
+	require.NoError(t, model.DB.First(&stored, route.ID).Error)
+	assert.Equal(t, model.UpstreamRouteStateShadow, stored.State)
+	assert.Equal(t, 3, stored.ConsecutiveSuccesses)
+}
+
+func TestPrepareManagedUpstreamShadowsIsIdempotent(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	now := time.Unix(1_788_320_000, 0)
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	original := *setting
+	setting.AutoEnroll = true
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4.1":1}`))
+	t.Cleanup(func() {
+		*setting = original
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+	})
+
+	source := model.UpstreamSource{
+		Key:              model.UpstreamSourceKeyHualong,
+		Name:             "Hualong",
+		ConsoleURL:       "https://api.hualong.online",
+		SelectedEndpoint: "https://api.hualong.online",
+		Status:           model.UpstreamHealthOperational,
+		Enabled:          true,
+		LastSnapshotAt:   now.Unix(),
+		LastSuccessAt:    now.Unix(),
+	}
+	require.NoError(t, model.DB.Create(&source).Error)
+	require.NoError(t, model.DB.Create(&model.UpstreamGroup{
+		SourceID:            source.ID,
+		ExternalID:          "20",
+		Name:                "GPT Pro",
+		Platform:            "openai",
+		BaseMultiplier:      0.15,
+		EffectiveMultiplier: 0.15,
+		HealthStatus:        model.UpstreamHealthOperational,
+		Models:              `["gpt-4.1"]`,
+		ObservedAt:          now.Unix(),
+	}).Error)
+
+	first, err := PrepareManagedUpstreamShadows(now)
+	require.NoError(t, err)
+	assert.Equal(t, 1, first.EnrollmentQueued)
+
+	second, err := PrepareManagedUpstreamShadows(now)
+	require.NoError(t, err)
+	assert.Zero(t, second.EnrollmentQueued)
+
+	var commandCount int64
+	require.NoError(t, model.DB.Model(&model.UpstreamSyncCommand{}).Count(&commandCount).Error)
+	assert.EqualValues(t, 1, commandCount)
 }
 
 func floatPointer(value float64) *float64 {

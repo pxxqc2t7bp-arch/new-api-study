@@ -325,6 +325,15 @@ func RequestUpstreamSync(c *gin.Context) {
 }
 
 func ReconcileUpstreamRoutes(c *gin.Context) {
+	if !operation_setting.GetUpstreamOrchestrationSetting().Enabled {
+		summary, err := service.PrepareManagedUpstreamShadows(time.Now())
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		common.ApiSuccess(c, gin.H{"prepared": true, "summary": summary})
+		return
+	}
 	task, created, err := service.EnqueueSystemTask(model.SystemTaskTypeUpstreamReconcile, nil)
 	if err != nil {
 		common.ApiError(c, err)

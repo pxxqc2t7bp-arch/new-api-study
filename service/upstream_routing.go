@@ -34,6 +34,38 @@ type upstreamRouteCandidate struct {
 	models []string
 }
 
+func PrepareManagedUpstreamShadows(now time.Time) (UpstreamReconcileSummary, error) {
+	var summary UpstreamReconcileSummary
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	sources, err := model.ListUpstreamSources()
+	if err != nil {
+		return summary, err
+	}
+	groups, err := model.ListUpstreamGroups()
+	if err != nil {
+		return summary, err
+	}
+	routes, err := model.ListUpstreamManagedRoutes()
+	if err != nil {
+		return summary, err
+	}
+	summary.SourcesChecked = len(sources)
+	summary.GroupsChecked = len(groups)
+	if !setting.AutoEnroll {
+		return summary, nil
+	}
+	candidates, err := buildUpstreamRouteCandidates(sources, groups, now, setting)
+	if err != nil {
+		return summary, err
+	}
+	summary.EnrollmentQueued, err = enqueueMissingUpstreamEnrollments(
+		candidates,
+		routes,
+		setting,
+	)
+	return summary, err
+}
+
 func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) {
 	var summary UpstreamReconcileSummary
 	setting := operation_setting.GetUpstreamOrchestrationSetting()
@@ -215,7 +247,8 @@ func desiredManagedRouteState(
 		}
 		return model.UpstreamRouteStateQuarantined, "upstream monitor red"
 	case model.UpstreamHealthOperational, model.UpstreamHealthDegraded:
-		if route.State != model.UpstreamRouteStateShadow {
+		if route.State != model.UpstreamRouteStateShadow ||
+			route.ConsecutiveSuccesses >= setting.ShadowSuccessesRequired {
 			return model.UpstreamRouteStateActive, ""
 		}
 	}
@@ -264,7 +297,9 @@ func buildUpstreamRouteCandidates(
 		eligible := make([]string, 0, len(upstreamModels))
 		for _, upstreamModel := range upstreamModels {
 			canonical := canonicalManagedModelName(upstreamModel, setting.ModelAliases)
-			if !managedModelMatchesPlatform(canonical, group.Platform, modelVendors) || !hasConfiguredModelPrice(canonical) {
+			if !isManagedTextModel(canonical, group.Platform) ||
+				!managedModelMatchesPlatform(canonical, group.Platform, modelVendors) ||
+				!hasConfiguredModelPrice(canonical) {
 				continue
 			}
 			eligible = append(eligible, canonical)
@@ -541,6 +576,26 @@ func managedModelMatchesPlatform(modelName string, platform string, vendors map[
 		return strings.Contains(vendor, "anthropic") || strings.Contains(vendor, "claude")
 	case "grok":
 		return strings.Contains(vendor, "xai") || strings.Contains(vendor, "grok")
+	default:
+		return false
+	}
+}
+
+func isManagedTextModel(modelName string, platform string) bool {
+	modelName = strings.ToLower(strings.TrimSpace(modelName))
+	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case "openai":
+		return (strings.HasPrefix(modelName, "gpt-") ||
+			strings.HasPrefix(modelName, "chatgpt-") ||
+			strings.HasPrefix(modelName, "o1") ||
+			strings.HasPrefix(modelName, "o3") ||
+			strings.HasPrefix(modelName, "o4")) &&
+			!strings.HasPrefix(modelName, "gpt-image-")
+	case "anthropic":
+		return strings.HasPrefix(modelName, "claude-")
+	case "grok":
+		return strings.HasPrefix(modelName, "grok-") &&
+			!strings.HasPrefix(modelName, "grok-imagine-")
 	default:
 		return false
 	}

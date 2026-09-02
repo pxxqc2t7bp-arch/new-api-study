@@ -239,7 +239,8 @@ func MarkManagedRouteProbeResult(routeID int64, succeeded bool, latencyMS int64,
 		nextState := model.UpstreamRouteStateActive
 		successes := route.ConsecutiveSuccesses + 1
 		if route.State == model.UpstreamRouteStateShadow &&
-			successes < operation_setting.GetUpstreamOrchestrationSetting().ShadowSuccessesRequired {
+			(!operation_setting.GetUpstreamOrchestrationSetting().Enabled ||
+				successes < operation_setting.GetUpstreamOrchestrationSetting().ShadowSuccessesRequired) {
 			nextState = model.UpstreamRouteStateShadow
 		}
 		if err := model.DB.Model(&route).Updates(map[string]any{

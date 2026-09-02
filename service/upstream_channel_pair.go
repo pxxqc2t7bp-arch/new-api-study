@@ -12,6 +12,7 @@ import (
 	rootdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 
 	"gorm.io/gorm"
 )
@@ -174,15 +175,24 @@ func buildManagedUpstreamChannel(payload rootdto.UpstreamEnrollmentCommand, apiK
 }
 
 func managedAdvancedCustomConfig(payload rootdto.UpstreamEnrollmentCommand, protocol string) *kitdto.AdvancedCustomConfig {
+	platform := strings.ToLower(strings.TrimSpace(payload.Platform))
 	switch protocol {
 	case model.UpstreamProtocolAnthropic:
 		upstreamPath := strings.TrimSpace(payload.MessagesPath)
 		if upstreamPath == "" {
-			upstreamPath = "/v1/messages"
+			if platform == "anthropic" {
+				upstreamPath = "/v1/messages"
+			} else {
+				upstreamPath = "/v1/chat/completions"
+			}
 		}
 		converter := strings.TrimSpace(payload.MessagesConverter)
 		if converter == "" {
-			converter = "none"
+			if platform == "anthropic" {
+				converter = relayconvert.ConverterNone
+			} else {
+				converter = relayconvert.ConverterClaudeMessagesToOpenAIChat
+			}
 		}
 		return &kitdto.AdvancedCustomConfig{Routes: []kitdto.AdvancedCustomRoute{{
 			IncomingPath: "/v1/messages",
@@ -192,17 +202,31 @@ func managedAdvancedCustomConfig(payload rootdto.UpstreamEnrollmentCommand, prot
 	default:
 		responsesPath := strings.TrimSpace(payload.ResponsesPath)
 		if responsesPath == "" {
-			responsesPath = "/v1/responses"
+			if platform == "anthropic" {
+				responsesPath = "/v1/chat/completions"
+			} else {
+				responsesPath = "/v1/responses"
+			}
 		}
 		responsesConverter := strings.TrimSpace(payload.ResponsesConverter)
 		if responsesConverter == "" {
-			responsesConverter = "none"
+			if platform == "anthropic" {
+				responsesConverter = relayconvert.ConverterOpenAIResponsesToOpenAIChat
+			} else {
+				responsesConverter = relayconvert.ConverterNone
+			}
+		}
+		chatPath := "/v1/chat/completions"
+		chatConverter := relayconvert.ConverterNone
+		if platform == "anthropic" {
+			chatPath = "/v1/messages"
+			chatConverter = relayconvert.ConverterOpenAIChatToClaudeMessages
 		}
 		return &kitdto.AdvancedCustomConfig{Routes: []kitdto.AdvancedCustomRoute{
 			{
 				IncomingPath: "/v1/chat/completions",
-				UpstreamPath: "/v1/chat/completions",
-				Converter:    "none",
+				UpstreamPath: chatPath,
+				Converter:    chatConverter,
 			},
 			{
 				IncomingPath: "/v1/responses",
