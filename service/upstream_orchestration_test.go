@@ -203,6 +203,7 @@ func TestManagedTextModelFilter(t *testing.T) {
 	assert.True(t, isManagedTextModel("claude-opus-5", "anthropic"))
 	assert.True(t, isManagedTextModel("grok-4.6", "grok"))
 	assert.False(t, isManagedTextModel("gpt-image-2", "openai"))
+	assert.False(t, isManagedTextModel("grok-imagine", "grok"))
 	assert.False(t, isManagedTextModel("grok-imagine-video-1.5", "grok"))
 }
 

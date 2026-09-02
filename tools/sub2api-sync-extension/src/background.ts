@@ -7,6 +7,7 @@ import {
   extractModelNames,
   finiteNumber,
   mergeModelsByGroup,
+  normalizeGroupID,
   normalizeHealth,
   normalizeModelNames,
   normalizeURL,
@@ -552,7 +553,7 @@ async function executeEnrollment(config, command) {
         method: 'POST',
         body: JSON.stringify({
           name: payload.key_name,
-          group_id: payload.external_group_id,
+          group_id: normalizeGroupID(payload.external_group_id),
           ...(payload.ip_whitelist?.length
             ? { ip_whitelist: payload.ip_whitelist }
             : {}),

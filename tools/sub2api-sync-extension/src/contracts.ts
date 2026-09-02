@@ -97,6 +97,13 @@ export function finiteNumber(value) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined
 }
 
+export function normalizeGroupID(value) {
+  const normalized = String(value ?? '').trim()
+  if (!/^[1-9][0-9]*$/.test(normalized)) return normalized
+  const parsed = Number(normalized)
+  return Number.isSafeInteger(parsed) ? parsed : normalized
+}
+
 export function normalizeHealth(value) {
   const status = String(value ?? '').trim().toLowerCase()
   if (

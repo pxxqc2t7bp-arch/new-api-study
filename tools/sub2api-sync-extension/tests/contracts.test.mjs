@@ -9,6 +9,7 @@ import {
   extractModelNames,
   finiteNumber,
   mergeModelsByGroup,
+  normalizeGroupID,
   normalizeHealth,
   normalizeURL,
   sanitizeError,
@@ -113,4 +114,10 @@ test('declares console and API endpoint host permissions', async () => {
   assert.ok(manifest.host_permissions.includes('https://leyiapi.com/*'))
   assert.ok(manifest.host_permissions.includes('https://ebondai.com/*'))
   assert.ok(manifest.host_permissions.includes('https://api.ebondai.com/*'))
+})
+
+test('normalizes numeric group ids for current Sub2API create-key schema', () => {
+  assert.equal(normalizeGroupID('117'), 117)
+  assert.equal(normalizeGroupID(21), 21)
+  assert.equal(normalizeGroupID('legacy-group'), 'legacy-group')
 })

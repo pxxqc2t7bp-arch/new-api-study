@@ -595,7 +595,7 @@ func isManagedTextModel(modelName string, platform string) bool {
 		return strings.HasPrefix(modelName, "claude-")
 	case "grok":
 		return strings.HasPrefix(modelName, "grok-") &&
-			!strings.HasPrefix(modelName, "grok-imagine-")
+			!strings.HasPrefix(modelName, "grok-imagine")
 	default:
 		return false
 	}
