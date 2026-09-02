@@ -22,6 +22,9 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(modelUpdateHandler{})
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
+	service.RegisterSystemTaskHandler(upstreamProbeHandler{})
+	service.RegisterSystemTaskHandler(upstreamReconcileHandler{})
+	service.RegisterSystemTaskHandler(upstreamDailyHandler{})
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and
@@ -150,6 +153,88 @@ func (asyncTaskPollHandler) NewPayload() any { return nil }
 func (asyncTaskPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	summary := service.RunTaskPollingOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
 	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
+}
+
+type upstreamProbeHandler struct{}
+
+func (upstreamProbeHandler) Type() string { return model.SystemTaskTypeUpstreamProbe }
+
+func (upstreamProbeHandler) Enabled() bool {
+	return operation_setting.GetUpstreamOrchestrationSetting().Enabled
+}
+
+func (upstreamProbeHandler) Interval() time.Duration { return time.Minute }
+
+func (upstreamProbeHandler) NewPayload() any { return nil }
+
+func (upstreamProbeHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	summary, err := runDueUpstreamProbeTask(ctx)
+	status := model.SystemTaskStatusSucceeded
+	if err != nil {
+		status = model.SystemTaskStatusFailed
+	}
+	finishSystemTaskHandler(task, runnerID, status, summary, err)
+}
+
+type upstreamReconcileHandler struct{}
+
+func (upstreamReconcileHandler) Type() string { return model.SystemTaskTypeUpstreamReconcile }
+
+func (upstreamReconcileHandler) Enabled() bool {
+	return operation_setting.GetUpstreamOrchestrationSetting().Enabled
+}
+
+func (upstreamReconcileHandler) Interval() time.Duration {
+	hours := operation_setting.GetUpstreamOrchestrationSetting().SyncIntervalHours
+	return time.Duration(hours) * time.Hour
+}
+
+func (upstreamReconcileHandler) NewPayload() any { return nil }
+
+func (upstreamReconcileHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	summary, err := service.ReconcileManagedUpstreams(time.Now())
+	status := model.SystemTaskStatusSucceeded
+	if err != nil {
+		status = model.SystemTaskStatusFailed
+	}
+	finishSystemTaskHandler(task, runnerID, status, summary, err)
+}
+
+type upstreamDailyHandler struct{}
+
+func (upstreamDailyHandler) Type() string { return model.SystemTaskTypeUpstreamDaily }
+
+func (upstreamDailyHandler) Enabled() bool {
+	return operation_setting.GetUpstreamOrchestrationSetting().Enabled
+}
+
+func (upstreamDailyHandler) Due(now time.Time, latest *model.SystemTask) bool {
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	location, err := time.LoadLocation(setting.Timezone)
+	if err != nil {
+		location = time.FixedZone("Asia/Shanghai", 8*60*60)
+	}
+	localNow := now.In(location)
+	hour, minute := 3, 0
+	if _, err := fmt.Sscanf(setting.DailyReconcileTime, "%d:%d", &hour, &minute); err != nil {
+		hour, minute = 3, 0
+	}
+	today := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), hour, minute, 0, 0, location)
+	if localNow.Before(today) {
+		return false
+	}
+	return latest == nil || latest.UpdatedAt < today.Unix()
+}
+
+func (upstreamDailyHandler) NewPayload() any { return nil }
+
+func (upstreamDailyHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	summary, err := service.RunUpstreamDailyMaintenance(ctx, time.Now())
+	status := model.SystemTaskStatusSucceeded
+	if err != nil {
+		status = model.SystemTaskStatusFailed
+	}
+	finishSystemTaskHandler(task, runnerID, status, summary, err)
 }
 
 func finishSystemTaskHandler(task *model.SystemTask, runnerID string, status model.SystemTaskStatus, result any, runErr error) {

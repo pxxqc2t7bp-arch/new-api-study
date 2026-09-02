@@ -193,8 +193,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
 	maxRetries := service.AdaptiveRetryTimes(retryParam)
+	failoverDeadline := time.Now().Add(time.Duration(operation_setting.GetUpstreamOrchestrationSetting().FailoverBudgetSeconds) * time.Second)
 
 	for ; retryParam.GetRetry() <= maxRetries; retryParam.IncreaseRetry() {
+		if retryParam.GetRetry() > 0 &&
+			operation_setting.GetUpstreamOrchestrationSetting().Enabled &&
+			time.Now().After(failoverDeadline) {
+			c.Set("channel_fallback_reason", "failover_budget_exhausted")
+			break
+		}
 		relayInfo.RetryIndex = retryParam.GetRetry()
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
@@ -220,6 +227,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
+		attemptStartedAt := time.Now()
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
 			newAPIError = relay.WssHelper(c, relayInfo)
@@ -233,6 +241,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if newAPIError == nil {
 			relayInfo.LastError = nil
+			channelID := channel.Id
+			elapsed := time.Since(attemptStartedAt)
+			gopool.Go(func() {
+				service.RecordManagedChannelSuccess(channelID, elapsed)
+			})
 			return
 		}
 

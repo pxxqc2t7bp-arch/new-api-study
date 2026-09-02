@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "New API Sub2API Sync",
+  "version": "0.1.0",
+  "description": "Synchronizes sanitized Sub2API routing, health and usage snapshots with New API.",
+  "permissions": [
+    "alarms",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://leyi12.xyz/*",
+    "https://api.hualong.online/*",
+    "https://ebondai.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://leyi12.xyz/*",
+        "https://api.hualong.online/*",
+        "https://ebondai.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "options.html",
+  "action": {
+    "default_title": "New API Sub2API Sync"
+  }
+}

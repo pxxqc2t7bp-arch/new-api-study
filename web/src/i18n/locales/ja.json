@@ -5538,6 +5538,20 @@
     "Zero retention": "データ保持なし",
     "Zhipu": "Zhipu",
     "Zhipu V4": "Zhipu V 4",
-    "Zoom": "ズーム"
+    "Zoom": "ズーム",
+    "Upstream Orchestration": "アップストリーム編成",
+    "Pair Chrome": "Chrome をペアリング",
+    "Sync": "同期",
+    "Reconcile": "再調整",
+    "Operation submitted": "操作を送信しました",
+    "Chrome pairing code": "Chrome ペアリングコード",
+    "Prices": "価格",
+    "Automation": "自動化",
+    "Sync devices": "同期デバイス",
+    "Policy": "ポリシー",
+    "Upstream route probing": "アップストリーム経路の探測",
+    "Upstream route reconciliation": "アップストリーム経路の再調整",
+    "Upstream daily reconciliation": "アップストリームの日次照合",
+    "Root Bark notification is not configured": "Root の Bark 通知が設定されていません"
   }
 }

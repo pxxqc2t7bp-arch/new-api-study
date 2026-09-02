@@ -391,10 +391,10 @@ func TestRelayChannelFailoverDoesNotRetry400(t *testing.T) {
 	requireRelayRefunded(t, user.Id)
 }
 
-func TestRelayChannelFailoverCapsAttemptsAtFourPriorities(t *testing.T) {
+func TestRelayChannelFailoverCapsAttemptsAtFivePriorities(t *testing.T) {
 	engine, user := setupRelayFailoverTest(t, false)
 	trace := &failoverCallTrace{}
-	priorities := []int64{30, 20, 10, 0, -10}
+	priorities := []int64{30, 20, 10, 0, -10, -20}
 	upstreams := make([]*failoverUpstream, 0, len(priorities))
 	for index, priority := range priorities {
 		name := fmt.Sprintf("tier-%d", priority)
@@ -407,9 +407,9 @@ func TestRelayChannelFailoverCapsAttemptsAtFourPriorities(t *testing.T) {
 	response := performRelayFailoverRequest(t, engine)
 
 	assert.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
-	assert.Equal(t, []string{"tier-30", "tier-20", "tier-10", "tier-0"}, trace.snapshot())
+	assert.Equal(t, []string{"tier-30", "tier-20", "tier-10", "tier-0", "tier--10"}, trace.snapshot())
 	for index, upstream := range upstreams {
-		if index < 4 {
+		if index < 5 {
 			assert.Equal(t, 1, upstream.callCount())
 		} else {
 			assert.Zero(t, upstream.callCount())

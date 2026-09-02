@@ -21,6 +21,16 @@ func NotifyRootUser(t string, subject string, content string) {
 	}
 }
 
+func NotifyRootBark(t string, subject string, content string) error {
+	user := model.GetRootUser().ToBaseUser()
+	setting := user.GetSetting()
+	if strings.TrimSpace(setting.BarkUrl) == "" {
+		return fmt.Errorf("root user has no bark url")
+	}
+	setting.NotifyType = dto.NotifyTypeBark
+	return NotifyUser(user.Id, user.Email, setting, dto.NewNotify(t, subject, content, nil))
+}
+
 func NotifyUpstreamModelUpdateWatchers(subject string, content string) {
 	var users []model.User
 	if err := model.DB.

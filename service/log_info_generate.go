@@ -93,6 +93,11 @@ func AppendChannelFailoverAdminInfo(ctx *gin.Context, adminInfo map[string]inter
 	if billedModel := ctx.GetString("billed_model"); billedModel != "" {
 		adminInfo["billed_model"] = billedModel
 	}
+	if channelID := common.GetContextKeyInt(ctx, constant.ContextKeyChannelId); channelID > 0 {
+		if upstreamRoute := GetManagedRouteAdminInfo(channelID); upstreamRoute != nil {
+			adminInfo["upstream_route"] = upstreamRoute
+		}
+	}
 	for _, key := range []string{
 		"actual_model_missing",
 		"actual_model_conflict",

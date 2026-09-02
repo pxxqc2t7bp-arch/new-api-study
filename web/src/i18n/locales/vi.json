@@ -5538,6 +5538,20 @@
     "Zero retention": "Không lưu dữ liệu",
     "Zhipu": "Zhipu",
     "Zhipu V4": "Zhipu V4",
-    "Zoom": "Zoom"
+    "Zoom": "Zoom",
+    "Upstream Orchestration": "Điều phối thượng nguồn",
+    "Pair Chrome": "Ghép nối Chrome",
+    "Sync": "Đồng bộ",
+    "Reconcile": "Đối soát",
+    "Operation submitted": "Đã gửi thao tác",
+    "Chrome pairing code": "Mã ghép nối Chrome",
+    "Prices": "Giá",
+    "Automation": "Tự động hóa",
+    "Sync devices": "Thiết bị đồng bộ",
+    "Policy": "Chính sách",
+    "Upstream route probing": "Kiểm tra tuyến thượng nguồn",
+    "Upstream route reconciliation": "Đối soát tuyến thượng nguồn",
+    "Upstream daily reconciliation": "Đối soát thượng nguồn hằng ngày",
+    "Root Bark notification is not configured": "Chưa cấu hình thông báo Bark cho Root"
   }
 }

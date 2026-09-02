@@ -29,6 +29,13 @@ func DisableChannel(channelError types.ChannelError, reason string) {
 		return
 	}
 
+	if handled, _, err := RecordManagedChannelFailure(channelError, reason); handled {
+		if err != nil {
+			common.SysError(fmt.Sprintf("failed to record managed channel failure: channel_id=%d error=%v", channelError.ChannelId, err))
+		}
+		return
+	}
+
 	channel, _ := model.CacheGetChannel(channelError.ChannelId)
 	resetAt, quotaLimited := ParsePlanQuotaReset(reason)
 	if channel != nil && quotaLimited && strings.HasPrefix(channel.GetTag(), "plan:") {

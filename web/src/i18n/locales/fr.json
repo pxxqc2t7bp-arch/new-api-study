@@ -5538,6 +5538,20 @@
     "Zero retention": "Aucune rétention",
     "Zhipu": "Zhipu",
     "Zhipu V4": "Zhipu V4",
-    "Zoom": "Zoom"
+    "Zoom": "Zoom",
+    "Upstream Orchestration": "Orchestration en amont",
+    "Pair Chrome": "Associer Chrome",
+    "Sync": "Synchroniser",
+    "Reconcile": "Réconcilier",
+    "Operation submitted": "Opération envoyée",
+    "Chrome pairing code": "Code d’association Chrome",
+    "Prices": "Tarifs",
+    "Automation": "Automatisation",
+    "Sync devices": "Appareils de synchronisation",
+    "Policy": "Politique",
+    "Upstream route probing": "Sondage des routes en amont",
+    "Upstream route reconciliation": "Réconciliation des routes en amont",
+    "Upstream daily reconciliation": "Réconciliation quotidienne en amont",
+    "Root Bark notification is not configured": "La notification Bark Root n’est pas configurée"
   }
 }

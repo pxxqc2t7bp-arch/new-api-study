@@ -1120,6 +1120,17 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*model.Channel {
 	selected := make([]*model.Channel, 0, len(channels))
 	selectedPlanDomains := make(map[string]struct{})
+	managedChannels := make(map[int]struct{})
+	if mode == operation_setting.ChannelTestModePassiveRecovery {
+		var managedIDs []int
+		if err := model.DB.Model(&model.UpstreamManagedRoute{}).
+			Where("detached = ?", false).
+			Pluck("channel_id", &managedIDs).Error; err == nil {
+			for _, channelID := range managedIDs {
+				managedChannels[channelID] = struct{}{}
+			}
+		}
+	}
 	now := time.Now().Unix()
 	for _, channel := range channels {
 		if channel.Status == common.ChannelStatusManuallyDisabled {
@@ -1132,6 +1143,9 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 			continue
 		}
 		if mode == operation_setting.ChannelTestModePassiveRecovery {
+			if _, managed := managedChannels[channel.Id]; managed {
+				continue
+			}
 			if disabledUntil := channel.GetDisabledUntil(); disabledUntil > now {
 				continue
 			}

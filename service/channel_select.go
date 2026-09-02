@@ -12,7 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const MaxAdaptiveChannelAttempts = 4
+const MaxAdaptiveChannelAttempts = 5
 
 func GetChannelConstraints(c *gin.Context) *dto.ChannelConstraints {
 	if c == nil {

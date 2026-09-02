@@ -5538,6 +5538,20 @@
     "Zero retention": "零數據保留",
     "Zhipu": "智譜",
     "Zhipu V4": "智譜 V4",
-    "Zoom": "縮放"
+    "Zoom": "縮放",
+    "Upstream Orchestration": "上游編排",
+    "Pair Chrome": "配對 Chrome",
+    "Sync": "同步",
+    "Reconcile": "重新編排",
+    "Operation submitted": "操作已提交",
+    "Chrome pairing code": "Chrome 配對碼",
+    "Prices": "價格",
+    "Automation": "自動化",
+    "Sync devices": "同步裝置",
+    "Policy": "策略",
+    "Upstream route probing": "上游線路探測",
+    "Upstream route reconciliation": "上游線路重排",
+    "Upstream daily reconciliation": "上游每日對帳",
+    "Root Bark notification is not configured": "Root 使用者尚未設定 Bark 通知"
   }
 }
