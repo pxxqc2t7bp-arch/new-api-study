@@ -10,8 +10,10 @@
   ],
   "host_permissions": [
     "https://leyi12.xyz/*",
+    "https://leyiapi.com/*",
     "https://api.hualong.online/*",
-    "https://ebondai.com/*"
+    "https://ebondai.com/*",
+    "https://api.ebondai.com/*"
   ],
   "optional_host_permissions": [
     "https://*/*",

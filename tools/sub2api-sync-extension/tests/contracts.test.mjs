@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import {
@@ -101,4 +102,15 @@ test('extracts standard v1 models and merges per-group discoveries', () => {
 
   assert.deepEqual(merged.get('12'), ['gpt-5.5', 'gpt-5.6'])
   assert.deepEqual(merged.get('13'), ['claude-sonnet-5'])
+})
+
+test('declares console and API endpoint host permissions', async () => {
+  const manifest = JSON.parse(
+    await readFile(new URL('../dist/manifest.json', import.meta.url), 'utf8')
+  )
+
+  assert.ok(manifest.host_permissions.includes('https://leyi12.xyz/*'))
+  assert.ok(manifest.host_permissions.includes('https://leyiapi.com/*'))
+  assert.ok(manifest.host_permissions.includes('https://ebondai.com/*'))
+  assert.ok(manifest.host_permissions.includes('https://api.ebondai.com/*'))
 })

@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -37,18 +38,26 @@ type OfficialPricingSyncSummary struct {
 }
 
 type officialTokenPrice struct {
-	Vendor         string  `json:"vendor"`
-	ModelName      string  `json:"model_name"`
-	InputPerM      float64 `json:"input_per_m"`
-	CachedReadPerM float64 `json:"cached_read_per_m"`
-	CacheWritePerM float64 `json:"cache_write_per_m"`
-	OutputPerM     float64 `json:"output_per_m"`
-	SourceURL      string  `json:"source_url"`
-	EvidenceHash   string  `json:"evidence_hash"`
+	Vendor               string  `json:"vendor"`
+	ModelName            string  `json:"model_name"`
+	InputPerM            float64 `json:"input_per_m"`
+	CachedReadPerM       float64 `json:"cached_read_per_m"`
+	CacheWritePerM       float64 `json:"cache_write_per_m"`
+	CacheWrite1hPerM     float64 `json:"cache_write_1h_per_m"`
+	OutputPerM           float64 `json:"output_per_m"`
+	LongContextThreshold int64   `json:"long_context_threshold,omitempty"`
+	LongInputPerM        float64 `json:"long_input_per_m,omitempty"`
+	LongCachedReadPerM   float64 `json:"long_cached_read_per_m,omitempty"`
+	LongCacheWritePerM   float64 `json:"long_cache_write_per_m,omitempty"`
+	LongCacheWrite1hPerM float64 `json:"long_cache_write_1h_per_m,omitempty"`
+	LongOutputPerM       float64 `json:"long_output_per_m,omitempty"`
+	SourceURL            string  `json:"source_url"`
+	EvidenceHash         string  `json:"evidence_hash"`
 }
 
 var officialPricingSourceURLs = map[string][]string{
 	"openai": {
+		"https://developers.openai.com/api/docs/pricing",
 		"https://openai.com/api/pricing/",
 	},
 	"anthropic": {
@@ -62,6 +71,7 @@ var officialPricingSourceURLs = map[string][]string{
 }
 
 var officialPriceNumberPattern = regexp.MustCompile(`(?i)(?:USD\s*)?\$?\s*([0-9]+(?:\.[0-9]+)?)`)
+var officialLongContextPattern = regexp.MustCompile(`(?i)(?:>=|>)\s*([0-9]+(?:\.[0-9]+)?)\s*k`)
 
 func RunOfficialPricingSync(ctx context.Context, now time.Time) (OfficialPricingSyncSummary, error) {
 	var summary OfficialPricingSyncSummary
@@ -213,6 +223,12 @@ func fetchOfficialPricingPage(ctx context.Context, rawURL string) ([]byte, error
 		return nil, errors.New("official pricing URL is not allowlisted")
 	}
 	baseClient := GetHttpClient()
+	if proxyURL := strings.TrimSpace(os.Getenv("UPSTREAM_PRICING_PROXY_URL")); proxyURL != "" {
+		baseClient, err = GetHttpClientWithProxy(proxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid official pricing proxy: %w", err)
+		}
+	}
 	client := &http.Client{
 		Timeout: 20 * time.Second,
 	}
@@ -257,6 +273,7 @@ func officialPricingHostAllowed(host string) bool {
 	host = strings.ToLower(strings.TrimSpace(host))
 	return host == "openai.com" ||
 		host == "www.openai.com" ||
+		host == "developers.openai.com" ||
 		host == "platform.claude.com" ||
 		host == "docs.x.ai" ||
 		host == "x.ai" ||
@@ -275,10 +292,25 @@ func parseOfficialPricingTables(
 		return nil, err
 	}
 	var prices []officialTokenPrice
+	seenModels := make(map[string]struct{})
+	documentHasPerMillionUnit := hasOfficialPerMillionUnit(normalizedNodeText(document))
 	var walk func(*html.Node)
 	walk = func(node *html.Node) {
 		if node.Type == html.ElementNode && node.Data == "table" {
-			prices = append(prices, parseOfficialPricingTable(vendor, sourceURL, node, allowedModels, aliases)...)
+			for _, price := range parseOfficialPricingTable(
+				vendor,
+				sourceURL,
+				node,
+				allowedModels,
+				aliases,
+				documentHasPerMillionUnit,
+			) {
+				if _, exists := seenModels[price.ModelName]; exists {
+					continue
+				}
+				seenModels[price.ModelName] = struct{}{}
+				prices = append(prices, price)
+			}
 			return
 		}
 		for child := node.FirstChild; child != nil; child = child.NextSibling {
@@ -292,103 +324,232 @@ func parseOfficialPricingTables(
 	return prices, nil
 }
 
+type officialPriceColumns struct {
+	model          int
+	input          []int
+	cachedRead     []int
+	cacheWrite     []int
+	cacheWrite1h   int
+	output         []int
+	headerEvidence string
+}
+
 func parseOfficialPricingTable(
 	vendor string,
 	sourceURL string,
 	table *html.Node,
 	allowedModels map[string]string,
 	aliases map[string]string,
+	documentHasPerMillionUnit bool,
 ) []officialTokenPrice {
 	rows := tableRows(table)
 	if len(rows) < 2 {
 		return nil
 	}
 	tableText := strings.ToLower(normalizedNodeText(table))
-	if !strings.Contains(tableText, "1m") &&
-		!strings.Contains(tableText, "million") &&
-		!strings.Contains(tableText, "mtok") {
+	if (!hasOfficialPerMillionUnit(tableText) && !documentHasPerMillionUnit) ||
+		strings.Contains(tableText, "price per second") ||
+		strings.Contains(tableText, "estimated cost") {
 		return nil
 	}
-	headerIndex := -1
-	inputColumn, cachedColumn, outputColumn := -1, -1, -1
-	for index, row := range rows {
-		for column, cell := range row {
-			value := strings.ToLower(cell)
-			switch {
-			case strings.Contains(value, "cached") && strings.Contains(value, "input"):
-				cachedColumn = column
-			case strings.Contains(value, "cache") && strings.Contains(value, "read"):
-				cachedColumn = column
-			case strings.Contains(value, "input"):
-				inputColumn = column
-			case strings.Contains(value, "output"):
-				outputColumn = column
-			}
-		}
-		if inputColumn >= 0 && outputColumn >= 0 {
-			headerIndex = index
-			break
-		}
-	}
-	if headerIndex < 0 {
+	headerIndex, columns, ok := officialPricingColumnsForRows(rows)
+	if !ok {
 		return nil
 	}
 	var prices []officialTokenPrice
 	for _, row := range rows[headerIndex+1:] {
-		maxColumn := max(inputColumn, outputColumn)
-		if cachedColumn > maxColumn {
-			maxColumn = cachedColumn
-		}
-		if len(row) <= maxColumn || len(row) == 0 {
+		requiredColumn := max(columns.model, max(columns.input[0], columns.output[0]))
+		if len(row) <= requiredColumn {
 			continue
 		}
-		modelName, matched := resolveOfficialModelName(strings.TrimSpace(row[0]), aliases, allowedModels)
+		rawModelName := strings.TrimSpace(row[columns.model])
+		modelName, matched := resolveOfficialModelName(rawModelName, aliases, allowedModels)
 		if !matched || !officialModelMatchesVendor(modelName, vendor, allowedModels) {
 			continue
 		}
-		input, inputOK := parseOfficialPriceCell(row[inputColumn])
-		output, outputOK := parseOfficialPriceCell(row[outputColumn])
+		input, inputOK := parseOfficialPriceCell(row[columns.input[0]])
+		output, outputOK := parseOfficialPriceCell(row[columns.output[0]])
 		if !inputOK || !outputOK {
 			continue
 		}
 		cached := input
-		if cachedColumn >= 0 {
-			if parsed, ok := parseOfficialPriceCell(row[cachedColumn]); ok {
+		if len(columns.cachedRead) > 0 && len(row) > columns.cachedRead[0] {
+			if parsed, ok := parseOfficialPriceCell(row[columns.cachedRead[0]]); ok {
 				cached = parsed
 			}
 		}
-		normalizedRow := strings.Join(row, "\x1f")
-		hash := sha256.Sum256([]byte(sourceURL + "\x00" + normalizedRow))
-		prices = append(prices, officialTokenPrice{
-			Vendor:         vendor,
-			ModelName:      modelName,
-			InputPerM:      input,
-			CachedReadPerM: cached,
-			CacheWritePerM: input,
-			OutputPerM:     output,
-			SourceURL:      sourceURL,
-			EvidenceHash:   hex.EncodeToString(hash[:]),
-		})
+		cacheWrite := input
+		if len(columns.cacheWrite) > 0 && len(row) > columns.cacheWrite[0] {
+			if parsed, ok := parseOfficialPriceCell(row[columns.cacheWrite[0]]); ok {
+				cacheWrite = parsed
+			}
+		}
+		cacheWrite1h := cacheWrite
+		if columns.cacheWrite1h >= 0 && len(row) > columns.cacheWrite1h {
+			if parsed, ok := parseOfficialPriceCell(row[columns.cacheWrite1h]); ok {
+				cacheWrite1h = parsed
+			}
+		}
+		price := officialTokenPrice{
+			Vendor:           vendor,
+			ModelName:        modelName,
+			InputPerM:        input,
+			CachedReadPerM:   cached,
+			CacheWritePerM:   cacheWrite,
+			CacheWrite1hPerM: cacheWrite1h,
+			OutputPerM:       output,
+			SourceURL:        sourceURL,
+		}
+		if len(columns.input) > 1 &&
+			len(columns.output) > 1 &&
+			len(row) > columns.input[1] &&
+			len(row) > columns.output[1] {
+			longInput, longInputOK := parseOfficialPriceCell(row[columns.input[1]])
+			longOutput, longOutputOK := parseOfficialPriceCell(row[columns.output[1]])
+			threshold := officialLongContextThresholdFor(vendor, rawModelName)
+			if longInputOK && longOutputOK && threshold > 0 {
+				price.LongContextThreshold = threshold
+				price.LongInputPerM = longInput
+				price.LongOutputPerM = longOutput
+				price.LongCachedReadPerM = longInput
+				if len(columns.cachedRead) > 1 && len(row) > columns.cachedRead[1] {
+					if parsed, ok := parseOfficialPriceCell(row[columns.cachedRead[1]]); ok {
+						price.LongCachedReadPerM = parsed
+					}
+				}
+				price.LongCacheWritePerM = longInput
+				if len(columns.cacheWrite) > 1 && len(row) > columns.cacheWrite[1] {
+					if parsed, ok := parseOfficialPriceCell(row[columns.cacheWrite[1]]); ok {
+						price.LongCacheWritePerM = parsed
+					}
+				}
+				price.LongCacheWrite1hPerM = price.LongCacheWritePerM
+			}
+		}
+		evidence := strings.Join([]string{
+			sourceURL,
+			columns.headerEvidence,
+			strings.Join(row, "\x1f"),
+			strconv.FormatInt(price.LongContextThreshold, 10),
+		}, "\x00")
+		hash := sha256.Sum256([]byte(evidence))
+		price.EvidenceHash = hex.EncodeToString(hash[:])
+		prices = append(prices, price)
 	}
 	return prices
 }
 
+func hasOfficialPerMillionUnit(value string) bool {
+	value = strings.ToLower(value)
+	return strings.Contains(value, "1m token") ||
+		strings.Contains(value, "million token") ||
+		strings.Contains(value, "mtok")
+}
+
+func officialPricingColumnsForRows(rows [][]string) (int, officialPriceColumns, bool) {
+	for headerIndex, header := range rows {
+		maxDataWidth := 0
+		for _, row := range rows[headerIndex+1:] {
+			if len(row) > maxDataWidth {
+				maxDataWidth = len(row)
+			}
+		}
+		offset := maxDataWidth - len(header)
+		if offset < 0 {
+			offset = 0
+		}
+		columns := officialPriceColumns{
+			model:          -1,
+			cacheWrite1h:   -1,
+			headerEvidence: strings.Join(header, "\x1f"),
+		}
+		for rowIndex := headerIndex; rowIndex >= 0; rowIndex-- {
+			for column, cell := range rows[rowIndex] {
+				if strings.EqualFold(strings.TrimSpace(cell), "model") {
+					columns.model = column
+					break
+				}
+			}
+			if columns.model >= 0 {
+				break
+			}
+		}
+		for column, cell := range header {
+			value := strings.ToLower(strings.TrimSpace(cell))
+			alignedColumn := column + offset
+			switch {
+			case strings.Contains(value, "cache") && strings.Contains(value, "write") && strings.Contains(value, "1h"):
+				columns.cacheWrite1h = alignedColumn
+			case strings.Contains(value, "cache") && strings.Contains(value, "write"):
+				columns.cacheWrite = append(columns.cacheWrite, alignedColumn)
+			case strings.Contains(value, "cached") && strings.Contains(value, "input"):
+				columns.cachedRead = append(columns.cachedRead, alignedColumn)
+			case strings.Contains(value, "cache") && (strings.Contains(value, "read") || strings.Contains(value, "hit")):
+				columns.cachedRead = append(columns.cachedRead, alignedColumn)
+			case strings.Contains(value, "input"):
+				columns.input = append(columns.input, alignedColumn)
+			case strings.Contains(value, "output"):
+				columns.output = append(columns.output, alignedColumn)
+			}
+		}
+		if columns.model >= 0 && len(columns.input) > 0 && len(columns.output) > 0 {
+			if headerIndex > 0 {
+				columns.headerEvidence = strings.Join(rows[headerIndex-1], "\x1f") + "\x1e" + columns.headerEvidence
+			}
+			return headerIndex, columns, true
+		}
+	}
+	return -1, officialPriceColumns{}, false
+}
+
+func officialLongContextThresholdFor(vendor string, rawModelName string) int64 {
+	normalized := strings.ReplaceAll(rawModelName, "≥", ">=")
+	if match := officialLongContextPattern.FindStringSubmatch(normalized); len(match) == 2 {
+		value, err := strconv.ParseFloat(match[1], 64)
+		if err == nil && value > 0 {
+			return int64(value * 1000)
+		}
+	}
+	if vendor == "openai" {
+		return 272000
+	}
+	return 0
+}
+
 func resolveOfficialModelName(raw string, aliases map[string]string, allowedModels map[string]string) (string, bool) {
 	raw = strings.TrimSpace(raw)
-	if alias, ok := aliases[raw]; ok {
-		canonical := strings.TrimSpace(alias)
-		_, exists := allowedModels[canonical]
-		return canonical, exists
-	}
-	if _, exists := allowedModels[raw]; exists {
-		return raw, true
+	normalized := normalizeOfficialModelLabel(raw)
+	for _, candidate := range []string{raw, normalized} {
+		if alias, ok := aliases[candidate]; ok {
+			canonical := strings.TrimSpace(alias)
+			_, exists := allowedModels[canonical]
+			return canonical, exists
+		}
+		if _, exists := allowedModels[candidate]; exists {
+			return candidate, true
+		}
 	}
 	for modelName := range allowedModels {
-		if strings.EqualFold(modelName, raw) {
+		if strings.EqualFold(modelName, normalized) {
 			return modelName, true
 		}
 	}
 	return "", false
+}
+
+func normalizeOfficialModelLabel(value string) string {
+	value = strings.TrimSpace(value)
+	lower := strings.ToLower(value)
+	if index := strings.Index(lower, "long context"); index > 0 {
+		value = strings.TrimSpace(value[:index])
+	}
+	lower = strings.ToLower(value)
+	if index := strings.Index(lower, " context length)"); index > 0 {
+		if open := strings.LastIndex(value[:index], "("); open > 0 {
+			value = strings.TrimSpace(value[:open])
+		}
+	}
+	return value
 }
 
 func tableRows(table *html.Node) [][]string {
@@ -461,14 +622,28 @@ func officialModelMatchesVendor(modelName string, vendor string, allowedModels m
 }
 
 func officialPriceExpression(price officialTokenPrice) string {
-	return fmt.Sprintf(
+	standard := fmt.Sprintf(
 		`tier("official", p*%.10g + cr*%.10g + cc*%.10g + cc1h*%.10g + c*%.10g)`,
 		price.InputPerM,
 		price.CachedReadPerM,
 		price.CacheWritePerM,
-		price.CacheWritePerM,
+		price.CacheWrite1hPerM,
 		price.OutputPerM,
 	)
+	if price.LongContextThreshold <= 0 ||
+		price.LongInputPerM <= 0 ||
+		price.LongOutputPerM <= 0 {
+		return standard
+	}
+	longContext := fmt.Sprintf(
+		`tier("official_long_context", p*%.10g + cr*%.10g + cc*%.10g + cc1h*%.10g + c*%.10g)`,
+		price.LongInputPerM,
+		price.LongCachedReadPerM,
+		price.LongCacheWritePerM,
+		price.LongCacheWrite1hPerM,
+		price.LongOutputPerM,
+	)
+	return fmt.Sprintf("len <= %d ? %s : %s", price.LongContextThreshold, standard, longContext)
 }
 
 func newOfficialPriceEvidence(
