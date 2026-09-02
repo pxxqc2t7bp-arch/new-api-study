@@ -18,6 +18,62 @@ export function asArray(value) {
   return []
 }
 
+export function collectGroupRates(response) {
+  const value = unwrap(response)
+  if (Array.isArray(value)) {
+    return new Map(
+      value.map((rate) => [
+        String(rate.group_id ?? rate.id),
+        rate,
+      ])
+    )
+  }
+  if (value && typeof value === 'object') {
+    return new Map(
+      Object.entries(value).map(([id, rate]) => [
+        String(id),
+        { user_rate_multiplier: rate },
+      ])
+    )
+  }
+  return new Map()
+}
+
+export function collectModelsByGroup(response) {
+  const result = new Map()
+  for (const channel of asArray(unwrap(response))) {
+    const sections = asArray(channel.platforms)
+    if (sections.length > 0) {
+      for (const section of sections) {
+        const models = normalizeModelNames(section.supported_models ?? [])
+        for (const group of asArray(section.groups)) {
+          addModels(result, String(group.id ?? group.group_id ?? ''), models)
+        }
+      }
+      continue
+    }
+    const models = normalizeModelNames(channel.supported_models ?? channel.models ?? [])
+    for (const group of asArray(channel.groups ?? channel.available_groups)) {
+      addModels(result, String(group.id ?? group.group_id ?? ''), models)
+    }
+  }
+  return result
+}
+
+function addModels(result, groupId, models) {
+  if (!groupId) return
+  result.set(groupId, [...new Set([...(result.get(groupId) || []), ...models])])
+}
+
+export function normalizeModelNames(value) {
+  const values = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(',')
+      : []
+  return [...new Set(values.map((item) => String(item?.name ?? item).trim()).filter(Boolean))]
+}
+
 export function finiteNumber(value) {
   const parsed = Number(value)
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined

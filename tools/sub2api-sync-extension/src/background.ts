@@ -1,9 +1,12 @@
 import {
   asArray,
+  collectGroupRates,
+  collectModelsByGroup,
   COMMAND_ALARM,
   DAILY_ALARM,
   finiteNumber,
   normalizeHealth,
+  normalizeModelNames,
   normalizeURL,
   randomId,
   sanitizeError,
@@ -269,12 +272,7 @@ async function siteRequest(source, authToken, path, options = {}) {
 }
 
 function normalizeGroups(source, groupsResponse, ratesResponse, channelsResponse, monitorsResponse) {
-  const rates = new Map(
-    asArray(unwrap(ratesResponse)).map((rate) => [
-      String(rate.group_id ?? rate.id),
-      rate,
-    ])
-  )
+  const rates = collectGroupRates(ratesResponse)
   const modelsByGroup = collectModelsByGroup(channelsResponse)
   const monitors = normalizeMonitors(monitorsResponse)
   return asArray(unwrap(groupsResponse))
@@ -325,20 +323,6 @@ function normalizeGroups(source, groupsResponse, ratesResponse, channelsResponse
         group.rate_multiplier > 0 &&
         group.models.length > 0
     )
-}
-
-function collectModelsByGroup(channelsResponse) {
-  const result = new Map()
-  for (const channel of asArray(unwrap(channelsResponse))) {
-    for (const group of asArray(channel.groups ?? channel.available_groups)) {
-      const groupId = String(group.id ?? group.group_id ?? '')
-      const models = normalizeModelNames(
-        group.supported_models ?? channel.supported_models ?? channel.models ?? []
-      )
-      result.set(groupId, [...new Set([...(result.get(groupId) || []), ...models])])
-    }
-  }
-  return result
 }
 
 function normalizeMonitors(monitorsResponse) {
@@ -433,15 +417,6 @@ function normalizePlatform(source, value) {
   }
   if (normalized.includes('grok') || normalized.includes('xai')) return 'grok'
   return ''
-}
-
-function normalizeModelNames(value) {
-  const values = Array.isArray(value)
-    ? value
-    : typeof value === 'string'
-      ? value.split(',')
-      : []
-  return [...new Set(values.map((item) => String(item?.name ?? item).trim()).filter(Boolean))]
 }
 
 function extractEndpoints(settingsResponse) {
