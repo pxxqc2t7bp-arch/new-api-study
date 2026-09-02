@@ -25,6 +25,7 @@ type UpstreamReconcileSummary struct {
 	RoutesActivated   int `json:"routes_activated"`
 	RoutesQuarantined int `json:"routes_quarantined"`
 	RoutesLongRed     int `json:"routes_long_red"`
+	RoutesRetained    int `json:"routes_retained"`
 	PrioritiesUpdated int `json:"priorities_updated"`
 }
 
@@ -116,6 +117,14 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 	for _, group := range groups {
 		groupByIdentity[upstreamGroupIdentity(group.SourceID, group.ExternalID)] = group
 	}
+	candidates, err := buildUpstreamRouteCandidates(sources, groups, now, setting)
+	if err != nil {
+		return summary, err
+	}
+	selectedGroups := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		selectedGroups[upstreamGroupIdentity(candidate.group.SourceID, candidate.group.ExternalID)] = struct{}{}
+	}
 
 	for i := range routes {
 		route := &routes[i]
@@ -127,7 +136,16 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 		if !sourceExists || !groupExists {
 			continue
 		}
-		state, reason := desiredManagedRouteState(*route, source, group, now, setting)
+		identity := upstreamGroupIdentity(route.SourceID, route.ExternalGroupID)
+		stateRoute := *route
+		if stateRoute.State == model.UpstreamRouteStateRetained {
+			stateRoute.State = model.UpstreamRouteStateShadow
+		}
+		state, reason := desiredManagedRouteState(stateRoute, source, group, now, setting)
+		if _, selected := selectedGroups[identity]; !selected {
+			state = model.UpstreamRouteStateRetained
+			reason = "outside managed candidate limit"
+		}
 		if state == route.State {
 			continue
 		}
@@ -147,6 +165,14 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 		if state == model.UpstreamRouteStateLongRed {
 			updates["next_probe_at"] = int64(0)
 			summary.RoutesLongRed++
+		}
+		if state == model.UpstreamRouteStateRetained {
+			updates["rank"] = 0
+			updates["next_probe_at"] = int64(0)
+			summary.RoutesRetained++
+		}
+		if state == model.UpstreamRouteStateShadow && route.State == model.UpstreamRouteStateRetained {
+			updates["next_probe_at"] = now.Unix()
 		}
 		if state == model.UpstreamRouteStateActive {
 			updates["red_since"] = int64(0)
@@ -175,10 +201,6 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 		route.State = state
 	}
 
-	candidates, err := buildUpstreamRouteCandidates(sources, groups, now, setting)
-	if err != nil {
-		return summary, err
-	}
 	if setting.AutoEnroll {
 		queued, queueErr := enqueueMissingUpstreamEnrollments(candidates, routes, setting)
 		if queueErr != nil {
@@ -186,7 +208,7 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 		}
 		summary.EnrollmentQueued = queued
 	}
-	updated, err := rankManagedRoutes(now, sources, groups)
+	updated, err := rankManagedRoutes(now, sources, groups, candidates)
 	if err != nil {
 		return summary, err
 	}
@@ -325,6 +347,7 @@ func selectUpstreamCandidateGroups(candidates []upstreamRouteCandidate, limit in
 		return lessUpstreamCandidate(candidates[i], candidates[j])
 	})
 	selected := make(map[string]upstreamRouteCandidate)
+	selectedModels := make(map[string]map[string]struct{})
 	modelCandidates := make(map[string][]upstreamRouteCandidate)
 	for _, candidate := range candidates {
 		for _, modelName := range candidate.models {
@@ -332,7 +355,8 @@ func selectUpstreamCandidateGroups(candidates []upstreamRouteCandidate, limit in
 			modelCandidates[key] = append(modelCandidates[key], candidate)
 		}
 	}
-	for _, perModel := range modelCandidates {
+	for key, perModel := range modelCandidates {
+		modelName := strings.SplitN(key, "\x00", 2)[1]
 		seenSources := make(map[int64]struct{})
 		chosen := make([]upstreamRouteCandidate, 0, limit)
 		for _, candidate := range perModel {
@@ -357,11 +381,21 @@ func selectUpstreamCandidateGroups(candidates []upstreamRouteCandidate, limit in
 			chosen = append(chosen, candidate)
 		}
 		for _, candidate := range chosen {
-			selected[upstreamGroupIdentity(candidate.group.SourceID, candidate.group.ExternalID)] = candidate
+			identity := upstreamGroupIdentity(candidate.group.SourceID, candidate.group.ExternalID)
+			selected[identity] = candidate
+			if selectedModels[identity] == nil {
+				selectedModels[identity] = make(map[string]struct{})
+			}
+			selectedModels[identity][modelName] = struct{}{}
 		}
 	}
 	result := make([]upstreamRouteCandidate, 0, len(selected))
-	for _, candidate := range selected {
+	for identity, candidate := range selected {
+		candidate.models = candidate.models[:0]
+		for modelName := range selectedModels[identity] {
+			candidate.models = append(candidate.models, modelName)
+		}
+		sort.Strings(candidate.models)
 		result = append(result, candidate)
 	}
 	sort.SliceStable(result, func(i, j int) bool {
@@ -462,7 +496,12 @@ func hasPendingEnrollment(sourceKey string, externalGroupID string) (bool, error
 	return false, nil
 }
 
-func rankManagedRoutes(now time.Time, sources []model.UpstreamSource, groups []model.UpstreamGroup) (int, error) {
+func rankManagedRoutes(
+	now time.Time,
+	sources []model.UpstreamSource,
+	groups []model.UpstreamGroup,
+	candidates []upstreamRouteCandidate,
+) (int, error) {
 	sourceByID := make(map[int64]model.UpstreamSource, len(sources))
 	for _, source := range sources {
 		sourceByID[source.ID] = source
@@ -470,6 +509,10 @@ func rankManagedRoutes(now time.Time, sources []model.UpstreamSource, groups []m
 	groupByIdentity := make(map[string]model.UpstreamGroup, len(groups))
 	for _, group := range groups {
 		groupByIdentity[upstreamGroupIdentity(group.SourceID, group.ExternalID)] = group
+	}
+	selectedModels := make(map[string][]string, len(candidates))
+	for _, candidate := range candidates {
+		selectedModels[upstreamGroupIdentity(candidate.group.SourceID, candidate.group.ExternalID)] = candidate.models
 	}
 	routes, err := model.ListUpstreamManagedRoutes()
 	if err != nil {
@@ -487,16 +530,24 @@ func rankManagedRoutes(now time.Time, sources []model.UpstreamSource, groups []m
 	updated := 0
 	for index := range routes {
 		route := &routes[index]
-		if route.Detached || route.State != model.UpstreamRouteStateActive {
+		if route.Detached {
 			continue
 		}
-		group, ok := groupByIdentity[upstreamGroupIdentity(route.SourceID, route.ExternalGroupID)]
+		identity := upstreamGroupIdentity(route.SourceID, route.ExternalGroupID)
+		group, ok := groupByIdentity[identity]
 		if !ok {
 			continue
 		}
-		rankByProtocol[route.Protocol]++
-		rank := rankByProtocol[route.Protocol]
-		priority := int64(1000 - rank)
+		models, selected := selectedModels[identity]
+		rank := 0
+		priority := int64(0)
+		status := common.ChannelStatusAutoDisabled
+		if selected && route.State == model.UpstreamRouteStateActive {
+			rankByProtocol[route.Protocol]++
+			rank = rankByProtocol[route.Protocol]
+			priority = int64(1000 - rank)
+			status = common.ChannelStatusEnabled
+		}
 		selectedEndpoint := sourceByID[route.SourceID].SelectedEndpoint
 		result := model.DB.Transaction(func(tx *gorm.DB) error {
 			if err := tx.Model(&model.UpstreamManagedRoute{}).Where("id = ?", route.ID).Updates(map[string]any{
@@ -506,20 +557,32 @@ func rankManagedRoutes(now time.Time, sources []model.UpstreamSource, groups []m
 			}).Error; err != nil {
 				return err
 			}
+			var channel model.Channel
+			if err := tx.Where("id = ?", route.ChannelID).First(&channel).Error; err != nil {
+				return err
+			}
+			channel.Priority = &priority
+			channel.BaseURL = &selectedEndpoint
+			channel.Status = status
+			if selected {
+				channel.Models = strings.Join(models, ",")
+			}
 			if err := tx.Model(&model.Channel{}).Where("id = ?", route.ChannelID).Updates(map[string]any{
 				"priority": priority,
 				"base_url": selectedEndpoint,
+				"models":   channel.Models,
+				"status":   status,
 			}).Error; err != nil {
 				return err
 			}
-			return tx.Model(&model.Ability{}).Where("channel_id = ?", route.ChannelID).Updates(map[string]any{
-				"priority": priority,
-			}).Error
+			return channel.UpdateAbilities(tx)
 		})
 		if result != nil {
 			return updated, result
 		}
-		updated++
+		if selected && route.State == model.UpstreamRouteStateActive {
+			updated++
+		}
 	}
 	return updated, nil
 }

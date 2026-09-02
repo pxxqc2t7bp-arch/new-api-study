@@ -3,6 +3,8 @@ package service
 import (
 	"errors"
 	"net/http"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -265,6 +267,112 @@ func TestSelectUpstreamCandidateGroupsCapsAtFiveWithSourceDiversity(t *testing.T
 		sourceIDs[candidate.source.ID] = struct{}{}
 	}
 	assert.Len(t, sourceIDs, 5)
+}
+
+func TestSelectUpstreamCandidateGroupsPrunesSharedModelsFromExtraGroups(t *testing.T) {
+	candidates := []upstreamRouteCandidate{
+		{source: model.UpstreamSource{ID: 1, Key: "a"}, group: model.UpstreamGroup{SourceID: 1, ExternalID: "a", Platform: "openai", EffectiveMultiplier: 0.01}, models: []string{"gpt-shared"}},
+		{source: model.UpstreamSource{ID: 2, Key: "b"}, group: model.UpstreamGroup{SourceID: 2, ExternalID: "b", Platform: "openai", EffectiveMultiplier: 0.02}, models: []string{"gpt-shared"}},
+		{source: model.UpstreamSource{ID: 3, Key: "c"}, group: model.UpstreamGroup{SourceID: 3, ExternalID: "c", Platform: "openai", EffectiveMultiplier: 0.03}, models: []string{"gpt-shared"}},
+		{source: model.UpstreamSource{ID: 4, Key: "d"}, group: model.UpstreamGroup{SourceID: 4, ExternalID: "d", Platform: "openai", EffectiveMultiplier: 0.04}, models: []string{"gpt-shared"}},
+		{source: model.UpstreamSource{ID: 5, Key: "e"}, group: model.UpstreamGroup{SourceID: 5, ExternalID: "e", Platform: "openai", EffectiveMultiplier: 0.05}, models: []string{"gpt-shared"}},
+		{source: model.UpstreamSource{ID: 6, Key: "f"}, group: model.UpstreamGroup{SourceID: 6, ExternalID: "f", Platform: "openai", EffectiveMultiplier: 0.06}, models: []string{"gpt-shared", "gpt-unique"}},
+	}
+
+	selected := selectUpstreamCandidateGroups(candidates, 5)
+
+	require.Len(t, selected, 6)
+	sharedCount := 0
+	for _, candidate := range selected {
+		if slices.Contains(candidate.models, "gpt-shared") {
+			sharedCount++
+		}
+		if candidate.group.ExternalID == "f" {
+			assert.Equal(t, []string{"gpt-unique"}, candidate.models)
+		}
+	}
+	assert.Equal(t, 5, sharedCount)
+}
+
+func TestRankManagedRoutesPersistsSelectedModelSubsets(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	now := time.Unix(1_788_320_000, 0)
+	sources := make([]model.UpstreamSource, 0, 6)
+	groups := make([]model.UpstreamGroup, 0, 6)
+	candidates := make([]upstreamRouteCandidate, 0, 6)
+	channelIDs := make(map[string]int)
+
+	for index := 1; index <= 6; index++ {
+		source := model.UpstreamSource{
+			Key:              string(rune('a' + index - 1)),
+			Name:             string(rune('A' + index - 1)),
+			ConsoleURL:       "https://example.com",
+			SelectedEndpoint: "https://api.example.com",
+			Status:           model.UpstreamHealthOperational,
+			Enabled:          true,
+			LastSnapshotAt:   now.Unix(),
+		}
+		require.NoError(t, model.DB.Create(&source).Error)
+		models := []string{"gpt-shared"}
+		if index == 6 {
+			models = append(models, "gpt-unique")
+		}
+		group := model.UpstreamGroup{
+			SourceID:            source.ID,
+			ExternalID:          source.Key,
+			Name:                source.Name,
+			Platform:            "openai",
+			EffectiveMultiplier: float64(index) / 100,
+			HealthStatus:        model.UpstreamHealthOperational,
+			ObservedAt:          now.Unix(),
+		}
+		require.NoError(t, model.DB.Create(&group).Error)
+		priority := int64(0)
+		weight := uint(100)
+		channel := model.Channel{
+			Type:     58,
+			Status:   common.ChannelStatusEnabled,
+			Name:     source.Name,
+			Weight:   &weight,
+			BaseURL:  &source.SelectedEndpoint,
+			Models:   strings.Join(models, ","),
+			Group:    "default",
+			Priority: &priority,
+		}
+		require.NoError(t, model.DB.Create(&channel).Error)
+		require.NoError(t, channel.AddAbilities(nil))
+		require.NoError(t, model.DB.Create(&model.UpstreamManagedRoute{
+			SourceID:        source.ID,
+			ExternalGroupID: group.ExternalID,
+			Platform:        group.Platform,
+			Protocol:        model.UpstreamProtocolOpenAI,
+			ChannelID:       channel.Id,
+			State:           model.UpstreamRouteStateActive,
+		}).Error)
+		sources = append(sources, source)
+		groups = append(groups, group)
+		candidates = append(candidates, upstreamRouteCandidate{
+			source: source,
+			group:  group,
+			models: models,
+		})
+		channelIDs[group.ExternalID] = channel.Id
+	}
+
+	selected := selectUpstreamCandidateGroups(candidates, 5)
+	updated, err := rankManagedRoutes(now, sources, groups, selected)
+
+	require.NoError(t, err)
+	assert.Equal(t, 6, updated)
+	var sharedCount int64
+	require.NoError(t, model.DB.Model(&model.Ability{}).
+		Where("model = ? AND enabled = ?", "gpt-shared", true).
+		Count(&sharedCount).Error)
+	assert.EqualValues(t, 5, sharedCount)
+	var sixth model.Channel
+	require.NoError(t, model.DB.First(&sixth, channelIDs["f"]).Error)
+	assert.Equal(t, "gpt-unique", sixth.Models)
 }
 
 func TestDesiredManagedRouteStatePromotesValidatedShadow(t *testing.T) {

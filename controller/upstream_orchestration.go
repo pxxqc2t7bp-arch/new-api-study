@@ -529,5 +529,10 @@ func runDueUpstreamProbeTask(ctx context.Context) (upstreamProbeSummary, error) 
 		_ = statusCode
 		summary.Failed++
 	}
+	if summary.Enabled > 0 {
+		if _, err := service.ReconcileManagedUpstreams(time.Now()); err != nil {
+			return summary, err
+		}
+	}
 	return summary, nil
 }
