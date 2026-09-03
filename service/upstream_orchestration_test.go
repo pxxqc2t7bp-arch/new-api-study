@@ -386,7 +386,13 @@ func TestRankManagedRoutesPersistsSelectedModelSubsets(t *testing.T) {
 	}
 
 	selected := selectUpstreamCandidateGroups(candidates, 5)
-	updated, err := rankManagedRoutes(now, sources, groups, selected)
+	updated, err := rankManagedRoutes(
+		now,
+		sources,
+		groups,
+		selected,
+		&operation_setting.UpstreamOrchestrationSetting{SyncIntervalHours: 4},
+	)
 
 	require.NoError(t, err)
 	assert.Equal(t, 6, updated)
@@ -398,6 +404,79 @@ func TestRankManagedRoutesPersistsSelectedModelSubsets(t *testing.T) {
 	var sixth model.Channel
 	require.NoError(t, model.DB.First(&sixth, channelIDs["f"]).Error)
 	assert.Equal(t, "gpt-unique", sixth.Models)
+}
+
+func TestRankManagedRoutesPreservesChannelWhenSnapshotIsStale(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	now := time.Unix(1_788_320_000, 0)
+	setting := &operation_setting.UpstreamOrchestrationSetting{
+		SyncIntervalHours: 4,
+	}
+	source := model.UpstreamSource{
+		Key:              "source",
+		Name:             "Source",
+		ConsoleURL:       "https://example.com",
+		SelectedEndpoint: "https://api.example.com",
+		Status:           model.UpstreamHealthOperational,
+		Enabled:          true,
+		LastSnapshotAt:   now.Add(-6 * time.Hour).Unix(),
+	}
+	require.NoError(t, model.DB.Create(&source).Error)
+	group := model.UpstreamGroup{
+		SourceID:            source.ID,
+		ExternalID:          "group",
+		Name:                "Group",
+		Platform:            "openai",
+		EffectiveMultiplier: 0.5,
+		HealthStatus:        model.UpstreamHealthOperational,
+		ObservedAt:          now.Add(-6 * time.Hour).Unix(),
+	}
+	require.NoError(t, model.DB.Create(&group).Error)
+	priority := int64(777)
+	weight := uint(100)
+	baseURL := source.SelectedEndpoint
+	channel := model.Channel{
+		Type:     58,
+		Status:   common.ChannelStatusEnabled,
+		Name:     "stale",
+		Weight:   &weight,
+		BaseURL:  &baseURL,
+		Models:   "gpt-stable",
+		Group:    "default",
+		Priority: &priority,
+	}
+	require.NoError(t, model.DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	route := model.UpstreamManagedRoute{
+		SourceID:        source.ID,
+		ExternalGroupID: group.ExternalID,
+		Platform:        group.Platform,
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           model.UpstreamRouteStateActive,
+		Rank:            7,
+	}
+	require.NoError(t, model.DB.Create(&route).Error)
+
+	updated, err := rankManagedRoutes(
+		now,
+		[]model.UpstreamSource{source},
+		[]model.UpstreamGroup{group},
+		nil,
+		setting,
+	)
+
+	require.NoError(t, err)
+	assert.Zero(t, updated)
+	var reloadedChannel model.Channel
+	require.NoError(t, model.DB.First(&reloadedChannel, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, reloadedChannel.Status)
+	assert.EqualValues(t, 777, *reloadedChannel.Priority)
+	assert.Equal(t, "gpt-stable", reloadedChannel.Models)
+	var reloadedRoute model.UpstreamManagedRoute
+	require.NoError(t, model.DB.First(&reloadedRoute, route.ID).Error)
+	assert.EqualValues(t, 7, reloadedRoute.Rank)
 }
 
 func TestDesiredManagedRouteStatePromotesValidatedShadow(t *testing.T) {

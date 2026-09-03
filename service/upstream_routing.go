@@ -210,7 +210,7 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 		}
 		summary.EnrollmentQueued = queued
 	}
-	updated, err := rankManagedRoutes(now, sources, groups, candidates)
+	updated, err := rankManagedRoutes(now, sources, groups, candidates, setting)
 	if err != nil {
 		return summary, err
 	}
@@ -533,6 +533,7 @@ func rankManagedRoutes(
 	sources []model.UpstreamSource,
 	groups []model.UpstreamGroup,
 	candidates []upstreamRouteCandidate,
+	setting *operation_setting.UpstreamOrchestrationSetting,
 ) (int, error) {
 	sourceByID := make(map[int64]model.UpstreamSource, len(sources))
 	for _, source := range sources {
@@ -570,6 +571,10 @@ func rankManagedRoutes(
 		if !ok {
 			continue
 		}
+		source, ok := sourceByID[route.SourceID]
+		if !ok || !managedCandidateSelectionEvaluable(source, group, now, setting) {
+			continue
+		}
 		models, selected := selectedModels[identity]
 		rank := 0
 		priority := int64(0)
@@ -580,7 +585,7 @@ func rankManagedRoutes(
 			priority = int64(1000 - rank)
 			status = common.ChannelStatusEnabled
 		}
-		selectedEndpoint := sourceByID[route.SourceID].SelectedEndpoint
+		selectedEndpoint := source.SelectedEndpoint
 		result := model.DB.Transaction(func(tx *gorm.DB) error {
 			if err := tx.Model(&model.UpstreamManagedRoute{}).Where("id = ?", route.ID).Updates(map[string]any{
 				"rank":                 rank,
