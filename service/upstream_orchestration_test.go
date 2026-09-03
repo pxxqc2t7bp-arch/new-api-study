@@ -238,7 +238,7 @@ func TestManagedModelExcludedIsScopedToSourceGroup(t *testing.T) {
 }
 
 func TestManagedRouteUsesNativeProtocol(t *testing.T) {
-	nativeOpenAI := model.Channel{OtherSettings: `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/v1/chat/completions","converter":"none"},{"incoming_path":"/v1/responses","upstream_path":"/v1/responses","converter":"none"}]}}`}
+	nativeOpenAI := model.Channel{OtherSettings: `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/chat/completions","converter":"none"},{"incoming_path":"/v1/responses","upstream_path":"/responses","converter":"none"}]}}`}
 	convertedOpenAI := model.Channel{OtherSettings: `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/v1/messages","converter":"openai_chat_completions_to_anthropic_messages"}]}}`}
 	nativeMessages := model.Channel{OtherSettings: `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/v1/messages","converter":"none"}]}}`}
 	mixedMessages := model.Channel{OtherSettings: `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/v1/messages","converter":"none","models":["gpt-native"]},{"incoming_path":"/v1/messages","upstream_path":"/v1/chat/completions","converter":"anthropic_messages_to_openai_chat_completions","models":["gpt-fallback"]}]}}`}

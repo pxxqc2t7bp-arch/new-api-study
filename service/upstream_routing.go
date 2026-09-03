@@ -674,8 +674,7 @@ func managedRouteUsesNativeProtocol(
 		}
 		found = true
 		converter := strings.TrimSpace(route.Converter)
-		if (converter != "" && converter != "none") ||
-			strings.TrimSpace(route.UpstreamPath) != incomingPath {
+		if converter != "" && converter != "none" {
 			return false
 		}
 	}
