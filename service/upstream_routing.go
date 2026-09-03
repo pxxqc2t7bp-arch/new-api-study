@@ -551,7 +551,35 @@ func rankManagedRoutes(
 	if err != nil {
 		return 0, err
 	}
+	channelIDs := make([]int, 0, len(routes))
+	for _, route := range routes {
+		channelIDs = append(channelIDs, route.ChannelID)
+	}
+	var channels []model.Channel
+	if len(channelIDs) > 0 {
+		if err := model.DB.Where("id IN ?", channelIDs).Find(&channels).Error; err != nil {
+			return 0, err
+		}
+	}
+	channelByID := make(map[int]model.Channel, len(channels))
+	for _, channel := range channels {
+		channelByID[channel.Id] = channel
+	}
 	sort.SliceStable(routes, func(i, j int) bool {
+		if routes[i].Protocol != routes[j].Protocol {
+			return routes[i].Protocol < routes[j].Protocol
+		}
+		leftNative := managedRouteUsesNativeProtocol(
+			channelByID[routes[i].ChannelID],
+			routes[i].Protocol,
+		)
+		rightNative := managedRouteUsesNativeProtocol(
+			channelByID[routes[j].ChannelID],
+			routes[j].Protocol,
+		)
+		if leftNative != rightNative {
+			return leftNative
+		}
 		leftGroup := groupByIdentity[upstreamGroupIdentity(routes[i].SourceID, routes[i].ExternalGroupID)]
 		rightGroup := groupByIdentity[upstreamGroupIdentity(routes[j].SourceID, routes[j].ExternalGroupID)]
 		return lessUpstreamCandidate(
@@ -622,6 +650,36 @@ func rankManagedRoutes(
 		}
 	}
 	return updated, nil
+}
+
+func managedRouteUsesNativeProtocol(
+	channel model.Channel,
+	protocol string,
+) bool {
+	config := channel.GetOtherSettings().AdvancedCustom
+	if config == nil {
+		return false
+	}
+	found := false
+	for _, route := range config.Routes {
+		incomingPath := strings.TrimSpace(route.IncomingPath)
+		relevant := protocol == model.UpstreamProtocolOpenAI &&
+			(incomingPath == "/v1/chat/completions" ||
+				incomingPath == "/v1/responses")
+		relevant = relevant ||
+			(protocol == model.UpstreamProtocolAnthropic &&
+				incomingPath == "/v1/messages")
+		if !relevant {
+			continue
+		}
+		found = true
+		converter := strings.TrimSpace(route.Converter)
+		if (converter != "" && converter != "none") ||
+			strings.TrimSpace(route.UpstreamPath) != incomingPath {
+			return false
+		}
+	}
+	return found
 }
 
 func loadManagedModelVendors() (map[string]string, error) {
