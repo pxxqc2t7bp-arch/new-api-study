@@ -175,24 +175,15 @@ func buildManagedUpstreamChannel(payload rootdto.UpstreamEnrollmentCommand, apiK
 }
 
 func managedAdvancedCustomConfig(payload rootdto.UpstreamEnrollmentCommand, protocol string) *kitdto.AdvancedCustomConfig {
-	platform := strings.ToLower(strings.TrimSpace(payload.Platform))
 	switch protocol {
 	case model.UpstreamProtocolAnthropic:
 		upstreamPath := strings.TrimSpace(payload.MessagesPath)
 		if upstreamPath == "" {
-			if platform == "anthropic" {
-				upstreamPath = "/v1/messages"
-			} else {
-				upstreamPath = "/v1/chat/completions"
-			}
+			upstreamPath = "/v1/messages"
 		}
 		converter := strings.TrimSpace(payload.MessagesConverter)
 		if converter == "" {
-			if platform == "anthropic" {
-				converter = relayconvert.ConverterNone
-			} else {
-				converter = relayconvert.ConverterClaudeMessagesToOpenAIChat
-			}
+			converter = relayconvert.ConverterNone
 		}
 		return &kitdto.AdvancedCustomConfig{Routes: []kitdto.AdvancedCustomRoute{{
 			IncomingPath: "/v1/messages",
@@ -202,31 +193,17 @@ func managedAdvancedCustomConfig(payload rootdto.UpstreamEnrollmentCommand, prot
 	default:
 		responsesPath := strings.TrimSpace(payload.ResponsesPath)
 		if responsesPath == "" {
-			if platform == "anthropic" {
-				responsesPath = "/v1/chat/completions"
-			} else {
-				responsesPath = "/v1/responses"
-			}
+			responsesPath = "/v1/responses"
 		}
 		responsesConverter := strings.TrimSpace(payload.ResponsesConverter)
 		if responsesConverter == "" {
-			if platform == "anthropic" {
-				responsesConverter = relayconvert.ConverterOpenAIResponsesToOpenAIChat
-			} else {
-				responsesConverter = relayconvert.ConverterNone
-			}
-		}
-		chatPath := "/v1/chat/completions"
-		chatConverter := relayconvert.ConverterNone
-		if platform == "anthropic" {
-			chatPath = "/v1/messages"
-			chatConverter = relayconvert.ConverterOpenAIChatToClaudeMessages
+			responsesConverter = relayconvert.ConverterNone
 		}
 		return &kitdto.AdvancedCustomConfig{Routes: []kitdto.AdvancedCustomRoute{
 			{
 				IncomingPath: "/v1/chat/completions",
-				UpstreamPath: chatPath,
-				Converter:    chatConverter,
+				UpstreamPath: "/v1/chat/completions",
+				Converter:    relayconvert.ConverterNone,
 			},
 			{
 				IncomingPath: "/v1/responses",

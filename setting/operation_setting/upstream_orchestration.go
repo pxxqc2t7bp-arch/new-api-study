@@ -29,6 +29,7 @@ type UpstreamOrchestrationSetting struct {
 	ShadowSuccessesRequired   int                 `json:"shadow_successes_required"`
 	StaticEgressIPs           map[string][]string `json:"static_egress_ips"`
 	ModelAliases              map[string]string   `json:"model_aliases"`
+	ModelExclusions           map[string][]string `json:"model_exclusions"`
 }
 
 var upstreamOrchestrationSetting = UpstreamOrchestrationSetting{
@@ -53,6 +54,7 @@ var upstreamOrchestrationSetting = UpstreamOrchestrationSetting{
 	ShadowSuccessesRequired:   3,
 	StaticEgressIPs:           map[string][]string{},
 	ModelAliases:              map[string]string{},
+	ModelExclusions:           map[string][]string{},
 }
 
 func init() {
@@ -122,5 +124,8 @@ func normalizeUpstreamOrchestrationSetting(setting *UpstreamOrchestrationSetting
 	}
 	if setting.ModelAliases == nil {
 		setting.ModelAliases = map[string]string{}
+	}
+	if setting.ModelExclusions == nil {
+		setting.ModelExclusions = map[string][]string{}
 	}
 }

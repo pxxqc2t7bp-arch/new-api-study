@@ -344,7 +344,14 @@ func buildUpstreamRouteCandidates(
 		eligible := make([]string, 0, len(upstreamModels))
 		for _, upstreamModel := range upstreamModels {
 			canonical := canonicalManagedModelName(upstreamModel, setting.ModelAliases)
-			if !isManagedTextModel(canonical, group.Platform) ||
+			if managedModelExcluded(
+				source.Key,
+				group.ExternalID,
+				upstreamModel,
+				canonical,
+				setting.ModelExclusions,
+			) ||
+				!isManagedTextModel(canonical, group.Platform) ||
 				!managedModelMatchesPlatform(canonical, group.Platform, modelVendors) ||
 				!hasConfiguredModelPrice(canonical) {
 				continue
@@ -706,6 +713,24 @@ func canonicalManagedModelName(modelName string, aliases map[string]string) stri
 		return strings.TrimSpace(alias)
 	}
 	return modelName
+}
+
+func managedModelExcluded(
+	sourceKey string,
+	externalGroupID string,
+	upstreamModel string,
+	canonicalModel string,
+	exclusions map[string][]string,
+) bool {
+	key := strings.ToLower(strings.TrimSpace(sourceKey)) + ":" +
+		strings.TrimSpace(externalGroupID)
+	for _, excluded := range exclusions[key] {
+		excluded = strings.TrimSpace(excluded)
+		if excluded == upstreamModel || excluded == canonicalModel {
+			return true
+		}
+	}
+	return false
 }
 
 func managedUpstreamKeyName(sourceKey string, externalGroupID string) string {

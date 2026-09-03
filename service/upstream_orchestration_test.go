@@ -169,37 +169,41 @@ func TestIngestUpstreamSnapshot(t *testing.T) {
 	})
 }
 
-func TestManagedAdvancedCustomConfigUsesUpstreamProtocol(t *testing.T) {
-	t.Run("OpenAI-compatible upstream", func(t *testing.T) {
-		payload := dto.UpstreamEnrollmentCommand{Platform: "openai"}
+func TestManagedAdvancedCustomConfigPrefersNativeProtocols(t *testing.T) {
+	for _, platform := range []string{"openai", "anthropic", "grok"} {
+		t.Run(platform, func(t *testing.T) {
+			payload := dto.UpstreamEnrollmentCommand{Platform: platform}
+
+			openAI := managedAdvancedCustomConfig(payload, model.UpstreamProtocolOpenAI)
+			require.Len(t, openAI.Routes, 2)
+			assert.Equal(t, "/v1/chat/completions", openAI.Routes[0].UpstreamPath)
+			assert.Equal(t, relayconvert.ConverterNone, openAI.Routes[0].Converter)
+			assert.Equal(t, "/v1/responses", openAI.Routes[1].UpstreamPath)
+			assert.Equal(t, relayconvert.ConverterNone, openAI.Routes[1].Converter)
+
+			anthropic := managedAdvancedCustomConfig(payload, model.UpstreamProtocolAnthropic)
+			require.Len(t, anthropic.Routes, 1)
+			assert.Equal(t, "/v1/messages", anthropic.Routes[0].UpstreamPath)
+			assert.Equal(t, relayconvert.ConverterNone, anthropic.Routes[0].Converter)
+		})
+	}
+
+	t.Run("explicit fallback overrides", func(t *testing.T) {
+		payload := dto.UpstreamEnrollmentCommand{
+			Platform:           "openai",
+			ResponsesPath:      "/v1/chat/completions",
+			ResponsesConverter: relayconvert.ConverterOpenAIResponsesToOpenAIChat,
+			MessagesPath:       "/v1/chat/completions",
+			MessagesConverter:  relayconvert.ConverterClaudeMessagesToOpenAIChat,
+		}
 
 		openAI := managedAdvancedCustomConfig(payload, model.UpstreamProtocolOpenAI)
-		require.Len(t, openAI.Routes, 2)
-		assert.Equal(t, "/v1/chat/completions", openAI.Routes[0].UpstreamPath)
-		assert.Equal(t, relayconvert.ConverterNone, openAI.Routes[0].Converter)
-		assert.Equal(t, "/v1/responses", openAI.Routes[1].UpstreamPath)
-		assert.Equal(t, relayconvert.ConverterNone, openAI.Routes[1].Converter)
+		assert.Equal(t, payload.ResponsesPath, openAI.Routes[1].UpstreamPath)
+		assert.Equal(t, payload.ResponsesConverter, openAI.Routes[1].Converter)
 
 		anthropic := managedAdvancedCustomConfig(payload, model.UpstreamProtocolAnthropic)
-		require.Len(t, anthropic.Routes, 1)
-		assert.Equal(t, "/v1/chat/completions", anthropic.Routes[0].UpstreamPath)
-		assert.Equal(t, relayconvert.ConverterClaudeMessagesToOpenAIChat, anthropic.Routes[0].Converter)
-	})
-
-	t.Run("Anthropic upstream", func(t *testing.T) {
-		payload := dto.UpstreamEnrollmentCommand{Platform: "anthropic"}
-
-		openAI := managedAdvancedCustomConfig(payload, model.UpstreamProtocolOpenAI)
-		require.Len(t, openAI.Routes, 2)
-		assert.Equal(t, "/v1/messages", openAI.Routes[0].UpstreamPath)
-		assert.Equal(t, relayconvert.ConverterOpenAIChatToClaudeMessages, openAI.Routes[0].Converter)
-		assert.Equal(t, "/v1/chat/completions", openAI.Routes[1].UpstreamPath)
-		assert.Equal(t, relayconvert.ConverterOpenAIResponsesToOpenAIChat, openAI.Routes[1].Converter)
-
-		anthropic := managedAdvancedCustomConfig(payload, model.UpstreamProtocolAnthropic)
-		require.Len(t, anthropic.Routes, 1)
-		assert.Equal(t, "/v1/messages", anthropic.Routes[0].UpstreamPath)
-		assert.Equal(t, relayconvert.ConverterNone, anthropic.Routes[0].Converter)
+		assert.Equal(t, payload.MessagesPath, anthropic.Routes[0].UpstreamPath)
+		assert.Equal(t, payload.MessagesConverter, anthropic.Routes[0].Converter)
 	})
 }
 
@@ -210,6 +214,27 @@ func TestManagedTextModelFilter(t *testing.T) {
 	assert.False(t, isManagedTextModel("gpt-image-2", "openai"))
 	assert.False(t, isManagedTextModel("grok-imagine", "grok"))
 	assert.False(t, isManagedTextModel("grok-imagine-video-1.5", "grok"))
+}
+
+func TestManagedModelExcludedIsScopedToSourceGroup(t *testing.T) {
+	exclusions := map[string][]string{
+		"hualong:21": {"claude-haiku-4-5-20251001"},
+	}
+
+	assert.True(t, managedModelExcluded(
+		"Hualong",
+		"21",
+		"claude-haiku-4-5-20251001",
+		"claude-haiku-4-5-20251001",
+		exclusions,
+	))
+	assert.False(t, managedModelExcluded(
+		"ebond",
+		"21",
+		"claude-haiku-4-5-20251001",
+		"claude-haiku-4-5-20251001",
+		exclusions,
+	))
 }
 
 func TestShouldRecordManagedRouteFailure(t *testing.T) {
