@@ -31,6 +31,9 @@ type managedRouteAdminCacheEntry struct {
 }
 
 var managedRouteAdminCache sync.Map
+var managedModelExclusionMutex sync.Mutex
+
+const managedModelExclusionsOption = "upstream_orchestration.model_exclusions"
 
 func GetManagedRouteAdminInfo(channelID int) map[string]any {
 	now := common.GetTimestamp()
@@ -120,12 +123,27 @@ func IsolateManagedRouteModel(channelID int, modelName string, reason string) (b
 	if channelID <= 0 || modelName == "" {
 		return false, nil
 	}
-	isolated := false
-	err := model.DB.Transaction(func(tx *gorm.DB) error {
-		var route model.UpstreamManagedRoute
+	route, err := model.GetUpstreamManagedRouteByChannelID(channelID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	exclusionAdded, err := persistManagedModelExclusion(
+		route.SourceID,
+		route.ExternalGroupID,
+		modelName,
+	)
+	if err != nil {
+		return false, err
+	}
+	isolated := exclusionAdded
+	err = model.DB.Transaction(func(tx *gorm.DB) error {
+		var lockedRoute model.UpstreamManagedRoute
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("channel_id = ? AND detached = ?", channelID, false).
-			First(&route).Error; err != nil {
+			First(&lockedRoute).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil
 			}
@@ -138,21 +156,21 @@ func IsolateManagedRouteModel(channelID int, modelName string, reason string) (b
 			return err
 		}
 		channelModels, removed := removeManagedModel(channel.Models, modelName)
-		if !removed {
-			return nil
-		}
-		channel.Models = strings.Join(channelModels, ",")
-		if err := tx.Model(&model.Channel{}).Where("id = ?", channelID).
-			Update("models", channel.Models).Error; err != nil {
-			return err
-		}
-		if err := channel.UpdateAbilities(tx); err != nil {
-			return err
+		if removed {
+			channel.Models = strings.Join(channelModels, ",")
+			if err := tx.Model(&model.Channel{}).Where("id = ?", channelID).
+				Update("models", channel.Models).Error; err != nil {
+				return err
+			}
+			if err := channel.UpdateAbilities(tx); err != nil {
+				return err
+			}
+			isolated = true
 		}
 
 		var group model.UpstreamGroup
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("source_id = ? AND external_id = ?", route.SourceID, route.ExternalGroupID).
+			Where("source_id = ? AND external_id = ?", lockedRoute.SourceID, lockedRoute.ExternalGroupID).
 			First(&group).Error; err != nil {
 			return err
 		}
@@ -160,20 +178,23 @@ func IsolateManagedRouteModel(channelID int, modelName string, reason string) (b
 		if err := common.UnmarshalJsonStr(group.Models, &groupModels); err != nil {
 			return err
 		}
-		groupModels, _ = removeManagedModel(strings.Join(groupModels, ","), modelName)
-		encodedModels, err := common.Marshal(groupModels)
-		if err != nil {
-			return err
-		}
+		groupModels, groupRemoved := removeManagedModel(strings.Join(groupModels, ","), modelName)
 		now := common.GetTimestamp()
-		if err := tx.Model(&model.UpstreamGroup{}).Where("id = ?", group.ID).
-			Updates(map[string]any{
-				"models":     string(encodedModels),
-				"updated_at": now,
-			}).Error; err != nil {
-			return err
+		if groupRemoved {
+			encodedModels, err := common.Marshal(groupModels)
+			if err != nil {
+				return err
+			}
+			if err := tx.Model(&model.UpstreamGroup{}).Where("id = ?", group.ID).
+				Updates(map[string]any{
+					"models":     string(encodedModels),
+					"updated_at": now,
+				}).Error; err != nil {
+				return err
+			}
+			isolated = true
 		}
-		if err := tx.Model(&model.UpstreamManagedRoute{}).Where("id = ?", route.ID).
+		if err := tx.Model(&model.UpstreamManagedRoute{}).Where("id = ?", lockedRoute.ID).
 			Updates(map[string]any{
 				"last_failure_at": now,
 				"last_reason":     strings.TrimSpace(reason),
@@ -192,6 +213,47 @@ func IsolateManagedRouteModel(channelID int, modelName string, reason string) (b
 		invalidateManagedRouteAdminInfo(channelID)
 	}
 	return isolated, nil
+}
+
+func persistManagedModelExclusion(
+	sourceID int64,
+	externalGroupID string,
+	modelName string,
+) (bool, error) {
+	managedModelExclusionMutex.Lock()
+	defer managedModelExclusionMutex.Unlock()
+
+	var source model.UpstreamSource
+	if err := model.DB.Select("key").First(&source, sourceID).Error; err != nil {
+		return false, err
+	}
+	var option model.Option
+	err := model.DB.Where("key = ?", managedModelExclusionsOption).First(&option).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, err
+	}
+	exclusions := make(map[string][]string)
+	if err == nil && strings.TrimSpace(option.Value) != "" {
+		if err := common.UnmarshalJsonStr(option.Value, &exclusions); err != nil {
+			return false, err
+		}
+	}
+	key := strings.ToLower(strings.TrimSpace(source.Key)) + ":" +
+		strings.TrimSpace(externalGroupID)
+	for _, excluded := range exclusions[key] {
+		if strings.TrimSpace(excluded) == modelName {
+			return false, nil
+		}
+	}
+	exclusions[key] = append(exclusions[key], modelName)
+	encoded, err := common.Marshal(exclusions)
+	if err != nil {
+		return false, err
+	}
+	if err := model.UpdateOption(managedModelExclusionsOption, string(encoded)); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func removeManagedModel(models string, target string) ([]string, bool) {

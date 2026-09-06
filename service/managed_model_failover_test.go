@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,8 +82,33 @@ func TestManagedModelUnsupportedDetection(t *testing.T) {
 func TestIsolateManagedRouteModelOnlyRemovesFailedModel(t *testing.T) {
 	db := setupChannelSelectAutoGroupsTest(t)
 	require.NoError(t, db.AutoMigrate(
+		&model.Option{},
+		&model.UpstreamSource{},
 		&model.UpstreamGroup{},
 		&model.UpstreamManagedRoute{},
+	))
+	common.OptionMapRWMutex.Lock()
+	originalOptionMap := common.OptionMap
+	common.OptionMap = make(map[string]string)
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = originalOptionMap
+		common.OptionMapRWMutex.Unlock()
+	})
+	originalExclusions, err := json.Marshal(
+		operation_setting.GetUpstreamOrchestrationSetting().ModelExclusions,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, model.UpdateOption(
+			managedModelExclusionsOption,
+			string(originalExclusions),
+		))
+	})
+	require.NoError(t, model.UpdateOption(
+		managedModelExclusionsOption,
+		`{"ebond:31":["gpt-existing"]}`,
 	))
 	priority := int64(998)
 	weight := uint(100)
@@ -96,6 +123,12 @@ func TestIsolateManagedRouteModelOnlyRemovesFailedModel(t *testing.T) {
 	}
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, channel.AddAbilities(nil))
+	require.NoError(t, db.Create(&model.UpstreamSource{
+		ID:         1,
+		Key:        "ebond",
+		Name:       "eBond",
+		ConsoleURL: "https://example.com",
+	}).Error)
 	group := model.UpstreamGroup{
 		SourceID:            1,
 		ExternalID:          "25",
@@ -141,4 +174,22 @@ func TestIsolateManagedRouteModelOnlyRemovesFailedModel(t *testing.T) {
 	var storedGroup model.UpstreamGroup
 	require.NoError(t, db.First(&storedGroup, group.ID).Error)
 	assert.Equal(t, `["gpt-5.5"]`, storedGroup.Models)
+
+	var option model.Option
+	require.NoError(t, db.First(
+		&option,
+		"key = ?",
+		managedModelExclusionsOption,
+	).Error)
+	var exclusions map[string][]string
+	require.NoError(t, json.Unmarshal([]byte(option.Value), &exclusions))
+	assert.Equal(t, []string{"gpt-existing"}, exclusions["ebond:31"])
+	assert.Equal(t, []string{"gpt-5.4"}, exclusions["ebond:25"])
+	assert.True(t, managedModelExcluded(
+		"ebond",
+		"25",
+		"gpt-5.4",
+		"gpt-5.4",
+		operation_setting.GetUpstreamOrchestrationSetting().ModelExclusions,
+	))
 }
