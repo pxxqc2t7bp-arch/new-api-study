@@ -206,6 +206,31 @@ func GetRandomSatisfiedChannelAtPriority(
 	return nil, errors.New("channel not found")
 }
 
+func ListSatisfiedChannelIDsAtPriority(
+	group string,
+	model string,
+	priority int64,
+	filters []dto.ChannelFilter,
+) ([]int, error) {
+	if !common.MemoryCacheEnabled {
+		return ListChannelIDsAtPriority(group, model, priority, filters)
+	}
+	channels := cachedSatisfiedChannelIDs(group, model, filters)
+	result := make([]int, 0, len(channels))
+	channelSyncLock.RLock()
+	defer channelSyncLock.RUnlock()
+	for _, channelID := range channels {
+		channel, ok := channelsIDM[channelID]
+		if !ok {
+			return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channelID)
+		}
+		if channel.GetPriority() == priority {
+			result = append(result, channelID)
+		}
+	}
+	return result, nil
+}
+
 func ListSatisfiedChannelPriorities(
 	group string,
 	model string,

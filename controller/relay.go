@@ -397,7 +397,28 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
 	if service.IsManagedChannel(channelError.ChannelId) {
-		if channelError.AutoBan && service.ShouldRecordManagedRouteFailure(err) {
+		if channelError.AutoBan && service.IsManagedModelUnsupported(err) {
+			modelName := c.GetString("original_model")
+			isolated, isolateErr := service.IsolateManagedRouteModel(
+				channelError.ChannelId,
+				modelName,
+				err.ErrorWithStatusCode(),
+			)
+			if isolateErr != nil {
+				common.SysError(fmt.Sprintf(
+					"failed to isolate unsupported managed model: channel_id=%d model=%s error=%v",
+					channelError.ChannelId,
+					modelName,
+					isolateErr,
+				))
+			} else if isolated {
+				logger.LogWarn(c, fmt.Sprintf(
+					"isolated unsupported managed model: channel_id=%d model=%s",
+					channelError.ChannelId,
+					modelName,
+				))
+			}
+		} else if channelError.AutoBan && service.ShouldRecordManagedRouteFailure(err) {
 			reason := err.ErrorWithStatusCode()
 			gopool.Go(func() {
 				if _, _, recordErr := service.RecordManagedChannelFailure(channelError, reason); recordErr != nil {

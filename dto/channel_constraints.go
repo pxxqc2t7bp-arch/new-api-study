@@ -39,6 +39,7 @@ const (
 	FilterRequestPath        ChannelFilterKind = "request_path"
 	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
 	FilterRoutingAccount     ChannelFilterKind = "routing_account"
+	FilterExcludeChannelIDs  ChannelFilterKind = "exclude_channel_ids"
 )
 
 type ChannelFilter struct {
@@ -47,6 +48,7 @@ type ChannelFilter struct {
 	TaskPluginKey          string
 	TaskPluginChannelTypes []int
 	RoutingAccount         string
+	ExcludedChannelIDs     []int
 }
 
 type ChannelConstraints struct {

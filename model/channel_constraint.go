@@ -12,6 +12,7 @@ var filterEvalOrder = []dto.ChannelFilterKind{
 	dto.FilterRequestPath,
 	dto.FilterTaskPluginIdentity,
 	dto.FilterRoutingAccount,
+	dto.FilterExcludeChannelIDs,
 }
 
 // ChannelSatisfiesFilters reports whether ch passes every filter.
@@ -107,6 +108,8 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 	case dto.FilterRoutingAccount:
 		required := strings.TrimSpace(filter.RoutingAccount)
 		return required != "" && strings.TrimSpace(ch.GetOtherSettings().RoutingAccount) == required
+	case dto.FilterExcludeChannelIDs:
+		return !slices.Contains(filter.ExcludedChannelIDs, ch.Id)
 	default:
 		return true
 	}
