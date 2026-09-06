@@ -14,8 +14,13 @@ var (
 		"dall-e-2",
 		"gpt-image-1",
 		"prefix:imagen-",
+		"prefix:doubao-seedream-",
+		"stable-diffusion-xl-v1",
 		"flux-",
 		"flux.1-",
+	}
+	VideoGenerationModels = []string{
+		"prefix:doubao-seedance-",
 	}
 	OpenAITextModels = []string{
 		"gpt-",
@@ -38,14 +43,28 @@ func IsOpenAIResponseOnlyModel(modelName string) bool {
 func IsImageGenerationModel(modelName string) bool {
 	modelName = strings.ToLower(modelName)
 	for _, m := range ImageGenerationModels {
-		if strings.Contains(modelName, m) {
-			return true
-		}
-		if strings.HasPrefix(m, "prefix:") && strings.HasPrefix(modelName, strings.TrimPrefix(m, "prefix:")) {
+		if modelNameMatchesRule(modelName, m) {
 			return true
 		}
 	}
 	return false
+}
+
+func IsVideoGenerationModel(modelName string) bool {
+	modelName = strings.ToLower(modelName)
+	for _, m := range VideoGenerationModels {
+		if modelNameMatchesRule(modelName, m) {
+			return true
+		}
+	}
+	return false
+}
+
+func modelNameMatchesRule(modelName string, rule string) bool {
+	if strings.HasPrefix(rule, "prefix:") {
+		return strings.HasPrefix(modelName, strings.TrimPrefix(rule, "prefix:"))
+	}
+	return strings.Contains(modelName, rule)
 }
 
 func IsOpenAITextModel(modelName string) bool {
