@@ -29,3 +29,27 @@ func TestDoubaoResponsesProtocol(t *testing.T) {
 		wantVendorName: "doubao",
 	})
 }
+
+func TestDoubaoDraftPreviewResponsesProtocol(t *testing.T) {
+	testVideoResponsesProtocol(t, videoResponsesTestCase{
+		pluginKey: "doubao",
+		model:     "doubao-seedance-2-5-draft-preview-260828",
+		requestBody: map[string]any{
+			"model":   "doubao-seedance-2-5-draft-preview-260828",
+			"input":   "a rotating red cube",
+			"seconds": 5,
+			"size":    "1920x1080",
+		},
+		wantAction: "text_to_video",
+		wantRequest: map[string]any{
+			"model":   "doubao-seedance-2-5-draft-preview-260828",
+			"prompt":  "a rotating red cube",
+			"seconds": float64(5),
+			"metadata": map[string]any{
+				"resolution": "1080p",
+			},
+		},
+		wantUsageKeys:  []string{"resolution", "tokens", "video_input"},
+		wantVendorName: "doubao",
+	})
+}

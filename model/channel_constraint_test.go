@@ -37,6 +37,10 @@ func TestFilterCandidateIDs(t *testing.T) {
 			}},
 		},
 	})
+	cxy := &Channel{Id: 900012, Type: constant.ChannelTypeVolcEngine, Status: common.ChannelStatusEnabled}
+	cxy.SetOtherSettings(kitdto.ChannelOtherSettings{RoutingAccount: kitdto.RoutingAccountCXY})
+	support := &Channel{Id: 900013, Type: constant.ChannelTypeVolcEngine, Status: common.ChannelStatusEnabled}
+	support.SetOtherSettings(kitdto.ChannelOtherSettings{RoutingAccount: kitdto.RoutingAccountSupport})
 
 	pathFilter := dto.ChannelFilter{Kind: dto.FilterRequestPath, RequestPath: "/v1/chat/completions"}
 	emptyPathFilter := dto.ChannelFilter{Kind: dto.FilterRequestPath, RequestPath: ""}
@@ -145,6 +149,27 @@ func TestFilterCandidateIDs(t *testing.T) {
 			wantKept:  []int{},
 			wantEmpty: dto.FilterRequestPath,
 		},
+		{
+			name:      "routing account keeps only matching channel",
+			ids:       []int{900012, 900013, 900003},
+			modelName: "media",
+			filters: []dto.ChannelFilter{{
+				Kind:           dto.FilterRoutingAccount,
+				RoutingAccount: kitdto.RoutingAccountCXY,
+			}},
+			wantKept: []int{900012},
+		},
+		{
+			name:      "routing account fails closed for missing cache entry",
+			ids:       []int{999999},
+			modelName: "media",
+			filters: []dto.ChannelFilter{{
+				Kind:           dto.FilterRoutingAccount,
+				RoutingAccount: kitdto.RoutingAccountCXY,
+			}},
+			wantKept:  []int{},
+			wantEmpty: dto.FilterRoutingAccount,
+		},
 	}
 
 	channelSyncLock.Lock()
@@ -157,6 +182,8 @@ func TestFilterCandidateIDs(t *testing.T) {
 		900005: jimeng,
 		900010: matchingCustom,
 		900011: otherCustom,
+		900012: cxy,
+		900013: support,
 	}
 	t.Cleanup(func() {
 		channelsIDM = previous
@@ -215,4 +242,19 @@ func TestChannelSatisfiesFilters(t *testing.T) {
 	}})
 	assert.False(t, ok)
 	assert.Equal(t, dto.FilterRequestPath, kind)
+
+	cxy := &Channel{Id: 4, Type: constant.ChannelTypeVolcEngine}
+	cxy.SetOtherSettings(kitdto.ChannelOtherSettings{RoutingAccount: kitdto.RoutingAccountCXY})
+	support := &Channel{Id: 5, Type: constant.ChannelTypeVolcEngine}
+	support.SetOtherSettings(kitdto.ChannelOtherSettings{RoutingAccount: kitdto.RoutingAccountSupport})
+	accountFilter := []dto.ChannelFilter{{
+		Kind:           dto.FilterRoutingAccount,
+		RoutingAccount: kitdto.RoutingAccountCXY,
+	}}
+	ok, kind = ChannelSatisfiesFilters(cxy, "media", accountFilter)
+	require.True(t, ok)
+	assert.Empty(t, kind)
+	ok, kind = ChannelSatisfiesFilters(support, "media", accountFilter)
+	assert.False(t, ok)
+	assert.Equal(t, dto.FilterRoutingAccount, kind)
 }
