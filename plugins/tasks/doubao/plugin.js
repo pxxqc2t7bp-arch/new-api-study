@@ -7,7 +7,7 @@ export const meta = {
     en: "Volcengine Doubao Seedance video generation (text-to-video, image-to-video, and video-to-video)",
     zh: "火山引擎豆包 Seedance 视频生成（文生视频、图生视频、视频生视频）",
   },
-  version: "1.0.0",
+  version: "1.0.1",
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
   models: [
@@ -20,6 +20,7 @@ export const meta = {
     "doubao-seedance-2-0-fast-260128",
     "doubao-seedance-2-0-mini-260615",
     "doubao-seedance-2-5-260628",
+    "doubao-seedance-2-5-draft-preview-260828",
   ],
   fetchMode: "per_task",
   usageSchema: {
@@ -137,7 +138,7 @@ function estimateTokens(seconds, resolution) {
 function videoInputRatio(model, resolution, content) {
   const video = hasVideo(content);
   const res = trimmed(resolution).toLowerCase();
-  if (model === "doubao-seedance-2-5-260628") {
+  if (model === "doubao-seedance-2-5-260628" || model === "doubao-seedance-2-5-draft-preview-260828") {
     if (res === "1080p") return video ? 7.0 / 10.7 : 11.7 / 10.7;
     return video ? 42 / 70 : 1;
   }

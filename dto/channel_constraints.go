@@ -38,6 +38,7 @@ type ChannelFilterKind string
 const (
 	FilterRequestPath        ChannelFilterKind = "request_path"
 	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
+	FilterRoutingAccount     ChannelFilterKind = "routing_account"
 )
 
 type ChannelFilter struct {
@@ -45,6 +46,7 @@ type ChannelFilter struct {
 	RequestPath            string
 	TaskPluginKey          string
 	TaskPluginChannelTypes []int
+	RoutingAccount         string
 }
 
 type ChannelConstraints struct {
@@ -64,6 +66,18 @@ func (cc *ChannelConstraints) AddFilter(f ChannelFilter) {
 		return
 	}
 	cc.Filters = append(cc.Filters, f)
+}
+
+func (cc *ChannelConstraints) HasFilter(kind ChannelFilterKind) bool {
+	if cc == nil {
+		return false
+	}
+	for _, filter := range cc.Filters {
+		if filter.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // ResolvedPin returns the winning pin after priority resolution.

@@ -2,6 +2,7 @@ package model
 
 import (
 	"slices"
+	"strings"
 
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
@@ -10,11 +11,12 @@ import (
 var filterEvalOrder = []dto.ChannelFilterKind{
 	dto.FilterRequestPath,
 	dto.FilterTaskPluginIdentity,
+	dto.FilterRoutingAccount,
 }
 
 // ChannelSatisfiesFilters reports whether ch passes every filter.
 // On false, it returns the kind of the first violated filter (request_path
-// then task_plugin_identity) for error attribution.
+// then task_plugin_identity, then routing_account) for error attribution.
 func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.ChannelFilter) (bool, dto.ChannelFilterKind) {
 	if ch == nil {
 		return false, ""
@@ -35,7 +37,7 @@ func ChannelSatisfiesFilters(ch *Channel, modelName string, filters []dto.Channe
 // filterCandidateIDs applies filters to a cached candidate id list.
 // Caller must hold channelSyncLock (read lock). The input slice is never mutated.
 // A missing id in channelsIDM is kept for request_path (downstream consistency
-// error) and dropped for task_plugin_identity, matching the previous filters.
+// error) and dropped for task_plugin_identity and routing_account.
 func filterCandidateIDs(ids []int, modelName string, filters []dto.ChannelFilter) (kept []int, emptiedBy dto.ChannelFilterKind) {
 	if len(ids) == 0 {
 		return ids, ""
@@ -102,6 +104,9 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 			return filter.TaskPluginKey != "" && ch.GetSetting().TaskPluginKey == filter.TaskPluginKey
 		}
 		return filter.TaskPluginKey == "" || slices.Contains(filter.TaskPluginChannelTypes, ch.Type)
+	case dto.FilterRoutingAccount:
+		required := strings.TrimSpace(filter.RoutingAccount)
+		return required != "" && strings.TrimSpace(ch.GetOtherSettings().RoutingAccount) == required
 	default:
 		return true
 	}

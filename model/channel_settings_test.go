@@ -98,3 +98,20 @@ func TestAdvancedCustomChannelRequiresModelListRouteOnlyWhenUpdateChecksEnabled(
 		})
 	}
 }
+
+func TestChannelValidateSettingsRejectsInvalidRoutingAccount(t *testing.T) {
+	for _, account := range []string{
+		"",
+		dto.RoutingAccountCXY,
+		dto.RoutingAccountSupport,
+		dto.RoutingAccountIndependent,
+	} {
+		channel := &Channel{}
+		channel.SetOtherSettings(dto.ChannelOtherSettings{RoutingAccount: account})
+		require.NoError(t, channel.ValidateSettings(), account)
+	}
+
+	channel := &Channel{}
+	channel.SetOtherSettings(dto.ChannelOtherSettings{RoutingAccount: "other"})
+	require.ErrorContains(t, channel.ValidateSettings(), "invalid routing_account")
+}
