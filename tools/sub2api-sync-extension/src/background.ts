@@ -21,9 +21,14 @@ import {
 import { ebondAdapter } from './site-adapters/ebond.js'
 import { hualongAdapter } from './site-adapters/hualong.js'
 import { leyiAdapter } from './site-adapters/leyi.js'
+import {
+  parseAuthRefreshResponse,
+  shouldRefreshAuthSession,
+} from './auth-session.js'
 
 const sources = [leyiAdapter, hualongAdapter, ebondAdapter]
 let syncPromise
+const authRefreshPromises = new Map()
 
 chrome.runtime.onInstalled.addListener(async () => {
   await scheduleAlarms()
@@ -274,7 +279,10 @@ async function fetchModels(baseURL, apiKey) {
   }
 }
 
-async function getSiteAuthToken(source) {
+async function getSiteAuthToken(
+  source,
+  { forceRefresh = false, failedAccessToken = '' } = {}
+) {
   let tabs = await chrome.tabs.query({ url: `${source.origin}/*` })
   let createdTab
   if (tabs.length === 0) {
@@ -286,13 +294,81 @@ async function getSiteAuthToken(source) {
     tabs = [createdTab]
   }
   try {
-    const response = await chrome.tabs.sendMessage(tabs[0].id, {
-      type: 'upstream:get-auth-token',
-    })
-    return String(response?.token || '')
+    const tabId = tabs[0].id
+    const session = await readSiteAuthSession(tabId)
+    if (
+      failedAccessToken &&
+      session.accessToken &&
+      session.accessToken !== failedAccessToken &&
+      !shouldRefreshAuthSession(session)
+    ) {
+      return session.accessToken
+    }
+    if (forceRefresh || shouldRefreshAuthSession(session)) {
+      return await refreshSiteAuthSession(source, tabId, session)
+    }
+    return session.accessToken
   } finally {
     if (createdTab?.id) await chrome.tabs.remove(createdTab.id).catch(() => {})
   }
+}
+
+async function readSiteAuthSession(tabId) {
+  const response = await chrome.tabs.sendMessage(tabId, {
+    type: 'upstream:get-auth-session',
+  })
+  return {
+    accessToken: String(response?.accessToken || ''),
+    refreshToken: String(response?.refreshToken || ''),
+    expiresAt: Number(response?.expiresAt) || 0,
+  }
+}
+
+async function refreshSiteAuthSession(source, tabId, session) {
+  const existing = authRefreshPromises.get(source.key)
+  if (existing) return existing
+  const promise = doRefreshSiteAuthSession(source, tabId, session).finally(() => {
+    authRefreshPromises.delete(source.key)
+  })
+  authRefreshPromises.set(source.key, promise)
+  return promise
+}
+
+async function doRefreshSiteAuthSession(source, tabId, session) {
+  if (!session.refreshToken) {
+    throw new Error(`${source.name}: login required`)
+  }
+  const response = await fetch(`${source.origin}/api/v1/auth/refresh`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ refresh_token: session.refreshToken }),
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok || (payload?.code != null && payload.code !== 0)) {
+    throw new Error(`${source.name}: session refresh failed`)
+  }
+  const refreshed = parseAuthRefreshResponse(payload)
+  const committed = await chrome.tabs.sendMessage(tabId, {
+    type: 'upstream:set-auth-session',
+    expectedRefreshToken: session.refreshToken,
+    accessToken: refreshed.accessToken,
+    refreshToken: refreshed.refreshToken,
+    expiresAt: refreshed.expiresAt,
+  })
+  if (committed?.updated) return refreshed.accessToken
+
+  const current = await readSiteAuthSession(tabId)
+  if (
+    current.accessToken &&
+    current.accessToken !== session.accessToken &&
+    !shouldRefreshAuthSession(current)
+  ) {
+    return current.accessToken
+  }
+  throw new Error(`${source.name}: authentication session changed`)
 }
 
 async function waitForTab(tabId) {
@@ -304,7 +380,13 @@ async function waitForTab(tabId) {
   throw new Error('site page did not finish loading')
 }
 
-async function siteRequest(source, authToken, path, options = {}) {
+async function siteRequest(
+  source,
+  authToken,
+  path,
+  options = {},
+  allowAuthRefresh = true
+) {
   const response = await fetch(`${source.origin}${path}`, {
     ...options,
     headers: {
@@ -316,6 +398,13 @@ async function siteRequest(source, authToken, path, options = {}) {
   })
   const payload = await response.json().catch(() => null)
   if (!response.ok) {
+    if (response.status === 401 && allowAuthRefresh) {
+      const refreshedToken = await getSiteAuthToken(source, {
+        forceRefresh: true,
+        failedAccessToken: authToken,
+      })
+      return siteRequest(source, refreshedToken, path, options, false)
+    }
     throw new Error(
       `${source.name} ${path}: ${payload?.message || `HTTP ${response.status}`}`
     )

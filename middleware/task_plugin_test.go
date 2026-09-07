@@ -48,6 +48,35 @@ func TestPrepareTaskPluginSubmitRejectsMissingModel(t *testing.T) {
 	assert.Contains(t, recorder.Body.String(), "model is required")
 }
 
+func TestPrepareTaskPluginSubmitDefersImageModelsOnly(t *testing.T) {
+	tests := []struct {
+		name     string
+		model    string
+		wantMode string
+	}{
+		{name: "seedream image", model: "doubao-seedream-5-0-pro-260628", wantMode: jsplugin.ExecutionModeDeferred},
+		{name: "seedance video", model: "doubao-seedance-2-0-260128", wantMode: ""},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Params = gin.Params{{Key: "key", Value: "doubao"}}
+			c.Request = httptest.NewRequest(
+				http.MethodPost,
+				"/v1/tasks/doubao",
+				strings.NewReader(`{"model":"`+testCase.model+`","prompt":"hello"}`),
+			)
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			PrepareTaskPluginSubmit()(c)
+
+			require.False(t, c.IsAborted(), recorder.Body.String())
+			assert.Equal(t, testCase.wantMode, c.GetString(jsplugin.ContextKeyExecutionMode))
+		})
+	}
+}
+
 func TestPrepareTaskPluginRouteUsesCanonicalContextAndResolvedSubmit(t *testing.T) {
 	plugin := compileTaskRoutePlugin(t, `
 export const meta = {

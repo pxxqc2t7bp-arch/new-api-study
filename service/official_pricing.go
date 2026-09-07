@@ -19,6 +19,8 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -38,21 +40,29 @@ type OfficialPricingSyncSummary struct {
 }
 
 type officialTokenPrice struct {
-	Vendor               string  `json:"vendor"`
-	ModelName            string  `json:"model_name"`
-	InputPerM            float64 `json:"input_per_m"`
-	CachedReadPerM       float64 `json:"cached_read_per_m"`
-	CacheWritePerM       float64 `json:"cache_write_per_m"`
-	CacheWrite1hPerM     float64 `json:"cache_write_1h_per_m"`
-	OutputPerM           float64 `json:"output_per_m"`
-	LongContextThreshold int64   `json:"long_context_threshold,omitempty"`
-	LongInputPerM        float64 `json:"long_input_per_m,omitempty"`
-	LongCachedReadPerM   float64 `json:"long_cached_read_per_m,omitempty"`
-	LongCacheWritePerM   float64 `json:"long_cache_write_per_m,omitempty"`
-	LongCacheWrite1hPerM float64 `json:"long_cache_write_1h_per_m,omitempty"`
-	LongOutputPerM       float64 `json:"long_output_per_m,omitempty"`
-	SourceURL            string  `json:"source_url"`
-	EvidenceHash         string  `json:"evidence_hash"`
+	Vendor               string                               `json:"vendor"`
+	ModelName            string                               `json:"model_name"`
+	CanonicalModel       string                               `json:"canonical_model,omitempty"`
+	Currency             string                               `json:"currency,omitempty"`
+	Unit                 string                               `json:"unit,omitempty"`
+	BillingBasis         string                               `json:"billing_basis,omitempty"`
+	Expression           string                               `json:"expression,omitempty"`
+	ValidFrom            int64                                `json:"valid_from,omitempty"`
+	ValidUntil           int64                                `json:"valid_until,omitempty"`
+	UsageSchema          map[string]jsplugin.UsageFieldSchema `json:"-"`
+	InputPerM            float64                              `json:"input_per_m"`
+	CachedReadPerM       float64                              `json:"cached_read_per_m"`
+	CacheWritePerM       float64                              `json:"cache_write_per_m"`
+	CacheWrite1hPerM     float64                              `json:"cache_write_1h_per_m"`
+	OutputPerM           float64                              `json:"output_per_m"`
+	LongContextThreshold int64                                `json:"long_context_threshold,omitempty"`
+	LongInputPerM        float64                              `json:"long_input_per_m,omitempty"`
+	LongCachedReadPerM   float64                              `json:"long_cached_read_per_m,omitempty"`
+	LongCacheWritePerM   float64                              `json:"long_cache_write_per_m,omitempty"`
+	LongCacheWrite1hPerM float64                              `json:"long_cache_write_1h_per_m,omitempty"`
+	LongOutputPerM       float64                              `json:"long_output_per_m,omitempty"`
+	SourceURL            string                               `json:"source_url"`
+	EvidenceHash         string                               `json:"evidence_hash"`
 }
 
 var officialPricingSourceURLs = map[string][]string{
@@ -67,6 +77,13 @@ var officialPricingSourceURLs = map[string][]string{
 		"https://docs.x.ai/developers/pricing",
 		"https://docs.x.ai/developers/models",
 		"https://x.ai/api",
+	},
+	"deepseek": {
+		"https://api-docs.deepseek.com/quick_start/pricing/",
+	},
+	"volcengine": {
+		"https://docs.volcengine.com/docs/82379/1544106?lang=zh",
+		"https://docs.volcengine.com/docs/82379/2630943?lang=zh",
 	},
 }
 
@@ -96,7 +113,7 @@ func RunOfficialPricingSync(ctx context.Context, now time.Time) (OfficialPricing
 				continue
 			}
 			summary.Fetched++
-			parsed, parseErr := parseOfficialPricingTables(vendor, sourceURL, body, allowedModels, aliases)
+			parsed, parseErr := parseOfficialPricingDocument(vendor, sourceURL, body, allowedModels, aliases, now)
 			if parseErr != nil {
 				lastErr = parseErr
 				continue
@@ -122,9 +139,15 @@ func RunOfficialPricingSync(ctx context.Context, now time.Time) (OfficialPricing
 	acceptedPrices := make([]officialTokenPrice, 0, len(prices))
 	for _, price := range prices {
 		expression := officialPriceExpression(price)
-		if err := billing_setting.SmokeTestExpr(expression); err != nil {
+		var expressionErr error
+		if price.BillingBasis == billingexpr.BillingBasisTask || price.BillingBasis == billingexpr.BillingBasisRequest {
+			expressionErr = billing_setting.SmokeTestTaskExpr(expression, price.UsageSchema)
+		} else {
+			expressionErr = billing_setting.SmokeTestExpr(expression)
+		}
+		if expressionErr != nil {
 			summary.Rejected++
-			evidence = append(evidence, newOfficialPriceEvidence(price, expressions[price.ModelName], expression, model.UpstreamPriceStatusRejected, err, now))
+			evidence = append(evidence, newOfficialPriceEvidence(price, expressions[price.ModelName], expression, model.UpstreamPriceStatusRejected, expressionErr, now))
 			continue
 		}
 		previous := expressions[price.ModelName]
@@ -173,19 +196,12 @@ func RunOfficialPricingSync(ctx context.Context, now time.Time) (OfficialPricing
 }
 
 func ensureOfficialModelMetadata(price officialTokenPrice) error {
-	var count int64
-	if err := model.DB.Model(&model.Model{}).
-		Where("model_name = ?", price.ModelName).
-		Count(&count).Error; err != nil {
-		return err
-	}
-	if count > 0 {
-		return nil
-	}
 	vendorName := map[string]string{
-		"openai":    "OpenAI",
-		"anthropic": "Anthropic",
-		"xai":       "xAI",
+		"openai":     "OpenAI",
+		"anthropic":  "Anthropic",
+		"xai":        "xAI",
+		"deepseek":   "DeepSeek",
+		"volcengine": "字节跳动",
 	}[price.Vendor]
 	if vendorName == "" {
 		return fmt.Errorf("unsupported official pricing vendor %q", price.Vendor)
@@ -200,12 +216,38 @@ func ensureOfficialModelMetadata(price officialTokenPrice) error {
 	} else if err != nil {
 		return err
 	}
-	endpoints, _ := common.Marshal([]string{
-		"/v1/chat/completions",
-		"/v1/responses",
-		"/v1/messages",
-	})
+	endpointMap := map[string]string{
+		"openai":         "/v1/chat/completions",
+		"openai-response": "/v1/responses",
+		"anthropic":      "/v1/messages",
+	}
+	if strings.HasPrefix(price.ModelName, "doubao-seedance-") {
+		endpointMap = map[string]string{
+			"openai-response": "/v1/responses",
+			"openai-video":    "/v1/videos",
+		}
+	} else if strings.HasPrefix(price.ModelName, "doubao-seedream-") {
+		endpointMap = map[string]string{
+			"image-generation": "/v1/images/generations",
+			"openai-response":   "/v1/responses",
+		}
+	}
+	endpoints, _ := common.Marshal(endpointMap)
 	icon := strings.ToLower(vendorName)
+	var existing model.Model
+	err = model.DB.Where("model_name = ?", price.ModelName).First(&existing).Error
+	if err == nil {
+		return model.DB.Model(&existing).Updates(map[string]any{
+			"vendor_id":     vendor.Id,
+			"endpoints":     string(endpoints),
+			"status":        1,
+			"sync_official": 1,
+			"updated_time":  common.GetTimestamp(),
+		}).Error
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
 	return (&model.Model{
 		ModelName:    price.ModelName,
 		Description:  fmt.Sprintf("Official %s model", vendorName),
@@ -275,9 +317,29 @@ func officialPricingHostAllowed(host string) bool {
 		host == "www.openai.com" ||
 		host == "developers.openai.com" ||
 		host == "platform.claude.com" ||
+		host == "api-docs.deepseek.com" ||
+		host == "docs.volcengine.com" ||
 		host == "docs.x.ai" ||
 		host == "x.ai" ||
 		host == "www.x.ai"
+}
+
+func parseOfficialPricingDocument(
+	vendor string,
+	sourceURL string,
+	body []byte,
+	allowedModels map[string]string,
+	aliases map[string]string,
+	now time.Time,
+) ([]officialTokenPrice, error) {
+	switch vendor {
+	case "deepseek":
+		return parseDeepSeekPricing(sourceURL, body, allowedModels)
+	case "volcengine":
+		return parseVolcenginePricing(sourceURL, body, allowedModels, now)
+	default:
+		return parseOfficialPricingTables(vendor, sourceURL, body, allowedModels, aliases)
+	}
 }
 
 func parseOfficialPricingTables(
@@ -624,6 +686,9 @@ func officialModelMatchesVendor(modelName string, vendor string, allowedModels m
 }
 
 func officialPriceExpression(price officialTokenPrice) string {
+	if strings.TrimSpace(price.Expression) != "" {
+		return price.Expression
+	}
 	standard := fmt.Sprintf(
 		`tier("official", p*%.10g + cr*%.10g + cc*%.10g + cc1h*%.10g + c*%.10g)`,
 		price.InputPerM,
@@ -664,8 +729,10 @@ func newOfficialPriceEvidence(
 	evidence := model.UpstreamPriceEvidence{
 		Vendor:          price.Vendor,
 		ModelName:       price.ModelName,
-		Currency:        "USD",
-		Unit:            "per_1m_tokens",
+		CanonicalModel:  price.CanonicalModel,
+		Currency:        price.Currency,
+		Unit:            price.Unit,
+		BillingBasis:    price.BillingBasis,
 		NormalizedPrice: string(normalized),
 		PreviousPrice:   previous,
 		SourceURL:       price.SourceURL,
@@ -673,6 +740,17 @@ func newOfficialPriceEvidence(
 		Status:          status,
 		Error:           errorMessage,
 		CapturedAt:      now.Unix(),
+		ValidFrom:       price.ValidFrom,
+		ValidUntil:      price.ValidUntil,
+	}
+	if evidence.Currency == "" {
+		evidence.Currency = "USD"
+	}
+	if evidence.Unit == "" {
+		evidence.Unit = "per_1m_tokens"
+	}
+	if evidence.BillingBasis == "" {
+		evidence.BillingBasis = billingexpr.BillingBasisToken
 	}
 	if status == model.UpstreamPriceStatusApplied {
 		evidence.AppliedAt = now.Unix()

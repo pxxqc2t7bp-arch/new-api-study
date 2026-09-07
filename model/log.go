@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/types"
 
@@ -359,6 +360,18 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 	if !common.LogConsumeEnabled {
 		return
 	}
+	streamID := common.GetContextKeyString(c, constant.ContextKeyStreamRecoveryID)
+	if streamID != "" {
+		claimed, err := ClaimStreamConsumeLog(streamID)
+		if err != nil {
+			logger.LogError(c, "failed to claim stream consume log: "+err.Error())
+			return
+		}
+		if !claimed {
+			logger.LogInfo(c, "stream consume log already claimed: "+streamID)
+			return
+		}
+	}
 	logger.LogInfo(c, fmt.Sprintf("record consume log: userId=%d, params=%s", userId, common.GetJsonString(params)))
 	username := c.GetString("username")
 	requestId := c.GetString(common.RequestIdKey)
@@ -401,6 +414,13 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 	err := createLog(log)
 	if err != nil {
 		logger.LogError(c, "failed to record log: "+err.Error())
+		if streamID != "" {
+			_ = FinishStreamConsumeLog(streamID, false)
+		}
+		return
+	}
+	if streamID != "" {
+		_ = FinishStreamConsumeLog(streamID, true)
 	}
 	if common.DataExportEnabled {
 		LogQuotaData(QuotaDataLogParams{

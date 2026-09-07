@@ -3,6 +3,7 @@ package billingexpr_test
 import (
 	"math"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -850,7 +851,7 @@ func TestTimeFunctions_ValidTimezone(t *testing.T) {
 }
 
 func TestTimeFunctions_AllFunctionsCompile(t *testing.T) {
-	exprStr := `tier("default", p) * (hour("Asia/Shanghai") >= 0 ? 1 : 1) * (minute("UTC") >= 0 ? 1 : 1) * (weekday("UTC") >= 0 ? 1 : 1) * (month("UTC") >= 1 ? 1 : 1) * (day("UTC") >= 1 ? 1 : 1)`
+	exprStr := `tier("default", p) * (unix() > 0 ? 1 : 1) * (hour("Asia/Shanghai") >= 0 ? 1 : 1) * (minute("UTC") >= 0 ? 1 : 1) * (weekday("UTC") >= 0 ? 1 : 1) * (month("UTC") >= 1 ? 1 : 1) * (day("UTC") >= 1 ? 1 : 1)`
 	cost, _, err := billingexpr.RunExpr(exprStr, billingexpr.TokenParams{P: 500})
 	if err != nil {
 		t.Fatal(err)
@@ -858,6 +859,30 @@ func TestTimeFunctions_AllFunctionsCompile(t *testing.T) {
 	if cost != 500 {
 		t.Errorf("cost = %f, want 500", cost)
 	}
+}
+
+func TestTimeFunctions_UseFrozenEvaluationTime(t *testing.T) {
+	beforePromotionEnd := time.Date(2026, time.September, 17, 5, 59, 59, 0, time.UTC).Unix()
+	atPromotionEnd := time.Date(2026, time.September, 17, 6, 0, 0, 0, time.UTC).Unix()
+	exprStr := `unix() < 1789624800 ? tier("promotion", p * 0.72) : tier("list", p)`
+
+	cost, trace, err := billingexpr.RunExprWithRequest(
+		exprStr,
+		billingexpr.TokenParams{P: 100},
+		billingexpr.RequestInput{EvaluatedAtUnix: beforePromotionEnd},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 72.0, cost)
+	assert.Equal(t, "promotion", trace.MatchedTier)
+
+	cost, trace, err = billingexpr.RunExprWithRequest(
+		exprStr,
+		billingexpr.TokenParams{P: 100},
+		billingexpr.RequestInput{EvaluatedAtUnix: atPromotionEnd},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 100.0, cost)
+	assert.Equal(t, "list", trace.MatchedTier)
 }
 
 func TestTimeFunctions_InvalidTimezone(t *testing.T) {

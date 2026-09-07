@@ -184,8 +184,12 @@ var GeminiSafetySetting string
 var CohereSafetySetting string
 
 const (
-	RequestIdKey         = "X-Oneapi-Request-Id"
-	UpstreamRequestIdKey = "X-Upstream-Request-Id"
+	RequestIdKey                    = "X-Oneapi-Request-Id"
+	UpstreamRequestIdKey            = "X-Upstream-Request-Id"
+	StreamRecoveryIDHeader          = "X-NewAPI-Stream-ID"
+	StreamRecoveryAttemptHeader     = "X-NewAPI-Stream-Attempt"
+	StreamRecoveryReplayedHeader    = "X-NewAPI-Stream-Replayed"
+	StreamRecoveryIdempotencyHeader = "X-NewAPI-Idempotency-Key"
 )
 
 const (

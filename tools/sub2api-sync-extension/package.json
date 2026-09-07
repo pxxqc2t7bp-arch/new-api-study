@@ -1,7 +1,7 @@
 {
   "name": "newapi-sub2api-sync-extension",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.5",
   "type": "module",
   "scripts": {
     "build": "node build.mjs",

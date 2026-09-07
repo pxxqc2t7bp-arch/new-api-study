@@ -22,6 +22,12 @@ var TaskPluginProtocolTimeoutSeconds int
 var TaskPluginProtocolTickMilliseconds int
 var TaskPluginProtocolTickJitterMilliseconds int
 var TaskPluginProtocolHeartbeatSeconds int
+var BatchStorageDir string
+var BatchMaxFileMB int
+var BatchMaxLines int
+var BatchWorkerConcurrency int
+var BatchRetentionHours int
+var BatchRequestTimeoutSeconds int
 
 // temporary variable for sora patch, will be removed in future
 var TaskPricePatches []string

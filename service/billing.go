@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
@@ -34,11 +37,45 @@ func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycom
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
+	streamID := common.GetContextKeyString(c, constant.ContextKeyStreamRecoveryID)
+	if streamID != "" {
+		execution, shouldReserve, err := beginStreamBillingReservation(streamID)
+		if err != nil {
+			return streamBillingError(err)
+		}
+		if !shouldReserve {
+			session, restoreErr := restoreStreamBillingSession(execution, relayInfo)
+			if restoreErr != nil {
+				return streamBillingError(restoreErr)
+			}
+			relayInfo.Billing = session
+			return nil
+		}
+	}
 	session, apiErr := NewBillingSession(c, relayInfo, preConsumedQuota)
 	if apiErr != nil {
+		if streamID != "" {
+			_, _ = model.UpdateStreamBillingState(
+				streamID,
+				[]string{model.StreamBillingReserving},
+				map[string]any{"billing_status": model.StreamBillingNone},
+			)
+		}
 		return apiErr
 	}
 	relayInfo.Billing = session
+	if streamID != "" {
+		session.streamID = streamID
+		if err := persistStreamBillingReservation(session); err != nil {
+			_, _ = model.UpdateStreamBillingState(
+				streamID,
+				[]string{model.StreamBillingReserving},
+				map[string]any{"billing_status": model.StreamBillingUncertain},
+			)
+			session.Refund(c)
+			return streamBillingError(err)
+		}
+	}
 	return nil
 }
 

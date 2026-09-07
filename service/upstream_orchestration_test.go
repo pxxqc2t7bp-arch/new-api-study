@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
@@ -237,6 +238,20 @@ func TestManagedModelExcludedIsScopedToSourceGroup(t *testing.T) {
 	))
 }
 
+func TestManagedProtocolModelExcludedSupportsGlobalAndScopedRules(t *testing.T) {
+	exclusions := map[string][]string{
+		"anthropic":          {"gpt-6-astra"},
+		"leyi:openai":        {"gpt-source-only"},
+		"ebond:group:openai": {"gpt-group-only"},
+	}
+
+	assert.True(t, managedProtocolModelExcluded("hualong", "group", "anthropic", "gpt-6-astra", exclusions))
+	assert.False(t, managedProtocolModelExcluded("hualong", "group", "openai", "gpt-6-astra", exclusions))
+	assert.True(t, managedProtocolModelExcluded("leyi", "group", "openai", "gpt-source-only", exclusions))
+	assert.False(t, managedProtocolModelExcluded("ebond", "other", "openai", "gpt-group-only", exclusions))
+	assert.True(t, managedProtocolModelExcluded("ebond", "group", "openai", "gpt-group-only", exclusions))
+}
+
 func TestManagedRouteUsesNativeProtocol(t *testing.T) {
 	nativeOpenAI := model.Channel{OtherSettings: `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/chat/completions","converter":"none"},{"incoming_path":"/v1/responses","upstream_path":"/responses","converter":"none"}]}}`}
 	convertedOpenAI := model.Channel{OtherSettings: `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/v1/messages","converter":"openai_chat_completions_to_anthropic_messages"}]}}`}
@@ -428,6 +443,81 @@ func TestRankManagedRoutesPersistsSelectedModelSubsets(t *testing.T) {
 	var sixth model.Channel
 	require.NoError(t, model.DB.First(&sixth, channelIDs["f"]).Error)
 	assert.Equal(t, "gpt-unique", sixth.Models)
+}
+
+func TestRankManagedRoutesAppliesProtocolModelExclusions(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	now := time.Unix(1_788_320_000, 0)
+	endpoint := "https://api.example.com"
+	source := model.UpstreamSource{
+		Key:              "source",
+		Name:             "Source",
+		SelectedEndpoint: endpoint,
+		Status:           model.UpstreamHealthOperational,
+		Enabled:          true,
+		LastSnapshotAt:   now.Unix(),
+	}
+	require.NoError(t, model.DB.Create(&source).Error)
+	group := model.UpstreamGroup{
+		SourceID:            source.ID,
+		ExternalID:          "group",
+		Name:                "Group",
+		Platform:            "openai",
+		EffectiveMultiplier: 0.1,
+		HealthStatus:        model.UpstreamHealthOperational,
+		ObservedAt:          now.Unix(),
+	}
+	require.NoError(t, model.DB.Create(&group).Error)
+	models := []string{"gpt-5.6-sol", "gpt-6-astra"}
+	channels := make(map[string]model.Channel)
+	for _, protocol := range []string{model.UpstreamProtocolOpenAI, model.UpstreamProtocolAnthropic} {
+		priority := int64(0)
+		weight := uint(100)
+		channel := model.Channel{
+			Type:     constant.ChannelTypeAdvancedCustom,
+			Status:   common.ChannelStatusEnabled,
+			Name:     protocol,
+			Weight:   &weight,
+			BaseURL:  &endpoint,
+			Models:   strings.Join(models, ","),
+			Group:    "default",
+			Priority: &priority,
+		}
+		require.NoError(t, model.DB.Create(&channel).Error)
+		require.NoError(t, channel.AddAbilities(nil))
+		require.NoError(t, model.DB.Create(&model.UpstreamManagedRoute{
+			SourceID:        source.ID,
+			ExternalGroupID: group.ExternalID,
+			Platform:        group.Platform,
+			Protocol:        protocol,
+			ChannelID:       channel.Id,
+			State:           model.UpstreamRouteStateActive,
+		}).Error)
+		channels[protocol] = channel
+	}
+
+	updated, err := rankManagedRoutes(
+		now,
+		[]model.UpstreamSource{source},
+		[]model.UpstreamGroup{group},
+		[]upstreamRouteCandidate{{source: source, group: group, models: models}},
+		&operation_setting.UpstreamOrchestrationSetting{
+			SyncIntervalHours: 4,
+			ProtocolModelExclusions: map[string][]string{
+				model.UpstreamProtocolAnthropic: {"gpt-6-astra"},
+			},
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 2, updated)
+
+	var openAI model.Channel
+	require.NoError(t, model.DB.First(&openAI, channels[model.UpstreamProtocolOpenAI].Id).Error)
+	assert.Equal(t, "gpt-5.6-sol,gpt-6-astra", openAI.Models)
+	var anthropic model.Channel
+	require.NoError(t, model.DB.First(&anthropic, channels[model.UpstreamProtocolAnthropic].Id).Error)
+	assert.Equal(t, "gpt-5.6-sol", anthropic.Models)
 }
 
 func TestRankManagedRoutesPreservesChannelWhenSnapshotIsStale(t *testing.T) {

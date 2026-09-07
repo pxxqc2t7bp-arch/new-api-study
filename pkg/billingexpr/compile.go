@@ -100,7 +100,7 @@ func usesRequestProbe(node ast.Node) bool {
 			return false
 		}
 		switch identifier.Value {
-		case "param", "header", "hour", "minute", "weekday", "month", "day":
+		case "param", "header", "unix", "hour", "minute", "weekday", "month", "day":
 			return true
 		default:
 			return false
@@ -140,6 +140,7 @@ var compileEnvPrototypeV1 = map[string]interface{}{
 	"param":      func(string) interface{} { return nil },
 	"u":          func(string) interface{} { return nil },
 	"has":        func(interface{}, string) bool { return false },
+	"unix":       func() int64 { return 0 },
 	"hour":       func(string) int { return 0 },
 	"minute":     func(string) int { return 0 },
 	"weekday":    func(string) int { return 0 },

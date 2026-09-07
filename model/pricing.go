@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 
 	"sync"
@@ -39,6 +40,10 @@ type Pricing struct {
 	BillingExpr            string                               `json:"billing_expr,omitempty"`
 	BillingUsageSchema     map[string]jsplugin.UsageFieldSchema `json:"billing_usage_schema,omitempty"`
 	BillingUsageExamples   []jsplugin.UsageExample              `json:"billing_usage_examples,omitempty"`
+	PricingStatus          string                               `json:"pricing_status,omitempty"`
+	PricingSourceURL       string                               `json:"pricing_source_url,omitempty"`
+	PricingEvidenceHash    string                               `json:"pricing_evidence_hash,omitempty"`
+	PricingValidUntil      int64                                `json:"pricing_valid_until,omitempty"`
 	PricingVersion         string                               `json:"pricing_version,omitempty"`
 }
 
@@ -273,9 +278,22 @@ func updatePricing() {
 		groups.Add(ability.Group)
 	}
 
+	var priceEvidence []UpstreamPriceEvidence
+	_ = DB.Order("captured_at desc, id desc").Find(&priceEvidence).Error
+	latestPriceEvidence := make(map[string]UpstreamPriceEvidence)
+	for _, evidence := range priceEvidence {
+		if evidence.ModelName == "" || evidence.ModelName == "*" {
+			continue
+		}
+		if _, exists := latestPriceEvidence[evidence.ModelName]; !exists {
+			latestPriceEvidence[evidence.ModelName] = evidence
+		}
+	}
+
 	//这里使用切片而不是Set，因为一个模型可能支持多个端点类型，并且第一个端点是优先使用端点
 	modelSupportEndpointsStr := make(map[string][]string)
 	advancedCustomConfigs := loadPricingAdvancedCustomConfigs(enableAbilities)
+	pluginGeneration := jsplugin.DefaultRegistry.Generation()
 
 	// 先根据已有能力填充原生端点
 	for _, ability := range enableAbilities {
@@ -287,6 +305,28 @@ func updatePricing() {
 			}
 		}
 		modelSupportEndpointsStr[ability.Model] = endpoints
+	}
+
+	// Task plugins add host-owned protocol surfaces independently of the
+	// channel's legacy type.
+	for modelName := range modelGroupsMap {
+		plugin, ok := pluginGeneration.GetByModel(modelName)
+		if !ok || plugin == nil {
+			continue
+		}
+		endpoints := modelSupportEndpointsStr[modelName]
+		for _, claim := range plugin.Meta.Protocols {
+			if len(claim.Models) > 0 && !slices.Contains(claim.Models, modelName) {
+				continue
+			}
+			switch claim.Name {
+			case "openai_responses":
+				endpoints = appendPricingEndpoint(endpoints, string(constant.EndpointTypeOpenAIResponse))
+			case "openai_video":
+				endpoints = appendPricingEndpoint(endpoints, string(constant.EndpointTypeOpenAIVideo))
+			}
+		}
+		modelSupportEndpointsStr[modelName] = endpoints
 	}
 
 	// 再补充模型自定义端点：若配置有效则追加到已有推断，不再裁剪渠道真实能力
@@ -359,7 +399,6 @@ func updatePricing() {
 	}
 
 	pricingMap = make([]Pricing, 0)
-	pluginGeneration := jsplugin.DefaultRegistry.Generation()
 	for model, groups := range modelGroupsMap {
 		pricing := Pricing{
 			ModelName:              model,
@@ -379,11 +418,14 @@ func updatePricing() {
 			pricing.VendorID = meta.VendorID
 		}
 		modelPrice, findPrice := ratio_setting.GetModelPrice(model, false)
+		explicitPrice := findPrice
+		explicitRatio := false
 		if findPrice {
 			pricing.ModelPrice = modelPrice
 			pricing.QuotaType = 1
 		} else {
-			modelRatio, _, _ := ratio_setting.GetModelRatio(model)
+			modelRatio, configured, _ := ratio_setting.GetModelRatio(model)
+			explicitRatio = configured
 			pricing.ModelRatio = modelRatio
 			pricing.CompletionRatio = ratio_setting.GetCompletionRatio(model)
 			pricing.QuotaType = 0
@@ -418,6 +460,21 @@ func updatePricing() {
 				}
 			}
 		}
+		configuredPrice := explicitPrice || explicitRatio || pricing.BillingExpr != ""
+		if evidence, ok := latestPriceEvidence[model]; ok && configuredPrice &&
+			(evidence.Status == UpstreamPriceStatusApplied || evidence.Status == UpstreamPriceStatusUnchanged) {
+			pricing.PricingStatus = "verified"
+			if evidence.CanonicalModel != "" && evidence.CanonicalModel != model {
+				pricing.PricingStatus = "inherited"
+			}
+			pricing.PricingSourceURL = evidence.SourceURL
+			pricing.PricingEvidenceHash = evidence.EvidenceHash
+			pricing.PricingValidUntil = evidence.ValidUntil
+		} else if configuredPrice {
+			pricing.PricingStatus = "estimated"
+		} else {
+			pricing.PricingStatus = "blocked"
+		}
 		plugin, ok := pluginGeneration.GetByModel(model)
 		if !ok {
 			if target, resolved := ResolveTaskModelAlias(pluginGeneration, model); resolved {
@@ -450,7 +507,7 @@ func updatePricing() {
 
 	// 防止大更新后数据不通用
 	if len(pricingMap) > 0 {
-		pricingMap[0].PricingVersion = "5a90f2b86c08bd983a9a2e6d66c255f4eaef9c4bc934386d2b6ae84ef0ff1f1f"
+		pricingMap[0].PricingVersion = "59af5dbc39ce01a4a6006d3b7897092974fff9dfd995efdd05330097fe63744c"
 	}
 
 	// 刷新缓存映射，供高并发快速查询

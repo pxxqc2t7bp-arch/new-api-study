@@ -140,9 +140,10 @@ type UpstreamRouteActionRequest struct {
 }
 
 type UpstreamSourceUpdateRequest struct {
-	Enabled             *bool               `json:"enabled,omitempty"`
-	LowBalanceThreshold *float64            `json:"low_balance_threshold,omitempty"`
-	StaticEgressIPs     []string            `json:"static_egress_ips,omitempty"`
-	ModelAliases        map[string]string   `json:"model_aliases,omitempty"`
-	ModelExclusions     map[string][]string `json:"model_exclusions,omitempty"`
+	Enabled                 *bool               `json:"enabled,omitempty"`
+	LowBalanceThreshold     *float64            `json:"low_balance_threshold,omitempty"`
+	StaticEgressIPs         []string            `json:"static_egress_ips,omitempty"`
+	ModelAliases            map[string]string   `json:"model_aliases,omitempty"`
+	ModelExclusions         map[string][]string `json:"model_exclusions,omitempty"`
+	ProtocolModelExclusions map[string][]string `json:"protocol_model_exclusions,omitempty"`
 }

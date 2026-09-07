@@ -326,6 +326,23 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 	if err != nil {
 		return hosttypes.PriceData{}, err
 	}
+	usageKeys := billingexpr.UsedUsageKeys(exprStr)
+	taskUsageBilling := len(usageKeys) > 0
+	if taskUsageBilling {
+		requestInput.Usage = make(map[string]any, len(meta.BillingUsage))
+		for key, value := range meta.BillingUsage {
+			requestInput.Usage[key] = value
+		}
+		for key := range usageKeys {
+			if _, ok := requestInput.Usage[key]; !ok {
+				return hosttypes.PriceData{}, fmt.Errorf(
+					"model %s tiered expr requires missing usage fact %s",
+					info.OriginModelName,
+					key,
+				)
+			}
+		}
+	}
 
 	rawCost, trace, err := billingexpr.RunExprWithRequest(exprStr, billingexpr.TokenParams{
 		P:   float64(promptTokens),
@@ -336,8 +353,13 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 		return hosttypes.PriceData{}, fmt.Errorf("model %s tiered expr run failed: %w", info.OriginModelName, err)
 	}
 
-	// Expression coefficients are $/1M tokens prices; convert to quota the same way per-call billing does.
-	quotaBeforeGroup := rawCost / 1_000_000 * common.QuotaPerUnit
+	quotaBeforeGroup := rawCost * common.QuotaPerUnit
+	billingBasis := billingexpr.BillingBasisRequest
+	if !taskUsageBilling {
+		// Token expressions use official prices per one million tokens.
+		quotaBeforeGroup /= 1_000_000
+		billingBasis = billingexpr.BillingBasisToken
+	}
 	preConsumedQuota, err := billingexpr.QuotaRoundStrict(quotaBeforeGroup * groupRatioInfo.GroupRatio)
 	if err != nil {
 		return hosttypes.PriceData{}, err
@@ -365,6 +387,10 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, promptT
 		EstimatedTier:             trace.MatchedTier,
 		QuotaPerUnit:              common.QuotaPerUnit,
 		ExprVersion:               billingexpr.ExprVersion(exprStr),
+		BillingBasis:              billingBasis,
+		PricingTimeUnix:           requestInput.EvaluatedAtUnix,
+		TaskUsageBilling:          taskUsageBilling,
+		UsageFacts:                requestInput.Usage,
 	}
 	info.TieredBillingSnapshot = snapshot
 	info.BillingRequestInput = &requestInput

@@ -33,6 +33,7 @@ type BillingSession struct {
 	fundingSettled   bool // funding.Settle 已成功，资金来源已提交
 	settled          bool // Settle 全部完成（资金 + 令牌）
 	refunded         bool // Refund 已调用
+	streamID         string
 	mu               sync.Mutex
 }
 
@@ -40,6 +41,59 @@ type BillingSession struct {
 // 资金来源和令牌额度分两步提交：若资金来源已提交但令牌调整失败，
 // 会标记 fundingSettled 防止 Refund 对已提交的资金来源执行退款。
 func (s *BillingSession) Settle(actualQuota int) error {
+	if s.streamID == "" {
+		return s.settle(actualQuota)
+	}
+	execution, err := model.GetStreamExecution(s.streamID)
+	if err != nil {
+		return err
+	}
+	if execution.BillingStatus == model.StreamBillingSettled {
+		s.mu.Lock()
+		s.settled = true
+		s.mu.Unlock()
+		return nil
+	}
+	won, err := model.UpdateStreamBillingState(
+		s.streamID,
+		[]string{model.StreamBillingReserved},
+		map[string]any{"billing_status": model.StreamBillingSettling},
+	)
+	if err != nil {
+		return err
+	}
+	if !won {
+		return fmt.Errorf("stream billing cannot settle from state %q", execution.BillingStatus)
+	}
+	if settleErr := s.settle(actualQuota); settleErr != nil {
+		_, _ = model.UpdateStreamBillingState(
+			s.streamID,
+			[]string{model.StreamBillingSettling},
+			map[string]any{
+				"billing_status": model.StreamBillingUncertain,
+				"actual_quota":   actualQuota,
+			},
+		)
+		return settleErr
+	}
+	won, err = model.UpdateStreamBillingState(
+		s.streamID,
+		[]string{model.StreamBillingSettling},
+		map[string]any{
+			"billing_status": model.StreamBillingSettled,
+			"actual_quota":   actualQuota,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if !won {
+		return errors.New("stream billing settlement state changed concurrently")
+	}
+	return nil
+}
+
+func (s *BillingSession) settle(actualQuota int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.settled {
@@ -82,8 +136,40 @@ func (s *BillingSession) Settle(actualQuota int) error {
 // Refund 退还所有预扣费，幂等安全，异步执行。
 func (s *BillingSession) Refund(c *gin.Context) {
 	s.mu.Lock()
-	if s.settled || s.refunded || !s.needsRefundLocked() {
+	if s.settled || s.refunded {
 		s.mu.Unlock()
+		return
+	}
+	needsRefund := s.needsRefundLocked()
+	streamID := s.streamID
+	if streamID != "" {
+		won, err := model.UpdateStreamBillingState(
+			streamID,
+			[]string{
+				model.StreamBillingReserving,
+				model.StreamBillingReserved,
+				model.StreamBillingUncertain,
+			},
+			map[string]any{"billing_status": model.StreamBillingRefunding},
+		)
+		if err != nil || !won {
+			s.mu.Unlock()
+			if err != nil {
+				common.SysLog("failed to start stream billing refund: " + err.Error())
+			}
+			return
+		}
+	}
+	if !needsRefund {
+		s.refunded = true
+		s.mu.Unlock()
+		if streamID != "" {
+			_, _ = model.UpdateStreamBillingState(
+				streamID,
+				[]string{model.StreamBillingRefunding},
+				map[string]any{"billing_status": model.StreamBillingRefunded},
+			)
+		}
 		return
 	}
 	s.refunded = true
@@ -105,20 +191,35 @@ func (s *BillingSession) Refund(c *gin.Context) {
 	funding := s.funding
 
 	gopool.Go(func() {
+		refundFailed := false
 		// 1) 退还资金来源
 		if err := funding.Refund(); err != nil {
 			common.SysLog("error refunding billing source: " + err.Error())
+			refundFailed = true
 		}
 		if extraReserved > 0 && funding.Source() == BillingSourceSubscription && subscriptionId > 0 {
 			if err := model.PostConsumeUserSubscriptionDelta(subscriptionId, -int64(extraReserved)); err != nil {
 				common.SysLog("error refunding subscription extra reserved quota: " + err.Error())
+				refundFailed = true
 			}
 		}
 		// 2) 退还令牌额度
 		if tokenConsumed > 0 && !isPlayground {
 			if err := model.IncreaseTokenQuota(tokenId, tokenKey, tokenConsumed); err != nil {
 				common.SysLog("error refunding token quota: " + err.Error())
+				refundFailed = true
 			}
+		}
+		if streamID != "" {
+			status := model.StreamBillingRefunded
+			if refundFailed {
+				status = model.StreamBillingUncertain
+			}
+			_, _ = model.UpdateStreamBillingState(
+				streamID,
+				[]string{model.StreamBillingRefunding},
+				map[string]any{"billing_status": status},
+			)
 		}
 	})
 }
@@ -175,6 +276,21 @@ func (s *BillingSession) Reserve(targetQuota int) error {
 	s.tokenConsumed += delta
 	s.extraReserved += delta
 	s.syncRelayInfo()
+	if s.streamID != "" {
+		updates := s.streamBillingSnapshotLocked()
+		updates["billing_status"] = model.StreamBillingReserved
+		won, err := model.UpdateStreamBillingState(
+			s.streamID,
+			[]string{model.StreamBillingReserved},
+			updates,
+		)
+		if err != nil {
+			return err
+		}
+		if !won {
+			return errors.New("stream billing reservation state changed concurrently")
+		}
+	}
 	return nil
 }
 
@@ -347,6 +463,32 @@ func (s *BillingSession) syncRelayInfo() {
 		info.SubscriptionId = 0
 		info.SubscriptionPreConsumed = 0
 	}
+}
+
+func (s *BillingSession) streamBillingSnapshot() map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.streamBillingSnapshotLocked()
+}
+
+func (s *BillingSession) streamBillingSnapshotLocked() map[string]any {
+	updates := map[string]any{
+		"billing_source":  s.funding.Source(),
+		"reserved_quota":  s.preConsumedQuota,
+		"token_consumed":  s.tokenConsumed,
+		"extra_reserved":  s.extraReserved,
+		"trusted":         s.trusted,
+		"subscription_id": 0,
+	}
+	if funding, ok := s.funding.(*SubscriptionFunding); ok {
+		updates["subscription_id"] = funding.subscriptionId
+		updates["subscription_pre_consumed"] = funding.preConsumed
+		updates["subscription_amount_total"] = funding.AmountTotal
+		updates["subscription_amount_used_after"] = funding.AmountUsedAfter
+		updates["subscription_plan_id"] = funding.PlanId
+		updates["subscription_plan_title"] = funding.PlanTitle
+	}
+	return updates
 }
 
 // ---------------------------------------------------------------------------

@@ -12,9 +12,12 @@ import (
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	commonRelay "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"gorm.io/gorm"
 )
 
 type TaskStatus string
+
+type TaskDispatchStatus string
 
 func (t TaskStatus) ToVideoStatus() string {
 	var status string
@@ -46,6 +49,15 @@ const (
 	TaskStatusUnknown               = "UNKNOWN"
 )
 
+const (
+	TaskExecutionModeDeferred = "deferred"
+
+	TaskDispatchStatusPending    TaskDispatchStatus = "pending"
+	TaskDispatchStatusRunning    TaskDispatchStatus = "running"
+	TaskDispatchStatusDispatched TaskDispatchStatus = "dispatched"
+	TaskDispatchStatusFailed     TaskDispatchStatus = "failed"
+)
+
 // TaskRefundLegacyCutoff separates tasks created before timeout refunds were
 // introduced. Those legacy tasks are failed without an automatic refund.
 const TaskRefundLegacyCutoff int64 = 1771718400 // 2026-02-22 00:00:00 UTC
@@ -67,8 +79,16 @@ type Task struct {
 	StartTime  int64                 `json:"start_time" gorm:"index"`
 	FinishTime int64                 `json:"finish_time" gorm:"index"`
 	Progress   string                `json:"progress" gorm:"type:varchar(20);index"`
-	Properties Properties            `json:"properties" gorm:"type:json"`
-	Username   string                `json:"username,omitempty" gorm:"-"`
+	// Deferred task dispatch is an outbox owned by the gateway. These fields
+	// stay private while remaining queryable for cross-process claiming.
+	ExecutionMode     string             `json:"-" gorm:"type:varchar(20);index"`
+	DispatchStatus    TaskDispatchStatus `json:"-" gorm:"type:varchar(20);index"`
+	DispatchOwner     string             `json:"-" gorm:"type:varchar(128)"`
+	DispatchLockUntil int64              `json:"-" gorm:"index"`
+	DispatchAttempts  int                `json:"-"`
+	DispatchError     string             `json:"-" gorm:"type:text"`
+	Properties        Properties         `json:"properties" gorm:"type:json"`
+	Username          string             `json:"username,omitempty" gorm:"-"`
 	// 禁止返回给用户，内部可能包含key等隐私信息
 	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
@@ -128,7 +148,22 @@ type TaskPrivateData struct {
 	// asked for background:true. Every task is durable and survives client
 	// disconnect regardless; this only echoes the protocol-level request
 	// attribute back on retrieval snapshots.
-	ResponsesBackground bool `json:"responses_background,omitempty"`
+	ResponsesBackground bool                 `json:"responses_background,omitempty"`
+	DeferredRequest     *TaskDeferredRequest `json:"deferred_request,omitempty"`
+}
+
+// TaskDeferredRequest is a credential-free snapshot of the normalized plugin
+// request. Channel credentials are resolved again when a worker claims it.
+type TaskDeferredRequest struct {
+	Path         string                      `json:"path"`
+	Method       string                      `json:"method"`
+	Params       map[string]string           `json:"params,omitempty"`
+	Query        map[string][]string         `json:"query,omitempty"`
+	Headers      map[string]string           `json:"headers,omitempty"`
+	RouteBody    json.RawMessage             `json:"route_body,omitempty"`
+	RequestBody  json.RawMessage             `json:"request_body"`
+	OriginTaskID string                      `json:"origin_task_id,omitempty"`
+	OriginTasks  []commonRelay.OriginTaskRef `json:"origin_tasks,omitempty"`
 }
 
 type TaskExecutionSnapshot struct {
@@ -361,6 +396,8 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	// get all tasks progress is not 100%
 	err = DB.Where("progress != ?", "100%").
 		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess, TaskStatusCancelled}).
+		Where("(execution_mode IS NULL OR execution_mode <> ? OR dispatch_status = ?)",
+			TaskExecutionModeDeferred, TaskDispatchStatusDispatched).
 		Limit(limit).Order("id").Find(&tasks).Error
 	if err != nil {
 		return nil
@@ -377,9 +414,143 @@ func HasUnfinishedSyncTasks() bool {
 	err := DB.Model(&Task{}).
 		Where("progress != ?", "100%").
 		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess, TaskStatusCancelled}).
+		Where("(execution_mode IS NULL OR execution_mode <> ? OR dispatch_status = ?)",
+			TaskExecutionModeDeferred, TaskDispatchStatusDispatched).
 		Limit(1).
 		Pluck("id", &id).Error
 	return err == nil && id != 0
+}
+
+// HasDispatchableDeferredTasks reports whether a pending task, or a task whose
+// worker lease expired, is available for deferred upstream submission.
+func HasDispatchableDeferredTasks(now int64) bool {
+	var id int64
+	err := deferredTaskDispatchQuery(now).
+		Model(&Task{}).
+		Limit(1).
+		Pluck("id", &id).Error
+	return err == nil && id != 0
+}
+
+func FindDispatchableDeferredTasks(now int64, limit int) ([]*Task, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	var tasks []*Task
+	err := deferredTaskDispatchQuery(now).
+		Order("id").
+		Limit(limit).
+		Find(&tasks).Error
+	return tasks, err
+}
+
+func deferredTaskDispatchQuery(now int64) *gorm.DB {
+	return DB.Where("execution_mode = ?", TaskExecutionModeDeferred).
+		Where("status NOT IN ?", []TaskStatus{TaskStatusFailure, TaskStatusSuccess, TaskStatusCancelled}).
+		Where(
+			"dispatch_status = ? OR (dispatch_status = ? AND dispatch_lock_until < ?)",
+			TaskDispatchStatusPending,
+			TaskDispatchStatusRunning,
+			now,
+		)
+}
+
+// ClaimDeferredTask atomically acquires or recovers one deferred task lease.
+func ClaimDeferredTask(id int64, owner string, now, lockUntil int64) (*Task, bool, error) {
+	if id <= 0 || owner == "" || lockUntil <= now {
+		return nil, false, nil
+	}
+	result := DB.Model(&Task{}).
+		Where("id = ? AND execution_mode = ?", id, TaskExecutionModeDeferred).
+		Where("status NOT IN ?", []TaskStatus{TaskStatusFailure, TaskStatusSuccess, TaskStatusCancelled}).
+		Where(
+			"dispatch_status = ? OR (dispatch_status = ? AND dispatch_lock_until < ?)",
+			TaskDispatchStatusPending,
+			TaskDispatchStatusRunning,
+			now,
+		).
+		Updates(map[string]any{
+			"dispatch_status":     TaskDispatchStatusRunning,
+			"dispatch_owner":      owner,
+			"dispatch_lock_until": lockUntil,
+			"dispatch_attempts":   gorm.Expr("dispatch_attempts + ?", 1),
+			"dispatch_error":      "",
+		})
+	if result.Error != nil || result.RowsAffected == 0 {
+		return nil, false, result.Error
+	}
+	var task Task
+	if err := DB.Where("id = ? AND dispatch_owner = ?", id, owner).First(&task).Error; err != nil {
+		return nil, false, err
+	}
+	return &task, true, nil
+}
+
+func RequeueDeferredTask(task *Task, owner, reason string) (bool, error) {
+	if task == nil {
+		return false, nil
+	}
+	result := DB.Model(&Task{}).
+		Where("id = ? AND dispatch_status = ? AND dispatch_owner = ?",
+			task.ID, TaskDispatchStatusRunning, owner).
+		Updates(map[string]any{
+			"dispatch_status":     TaskDispatchStatusPending,
+			"dispatch_owner":      "",
+			"dispatch_lock_until": 0,
+			"dispatch_error":      reason,
+		})
+	return result.RowsAffected > 0, result.Error
+}
+
+// CompleteDeferredTask stores the accepted upstream task result under the
+// dispatch lease. Clearing DeferredRequest minimizes retained user input.
+func CompleteDeferredTask(task *Task, owner string) (bool, error) {
+	if task == nil {
+		return false, nil
+	}
+	result := DB.Model(&Task{}).
+		Where("id = ? AND dispatch_status = ? AND dispatch_owner = ?",
+			task.ID, TaskDispatchStatusRunning, owner).
+		Updates(map[string]any{
+			"status":              task.Status,
+			"progress":            task.Progress,
+			"start_time":          task.StartTime,
+			"finish_time":         task.FinishTime,
+			"fail_reason":         task.FailReason,
+			"private_data":        task.PrivateData,
+			"data":                task.Data,
+			"dispatch_status":     TaskDispatchStatusDispatched,
+			"dispatch_owner":      "",
+			"dispatch_lock_until": 0,
+			"dispatch_error":      "",
+		})
+	return result.RowsAffected > 0, result.Error
+}
+
+func FailDeferredTask(task *Task, owner, reason string, now int64) (bool, error) {
+	if task == nil {
+		return false, nil
+	}
+	task.Status = TaskStatusFailure
+	task.Progress = "100%"
+	task.FailReason = reason
+	task.FinishTime = now
+	task.PrivateData.DeferredRequest = nil
+	result := DB.Model(&Task{}).
+		Where("id = ? AND dispatch_status = ? AND dispatch_owner = ?",
+			task.ID, TaskDispatchStatusRunning, owner).
+		Updates(map[string]any{
+			"status":              task.Status,
+			"progress":            task.Progress,
+			"finish_time":         task.FinishTime,
+			"fail_reason":         task.FailReason,
+			"private_data":        task.PrivateData,
+			"dispatch_status":     TaskDispatchStatusFailed,
+			"dispatch_owner":      "",
+			"dispatch_lock_until": 0,
+			"dispatch_error":      reason,
+		})
+	return result.RowsAffected > 0, result.Error
 }
 
 func GetByOnlyTaskId(taskId string) (*Task, bool, error) {

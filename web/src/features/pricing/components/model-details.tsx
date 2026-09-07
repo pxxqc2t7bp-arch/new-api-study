@@ -22,6 +22,7 @@ import {
   ArrowLeft,
   CalendarClock,
   Code2,
+  ExternalLink,
   FileText,
   HeartPulse,
   Info,
@@ -55,6 +56,7 @@ import {
   formatUptimePct,
   getSuccessRateTextClass,
 } from '@/features/performance-metrics/lib/format'
+import { toIntlLocale } from '@/i18n/languages'
 import { getLobeIcon } from '@/lib/lobe-icon'
 import { cn } from '@/lib/utils'
 
@@ -509,7 +511,7 @@ function ModelBackendSignalsSection(props: { model: PricingModel }) {
 }
 
 function ModelBackendProviderSection(props: { model: PricingModel }) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const model = props.model
   const groups = normalizeCatalogItems(model.enable_groups)
   const endpoints = normalizeCatalogItems(model.supported_endpoint_types)
@@ -529,6 +531,52 @@ function ModelBackendProviderSection(props: { model: PricingModel }) {
       <ModelBillingModeBadge model={model} />
     </CatalogInfoCell>
   )
+
+  if (model.pricing_status) {
+    const statusLabels = {
+      verified: t('Verified price'),
+      inherited: t('Inherited price'),
+      estimated: t('Estimated price'),
+      blocked: t('Unconfigured price'),
+    }
+    const validUntil = model.pricing_valid_until
+      ? new Intl.DateTimeFormat(
+          toIntlLocale(i18n.resolvedLanguage || i18n.language),
+          {
+            dateStyle: 'medium',
+            timeStyle: 'short',
+          }
+        ).format(new Date(model.pricing_valid_until * 1000))
+      : null
+    cells.push(
+      <CatalogInfoCell key='pricing-status' label={t('Price source')}>
+        <span className='flex min-w-0 flex-col gap-0.5 text-sm'>
+          {model.pricing_source_url ? (
+            <a
+              className='text-foreground inline-flex min-w-0 items-center gap-1 font-semibold hover:underline'
+              href={model.pricing_source_url}
+              target='_blank'
+              rel='noreferrer'
+            >
+              <span className='truncate'>
+                {statusLabels[model.pricing_status]}
+              </span>
+              <ExternalLink className='size-3 shrink-0' aria-hidden='true' />
+            </a>
+          ) : (
+            <span className='text-foreground font-semibold'>
+              {statusLabels[model.pricing_status]}
+            </span>
+          )}
+          {validUntil && (
+            <span className='text-muted-foreground text-xs'>
+              {t('Valid until {{time}}', { time: validUntil })}
+            </span>
+          )}
+        </span>
+      </CatalogInfoCell>
+    )
+  }
 
   if (groups.length > 0) {
     cells.push(

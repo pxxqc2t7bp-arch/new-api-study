@@ -21,6 +21,7 @@ const (
 	ContextKeyTokenModelLimit        ContextKey = "token_model_limit"
 	ContextKeyTokenCrossGroupRetry   ContextKey = "token_cross_group_retry"
 	ContextKeyTokenAutoGroups        ContextKey = "token_auto_groups"
+	ContextKeyTokenStreamRecovery    ContextKey = "token_stream_recovery"
 
 	/* channel related keys */
 	ContextKeyChannelId                ContextKey = "channel_id"
@@ -68,6 +69,11 @@ const (
 	// ContextKeyLanguage stores the user's language preference for i18n
 	ContextKeyLanguage ContextKey = "language"
 	ContextKeyIsStream ContextKey = "is_stream"
+
+	ContextKeyStreamRecoveryWorker ContextKey = "stream_recovery_worker"
+	ContextKeyStreamRecoveryID     ContextKey = "stream_recovery_id"
+	ContextKeyStreamRecoveryRunner ContextKey = "stream_recovery_runner"
+	ContextKeyStreamRecoveryBroker ContextKey = "stream_recovery_broker"
 
 	// ContextKeyAuditLogged marks that the current request has already recorded
 	// a manage/operation audit log inside the handler. When set, the admin-audit

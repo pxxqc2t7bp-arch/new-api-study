@@ -167,6 +167,15 @@ func initUserSessionSettings() {
 	}
 }
 
+func positiveEnvInt(name string, fallback int) int {
+	value := GetEnvOrDefault(name, fallback)
+	if value <= 0 {
+		SysError(fmt.Sprintf("%s must be positive, using default value: %d", name, fallback))
+		return fallback
+	}
+	return value
+}
+
 func positiveUserSessionEnv(name string, fallback int) int {
 	value := GetEnvOrDefault(name, fallback)
 	if value <= 0 {
@@ -209,6 +218,12 @@ func initConstantEnv() {
 	constant.TaskPluginProtocolTickMilliseconds = GetEnvOrDefault("TASK_PLUGIN_PROTOCOL_TICK_MILLISECONDS", 2000)
 	constant.TaskPluginProtocolTickJitterMilliseconds = GetEnvOrDefault("TASK_PLUGIN_PROTOCOL_TICK_JITTER_MILLISECONDS", 500)
 	constant.TaskPluginProtocolHeartbeatSeconds = GetEnvOrDefault("TASK_PLUGIN_PROTOCOL_HEARTBEAT_SECONDS", 15)
+	constant.BatchStorageDir = GetEnvOrDefaultString("BATCH_STORAGE_DIR", "/data/new-api/batches")
+	constant.BatchMaxFileMB = positiveEnvInt("BATCH_MAX_FILE_MB", 200)
+	constant.BatchMaxLines = positiveEnvInt("BATCH_MAX_LINES", 50_000)
+	constant.BatchWorkerConcurrency = positiveEnvInt("BATCH_WORKER_CONCURRENCY", 4)
+	constant.BatchRetentionHours = positiveEnvInt("BATCH_RETENTION_HOURS", 24*30)
+	constant.BatchRequestTimeoutSeconds = positiveEnvInt("BATCH_REQUEST_TIMEOUT_SECONDS", 900)
 
 	soraPatchStr := GetEnvOrDefaultString("TASK_PRICE_PATCH", "")
 	if soraPatchStr != "" {

@@ -6,7 +6,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	_ "github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -15,14 +17,14 @@ func resetPricingEndpointTestTables(t *testing.T) {
 	t.Helper()
 	originalMemoryCacheEnabled := common.MemoryCacheEnabled
 	common.MemoryCacheEnabled = true
-	require.NoError(t, DB.AutoMigrate(&Channel{}, &Ability{}, &Model{}, &Vendor{}))
-	for _, table := range []string{"abilities", "channels", "models", "vendors"} {
+	require.NoError(t, DB.AutoMigrate(&Channel{}, &Ability{}, &Model{}, &Vendor{}, &UpstreamPriceEvidence{}))
+	for _, table := range []string{"abilities", "channels", "models", "vendors", "upstream_price_evidence"} {
 		require.NoError(t, DB.Exec("DELETE FROM "+table).Error)
 	}
 	InitChannelCache()
 	InvalidatePricingCache()
 	t.Cleanup(func() {
-		for _, table := range []string{"abilities", "channels", "models", "vendors"} {
+		for _, table := range []string{"abilities", "channels", "models", "vendors", "upstream_price_evidence"} {
 			require.NoError(t, DB.Exec("DELETE FROM "+table).Error)
 		}
 		InitChannelCache()
@@ -190,6 +192,22 @@ func TestPricingNativeChannelEndpointTypesUnchanged(t *testing.T) {
 	assert.Equal(t, []constant.EndpointType{constant.EndpointTypeAnthropic, constant.EndpointTypeOpenAI}, byModel["claude-3-5-sonnet"])
 }
 
+func TestPricingHonorsTaskPluginProtocolModelScope(t *testing.T) {
+	resetPricingEndpointTestTables(t)
+
+	insertPricingEndpointChannel(t, 204, constant.ChannelTypeVolcEngine, dto.ChannelOtherSettings{})
+	insertPricingEndpointAbility(t, 204, "doubao-seedream-5-0-pro-260628")
+	insertPricingEndpointAbility(t, 204, "doubao-seedance-2-0-260128")
+
+	byModel := pricingEndpointTypesByModel(t)
+
+	assert.Contains(t, byModel["doubao-seedream-5-0-pro-260628"], constant.EndpointTypeImageGeneration)
+	assert.Contains(t, byModel["doubao-seedream-5-0-pro-260628"], constant.EndpointTypeOpenAIResponse)
+	assert.NotContains(t, byModel["doubao-seedream-5-0-pro-260628"], constant.EndpointTypeOpenAIVideo)
+	assert.Contains(t, byModel["doubao-seedance-2-0-260128"], constant.EndpointTypeOpenAIResponse)
+	assert.Contains(t, byModel["doubao-seedance-2-0-260128"], constant.EndpointTypeOpenAIVideo)
+}
+
 func TestInitChannelCacheInvalidatesPricingCache(t *testing.T) {
 	resetPricingEndpointTestTables(t)
 
@@ -291,4 +309,40 @@ func TestCacheUpdateChannelSyncsAdvancedCustomConfig(t *testing.T) {
 	CacheUpdateChannel(channel)
 
 	assert.Nil(t, channel2advancedCustomConfig[401])
+}
+
+func TestPricingReportsEvidenceAndBlocksFallbackRatio(t *testing.T) {
+	resetPricingEndpointTestTables(t)
+	previousRatios := ratio_setting.ModelRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4o":1.25}`))
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(previousRatios))
+	})
+
+	insertPricingEndpointChannel(t, 501, constant.ChannelTypeOpenAI, dto.ChannelOtherSettings{})
+	insertPricingEndpointAbility(t, 501, "gpt-4o")
+	insertPricingEndpointAbility(t, 501, "zz-unconfigured-model")
+	require.NoError(t, DB.Create(&UpstreamPriceEvidence{
+		Vendor:          "openai",
+		ModelName:       "gpt-4o",
+		CanonicalModel:  "gpt-4o",
+		Currency:        "USD",
+		Unit:            "per_1m_tokens",
+		BillingBasis:    "token",
+		NormalizedPrice: `{"input_per_m":2.5}`,
+		SourceURL:       "https://openai.com/api/pricing/",
+		EvidenceHash:    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Status:          UpstreamPriceStatusUnchanged,
+		CapturedAt:      100,
+		ValidUntil:      200,
+	}).Error)
+
+	pricing := pricingByModel(GetPricing())
+	require.Contains(t, pricing, "gpt-4o")
+	assert.Equal(t, "verified", pricing["gpt-4o"].PricingStatus)
+	assert.Equal(t, "https://openai.com/api/pricing/", pricing["gpt-4o"].PricingSourceURL)
+	assert.Equal(t, int64(200), pricing["gpt-4o"].PricingValidUntil)
+
+	require.Contains(t, pricing, "zz-unconfigured-model")
+	assert.Equal(t, "blocked", pricing["zz-unconfigured-model"].PricingStatus)
 }
