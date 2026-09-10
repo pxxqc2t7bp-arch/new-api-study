@@ -34,27 +34,32 @@ export const meta = {
   models: SEEDANCE_MODELS.concat(SEEDREAM_MODELS),
   fetchMode: "per_task",
   usageSchema: {
+    // Upstream billing tokens (estimated at submit, actual on completion).
     tokens: {
       type: "number",
       unit: "token",
-      description: {
-        en: "Upstream billing tokens (estimated at submit, actual on completion).",
-        zh: "上游计费 token（提交时预估，完成后按实际值）。",
-      },
+      description: { en: "Billing token unit price", zh: "计费 Token 单价" },
     },
+    // Output video resolution; Seedance token unit price varies by resolution tier.
     resolution: {
       enum: ["480p", "720p", "1080p", "4k", "1K", "2K", "3K", "4K"],
-      description: {
-        en: "Output video resolution; Seedance token unit price varies by resolution tier.",
-        zh: "输出视频分辨率；Seedance token 单价随分辨率档位变化。",
+      enumLabels: {
+        "480p": { en: "480p", zh: "480p" },
+        "720p": { en: "720p", zh: "720p" },
+        "1080p": { en: "1080p", zh: "1080p" },
+        "4k": { en: "4k", zh: "4k" },
+        "1K": { en: "1K", zh: "1K" },
+        "2K": { en: "2K", zh: "2K" },
+        "3K": { en: "3K", zh: "3K" },
+        "4K": { en: "4K", zh: "4K" },
       },
+      description: { en: "Output video resolution", zh: "输出视频分辨率" },
     },
+    // Whether the request includes reference video input; Seedance prices video-to-video tokens at a lower unit rate.
     video_input: {
       enum: ["none", "video"],
-      description: {
-        en: "Whether the request includes reference video input; Seedance prices video-to-video tokens at a lower unit rate.",
-        zh: "请求是否包含参考视频输入；Seedance 对视频生视频 token 按更低单价计费。",
-      },
+      enumLabels: { none: { en: "No reference video", zh: "无参考视频" }, video: { en: "With reference video", zh: "有参考视频" } },
+      description: { en: "Reference video input", zh: "参考视频输入" },
     },
     image_count: {
       type: "number",
@@ -507,7 +512,7 @@ export function parseTaskResult(ctx, body) {
     const reason = body.error && body.error.message ? body.error.message : body.status;
     return { status: "FAILURE", progress: "100%", reason: reason };
   }
-  return { status: "IN_PROGRESS", progress: "30%" };
+  return { status: "UNKNOWN", reason: "unrecognized status: " + String(body.status || "") };
 }
 
 function artifactData(ctx) {

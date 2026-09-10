@@ -126,6 +126,24 @@ func TestDispatchDeferredTaskRebuildsCredentialsAndSubmits(t *testing.T) {
 	assert.Equal(t, 1, upstreamCalls)
 }
 
+func TestApplyDeferredTaskResultPersistsPluginState(t *testing.T) {
+	task := &model.Task{
+		PrivateData: model.TaskPrivateData{
+			DeferredRequest: &model.TaskDeferredRequest{RequestBody: json.RawMessage(`{}`)},
+			PluginState:     json.RawMessage(`{"round":"queued"}`),
+		},
+	}
+	result := &relay.TaskSubmitResult{
+		UpstreamTaskID: "upstream-task",
+		PluginState:    []byte(`{"round":"submitted"}`),
+	}
+
+	applyDeferredTaskResult(task, result)
+
+	assert.JSONEq(t, `{"round":"submitted"}`, string(task.PrivateData.PluginState))
+	assert.Nil(t, task.PrivateData.DeferredRequest)
+}
+
 func TestDeferredSubmissionPersistsBeforeCallingUpstream(t *testing.T) {
 	previousDB := model.DB
 	previousLogDB := model.LOG_DB

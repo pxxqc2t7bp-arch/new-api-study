@@ -103,7 +103,7 @@ func TestBuildThreeDRequestBody(t *testing.T) {
 }
 
 func TestParseThreeDTaskResult(t *testing.T) {
-	result, err := (&TaskAdaptor{}).ParseTaskResult([]byte(`{
+	result, err := (&TaskAdaptor{}).ParseTaskResult(nil, nil, []byte(`{
 		"id":"cgt-1",
 		"model":"hyper3d-gen2-260112",
 		"status":"succeeded",
@@ -189,7 +189,7 @@ func TestThreeDConcurrentFetch1500(t *testing.T) {
 			response, err := (&TaskAdaptor{}).FetchTask(
 				server.URL,
 				"test-key",
-				map[string]any{"task_id": "cgt-load"},
+				&model.Task{TaskID: "cgt-load"},
 				"",
 			)
 			if err != nil {
@@ -204,7 +204,7 @@ func TestThreeDConcurrentFetch1500(t *testing.T) {
 				results[index] = err.Error()
 				return
 			}
-			result, err := (&TaskAdaptor{}).ParseTaskResult(body)
+			result, err := (&TaskAdaptor{}).ParseTaskResult(nil, response, body)
 			if err != nil || result.TotalTokens != 30000 {
 				failures.Add(1)
 				if err != nil {

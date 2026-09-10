@@ -60,7 +60,7 @@ const (
 	ChannelTypeNewAPI         = 60
 	ChannelTypeTaskPlugin     = 61
 	ChannelTypeVolcEngine3D   = 62
-	ChannelTypeDummy          // this one is only for count, do not add any channel after this
+	ChannelTypeDummy          = 63 // this one is only for count, do not add any channel after this
 
 )
 

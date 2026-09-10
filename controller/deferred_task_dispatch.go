@@ -327,6 +327,9 @@ func deferredTieredSnapshot(task *model.Task) *billingexpr.BillingSnapshot {
 func applyDeferredTaskResult(task *model.Task, result *relay.TaskSubmitResult) {
 	task.PrivateData.UpstreamTaskID = result.UpstreamTaskID
 	task.PrivateData.DeferredRequest = nil
+	if len(result.PluginState) > 0 {
+		task.PrivateData.PluginState = result.PluginState
+	}
 	task.Data = result.TaskData
 	task.Status = model.TaskStatusSubmitted
 	task.Progress = taskcommon.ProgressSubmitted
