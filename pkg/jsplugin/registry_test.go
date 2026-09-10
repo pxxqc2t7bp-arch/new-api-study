@@ -22,6 +22,29 @@ func TestRegistryOverrideTakesPrecedenceOverFactory(t *testing.T) {
 	assert.Equal(t, "1.0.0-override", plugin.Meta.Version)
 }
 
+func TestRegistryOverrideLayerCanBeDisabledAndRestored(t *testing.T) {
+	registry := NewRegistry()
+	require.NoError(t, registerTestPlugin(registry, "1.0.0-factory", true))
+	require.NoError(t, registerTestPlugin(registry, "1.0.0-override", false))
+	override := registry.OverridePlugins()["test"]
+	require.NotNil(t, override)
+
+	registry.SetOverrideEnabled(false)
+
+	plugin, ok := registry.Get("test")
+	require.True(t, ok)
+	assert.Equal(t, "1.0.0-factory", plugin.Meta.Version)
+	assert.Same(t, override, registry.OverridePlugins()["test"])
+	assert.Empty(t, registry.ActiveOverridePlugins())
+
+	registry.SetOverrideEnabled(true)
+
+	plugin, ok = registry.Get("test")
+	require.True(t, ok)
+	assert.Same(t, override, plugin)
+	assert.Same(t, override, registry.ActiveOverridePlugins()["test"])
+}
+
 func TestRegistryUnregisterFallsBackToFactory(t *testing.T) {
 	registry := NewRegistry()
 	require.NoError(t, registerTestPlugin(registry, "1.0.0-factory", true))

@@ -361,7 +361,9 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 			task.PrivateData.ResultURL = responseItem.TaskInfo.Url
 		}
 
-		isDone := task.Status == model.TaskStatusSuccess || task.Status == model.TaskStatusFailure
+		isDone := task.Status == model.TaskStatusSuccess ||
+			task.Status == model.TaskStatusFailure ||
+			task.Status == model.TaskStatusCancelled
 		terminalTransition := isDone && snap.Status != task.Status
 		won, updateErr := task.UpdateWithStatus(snap.Status)
 		if updateErr != nil {
@@ -374,7 +376,8 @@ func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, chan
 		}
 		if terminalTransition {
 			billingSettled := settleTaskBillingOnComplete(ctx, adaptor, task, &responseItem.TaskInfo)
-			if task.Status == model.TaskStatusFailure && !billingSettled && task.Quota != 0 {
+			if (task.Status == model.TaskStatusFailure || task.Status == model.TaskStatusCancelled) &&
+				!billingSettled && task.Quota != 0 {
 				RefundTaskQuota(ctx, task, task.FailReason)
 			}
 		}
@@ -685,8 +688,8 @@ func truncateBase64(s string) string {
 // 表达式求值失败会保留预扣额度，因此也视为已接管，避免错误全退。
 func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) bool {
 	if bc := task.PrivateData.BillingContext; bc != nil && bc.TieredSnapshot != nil {
-		// 用量表达式结算只适用于成功任务；失败任务由调用方全额退款。
-		if task.Status == model.TaskStatusFailure {
+		// 用量表达式结算只适用于成功任务；失败或取消任务由调用方全额退款。
+		if task.Status == model.TaskStatusFailure || task.Status == model.TaskStatusCancelled {
 			return false
 		}
 		usageFacts := make(map[string]any, len(bc.TieredSnapshot.UsageFacts)+len(taskResult.UsageFacts))
@@ -705,7 +708,7 @@ func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor
 		RecalculateTaskQuota(ctx, task, result.ActualQuotaAfterGroup, "任务用量表达式结算", result.Clamp)
 		return true
 	}
-	// 按次计费的成功任务保持预扣；失败任务由调用方全额退款。
+	// 按次计费的成功任务保持预扣；失败或取消任务由调用方全额退款。
 	if bc := task.PrivateData.BillingContext; bc != nil && bc.PerCallBilling {
 		logger.LogInfo(ctx, fmt.Sprintf("任务 %s 按次计费，跳过差额结算", task.TaskID))
 		return false

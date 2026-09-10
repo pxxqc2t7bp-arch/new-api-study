@@ -264,6 +264,7 @@ func TestUpdateBatchTasksSettlesTieredUsageForTerminalStates(t *testing.T) {
 		{name: "failure with usage", status: model.TaskStatusFailure, units: 3, actualQuota: 0},
 		{name: "success with zero usage", status: model.TaskStatusSuccess, units: 0, actualQuota: 0},
 		{name: "failure with zero usage", status: model.TaskStatusFailure, units: 0, actualQuota: 0},
+		{name: "cancelled without reason", status: model.TaskStatusCancelled, units: 0, actualQuota: 0},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -418,6 +419,44 @@ func TestUpdateBatchTasksRefundsFailedTaskWithoutUsageSettlement(t *testing.T) {
 	log := getLastLog(t)
 	require.NotNil(t, log)
 	assert.Equal(t, model.LogTypeRefund, log.Type)
+}
+
+func TestUpdateBatchTasksRefundsCancelledTaskWithoutReasonExactlyOnce(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 44, 44, 144
+	const initialQuota, preConsumedQuota, tokenRemain = 10_000, 4_000, 7_000
+	seedUser(t, userID, initialQuota)
+	seedToken(t, tokenID, userID, "sk-batch-cancelled", tokenRemain)
+	seedTaskPollingChannel(t, channelID, true)
+
+	task := makeTask(userID, channelID, preConsumedQuota, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "task_batch_cancelled"
+	task.Platform = "batch-plugin"
+	task.PrivateData.UpstreamTaskID = "upstream_batch_cancelled"
+	require.NoError(t, model.DB.Create(task).Error)
+
+	upstreamID := task.GetUpstreamTaskID()
+	adaptor := &batchPollingAdaptor{results: map[string]*BatchTaskResult{
+		upstreamID: {TaskInfo: relaycommon.TaskInfo{TaskID: upstreamID, Status: model.TaskStatusCancelled}},
+	}}
+	taskChannels := map[int][]string{channelID: {upstreamID}}
+	tasks := map[string]*model.Task{upstreamID: task}
+
+	require.NoError(t, UpdateBatchTasks(context.Background(), adaptor, taskChannels, tasks))
+
+	var persisted model.Task
+	require.NoError(t, model.DB.First(&persisted, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusCancelled, persisted.Status)
+	assert.Zero(t, persisted.Quota)
+	assert.Equal(t, initialQuota+preConsumedQuota, getUserQuota(t, userID))
+	assert.Equal(t, tokenRemain+preConsumedQuota, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, int64(1), countLogs(t))
+
+	require.NoError(t, UpdateBatchTasks(context.Background(), adaptor, taskChannels, tasks))
+	assert.Equal(t, initialQuota+preConsumedQuota, getUserQuota(t, userID))
+	assert.Equal(t, tokenRemain+preConsumedQuota, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, int64(1), countLogs(t))
 }
 
 func TestUpdateVideoTasksCanSkipPollingSleepPerChannel(t *testing.T) {

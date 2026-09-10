@@ -407,6 +407,47 @@ export function parseTaskResult() { return {}; }
 	t.Fatal("task plugin option not found")
 }
 
+func TestListTaskPluginsShowsDisabledFallbackWhenOverridesAreDisabled(t *testing.T) {
+	setupTaskPluginControllerTest(t)
+	factorySource, err := plugins.Source("kling")
+	require.NoError(t, err)
+	overrideSource := strings.Replace(factorySource, `version: "1.0.0"`, `version: "1.0.0-test-disabled-override"`, 1)
+	loaded, err := jsplugin.DefaultRegistry.Register(overrideSource, jsplugin.Options{})
+	require.NoError(t, err)
+	plugin := model.TaskPlugin{
+		Key: "kling", APIVersion: loaded.Meta.APIVersion, Version: loaded.Meta.Version,
+		Source: overrideSource, SourceHash: "test-hash", Enabled: true,
+	}
+	require.NoError(t, model.SaveTaskPlugin(&plugin))
+	originalEnabled := constant.TaskPluginOverrideEnabled
+	constant.TaskPluginOverrideEnabled = false
+	jsplugin.DefaultRegistry.SetOverrideEnabled(false)
+	t.Cleanup(func() {
+		constant.TaskPluginOverrideEnabled = originalEnabled
+		jsplugin.DefaultRegistry.SetOverrideEnabled(originalEnabled)
+		require.NoError(t, jsplugin.DefaultRegistry.Unregister("kling"))
+	})
+
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodGet, "/api/plugin/task", nil)
+	ListTaskPlugins(context)
+
+	var response struct {
+		Success bool                 `json:"success"`
+		Data    []taskPluginListItem `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	require.True(t, response.Success)
+	for _, item := range response.Data {
+		if item.Meta.Key == "kling" {
+			assert.Equal(t, "disabled_fallback", item.RuntimeStatus)
+			return
+		}
+	}
+	t.Fatal("kling plugin not found")
+}
+
 func TestDeleteActiveOverrideFallsBackToFactoryAndDeletesRecord(t *testing.T) {
 	setupTaskPluginControllerTest(t)
 	factorySource, err := plugins.Source("kling")
