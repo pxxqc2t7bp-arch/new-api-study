@@ -2,6 +2,7 @@ package plugins_test
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,8 +15,10 @@ import (
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/router"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -37,6 +40,28 @@ func TestRC36Compatibility(t *testing.T) {
 
 		require.NoError(t, err)
 		assert.Equal(t, jsplugin.FixtureReport{Total: 6, Passed: 6}, report)
+	})
+
+	t.Run("current built-in sources load and replay through the fixture API", func(t *testing.T) {
+		fixture := []byte(`{
+			"cases": [{
+				"name": "non-success tasks expose no artifacts",
+				"hook": "listArtifacts",
+				"args": [{"status": "FAILURE", "data": {}}],
+				"expected": []
+			}]
+		}`)
+		for _, key := range []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "vertex-ai", "vidu"} {
+			t.Run(key, func(t *testing.T) {
+				source, err := builtinplugins.Source(key)
+				require.NoError(t, err)
+
+				report, err := jsplugin.ReplayFixture(t.Context(), source, fixture)
+
+				require.NoError(t, err)
+				assert.Equal(t, jsplugin.FixtureReport{Total: 1, Passed: 1}, report)
+			})
+		}
 	})
 
 	t.Run("Files Batch 3D and artifact routes remain registered", func(t *testing.T) {
@@ -298,6 +323,162 @@ func TestRC36Compatibility(t *testing.T) {
 		assert.Equal(t, "2.0.0", currentPlugin.Meta.Version)
 	})
 
+	t.Run("old and legacy in-flight tasks complete with the active newer plugin", func(t *testing.T) {
+		database := setupRC36CompatibilityDatabase(t)
+		require.NoError(t, database.AutoMigrate(&model.Log{}))
+		previousLogDB := model.LOG_DB
+		previousLogConsume := common.LogConsumeEnabled
+		model.LOG_DB = database
+		common.LogConsumeEnabled = false
+		t.Cleanup(func() {
+			model.LOG_DB = previousLogDB
+			common.LogConsumeEnabled = previousLogConsume
+		})
+
+		v1Source := strings.ReplaceAll(rc36PollingCompatibilityPluginSource, "compat-version", "1.0.0")
+		v1, err := jsplugin.DefaultRegistry.Register(v1Source, jsplugin.Options{})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(v1.Meta.Key)) })
+		oldGeneration := jsplugin.DefaultRegistry.Generation()
+		require.NotNil(t, oldGeneration)
+
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			assert.Equal(t, "2.0.0", request.Header.Get("X-Plugin-Version"))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"state":"complete","units":3}`)
+		}))
+		defer upstream.Close()
+
+		require.NoError(t, database.Create(&model.User{
+			Id:       937,
+			Username: "rc36-in-flight-owner",
+			Group:    "default",
+			Quota:    10_000,
+			Status:   common.UserStatusEnabled,
+		}).Error)
+		channel := model.Channel{
+			Type:      constant.ChannelTypeTaskPlugin,
+			Name:      "rc36 in-flight",
+			Key:       "current-credential",
+			BaseURL:   &upstream.URL,
+			Status:    common.ChannelStatusEnabled,
+			Models:    "rc36-poll-model",
+			Group:     "default",
+			UsedQuota: 10_000,
+		}
+		require.NoError(t, database.Create(&channel).Error)
+
+		newTask := func(taskID, upstreamTaskID string) model.Task {
+			expression := `tier("actual", u("units"))`
+			return model.Task{
+				TaskID:    taskID,
+				Platform:  constant.TaskPlatform(v1.Meta.Key),
+				UserId:    937,
+				Group:     "default",
+				ChannelId: channel.Id,
+				Quota:     5_000,
+				Status:    model.TaskStatusInProgress,
+				Progress:  "30%",
+				Properties: model.Properties{
+					OriginModelName:   "rc36-poll-model",
+					UpstreamModelName: "rc36-poll-model",
+				},
+				PrivateData: model.TaskPrivateData{
+					UpstreamTaskID: upstreamTaskID,
+					BillingContext: &model.TaskBillingContext{
+						OriginModelName: "rc36-poll-model",
+						GroupRatio:      1,
+						TieredSnapshot: &billingexpr.BillingSnapshot{
+							ExprString:       expression,
+							ExprHash:         billingexpr.ExprHashString(expression),
+							GroupRatio:       1,
+							QuotaPerUnit:     1_000,
+							ExprVersion:      1,
+							TaskUsageBilling: true,
+						},
+					},
+				},
+			}
+		}
+
+		snapshotted := newTask("task_rc36_snapshotted", "upstream-snapshotted")
+		snapshotted.PrivateData.Execution = &model.TaskExecutionSnapshot{
+			TaskPlugin: &model.TaskPluginSnapshot{
+				Key:        v1.Meta.Key,
+				Name:       v1.Meta.Name,
+				Version:    v1.Meta.Version,
+				APIVersion: v1.Meta.APIVersion,
+				Generation: oldGeneration.Number,
+			},
+		}
+		require.NoError(t, database.Create(&snapshotted).Error)
+
+		legacy := newTask("task_rc36_legacy", "upstream-legacy")
+		require.NoError(t, database.Create(&legacy).Error)
+		var legacyPrivateData string
+		require.NoError(t, database.Model(&model.Task{}).
+			Select("private_data").
+			Where("id = ?", legacy.ID).
+			Scan(&legacyPrivateData).Error)
+		assert.NotContains(t, legacyPrivateData, `"execution"`)
+		assert.NotContains(t, legacyPrivateData, `"plugin_state"`)
+		assert.NotContains(t, legacyPrivateData, `"poll_failures"`)
+
+		var persistedSnapshot model.Task
+		require.NoError(t, database.First(&persistedSnapshot, snapshotted.ID).Error)
+		require.NotNil(t, persistedSnapshot.PrivateData.Execution)
+		require.NotNil(t, persistedSnapshot.PrivateData.Execution.TaskPlugin)
+		assert.Equal(t, "1.0.0", persistedSnapshot.PrivateData.Execution.TaskPlugin.Version)
+		assert.Equal(t, oldGeneration.Number, persistedSnapshot.PrivateData.Execution.TaskPlugin.Generation)
+
+		v2Source := strings.ReplaceAll(rc36PollingCompatibilityPluginSource, "compat-version", "2.0.0")
+		v2, err := jsplugin.DefaultRegistry.Register(v2Source, jsplugin.Options{})
+		require.NoError(t, err)
+		currentGeneration := jsplugin.DefaultRegistry.Generation()
+		require.Greater(t, currentGeneration.Number, oldGeneration.Number)
+		currentPlugin, found := currentGeneration.Get(v2.Meta.Key)
+		require.True(t, found)
+		require.Same(t, v2, currentPlugin)
+		assert.Equal(t, "2.0.0", currentPlugin.Meta.Version)
+
+		previousAdaptorFactory := service.GetTaskAdaptorFunc
+		service.GetTaskAdaptorFunc = func(platform constant.TaskPlatform) service.TaskPollingAdaptor {
+			return relay.GetTaskAdaptor(platform)
+		}
+		t.Cleanup(func() { service.GetTaskAdaptorFunc = previousAdaptorFactory })
+
+		for _, task := range []*model.Task{&persistedSnapshot, &legacy} {
+			service.DispatchPlatformUpdate(
+				t.Context(),
+				task.Platform,
+				map[int][]string{channel.Id: {task.GetUpstreamTaskID()}},
+				map[string]*model.Task{task.GetUpstreamTaskID(): task},
+			)
+		}
+
+		var settledSnapshot model.Task
+		require.NoError(t, database.First(&settledSnapshot, snapshotted.ID).Error)
+		assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), settledSnapshot.Status)
+		assert.Equal(t, 3_000, settledSnapshot.Quota)
+		require.NotNil(t, settledSnapshot.PrivateData.Execution)
+		require.NotNil(t, settledSnapshot.PrivateData.Execution.TaskPlugin)
+		assert.Equal(t, "1.0.0", settledSnapshot.PrivateData.Execution.TaskPlugin.Version)
+		assert.Equal(t, oldGeneration.Number, settledSnapshot.PrivateData.Execution.TaskPlugin.Generation)
+
+		var settledLegacy model.Task
+		require.NoError(t, database.First(&settledLegacy, legacy.ID).Error)
+		assert.Equal(t, model.TaskStatus(model.TaskStatusSuccess), settledLegacy.Status)
+		assert.Equal(t, 3_000, settledLegacy.Quota)
+		assert.Nil(t, settledLegacy.PrivateData.Execution)
+
+		var settledUser model.User
+		require.NoError(t, database.First(&settledUser, 937).Error)
+		assert.Equal(t, 14_000, settledUser.Quota)
+		var settledChannel model.Channel
+		require.NoError(t, database.First(&settledChannel, channel.Id).Error)
+		assert.EqualValues(t, 6_000, settledChannel.UsedQuota)
+	})
+
 	t.Run("rc36 schema metadata and usage examples compile", func(t *testing.T) {
 		registry := jsplugin.NewRegistry()
 		_, err := registry.Register(rc36SortPriorityPluginSource, jsplugin.Options{})
@@ -402,6 +583,43 @@ export const protocols = {
     render: function(ctx, task) { return {id: task.task_id, status: task.status}; }
   }
 };
+`
+
+const rc36PollingCompatibilityPluginSource = `
+export const meta = {
+  apiVersion: 1,
+  key: "rc36-poll-compat",
+  name: "RC36 Poll Compatibility",
+  version: "compat-version",
+  author: {name: "Compatibility Test"},
+  models: ["rc36-poll-model"],
+  fetchMode: "per_task",
+  usageSchema: {
+    units: {type: "number", unit: "count", description: {en: "Completed units"}}
+  }
+};
+export function buildSubmitRequest(ctx) {
+  return {url: ctx.baseUrl + "/tasks", method: "POST", body: ctx.requestBody};
+}
+export function parseSubmitResponse(ctx, response) {
+  return {taskId: response.body.id};
+}
+export function buildQueryRequest(ctx) {
+  return {
+    url: ctx.baseUrl + "/tasks/" + ctx.taskId,
+    method: "GET",
+    headers: {"X-Plugin-Version": "compat-version"}
+  };
+}
+export function parseTaskResult(ctx, body) {
+  if ("compat-version" !== "2.0.0") {
+    return {status: "UNKNOWN", reason: "old parser must not handle this response"};
+  }
+  return {status: body.state === "complete" ? "SUCCESS" : "IN_PROGRESS"};
+}
+export function extractUsageOnComplete(ctx, result, body) {
+  return {units: body.units};
+}
 `
 
 const rc36SortPriorityPluginSource = `
