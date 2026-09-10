@@ -1,6 +1,7 @@
 package plugins_test
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
@@ -34,7 +36,7 @@ func TestRC36Compatibility(t *testing.T) {
 		report, err := jsplugin.ReplayFixture(t.Context(), source, fixture)
 
 		require.NoError(t, err)
-		assert.Equal(t, jsplugin.FixtureReport{Total: 5, Passed: 5}, report)
+		assert.Equal(t, jsplugin.FixtureReport{Total: 6, Passed: 6}, report)
 	})
 
 	t.Run("Files Batch 3D and artifact routes remain registered", func(t *testing.T) {
@@ -82,11 +84,12 @@ func TestRC36Compatibility(t *testing.T) {
 		require.NoError(t, err)
 		binding, found := registry.Generation().LookupDeclaredRoute(http.MethodPost, "/compat/native/tasks")
 		require.True(t, found)
+		route := binding.Route
 
 		decodedValue, err := plugin.Engine.CallMember(
-			t.Context(),
+			context.Background(),
 			"native",
-			binding.Route.Decode,
+			route.Decode,
 			jsplugin.RouteRequestContext{
 				Path:   "/compat/native/tasks",
 				Method: http.MethodPost,
@@ -106,11 +109,11 @@ func TestRC36Compatibility(t *testing.T) {
 		}, decoded["requestBody"])
 
 		renderedValue, err := plugin.Engine.CallMember(
-			t.Context(),
+			context.Background(),
 			"native",
-			binding.Route.Render,
+			route.Render,
 			map[string]any{},
-			map[string]any{"task_id": "task_rc36_native", "status": "SUCCESS"},
+			map[string]any{"task_id": "task_rc36_native", "status": model.TaskStatusSuccess},
 		)
 		require.NoError(t, err)
 		assert.Equal(t, map[string]any{"id": "task_rc36_native"}, jsonObject(t, renderedValue))
@@ -160,16 +163,30 @@ func TestRC36Compatibility(t *testing.T) {
 			},
 		}
 		task.SetData(map[string]any{"url": upstream.URL})
+		require.NoError(t, database.Create(&model.User{
+			Id:       task.UserId,
+			Username: "rc36-artifact-owner",
+			Password: "not-used-in-test",
+			Status:   common.UserStatusEnabled,
+		}).Error)
 		require.NoError(t, database.Create(&task).Error)
 
+		originalCryptoSecret := common.CryptoSecret
+		common.CryptoSecret = "rc36-artifact-access-secret"
+		t.Cleanup(func() { common.CryptoSecret = originalCryptoSecret })
+		access, err := service.IssueTaskArtifactAccess(task.TaskID, "video")
+		require.NoError(t, err)
+
 		engine := gin.New()
-		engine.Use(func(c *gin.Context) {
-			c.Set("id", task.UserId)
-			c.Next()
-		})
 		path := "/v1/tasks/:key/artifacts/:artifact_key/content"
-		engine.GET(path, controller.TaskArtifactContent)
-		engine.HEAD(path, controller.TaskArtifactContent)
+		handlerReached := make(map[string]bool, 2)
+		handler := func(c *gin.Context) {
+			handlerReached[c.Request.Method] = true
+			assert.True(t, middleware.IsTaskArtifactAccess(c))
+			controller.TaskArtifactContent(c)
+		}
+		engine.GET(path, middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), handler)
+		engine.HEAD(path, middleware.TokenOrTaskArtifactAccessAuth("key", "artifact_key"), handler)
 
 		for _, testCase := range []struct {
 			method string
@@ -181,13 +198,15 @@ func TestRC36Compatibility(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			request := httptest.NewRequest(
 				testCase.method,
-				"/v1/tasks/"+task.TaskID+"/artifacts/video/content",
+				"/v1/tasks/"+task.TaskID+"/artifacts/video/content?access="+access,
 				nil,
 			)
+			request.RemoteAddr = "192.0.2.1:1234"
 
 			engine.ServeHTTP(recorder, request)
 
 			assert.Equal(t, http.StatusOK, recorder.Code)
+			assert.True(t, handlerReached[testCase.method])
 			requestMethodsMu.Lock()
 			require.NotEmpty(t, requestMethods)
 			actualMethod := requestMethods[len(requestMethods)-1]
@@ -209,10 +228,13 @@ func TestRC36Compatibility(t *testing.T) {
 
 	t.Run("model aliases retain plugin ownership and protocol capabilities", func(t *testing.T) {
 		database := setupRC36CompatibilityDatabase(t)
-		source := strings.ReplaceAll(rc36RuntimePluginSource, "compat-version", "1.0.0")
-		plugin, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+		registry := jsplugin.NewRegistry()
+		v1Source := strings.ReplaceAll(rc36RuntimePluginSource, "compat-version", "1.0.0")
+		_, err := registry.RegisterFactory(v1Source, jsplugin.Options{})
 		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(plugin.Meta.Key)) })
+		generationN := registry.Generation()
+		_, _ = model.ResolveTaskModelAlias(generationN, "CUSTOMER-VIDEO")
+
 		mapping := `{"customer-video":"compat-video"}`
 		require.NoError(t, database.Create(&model.Channel{
 			Id:           93601,
@@ -222,8 +244,12 @@ func TestRC36Compatibility(t *testing.T) {
 			Models:       "customer-video,compat-video",
 			ModelMapping: &mapping,
 		}).Error)
-		model.InitChannelCache()
-		generation := jsplugin.DefaultRegistry.Generation()
+
+		v2Source := strings.ReplaceAll(rc36RuntimePluginSource, "compat-version", "2.0.0")
+		plugin, err := registry.Register(v2Source, jsplugin.Options{})
+		require.NoError(t, err)
+		generation := registry.Generation()
+		require.Equal(t, generationN.Number+1, generation.Number)
 
 		target, found := model.ResolveTaskModelAlias(generation, "CUSTOMER-VIDEO")
 		require.True(t, found)
@@ -274,6 +300,9 @@ func TestRC36Compatibility(t *testing.T) {
 
 	t.Run("rc36 schema metadata and usage examples compile", func(t *testing.T) {
 		registry := jsplugin.NewRegistry()
+		_, err := registry.Register(rc36SortPriorityPluginSource, jsplugin.Options{})
+		require.NoError(t, err)
+
 		plugin, err := registry.Register(rc36SchemaPluginSource, jsplugin.Options{})
 		require.NoError(t, err)
 
@@ -306,15 +335,18 @@ func setupRC36CompatibilityDatabase(t *testing.T) *gorm.DB {
 	t.Helper()
 	originalDB := model.DB
 	originalMemoryCache := common.MemoryCacheEnabled
+	originalRedisEnabled := common.RedisEnabled
 	common.MemoryCacheEnabled = false
+	common.RedisEnabled = false
 	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Task{}))
+	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Task{}, &model.User{}))
 	model.DB = database
 	t.Cleanup(func() {
 		model.DB = originalDB
 		model.InitChannelCache()
 		common.MemoryCacheEnabled = originalMemoryCache
+		common.RedisEnabled = originalRedisEnabled
 	})
 	return database
 }
@@ -370,6 +402,24 @@ export const protocols = {
     render: function(ctx, task) { return {id: task.task_id, status: task.status}; }
   }
 };
+`
+
+const rc36SortPriorityPluginSource = `
+export const meta = {
+  sortPriority: 25,
+  apiVersion: 1,
+  key: "rc36-sort-priority-compat",
+  name: "RC36 Sort Priority Compatibility",
+  version: "1.0.0",
+  author: {name: "Compatibility Test"},
+  channelTypes: [9363],
+  models: ["rc36-sort-priority"],
+  fetchMode: "per_task"
+};
+export function buildSubmitRequest(ctx) { return {url: ctx.baseUrl + "/tasks", method: "POST", body: ctx.requestBody}; }
+export function parseSubmitResponse(ctx, response) { return {taskId: response.body.id}; }
+export function buildQueryRequest(ctx) { return {url: ctx.baseUrl + "/tasks/" + ctx.taskId, method: "GET"}; }
+export function parseTaskResult(ctx, body) { return body; }
 `
 
 const rc36SchemaPluginSource = `

@@ -96,6 +96,30 @@
       ]
     },
     {
+      "name": "image artifact GET content request is credentialless",
+      "hook": "buildContentRequest",
+      "args": [
+        {
+          "artifactKey": "image_0",
+          "clientRequest": {"method": "GET"},
+          "data": {
+            "media_type": "image",
+            "response": {
+              "data": [
+                {"url": "https://upstream.example.test/one.png"},
+                {"url": "https://upstream.example.test/two.png"}
+              ]
+            }
+          }
+        }
+      ],
+      "expected": {
+        "url": "https://upstream.example.test/one.png",
+        "method": "GET",
+        "credentialless": true
+      }
+    },
+    {
       "name": "image artifact content request is credentialless",
       "hook": "buildContentRequest",
       "args": [
