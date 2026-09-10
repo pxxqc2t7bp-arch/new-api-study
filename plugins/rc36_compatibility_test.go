@@ -2,16 +2,21 @@ package plugins_test
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/router"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -70,6 +75,131 @@ func TestRC36Compatibility(t *testing.T) {
 		}
 	})
 
+	t.Run("native route decodes and renders a task", func(t *testing.T) {
+		registry := jsplugin.NewRegistry()
+		source := strings.ReplaceAll(rc36RuntimePluginSource, "compat-version", "1.0.0")
+		plugin, err := registry.RegisterFactory(source, jsplugin.Options{})
+		require.NoError(t, err)
+		binding, found := registry.Generation().LookupDeclaredRoute(http.MethodPost, "/compat/native/tasks")
+		require.True(t, found)
+
+		decodedValue, err := plugin.Engine.CallMember(
+			t.Context(),
+			"native",
+			binding.Route.Decode,
+			jsplugin.RouteRequestContext{
+				Path:   "/compat/native/tasks",
+				Method: http.MethodPost,
+				Body: map[string]any{"kind": "json", "value": map[string]any{
+					"model":  "compat-video",
+					"prompt": "render this",
+				}},
+			}.JSValue(),
+		)
+		require.NoError(t, err)
+		decoded := jsonObject(t, decodedValue)
+		assert.Equal(t, "submit", decoded["kind"])
+		assert.Equal(t, "compat-video", decoded["model"])
+		assert.Equal(t, map[string]any{
+			"model":  "compat-video",
+			"prompt": "render this",
+		}, decoded["requestBody"])
+
+		renderedValue, err := plugin.Engine.CallMember(
+			t.Context(),
+			"native",
+			binding.Route.Render,
+			map[string]any{},
+			map[string]any{"task_id": "task_rc36_native", "status": "SUCCESS"},
+		)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]any{"id": "task_rc36_native"}, jsonObject(t, renderedValue))
+	})
+
+	t.Run("artifact routes proxy GET and HEAD", func(t *testing.T) {
+		database := setupRC36CompatibilityDatabase(t)
+		source := strings.ReplaceAll(rc36RuntimePluginSource, "compat-version", "1.0.0")
+		plugin, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(plugin.Meta.Key)) })
+
+		var requestMethodsMu sync.Mutex
+		requestMethods := make([]string, 0, 2)
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			requestMethodsMu.Lock()
+			requestMethods = append(requestMethods, request.Method)
+			requestMethodsMu.Unlock()
+			w.Header().Set("Content-Type", "video/mp4")
+			w.Header().Set("Content-Length", "14")
+			if request.Method == http.MethodGet {
+				_, _ = w.Write([]byte("artifact-bytes"))
+			}
+		}))
+		defer upstream.Close()
+		allowPrivateArtifactProxy(t)
+
+		channel := model.Channel{
+			Type:    constant.ChannelTypeTaskPlugin,
+			Status:  common.ChannelStatusEnabled,
+			Name:    "rc36 artifact",
+			Key:     plugin.Meta.Key,
+			BaseURL: &upstream.URL,
+			Models:  "compat-video",
+		}
+		require.NoError(t, database.Create(&channel).Error)
+		task := model.Task{
+			TaskID:    "task_rc36_artifact",
+			Platform:  constant.TaskPlatform(plugin.Meta.Key),
+			UserId:    936,
+			ChannelId: channel.Id,
+			Status:    model.TaskStatusSuccess,
+			PrivateData: model.TaskPrivateData{
+				Execution: &model.TaskExecutionSnapshot{
+					TaskPlugin: &model.TaskPluginSnapshot{Key: plugin.Meta.Key},
+				},
+			},
+		}
+		task.SetData(map[string]any{"url": upstream.URL})
+		require.NoError(t, database.Create(&task).Error)
+
+		engine := gin.New()
+		engine.Use(func(c *gin.Context) {
+			c.Set("id", task.UserId)
+			c.Next()
+		})
+		path := "/v1/tasks/:key/artifacts/:artifact_key/content"
+		engine.GET(path, controller.TaskArtifactContent)
+		engine.HEAD(path, controller.TaskArtifactContent)
+
+		for _, testCase := range []struct {
+			method string
+			body   string
+		}{
+			{method: http.MethodGet, body: "artifact-bytes"},
+			{method: http.MethodHead},
+		} {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(
+				testCase.method,
+				"/v1/tasks/"+task.TaskID+"/artifacts/video/content",
+				nil,
+			)
+
+			engine.ServeHTTP(recorder, request)
+
+			assert.Equal(t, http.StatusOK, recorder.Code)
+			requestMethodsMu.Lock()
+			require.NotEmpty(t, requestMethods)
+			actualMethod := requestMethods[len(requestMethods)-1]
+			requestMethodsMu.Unlock()
+			assert.Equal(t, testCase.method, actualMethod)
+			assert.Equal(t, testCase.body, recorder.Body.String())
+			assert.Equal(t, "video/mp4", recorder.Header().Get("Content-Type"))
+			assert.Equal(t, "14", recorder.Header().Get("Content-Length"))
+			assert.Equal(t, "private, no-store", recorder.Header().Get("Cache-Control"))
+		}
+	})
+
 	t.Run("custom channel type assignments stay stable", func(t *testing.T) {
 		assert.Equal(t, 61, constant.ChannelTypeTaskPlugin)
 		assert.Equal(t, 62, constant.ChannelTypeVolcEngine3D)
@@ -78,19 +208,13 @@ func TestRC36Compatibility(t *testing.T) {
 	})
 
 	t.Run("model aliases retain plugin ownership and protocol capabilities", func(t *testing.T) {
-		originalDB := model.DB
-		t.Cleanup(func() { model.DB = originalDB })
-		database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-		require.NoError(t, err)
-		model.DB = database
-		require.NoError(t, model.DB.AutoMigrate(&model.Channel{}))
-
+		database := setupRC36CompatibilityDatabase(t)
 		source := strings.ReplaceAll(rc36RuntimePluginSource, "compat-version", "1.0.0")
-		registry := jsplugin.NewRegistry()
-		plugin, err := registry.RegisterFactory(source, jsplugin.Options{})
+		plugin, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
 		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(plugin.Meta.Key)) })
 		mapping := `{"customer-video":"compat-video"}`
-		require.NoError(t, model.DB.Create(&model.Channel{
+		require.NoError(t, database.Create(&model.Channel{
 			Id:           93601,
 			Type:         constant.ChannelTypeTaskPlugin,
 			Status:       common.ChannelStatusEnabled,
@@ -98,27 +222,29 @@ func TestRC36Compatibility(t *testing.T) {
 			Models:       "customer-video,compat-video",
 			ModelMapping: &mapping,
 		}).Error)
+		model.InitChannelCache()
+		generation := jsplugin.DefaultRegistry.Generation()
 
-		target, found := model.ResolveTaskModelAlias(registry.Generation(), "CUSTOMER-VIDEO")
+		target, found := model.ResolveTaskModelAlias(generation, "CUSTOMER-VIDEO")
 		require.True(t, found)
 		assert.Equal(t, "customer-video", target.Alias)
 		assert.Equal(t, "compat-video", target.Declared)
 		assert.Equal(t, plugin.Meta.Key, target.PluginKey)
 
-		responses, found := registry.Generation().LookupEndpoint(http.MethodPost, "/v1/responses", "compat-image")
+		responses, found := generation.LookupEndpoint(http.MethodPost, "/v1/responses", "compat-image")
 		require.True(t, found)
 		assert.Equal(t, plugin.Meta.Key, responses.Plugin.Meta.Key)
-		_, found = registry.Generation().LookupEndpoint(http.MethodPost, "/v1/responses", "compat-video")
+		_, found = generation.LookupEndpoint(http.MethodPost, "/v1/responses", "compat-video")
 		assert.False(t, found)
-		video, found := registry.Generation().LookupEndpoint(http.MethodPost, "/v1/videos", "compat-video")
+		video, found := generation.LookupEndpoint(http.MethodPost, "/v1/videos", "compat-video")
 		require.True(t, found)
 		assert.Equal(t, plugin.Meta.Key, video.Plugin.Meta.Key)
-		_, found = registry.Generation().LookupEndpoint(http.MethodPost, "/v1/videos", "compat-image")
+		_, found = generation.LookupEndpoint(http.MethodPost, "/v1/videos", "compat-image")
 		assert.False(t, found)
 		assert.True(t, plugin.Meta.ProtocolSupports("openai_responses", "sync"))
 		assert.False(t, plugin.Meta.ProtocolSupports("openai_responses", "stream"))
 
-		native, found := registry.Generation().LookupDeclaredRoute(http.MethodPost, "/compat/native/tasks")
+		native, found := generation.LookupDeclaredRoute(http.MethodPost, "/compat/native/tasks")
 		require.True(t, found)
 		assert.Equal(t, []string{"compat-video"}, native.Route.Models)
 	})
@@ -173,6 +299,36 @@ func TestRC36Compatibility(t *testing.T) {
 				"facts": map[string]any{"resolution": "720p"},
 			},
 		}, meta["usageExamples"])
+	})
+}
+
+func setupRC36CompatibilityDatabase(t *testing.T) *gorm.DB {
+	t.Helper()
+	originalDB := model.DB
+	originalMemoryCache := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.Task{}))
+	model.DB = database
+	t.Cleanup(func() {
+		model.DB = originalDB
+		model.InitChannelCache()
+		common.MemoryCacheEnabled = originalMemoryCache
+	})
+	return database
+}
+
+func allowPrivateArtifactProxy(t *testing.T) {
+	t.Helper()
+	originalFetchSetting := *system_setting.GetFetchSetting()
+	system_setting.GetFetchSetting().EnableSSRFProtection = true
+	system_setting.GetFetchSetting().AllowPrivateIp = true
+	system_setting.GetFetchSetting().AllowedPorts = []string{"1-65535"}
+	service.InitHttpClient()
+	t.Cleanup(func() {
+		*system_setting.GetFetchSetting() = originalFetchSetting
+		service.InitHttpClient()
 	})
 }
 
