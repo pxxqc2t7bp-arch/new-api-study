@@ -424,6 +424,9 @@ func TestRC36Compatibility(t *testing.T) {
 		assert.NotContains(t, legacyPrivateData, `"plugin_state"`)
 		assert.NotContains(t, legacyPrivateData, `"poll_failures"`)
 
+		var persistedLegacy model.Task
+		require.NoError(t, database.First(&persistedLegacy, legacy.ID).Error)
+
 		var persistedSnapshot model.Task
 		require.NoError(t, database.First(&persistedSnapshot, snapshotted.ID).Error)
 		require.NotNil(t, persistedSnapshot.PrivateData.Execution)
@@ -447,7 +450,7 @@ func TestRC36Compatibility(t *testing.T) {
 		}
 		t.Cleanup(func() { service.GetTaskAdaptorFunc = previousAdaptorFactory })
 
-		for _, task := range []*model.Task{&persistedSnapshot, &legacy} {
+		for _, task := range []*model.Task{&persistedSnapshot, &persistedLegacy} {
 			service.DispatchPlatformUpdate(
 				t.Context(),
 				task.Platform,
