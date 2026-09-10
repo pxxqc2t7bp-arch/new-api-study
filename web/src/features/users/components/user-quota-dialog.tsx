@@ -119,10 +119,10 @@ export function UserQuotaDialog(props: UserQuotaDialogProps) {
       bodyClassName='space-y-4'
       footer={
         <>
-          <Button variant='outline' onClick={handleCancel}>
+          <Button type='button' variant='outline' onClick={handleCancel}>
             {t('Cancel')}
           </Button>
-          <Button onClick={handleConfirm} disabled={loading}>
+          <Button type='button' onClick={handleConfirm} disabled={loading}>
             {loading ? t('Processing...') : t('Confirm')}
           </Button>
         </>
