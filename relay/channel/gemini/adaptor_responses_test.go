@@ -6,6 +6,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -43,7 +44,6 @@ func TestConvertOpenAIResponsesRequestToGeminiFunctionToolAndChoice(t *testing.T
 					},
 				},
 			},
-			{"type": "custom", "name": "freeform"},
 		}),
 		ToolChoice: mustGeminiRawMessage(t, map[string]any{
 			"type": "function",
@@ -103,8 +103,8 @@ func TestConvertOpenAIResponsesRequestToGeminiFunctionCallConversation(t *testin
 	assert.Equal(t, map[string]any{"ok": true}, got.Contents[1].Parts[0].FunctionResponse.Response)
 }
 
-func TestConvertOpenAIResponsesRequestToGeminiSkipsCustomToolCalls(t *testing.T) {
-	got := mustConvertResponsesToGemini(t, dto.OpenAIResponsesRequest{
+func TestConvertOpenAIResponsesRequestToGeminiRejectsCustomToolCallsByDefault(t *testing.T) {
+	req := dto.OpenAIResponsesRequest{
 		Model: "gemini-test",
 		Input: mustGeminiRawMessage(t, []map[string]any{
 			{
@@ -138,19 +138,24 @@ func TestConvertOpenAIResponsesRequestToGeminiSkipsCustomToolCalls(t *testing.T)
 			{"type": "custom", "name": "apply_patch"},
 			{"type": "unknown", "name": "unknown"},
 		}),
-	})
+	}
+	info := &relaycommon.RelayInfo{
+		OriginModelName: req.Model,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: req.Model,
+		},
+	}
 
-	assert.Empty(t, got.GetTools())
-	require.Len(t, got.Contents, 2)
-	assert.Equal(t, "model", got.Contents[0].Role)
-	require.Len(t, got.Contents[0].Parts, 1)
-	assert.Equal(t, "before custom", got.Contents[0].Parts[0].Text)
-	assert.Nil(t, got.Contents[0].Parts[0].FunctionCall)
+	_, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(nil, info, req)
 
-	assert.Equal(t, "user", got.Contents[1].Role)
-	require.Len(t, got.Contents[1].Parts, 1)
-	assert.Equal(t, "next turn", got.Contents[1].Parts[0].Text)
-	assert.Nil(t, got.Contents[1].Parts[0].FunctionResponse)
+	require.Error(t, err)
+	var loss *types.ConversionLossError
+	require.ErrorAs(t, err, &loss)
+	require.Len(t, loss.Diagnostics, 2)
+	for _, diagnostic := range loss.Diagnostics {
+		assert.Equal(t, "custom_tool_omitted", diagnostic.Code)
+	}
+	assert.Equal(t, loss.Diagnostics, info.ConversionDiagnostics())
 }
 
 func mustConvertResponsesToGemini(t *testing.T, req dto.OpenAIResponsesRequest) *dto.GeminiChatRequest {
