@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -513,6 +515,30 @@ func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) e
 	common.SetContextKey(c, constant.ContextKeyTokenGroup, token.Group)
 	common.SetContextKey(c, constant.ContextKeyTokenCrossGroupRetry, token.CrossGroupRetry)
 	common.SetContextKey(c, constant.ContextKeyTokenStreamRecovery, token.StreamRecoveryEnabled)
+	allowedRouting, err := token.GetAllowedRoutingStrategies()
+	if err != nil {
+		common.SysError(fmt.Sprintf("failed to parse routing strategies for token %d: %v", token.Id, err))
+		allowedRouting = []string{string(hosttypes.RoutingStrategyStable)}
+	}
+	defaultRouting, ok := hosttypes.ParseRoutingStrategy(token.DefaultRoutingStrategy)
+	if !ok || !slices.Contains(allowedRouting, string(defaultRouting)) {
+		defaultRouting = hosttypes.RoutingStrategyStable
+	}
+	defaultConversion := types.ConversionLossPolicy(strings.TrimSpace(token.DefaultConversionPolicy))
+	switch defaultConversion {
+	case types.ConversionLossPolicySafe, types.ConversionLossPolicyAllow:
+		if !token.AllowLossyConversion {
+			defaultConversion = types.ConversionLossPolicyStrict
+		}
+	case "", types.ConversionLossPolicyStrict:
+		defaultConversion = types.ConversionLossPolicyStrict
+	default:
+		defaultConversion = types.ConversionLossPolicyStrict
+	}
+	common.SetContextKey(c, constant.ContextKeyTokenDefaultRoutingStrategy, string(defaultRouting))
+	common.SetContextKey(c, constant.ContextKeyTokenAllowedRoutingStrategies, allowedRouting)
+	common.SetContextKey(c, constant.ContextKeyTokenDefaultConversionPolicy, string(defaultConversion))
+	common.SetContextKey(c, constant.ContextKeyTokenAllowLossyConversion, token.AllowLossyConversion)
 	if token.AutoGroups != "" {
 		autoGroups, err := token.GetAutoGroups()
 		if err != nil {

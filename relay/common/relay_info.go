@@ -126,6 +126,8 @@ type RelayInfo struct {
 	UserEmail           string
 	UserQuota           int
 	RelayFormat         types.RelayFormat
+	RoutingStrategy     hosttypes.RoutingStrategy
+	ConversionPolicy    types.ConversionLossPolicy
 	SendResponseCount   int
 	// ClaudeToChatStreamState / ChatToGeminiStreamState hold per-attempt
 	// stream converters. InitChannelMeta nils them so a retry cannot resume a
@@ -557,6 +559,19 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 	}
 	reasoningEffort := reasoningEffortFromRequest(request)
 	originModelName := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
+	routingStrategy := hosttypes.RoutingStrategyStable
+	if resolved, ok := common.GetContextKeyType[hosttypes.RoutingStrategy](c, constant.ContextKeyRoutingStrategy); ok {
+		if parsed, valid := hosttypes.ParseRoutingStrategy(string(resolved)); valid {
+			routingStrategy = parsed
+		}
+	}
+	conversionPolicy := types.ConversionLossPolicyStrict
+	if resolved, ok := common.GetContextKeyType[types.ConversionLossPolicy](c, constant.ContextKeyConversionPolicy); ok {
+		switch resolved {
+		case types.ConversionLossPolicyStrict, types.ConversionLossPolicySafe, types.ConversionLossPolicyAllow:
+			conversionPolicy = resolved
+		}
+	}
 	info := &RelayInfo{
 		Request:         request,
 		ReasoningEffort: reasoningEffort,
@@ -568,7 +583,9 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 		UserQuota:  common.GetContextKeyInt(c, constant.ContextKeyUserQuota),
 		UserEmail:  common.GetContextKeyString(c, constant.ContextKeyUserEmail),
 
-		OriginModelName: originModelName,
+		OriginModelName:  originModelName,
+		RoutingStrategy:  routingStrategy,
+		ConversionPolicy: conversionPolicy,
 
 		TokenId:        common.GetContextKeyInt(c, constant.ContextKeyTokenId),
 		TokenKey:       common.GetContextKeyString(c, constant.ContextKeyTokenKey),
@@ -892,8 +909,15 @@ func (info *RelayInfo) ConvOptions() *convmeta.Options {
 
 	claudeSettings := model_setting.GetClaudeSettings()
 	geminiSettings := model_setting.GetGeminiSettings()
+	conversionPolicy := types.ConversionLossPolicyStrict
+	if info != nil {
+		switch info.ConversionPolicy {
+		case types.ConversionLossPolicyStrict, types.ConversionLossPolicySafe, types.ConversionLossPolicyAllow:
+			conversionPolicy = info.ConversionPolicy
+		}
+	}
 	options := &convmeta.Options{
-		ToolLossPolicy: types.ConversionLossPolicyStrict,
+		ToolLossPolicy: conversionPolicy,
 		Claude: convmeta.ClaudeOptions{
 			ThinkingAdapterEnabled:                claudeSettings.ThinkingAdapterEnabled,
 			ThinkingAdapterBudgetTokensPercentage: claudeSettings.ThinkingAdapterBudgetTokensPercentage,

@@ -32,14 +32,33 @@ func (input *tokenAutoGroupsInput) UnmarshalJSON(data []byte) error {
 	return common.Unmarshal(data, &input.Groups)
 }
 
+type tokenRoutingStrategiesInput struct {
+	Set        bool
+	Strategies []string
+}
+
+func (input *tokenRoutingStrategiesInput) UnmarshalJSON(data []byte) error {
+	input.Set = true
+	if strings.TrimSpace(string(data)) == "null" {
+		input.Strategies = nil
+		return nil
+	}
+	return common.Unmarshal(data, &input.Strategies)
+}
+
 type tokenRequest struct {
 	model.Token
-	AutoGroups tokenAutoGroupsInput `json:"auto_groups"`
+	AutoGroups               tokenAutoGroupsInput        `json:"auto_groups"`
+	DefaultRoutingStrategy   *string                     `json:"default_routing_strategy"`
+	AllowedRoutingStrategies tokenRoutingStrategiesInput `json:"allowed_routing_strategies"`
+	DefaultConversionPolicy  *string                     `json:"default_conversion_policy"`
+	AllowLossyConversion     *bool                       `json:"allow_lossy_conversion"`
 }
 
 type tokenResponse struct {
 	*model.Token
-	AutoGroups []string `json:"auto_groups"`
+	AutoGroups               []string `json:"auto_groups"`
+	AllowedRoutingStrategies []string `json:"allowed_routing_strategies"`
 }
 
 func maxTokenQuota() int {
@@ -66,7 +85,16 @@ func buildMaskedTokenResponse(token *model.Token) *tokenResponse {
 	if len(autoGroups) == 0 {
 		autoGroups = nil
 	}
-	return &tokenResponse{Token: &maskedToken, AutoGroups: autoGroups}
+	allowedRouting, err := token.GetAllowedRoutingStrategies()
+	if err != nil {
+		common.SysError(fmt.Sprintf("failed to parse routing strategies for token %d: %v", token.Id, err))
+		allowedRouting = []string{"stable"}
+	}
+	return &tokenResponse{
+		Token:                    &maskedToken,
+		AutoGroups:               autoGroups,
+		AllowedRoutingStrategies: allowedRouting,
+	}
 }
 
 func buildMaskedTokenResponses(tokens []*model.Token) []*tokenResponse {
@@ -121,6 +149,36 @@ func setTokenAutoGroups(c *gin.Context, token *model.Token, groups []string) boo
 	}
 
 	if err := token.SetAutoGroups(groups); err != nil {
+		common.ApiError(c, err)
+		return false
+	}
+	return true
+}
+
+func applyTokenRequestPolicy(c *gin.Context, token *model.Token, request tokenRequest, initialize bool) bool {
+	hasPolicyUpdate := request.DefaultRoutingStrategy != nil ||
+		request.AllowedRoutingStrategies.Set ||
+		request.DefaultConversionPolicy != nil ||
+		request.AllowLossyConversion != nil
+	if !initialize && !hasPolicyUpdate {
+		return true
+	}
+	if request.DefaultRoutingStrategy != nil {
+		token.DefaultRoutingStrategy = *request.DefaultRoutingStrategy
+	}
+	if request.AllowedRoutingStrategies.Set {
+		if err := token.SetAllowedRoutingStrategies(request.AllowedRoutingStrategies.Strategies); err != nil {
+			common.ApiError(c, err)
+			return false
+		}
+	}
+	if request.DefaultConversionPolicy != nil {
+		token.DefaultConversionPolicy = *request.DefaultConversionPolicy
+	}
+	if request.AllowLossyConversion != nil {
+		token.AllowLossyConversion = *request.AllowLossyConversion
+	}
+	if err := token.NormalizeRequestPolicySettings(); err != nil {
 		common.ApiError(c, err)
 		return false
 	}
@@ -287,6 +345,9 @@ func AddToken(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgTokenNameTooLong)
 		return
 	}
+	if !applyTokenRequestPolicy(c, &token, request, true) {
+		return
+	}
 	params := tokenAuditParams(c)
 	params["name"] = token.Name
 	// 非无限额度时，检查额度值是否超出有效范围
@@ -330,21 +391,25 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	cleanToken := model.Token{
-		UserId:                c.GetInt("id"),
-		Name:                  token.Name,
-		Key:                   key,
-		CreatedTime:           common.GetTimestamp(),
-		AccessedTime:          common.GetTimestamp(),
-		ExpiredTime:           token.ExpiredTime,
-		RemainQuota:           token.RemainQuota,
-		UnlimitedQuota:        token.UnlimitedQuota,
-		ModelLimitsEnabled:    token.ModelLimitsEnabled,
-		ModelLimits:           token.ModelLimits,
-		AllowIps:              token.AllowIps,
-		StreamRecoveryEnabled: token.StreamRecoveryEnabled,
-		Group:                 token.Group,
-		CrossGroupRetry:       token.CrossGroupRetry,
-		AutoGroups:            token.AutoGroups,
+		UserId:                   c.GetInt("id"),
+		Name:                     token.Name,
+		Key:                      key,
+		CreatedTime:              common.GetTimestamp(),
+		AccessedTime:             common.GetTimestamp(),
+		ExpiredTime:              token.ExpiredTime,
+		RemainQuota:              token.RemainQuota,
+		UnlimitedQuota:           token.UnlimitedQuota,
+		ModelLimitsEnabled:       token.ModelLimitsEnabled,
+		ModelLimits:              token.ModelLimits,
+		AllowIps:                 token.AllowIps,
+		StreamRecoveryEnabled:    token.StreamRecoveryEnabled,
+		Group:                    token.Group,
+		CrossGroupRetry:          token.CrossGroupRetry,
+		AutoGroups:               token.AutoGroups,
+		DefaultRoutingStrategy:   token.DefaultRoutingStrategy,
+		AllowedRoutingStrategies: token.AllowedRoutingStrategies,
+		DefaultConversionPolicy:  token.DefaultConversionPolicy,
+		AllowLossyConversion:     token.AllowLossyConversion,
 	}
 	err = cleanToken.Insert()
 	if err != nil {
@@ -449,6 +514,9 @@ func UpdateToken(c *gin.Context) {
 				return
 			}
 		}
+		if !applyTokenRequestPolicy(c, cleanToken, request, false) {
+			return
+		}
 	}
 	err = cleanToken.Update()
 	if err != nil {
@@ -475,6 +543,10 @@ func UpdateToken(c *gin.Context) {
 			{"group", previous.Group != cleanToken.Group},
 			{"cross_group_retry", previous.CrossGroupRetry != cleanToken.CrossGroupRetry},
 			{"auto_groups", previous.AutoGroups != cleanToken.AutoGroups},
+			{"default_routing_strategy", previous.DefaultRoutingStrategy != cleanToken.DefaultRoutingStrategy},
+			{"allowed_routing_strategies", previous.AllowedRoutingStrategies != cleanToken.AllowedRoutingStrategies},
+			{"default_conversion_policy", previous.DefaultConversionPolicy != cleanToken.DefaultConversionPolicy},
+			{"allow_lossy_conversion", previous.AllowLossyConversion != cleanToken.AllowLossyConversion},
 		} {
 			if field.changed {
 				changedFields = append(changedFields, field.name)

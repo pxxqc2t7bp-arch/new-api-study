@@ -70,8 +70,8 @@ func SetRelayRouter(router *gin.Engine) {
 	relayV1Router.Use(middleware.RouteTag("relay"))
 	relayV1Router.Use(middleware.SystemPerformanceCheck())
 	relayV1Router.Use(middleware.TokenAuth())
-	relayV1Router.Use(middleware.ModelRequestRateLimit())
 	streamSessionRouter := relayV1Router.Group("/stream-sessions")
+	streamSessionRouter.Use(middleware.ModelRequestRateLimit())
 	{
 		streamSessionRouter.GET("/:stream_id", controller.GetStreamRecoverySession)
 		streamSessionRouter.DELETE("/:stream_id", controller.CancelStreamRecoverySession)
@@ -79,30 +79,34 @@ func SetRelayRouter(router *gin.Engine) {
 	{
 		// WebSocket 路由（统一到 Relay）
 		wsRouter := relayV1Router.Group("")
-		wsRouter.Use(middleware.Distribute())
+		wsRouter.Use(middleware.ModelRequestRateLimit(), middleware.Distribute())
 		wsRouter.GET("/realtime", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAIRealtime)
 		})
 	}
 	{
-		//http router
-		httpRouter := relayV1Router.Group("")
-		httpRouter.Use(middleware.Distribute())
+		ordinaryRouter := relayV1Router.Group("")
+		ordinaryRouter.Use(middleware.OrdinaryRequestPolicy())
+		ordinaryRouter.Use(middleware.ModelRequestRateLimit())
+		ordinaryRouter.Use(middleware.Distribute())
 
-		// claude related routes
-		// TODO: /messages/count_tokens is disabled. The current controller.CountClaudeTokens
-		// httpRouter.POST("/messages/count_tokens", controller.CountClaudeTokens)
-		httpRouter.POST("/messages", func(c *gin.Context) {
+		ordinaryRouter.POST("/messages", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatClaude)
 		})
-
-		// chat related routes
-		httpRouter.POST("/completions", func(c *gin.Context) {
+		ordinaryRouter.POST("/completions", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAI)
 		})
-		httpRouter.POST("/chat/completions", func(c *gin.Context) {
+		ordinaryRouter.POST("/chat/completions", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAI)
 		})
+		ordinaryRouter.POST("/models/*path", func(c *gin.Context) {
+			controller.Relay(c, types.RelayFormatGemini)
+		})
+	}
+	{
+		//http router
+		httpRouter := relayV1Router.Group("")
+		httpRouter.Use(middleware.ModelRequestRateLimit(), middleware.Distribute())
 
 		// response related routes
 		httpRouter.POST("/responses/compact", func(c *gin.Context) {
@@ -153,9 +157,6 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.POST("/engines/:model/embeddings", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatGemini)
 		})
-		httpRouter.POST("/models/*path", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatGemini)
-		})
 
 		// other relay routes
 		httpRouter.POST("/moderations", func(c *gin.Context) {
@@ -187,6 +188,7 @@ func SetRelayRouter(router *gin.Engine) {
 	relayGeminiRouter.Use(middleware.RouteTag("relay"))
 	relayGeminiRouter.Use(middleware.SystemPerformanceCheck())
 	relayGeminiRouter.Use(middleware.TokenAuth())
+	relayGeminiRouter.Use(middleware.OrdinaryRequestPolicy())
 	relayGeminiRouter.Use(middleware.ModelRequestRateLimit())
 	relayGeminiRouter.Use(middleware.Distribute())
 	{

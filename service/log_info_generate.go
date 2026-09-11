@@ -137,6 +137,8 @@ func AppendRelayLogAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo,
 	}
 	other.SetAdmin("use_channel", ctx.GetStringSlice("use_channel"))
 	if relayInfo != nil {
+		other.SetAdmin("routing_strategy", string(relayInfo.RoutingStrategy))
+		other.SetAdmin("conversion_policy", string(relayInfo.ConversionPolicy))
 		if billingModel := relayInfo.GetBillingModelName(); billingModel != "" && billingModel != relayInfo.OriginModelName {
 			other.SetAdmin("billing_model", billingModel)
 		}

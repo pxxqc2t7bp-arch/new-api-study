@@ -559,6 +559,158 @@ func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
 	}
 }
 
+func TestAddTokenNormalizesAndPersistsRequestPolicy(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	body := map[string]any{
+		"name":                       "request-policy-token",
+		"expired_time":               -1,
+		"unlimited_quota":            true,
+		"group":                      "default",
+		"default_routing_strategy":   " economy ",
+		"allowed_routing_strategies": []string{" economy ", "latency"},
+		"default_conversion_policy":  " safe ",
+		"allow_lossy_conversion":     true,
+	}
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+	AddToken(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	require.True(t, response.Success, response.Message)
+	var token model.Token
+	require.NoError(t, db.Where("name = ?", "request-policy-token").First(&token).Error)
+	assert.Equal(t, "economy", token.DefaultRoutingStrategy)
+	assert.JSONEq(t, `["economy","latency"]`, token.AllowedRoutingStrategies)
+	assert.Equal(t, "safe", token.DefaultConversionPolicy)
+	assert.True(t, token.AllowLossyConversion)
+}
+
+func TestAddTokenRejectsInvalidRequestPolicy(t *testing.T) {
+	tests := []struct {
+		name   string
+		fields map[string]any
+	}{
+		{
+			name: "unknown routing default",
+			fields: map[string]any{
+				"default_routing_strategy": "fastest",
+			},
+		},
+		{
+			name: "unknown allowed routing strategy",
+			fields: map[string]any{
+				"allowed_routing_strategies": []string{"stable", "fastest"},
+			},
+		},
+		{
+			name: "routing default is not allowed",
+			fields: map[string]any{
+				"default_routing_strategy":   "economy",
+				"allowed_routing_strategies": []string{"stable"},
+			},
+		},
+		{
+			name: "unknown conversion default",
+			fields: map[string]any{
+				"default_conversion_policy": "lossy",
+			},
+		},
+		{
+			name: "lossy conversion default is unauthorized",
+			fields: map[string]any{
+				"default_conversion_policy": "allow",
+				"allow_lossy_conversion":    false,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := setupTokenControllerTestDB(t)
+			body := map[string]any{
+				"name":            "invalid-policy-token",
+				"expired_time":    -1,
+				"unlimited_quota": true,
+				"group":           "default",
+			}
+			for key, value := range test.fields {
+				body[key] = value
+			}
+
+			ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+			AddToken(ctx)
+
+			response := decodeAPIResponse(t, recorder)
+			assert.False(t, response.Success)
+			var count int64
+			require.NoError(t, db.Model(&model.Token{}).Count(&count).Error)
+			assert.Zero(t, count)
+		})
+	}
+}
+
+func TestUpdateTokenValidatesPersistsAndPreservesRequestPolicy(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	token := seedToken(t, db, 1, "policy-update-token", "policy-update-key")
+	token.DefaultRoutingStrategy = "economy"
+	token.AllowedRoutingStrategies = `["economy","latency"]`
+	token.DefaultConversionPolicy = "safe"
+	token.AllowLossyConversion = true
+	require.NoError(t, db.Save(token).Error)
+
+	baseBody := map[string]any{
+		"id":                   token.Id,
+		"name":                 "policy-update-token",
+		"status":               common.TokenStatusEnabled,
+		"expired_time":         -1,
+		"remain_quota":         100,
+		"unlimited_quota":      true,
+		"group":                "default",
+		"cross_group_retry":    false,
+		"model_limits_enabled": false,
+	}
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", baseBody, 1)
+	UpdateToken(ctx)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+
+	var preserved model.Token
+	require.NoError(t, db.First(&preserved, token.Id).Error)
+	assert.Equal(t, "economy", preserved.DefaultRoutingStrategy)
+	assert.JSONEq(t, `["economy","latency"]`, preserved.AllowedRoutingStrategies)
+	assert.Equal(t, "safe", preserved.DefaultConversionPolicy)
+	assert.True(t, preserved.AllowLossyConversion)
+
+	updateBody := make(map[string]any, len(baseBody)+4)
+	for key, value := range baseBody {
+		updateBody[key] = value
+	}
+	updateBody["default_routing_strategy"] = "latency"
+	updateBody["allowed_routing_strategies"] = []string{"stable", "latency"}
+	updateBody["default_conversion_policy"] = "allow"
+	updateBody["allow_lossy_conversion"] = true
+	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/", updateBody, 1)
+	UpdateToken(ctx)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+
+	var updated model.Token
+	require.NoError(t, db.First(&updated, token.Id).Error)
+	assert.Equal(t, "latency", updated.DefaultRoutingStrategy)
+	assert.JSONEq(t, `["stable","latency"]`, updated.AllowedRoutingStrategies)
+	assert.Equal(t, "allow", updated.DefaultConversionPolicy)
+	assert.True(t, updated.AllowLossyConversion)
+
+	updateBody["default_conversion_policy"] = "safe"
+	updateBody["allow_lossy_conversion"] = false
+	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/", updateBody, 1)
+	UpdateToken(ctx)
+	assert.False(t, decodeAPIResponse(t, recorder).Success)
+
+	var rejected model.Token
+	require.NoError(t, db.First(&rejected, token.Id).Error)
+	assert.Equal(t, "allow", rejected.DefaultConversionPolicy)
+	assert.True(t, rejected.AllowLossyConversion)
+}
+
 func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	token := seedToken(t, db, 1, "owned-token", "owner1234token5678")

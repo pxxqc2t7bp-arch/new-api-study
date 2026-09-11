@@ -4,9 +4,34 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestAppendRelayLogAdminInfoIncludesResolvedRequestPolicy(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	other := model.NewLogOther()
+	info := &relaycommon.RelayInfo{
+		RoutingStrategy:  hosttypes.RoutingStrategyLatency,
+		ConversionPolicy: relaytypes.ConversionLossPolicySafe,
+		TokenKey:         "sk-secret",
+	}
+
+	AppendRelayLogAdminInfo(ctx, info, other)
+
+	adminInfo, ok := other.Snapshot()["admin_info"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "latency", adminInfo["routing_strategy"])
+	assert.Equal(t, "safe", adminInfo["conversion_policy"])
+	assert.NotContains(t, adminInfo, "token_key")
+	assert.NotContains(t, adminInfo, "service_tier")
+}
 
 func TestAppendChannelFailoverAdminInfoSingleAttempt(t *testing.T) {
 	gin.SetMode(gin.TestMode)

@@ -3,34 +3,41 @@ package model
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
 )
 
 type Token struct {
-	Id                    int            `json:"id"`
-	UserId                int            `json:"user_id" gorm:"index"`
-	Key                   string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
-	Status                int            `json:"status" gorm:"default:1"`
-	Name                  string         `json:"name" gorm:"index" `
-	CreatedTime           int64          `json:"created_time" gorm:"bigint"`
-	AccessedTime          int64          `json:"accessed_time" gorm:"bigint"`
-	ExpiredTime           int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
-	RemainQuota           int            `json:"remain_quota" gorm:"default:0"`
-	UnlimitedQuota        bool           `json:"unlimited_quota"`
-	ModelLimitsEnabled    bool           `json:"model_limits_enabled"`
-	ModelLimits           string         `json:"model_limits" gorm:"type:text"`
-	AllowIps              *string        `json:"allow_ips" gorm:"default:''"`
-	StreamRecoveryEnabled bool           `json:"stream_recovery_enabled"`
-	UsedQuota             int            `json:"used_quota" gorm:"default:0"` // used quota
-	Group                 string         `json:"group" gorm:"default:''"`
-	CrossGroupRetry       bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
-	AutoGroups            string         `json:"-" gorm:"type:text"`
-	DeletedAt             gorm.DeletedAt `gorm:"index"`
+	Id                       int            `json:"id"`
+	UserId                   int            `json:"user_id" gorm:"index"`
+	Key                      string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
+	Status                   int            `json:"status" gorm:"default:1"`
+	Name                     string         `json:"name" gorm:"index" `
+	CreatedTime              int64          `json:"created_time" gorm:"bigint"`
+	AccessedTime             int64          `json:"accessed_time" gorm:"bigint"`
+	ExpiredTime              int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
+	RemainQuota              int            `json:"remain_quota" gorm:"default:0"`
+	UnlimitedQuota           bool           `json:"unlimited_quota"`
+	ModelLimitsEnabled       bool           `json:"model_limits_enabled"`
+	ModelLimits              string         `json:"model_limits" gorm:"type:text"`
+	AllowIps                 *string        `json:"allow_ips" gorm:"default:''"`
+	StreamRecoveryEnabled    bool           `json:"stream_recovery_enabled"`
+	UsedQuota                int            `json:"used_quota" gorm:"default:0"` // used quota
+	Group                    string         `json:"group" gorm:"default:''"`
+	CrossGroupRetry          bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
+	AutoGroups               string         `json:"-" gorm:"type:text"`
+	DefaultRoutingStrategy   string         `json:"default_routing_strategy" gorm:"type:varchar(16)"`
+	AllowedRoutingStrategies string         `json:"-" gorm:"type:text"`
+	DefaultConversionPolicy  string         `json:"default_conversion_policy" gorm:"type:varchar(16)"`
+	AllowLossyConversion     bool           `json:"allow_lossy_conversion"`
+	DeletedAt                gorm.DeletedAt `gorm:"index"`
 }
 
 func (token *Token) GetAutoGroups() ([]string, error) {
@@ -55,6 +62,90 @@ func (token *Token) SetAutoGroups(groups []string) error {
 	}
 	token.AutoGroups = string(data)
 	return nil
+}
+
+func (token *Token) GetAllowedRoutingStrategies() ([]string, error) {
+	if token.AllowedRoutingStrategies == "" {
+		return []string{string(hosttypes.RoutingStrategyStable)}, nil
+	}
+	var values []string
+	if err := common.UnmarshalJsonStr(token.AllowedRoutingStrategies, &values); err != nil {
+		return nil, err
+	}
+	return normalizeRoutingStrategies(values)
+}
+
+func (token *Token) SetAllowedRoutingStrategies(values []string) error {
+	normalized, err := normalizeRoutingStrategies(values)
+	if err != nil {
+		return err
+	}
+	data, err := common.Marshal(normalized)
+	if err != nil {
+		return err
+	}
+	token.AllowedRoutingStrategies = string(data)
+	return nil
+}
+
+func (token *Token) NormalizeRequestPolicySettings() error {
+	defaultRouting := strings.TrimSpace(token.DefaultRoutingStrategy)
+	if defaultRouting == "" {
+		defaultRouting = string(hosttypes.RoutingStrategyStable)
+	}
+	routing, ok := hosttypes.ParseRoutingStrategy(defaultRouting)
+	if !ok {
+		return fmt.Errorf("unsupported default routing strategy %q", defaultRouting)
+	}
+
+	allowed, err := token.GetAllowedRoutingStrategies()
+	if err != nil {
+		return fmt.Errorf("invalid allowed routing strategies: %w", err)
+	}
+	if !slices.Contains(allowed, string(routing)) {
+		return fmt.Errorf("default routing strategy %q is not authorized", routing)
+	}
+
+	conversion := relaytypes.ConversionLossPolicy(strings.TrimSpace(token.DefaultConversionPolicy))
+	if conversion == "" {
+		conversion = relaytypes.ConversionLossPolicyStrict
+	}
+	switch conversion {
+	case relaytypes.ConversionLossPolicyStrict:
+	case relaytypes.ConversionLossPolicySafe, relaytypes.ConversionLossPolicyAllow:
+		if !token.AllowLossyConversion {
+			return fmt.Errorf("default conversion policy %q requires lossy conversion authorization", conversion)
+		}
+	default:
+		return fmt.Errorf("unsupported default conversion policy %q", conversion)
+	}
+
+	token.DefaultRoutingStrategy = string(routing)
+	if err := token.SetAllowedRoutingStrategies(allowed); err != nil {
+		return err
+	}
+	token.DefaultConversionPolicy = string(conversion)
+	return nil
+}
+
+func normalizeRoutingStrategies(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return []string{string(hosttypes.RoutingStrategyStable)}, nil
+	}
+	normalized := make([]string, 0, len(values))
+	seen := make(map[hosttypes.RoutingStrategy]struct{}, len(values))
+	for _, value := range values {
+		strategy, ok := hosttypes.ParseRoutingStrategy(value)
+		if !ok {
+			return nil, fmt.Errorf("unsupported routing strategy %q", strings.TrimSpace(value))
+		}
+		if _, exists := seen[strategy]; exists {
+			return nil, fmt.Errorf("duplicate routing strategy %q", strategy)
+		}
+		seen[strategy] = struct{}{}
+		normalized = append(normalized, string(strategy))
+	}
+	return normalized, nil
 }
 
 func (token *Token) Clean() {
@@ -315,7 +406,8 @@ func (token *Token) Update() (err error) {
 	}
 	return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
 		"model_limits_enabled", "model_limits", "allow_ips", "stream_recovery_enabled", "group",
-		"cross_group_retry", "auto_groups").Updates(token).Error
+		"cross_group_retry", "auto_groups", "default_routing_strategy", "allowed_routing_strategies",
+		"default_conversion_policy", "allow_lossy_conversion").Updates(token).Error
 }
 
 func (token *Token) SelectUpdate() (err error) {

@@ -28,6 +28,28 @@ func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 	assert.Equal(t, []string{"vip", "default"}, groups)
 }
 
+func TestTokenRequestPolicyRoundTripsThroughRedisHashCache(t *testing.T) {
+	useUserCacheMiniRedis(t)
+	token := Token{
+		Id:                       43,
+		UserId:                   7,
+		Key:                      "token-request-policy-cache-key",
+		Name:                     "request-policy-cache",
+		DefaultRoutingStrategy:   "economy",
+		AllowedRoutingStrategies: `["economy","latency"]`,
+		DefaultConversionPolicy:  "safe",
+		AllowLossyConversion:     true,
+	}
+
+	require.NoError(t, cacheSetTokenForTest(token))
+	cached, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, token.DefaultRoutingStrategy, cached.DefaultRoutingStrategy)
+	assert.Equal(t, token.AllowedRoutingStrategies, cached.AllowedRoutingStrategies)
+	assert.Equal(t, token.DefaultConversionPolicy, cached.DefaultConversionPolicy)
+	assert.Equal(t, token.AllowLossyConversion, cached.AllowLossyConversion)
+}
+
 func TestTokenUpdateSynchronouslyNarrowsPreheatedAutoGroupsCache(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)

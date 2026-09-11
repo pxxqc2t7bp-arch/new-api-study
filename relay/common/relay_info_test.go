@@ -6,10 +6,13 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	rootcommon "github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -100,6 +103,35 @@ func TestRelayInfoConvOptionsDoesNotAuthorizeChannelToolLossPolicy(t *testing.T)
 
 	assert.Equal(t, types.ConversionLossPolicyStrict, options.ToolLossPolicy)
 	assert.Equal(t, types.ConversionLossPolicyStrict, options.EffectiveToolLossPolicy())
+}
+
+func TestGenRelayInfoPropagatesResolvedRequestPolicyToConversionOptions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	rootcommon.SetContextKey(ctx, constant.ContextKeyRoutingStrategy, hosttypes.RoutingStrategyEconomy)
+	rootcommon.SetContextKey(ctx, constant.ContextKeyConversionPolicy, types.ConversionLossPolicyAllow)
+
+	info, err := GenRelayInfo(ctx, types.RelayFormatOpenAI, &dto.GeneralOpenAIRequest{Model: "gpt-test"}, nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, hosttypes.RoutingStrategyEconomy, info.RoutingStrategy)
+	assert.Equal(t, types.ConversionLossPolicyAllow, info.ConversionPolicy)
+	assert.Equal(t, types.ConversionLossPolicyAllow, info.ConvOptions().ToolLossPolicy)
+	assert.Equal(t, types.ConversionLossPolicyAllow, info.ConvOptions().EffectiveToolLossPolicy())
+}
+
+func TestGenRelayInfoDefaultsRequestPolicyWithoutMiddlewareContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+
+	info, err := GenRelayInfo(ctx, types.RelayFormatOpenAI, &dto.GeneralOpenAIRequest{Model: "gpt-test"}, nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, hosttypes.RoutingStrategyStable, info.RoutingStrategy)
+	assert.Equal(t, types.ConversionLossPolicyStrict, info.ConversionPolicy)
+	assert.Equal(t, types.ConversionLossPolicyStrict, info.ConvOptions().ToolLossPolicy)
 }
 
 func TestGenRelayInfoCapturesRequestReasoningEffort(t *testing.T) {
