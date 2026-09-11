@@ -409,7 +409,7 @@ func attachGeminiRequest(request any, set Set) (any, []types.ConversionDiagnosti
 			if set.Source == types.RelayFormatOpenAIResponses && (definition.NativeType == "custom" || definition.NativeType == "unknown") {
 				diagnostics = append(diagnostics, presentationLoss(
 					fmt.Sprintf("tools[%d]", index),
-					"custom_tool_omitted",
+					types.ConversionDiagnosticCodeCustomToolOmitted,
 					"Gemini cannot represent this OpenAI free-form or unknown tool; its preprocessed call history and definition were omitted",
 				))
 				continue
@@ -417,7 +417,7 @@ func attachGeminiRequest(request any, set Set) (any, []types.ConversionDiagnosti
 			if set.Source == types.RelayFormatOpenAIResponses && definition.Kind == KindNative {
 				diagnostics = append(diagnostics, semanticLoss(
 					fmt.Sprintf("tools[%d]", index),
-					"unsupported_opaque_tool",
+					types.ConversionDiagnosticCodeUnsupportedOpaqueTool,
 					fmt.Sprintf("Gemini cannot represent OpenAI opaque tool %q; the definition was omitted", definition.NativeType),
 				))
 				continue

@@ -11,6 +11,7 @@ import (
 	sharedclaude "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/shared/claude"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 func convertOpenAIResponsesRequestToClaudeMessages(c context.Context, info convmeta.Meta, request any) (any, error) {
@@ -28,7 +29,7 @@ func OpenAIResponsesRequestToClaudeMessages(c context.Context, info convmeta.Met
 	if req.Model == "" {
 		return nil, fmt.Errorf("model is required")
 	}
-	if err := ValidateRequestChatUnsupportedFields(req); err != nil {
+	if err := ValidateRequestChatUnsupportedFields(req, types.RelayFormatClaude); err != nil {
 		return nil, err
 	}
 

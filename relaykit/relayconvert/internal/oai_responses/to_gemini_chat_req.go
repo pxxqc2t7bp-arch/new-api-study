@@ -12,6 +12,7 @@ import (
 	sharedgemini "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/shared/gemini"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 func convertOpenAIResponsesRequestToGeminiChat(c context.Context, info convmeta.Meta, request any) (any, error) {
@@ -35,7 +36,7 @@ func OpenAIResponsesRequestToGeminiChat(c context.Context, req *dto.OpenAIRespon
 	if req.Model == "" {
 		return nil, fmt.Errorf("model is required")
 	}
-	if err := ValidateRequestChatUnsupportedFields(req); err != nil {
+	if err := ValidateRequestChatUnsupportedFields(req, types.RelayFormatGemini); err != nil {
 		return nil, err
 	}
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	oairesponses "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/oai_responses"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
@@ -54,7 +55,7 @@ func inspectOpenAIResponsesRequest(request *dto.OpenAIResponsesRequest, to types
 	if request == nil {
 		return nil
 	}
-	var diagnostics []types.ConversionDiagnostic
+	diagnostics := oairesponses.UnsupportedStatefulFieldDiagnostics(request, to)
 	if rawJSONPresent(request.Text) && to == types.RelayFormatClaude {
 		diagnostics = append(diagnostics, requestPresentationLoss(
 			"text.format",

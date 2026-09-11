@@ -21,6 +21,10 @@ const (
 	ConversionDiagnosticCodeVendorSpecificToolUnsupported  = "vendor_specific_tool_unsupported"
 	ConversionDiagnosticCodeEncryptedReasoningUnsupported  = "encrypted_reasoning_unsupported"
 	ConversionDiagnosticCodeSessionReferenceUnsupported    = "session_reference_unsupported"
+	ConversionDiagnosticCodeClaudeSamplingRemoved          = "claude_sampling_removed"
+	ConversionDiagnosticCodeClaudeSamplingConstrained      = "claude_sampling_constrained"
+	ConversionDiagnosticCodeCustomToolOmitted              = "custom_tool_omitted"
+	ConversionDiagnosticCodeUnsupportedOpaqueTool          = "unsupported_opaque_tool"
 )
 
 type ConversionDiagnostic struct {

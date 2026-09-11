@@ -126,12 +126,38 @@ func ordinaryConversionCapability(spec relayconvert.TextConverterSpec) OrdinaryC
 			Description: "Gemini generateContent does not expose an equivalent parallel-tool-call control",
 		})
 	}
+	if spec.From != types.RelayFormatClaude && spec.To == types.RelayFormatClaude {
+		losses = append(losses,
+			OrdinaryConversionLoss{
+				Code:        types.ConversionDiagnosticCodeClaudeSamplingRemoved,
+				Feature:     ConversionFeatureOptionalScalars,
+				Description: "Claude models with strict thinking controls remove temperature, top_p, and top_k",
+			},
+			OrdinaryConversionLoss{
+				Code:        types.ConversionDiagnosticCodeClaudeSamplingConstrained,
+				Feature:     ConversionFeatureOptionalScalars,
+				Description: "Claude manual thinking removes temperature and top_k and constrains top_p",
+			},
+		)
+	}
 
 	if spec.From != types.RelayFormatGemini && spec.To == types.RelayFormatGemini {
 		losses = append(losses, OrdinaryConversionLoss{
 			Code:        types.ConversionDiagnosticCodeUnsupportedFunctionStrict,
 			Feature:     ConversionFeatureFunctionTools,
 			Description: "Gemini generateContent does not expose function strictness",
+		})
+	}
+	if spec.From == types.RelayFormatOpenAIResponses && spec.To == types.RelayFormatGemini {
+		losses = append(losses, OrdinaryConversionLoss{
+			Code:        types.ConversionDiagnosticCodeCustomToolOmitted,
+			Feature:     ConversionFeatureFunctionTools,
+			Description: "Gemini generateContent omits OpenAI Responses custom and unknown tool definitions",
+		})
+		rejections = append(rejections, OrdinaryConversionLoss{
+			Code:        types.ConversionDiagnosticCodeUnsupportedOpaqueTool,
+			Feature:     ConversionFeatureFunctionTools,
+			Description: "Gemini generateContent cannot represent opaque OpenAI Responses tool definitions",
 		})
 	}
 	rejections = append(rejections, OrdinaryConversionLoss{
@@ -160,7 +186,7 @@ func ordinaryConversionCapability(spec relayconvert.TextConverterSpec) OrdinaryC
 			Description: "encrypted or signed provider reasoning state is not portable across protocols",
 		})
 	}
-	if spec.From == types.RelayFormatClaude || spec.From == types.RelayFormatGemini {
+	if spec.From == types.RelayFormatOpenAIResponses || spec.From == types.RelayFormatClaude || spec.From == types.RelayFormatGemini {
 		rejections = append(rejections, OrdinaryConversionLoss{
 			Code:        types.ConversionDiagnosticCodeSessionReferenceUnsupported,
 			Feature:     ConversionFeatureSessionState,

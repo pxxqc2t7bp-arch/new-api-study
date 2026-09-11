@@ -1,8 +1,12 @@
 package service
 
 import (
+	"context"
 	"testing"
 
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -67,37 +71,123 @@ func TestResolveOrdinaryConversionPolicyRequiresAuthorizationForLossyStrategies(
 	}
 }
 
-func TestOrdinaryConversionCapabilitiesUseEmittedDiagnosticCodes(t *testing.T) {
-	t.Parallel()
-
-	capabilities := OrdinaryConversionCapabilities()
-	emittedCodes := []string{
-		types.ConversionDiagnosticCodeStructuredOutputUnsupported,
-		types.ConversionDiagnosticCodeUnsupportedFunctionStrict,
-		types.ConversionDiagnosticCodeUnsupportedParallelToolControl,
-		types.ConversionDiagnosticCodeUnverifiedToolMapping,
-		types.ConversionDiagnosticCodeUnsupportedHostedTool,
-		types.ConversionDiagnosticCodeVendorSpecificToolUnsupported,
-		types.ConversionDiagnosticCodeEncryptedReasoningUnsupported,
-		types.ConversionDiagnosticCodeSessionReferenceUnsupported,
-	}
-	for _, capability := range capabilities {
-		for _, code := range conversionLossCodes(capability.Losses) {
-			assert.Contains(t, emittedCodes, code)
-		}
-		for _, code := range conversionLossCodes(capability.Rejections) {
-			assert.Contains(t, emittedCodes, code)
-		}
-	}
-
+func TestOrdinaryConversionCapabilitiesMatchRuntimeDiagnostics(t *testing.T) {
 	responsesToGemini, ok := LookupOrdinaryConversionCapability(types.RelayFormatOpenAIResponses, types.RelayFormatGemini)
 	require.True(t, ok)
-	assert.ElementsMatch(t, []string{types.ConversionDiagnosticCodeUnsupportedFunctionStrict}, conversionLossCodes(responsesToGemini.Losses))
+
+	result, err := relayconvert.ConvertRequest(context.Background(), conversionAllowInfo("gemini-test", "gpt-test"), types.RelayFormatGemini, &dto.OpenAIResponsesRequest{
+		Model: "gemini-test",
+		Input: []byte(`"hello"`),
+		Tools: []byte(`[
+			{"type":"custom","name":"apply_patch"},
+			{"type":"unknown","name":"unknown"},
+			{"type":"opaque_preview","name":"opaque"}
+		]`),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	for _, expected := range []struct {
+		code       string
+		rejections bool
+	}{
+		{code: types.ConversionDiagnosticCodeCustomToolOmitted},
+		{code: types.ConversionDiagnosticCodeUnsupportedOpaqueTool, rejections: true},
+	} {
+		assert.True(t, hasConversionDiagnosticCode(result.Diagnostics, expected.code), "runtime diagnostic %s", expected.code)
+		losses := responsesToGemini.Losses
+		if expected.rejections {
+			losses = responsesToGemini.Rejections
+		}
+		assert.Equal(t, ConversionFeatureFunctionTools, conversionLossByCode(t, losses, expected.code).Feature)
+	}
+
+	statefulRequest := &dto.OpenAIResponsesRequest{
+		Model:              "gpt-test",
+		Input:              []byte(`"hello"`),
+		Conversation:       []byte(`"conv_1"`),
+		PreviousResponseID: "resp_1",
+		Prompt:             []byte(`{"id":"pmpt_1"}`),
+		ContextManagement:  []byte(`{"type":"auto"}`),
+	}
+	wantPaths := []string{"conversation", "previous_response_id", "prompt", "context_management"}
+	for _, target := range []types.RelayFormat{
+		types.RelayFormatOpenAI,
+		types.RelayFormatClaude,
+		types.RelayFormatGemini,
+	} {
+		t.Run("responses state to "+string(target), func(t *testing.T) {
+			result, err := relayconvert.ConvertRequest(context.Background(), conversionAllowInfo(string(target), "gpt-test"), target, statefulRequest)
+			require.Error(t, err)
+			assert.Nil(t, result, "unsupported private state must fail before producing an upstream request")
+
+			var loss *types.ConversionLossError
+			require.ErrorAs(t, err, &loss)
+			require.Len(t, loss.Diagnostics, len(wantPaths))
+			for index, diagnostic := range loss.Diagnostics {
+				assert.Equal(t, types.ConversionDiagnosticCodeSessionReferenceUnsupported, diagnostic.Code)
+				assert.Equal(t, wantPaths[index], diagnostic.Path)
+				assert.Equal(t, types.RelayFormat(types.RelayFormatOpenAIResponses), diagnostic.From)
+				assert.Equal(t, target, diagnostic.To)
+			}
+
+			capability, ok := LookupOrdinaryConversionCapability(types.RelayFormatOpenAIResponses, target)
+			require.True(t, ok)
+			assert.Equal(t, ConversionFeatureSessionState, conversionLossByCode(
+				t,
+				capability.Rejections,
+				types.ConversionDiagnosticCodeSessionReferenceUnsupported,
+			).Feature)
+		})
+	}
+
+	for _, sampling := range []struct {
+		name  string
+		model string
+		code  string
+	}{
+		{
+			name:  "removed",
+			model: "claude-opus-4-8",
+			code:  types.ConversionDiagnosticCodeClaudeSamplingRemoved,
+		},
+		{
+			name:  "constrained",
+			model: "claude-sonnet-4-6",
+			code:  types.ConversionDiagnosticCodeClaudeSamplingConstrained,
+		},
+	} {
+		t.Run("Claude sampling "+sampling.name, func(t *testing.T) {
+			for _, from := range []types.RelayFormat{
+				types.RelayFormatOpenAI,
+				types.RelayFormatOpenAIResponses,
+				types.RelayFormatGemini,
+			} {
+				t.Run(string(from), func(t *testing.T) {
+					request, info := samplingConversionRequest(from, sampling.model, sampling.name == "constrained")
+					result, err := relayconvert.ConvertRequest(context.Background(), info, types.RelayFormatClaude, request)
+					require.NoError(t, err)
+					require.NotNil(t, result)
+					assert.True(t, hasConversionDiagnosticCode(result.Diagnostics, sampling.code), "runtime diagnostic %s; got %+v", sampling.code, result.Diagnostics)
+
+					capability, ok := LookupOrdinaryConversionCapability(from, types.RelayFormatClaude)
+					require.True(t, ok)
+					assert.Equal(t, ConversionFeatureOptionalScalars, conversionLossByCode(t, capability.Losses, sampling.code).Feature)
+				})
+			}
+		})
+	}
+
+	assert.ElementsMatch(t, []string{
+		types.ConversionDiagnosticCodeUnsupportedFunctionStrict,
+		types.ConversionDiagnosticCodeCustomToolOmitted,
+	}, conversionLossCodes(responsesToGemini.Losses))
 	assert.ElementsMatch(t, []string{
 		types.ConversionDiagnosticCodeEncryptedReasoningUnsupported,
 		types.ConversionDiagnosticCodeUnsupportedHostedTool,
 		types.ConversionDiagnosticCodeUnverifiedToolMapping,
 		types.ConversionDiagnosticCodeUnsupportedParallelToolControl,
+		types.ConversionDiagnosticCodeUnsupportedOpaqueTool,
+		types.ConversionDiagnosticCodeSessionReferenceUnsupported,
 	}, conversionLossCodes(responsesToGemini.Rejections))
 
 	geminiToChat, ok := LookupOrdinaryConversionCapability(types.RelayFormatGemini, types.RelayFormatOpenAI)
@@ -150,4 +240,74 @@ func conversionLossByCode(t *testing.T, losses []OrdinaryConversionLoss, code st
 	}
 	require.FailNow(t, "missing conversion loss", "code=%s", code)
 	return OrdinaryConversionLoss{}
+}
+
+func hasConversionDiagnosticCode(diagnostics []types.ConversionDiagnostic, code string) bool {
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func conversionAllowInfo(upstreamModel string, originModel string) *convmeta.Values {
+	return &convmeta.Values{
+		OriginModelName:     originModel,
+		UpstreamModelName:   upstreamModel,
+		ChannelMetaAttached: true,
+		Options: &convmeta.Options{
+			ToolLossPolicy: types.ConversionLossPolicyAllow,
+			Claude: convmeta.ClaudeOptions{
+				DefaultMaxTokens: func(string) int { return 4096 },
+			},
+		},
+	}
+}
+
+func samplingConversionRequest(from types.RelayFormat, model string, constrained bool) (any, *convmeta.Values) {
+	temperature := 0.7
+	maxTokens := uint(4096)
+	info := conversionAllowInfo(model, model)
+
+	switch from {
+	case types.RelayFormatOpenAI:
+		request := &dto.GeneralOpenAIRequest{
+			Model:       model,
+			Messages:    []dto.Message{{Role: "user", Content: "hello"}},
+			MaxTokens:   &maxTokens,
+			Temperature: &temperature,
+		}
+		if constrained {
+			request.ReasoningEffort = "high"
+		}
+		return request, info
+	case types.RelayFormatOpenAIResponses:
+		request := &dto.OpenAIResponsesRequest{
+			Model:           model,
+			Input:           []byte(`"hello"`),
+			MaxOutputTokens: &maxTokens,
+			Temperature:     &temperature,
+		}
+		if constrained {
+			request.Reasoning = &dto.Reasoning{Effort: "high"}
+		}
+		return request, info
+	case types.RelayFormatGemini:
+		info.OriginModelName = "gemini-2.5-pro"
+		request := &dto.GeminiChatRequest{
+			Contents: []dto.GeminiChatContent{{Role: "user", Parts: []dto.GeminiPart{{Text: "hello"}}}},
+			GenerationConfig: dto.GeminiChatGenerationConfig{
+				MaxOutputTokens: &maxTokens,
+				Temperature:     &temperature,
+			},
+		}
+		if constrained {
+			budget := 2048
+			request.GenerationConfig.ThinkingConfig = &dto.GeminiThinkingConfig{ThinkingBudget: &budget}
+		}
+		return request, info
+	default:
+		panic("unsupported sampling conversion source")
+	}
 }

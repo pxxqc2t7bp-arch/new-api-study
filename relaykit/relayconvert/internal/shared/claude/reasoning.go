@@ -134,7 +134,7 @@ func ApplyReasoning(ctx context.Context, req *dto.ClaudeRequest, info convmeta.M
 	if rendered.ClearSampling {
 		if req.Temperature != nil || req.TopP != nil || req.TopK != nil {
 			convdiag.Add(ctx, types.ConversionDiagnostic{
-				Code:     "claude_sampling_removed",
+				Code:     types.ConversionDiagnosticCodeClaudeSamplingRemoved,
 				Path:     "temperature/top_p/top_k",
 				Message:  fmt.Sprintf("model %q does not accept sampling controls with the selected thinking mode", capabilityModel),
 				Severity: types.ConversionDiagnosticWarning,
@@ -153,7 +153,7 @@ func ApplyReasoning(ctx context.Context, req *dto.ClaudeRequest, info convmeta.M
 		}
 		if removedSampling {
 			convdiag.Add(ctx, types.ConversionDiagnostic{
-				Code:     "claude_sampling_constrained",
+				Code:     types.ConversionDiagnosticCodeClaudeSamplingConstrained,
 				Path:     "temperature/top_p/top_k",
 				Message:  fmt.Sprintf("model %q accepts only top_p between 0.95 and 1 with manual thinking", capabilityModel),
 				Severity: types.ConversionDiagnosticWarning,
