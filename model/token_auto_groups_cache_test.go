@@ -661,6 +661,80 @@ func TestRedisResetDuringTokenMutationDoesNotRecacheOldToken(t *testing.T) {
 	assertRedisResetDuringTokenMutationDoesNotRecacheOldToken(t, "token-reset-during-mutation")
 }
 
+func assertColdTokenRecoveryDoesNotBlockIndependentTokenMutation(
+	t *testing.T,
+	coldKey string,
+	activeKey string,
+) {
+	t.Helper()
+	cold := Token{
+		UserId:          7,
+		Key:             coldKey,
+		Name:            "cold-recovery",
+		Status:          common.TokenStatusDisabled,
+		ExpiredTime:     -1,
+		RemainQuota:     100,
+		UnlimitedQuota:  true,
+		CacheGeneration: 4,
+	}
+	require.NoError(t, cold.Insert())
+	active := Token{
+		UserId:         7,
+		Key:            activeKey,
+		Name:           "independent-mutation",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	for tokenCacheMutationLock(cold.Key) == tokenCacheMutationLock(active.Key) {
+		active.Key += "x"
+	}
+	require.NoError(t, active.Insert())
+	require.NoError(t, cacheSetTokenForTest(active))
+
+	recoveryLockedRow := make(chan struct{})
+	releaseRecovery := make(chan struct{})
+	var tokenQueries atomic.Int64
+	const callbackName = "test:block_cold_token_recovery"
+	require.NoError(t, DB.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "tokens" &&
+			tokenQueries.Add(1) == 2 {
+			close(recoveryLockedRow)
+			<-releaseRecovery
+		}
+	}))
+	t.Cleanup(func() {
+		_ = DB.Callback().Query().Remove(callbackName)
+	})
+
+	recoveryResult := make(chan error, 1)
+	go func() {
+		_, err := GetTokenByKey(cold.Key, false)
+		recoveryResult <- err
+	}()
+	<-recoveryLockedRow
+
+	active.Status = common.TokenStatusDisabled
+	mutationResult := make(chan error, 1)
+	go func() {
+		mutationResult <- active.SelectUpdate()
+	}()
+
+	var mutationErr error
+	select {
+	case mutationErr = <-mutationResult:
+	case <-time.After(100 * time.Millisecond):
+		close(releaseRecovery)
+		<-recoveryResult
+		<-mutationResult
+		t.Fatal("cold recovery blocked an unrelated token mutation")
+	}
+	close(releaseRecovery)
+	require.NoError(t, mutationErr)
+	require.NoError(t, <-recoveryResult)
+}
+
 func TestSecondTokenWriterDoesNotSkipFirstFinalization(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)
@@ -1319,6 +1393,54 @@ func TestBatchDeleteTokensFinalizesEveryCommittedMutation(t *testing.T) {
 	assert.Zero(t, remaining)
 }
 
+func TestBatchDeleteOnlyDeletesRowsLockedBeforeFencing(t *testing.T) {
+	truncateTables(t)
+	previousRedisEnabled := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = previousRedisEnabled })
+
+	locked := Token{
+		UserId:         7,
+		Key:            "token-batch-locked",
+		Name:           "batch-locked",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, locked.Insert())
+	inserted := Token{
+		Id:             locked.Id + 1000,
+		UserId:         locked.UserId,
+		Key:            "token-batch-inserted-after-lock",
+		Name:           "batch-inserted-after-lock",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+
+	var intercepted atomic.Bool
+	const callbackName = "test:insert_token_before_batch_delete"
+	require.NoError(t, DB.Callback().Delete().Before("gorm:delete").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "tokens" && intercepted.CompareAndSwap(false, true) {
+			insertTx := tx.Session(&gorm.Session{NewDB: true})
+			tx.AddError(insertTx.Create(&inserted).Error)
+		}
+	}))
+	t.Cleanup(func() {
+		_ = DB.Callback().Delete().Remove(callbackName)
+	})
+
+	count, err := BatchDeleteTokens([]int{inserted.Id, locked.Id}, locked.UserId)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+	var stored Token
+	require.NoError(t, DB.First(&stored, inserted.Id).Error)
+	assert.Equal(t, inserted.Key, stored.Key)
+	assert.ErrorIs(t, DB.First(&Token{}, locked.Id).Error, gorm.ErrRecordNotFound)
+}
+
 func TestBatchDeleteCommitErrorRemainsFailClosed(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -1451,6 +1573,8 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 					keyPrefix + "-redis-reset",
 					keyPrefix + "-reset-during-mutation",
 					keyPrefix + "-distinct-mutation",
+					keyPrefix + "-cold-recovery",
+					keyPrefix + "-independent-mutation",
 				}
 				for _, key := range keys {
 					_ = common.RDB.Del(
@@ -1676,6 +1800,17 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 				assertTokenCommitAcknowledgementLossDoesNotClaimAnotherMutation(
 					t,
 					keyPrefix+"-distinct-mutation",
+				)
+			})
+
+			t.Run("cold recovery does not block an independent mutation", func(t *testing.T) {
+				if test.dbType == common.DatabaseTypeSQLite {
+					t.Skip("SQLite serializes the independent write at the database level")
+				}
+				assertColdTokenRecoveryDoesNotBlockIndependentTokenMutation(
+					t,
+					keyPrefix+"-cold-recovery",
+					keyPrefix+"-independent-mutation",
 				)
 			})
 		})

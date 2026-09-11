@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"slices"
 	"strings"
 	"sync"
@@ -380,14 +381,29 @@ func getTokenByKeyFromDB(key string) (*Token, error) {
 	return token, nil
 }
 
-// Mutations share the read side so Redis still rejects concurrent writers.
-// Cold cache recovery takes the exclusive side to prevent it from publishing
-// a database snapshot while a local mutation is between its fence and commit.
-var tokenCacheMutationMu sync.RWMutex
+// Single-token operations share the gate and coordinate on a bounded lock
+// shard. Mutations use the shard's read side so Redis still rejects concurrent
+// writers, while cold recovery takes the exclusive side. Batch deletion takes
+// the gate exclusively before it discovers and locks all affected token rows.
+const tokenCacheMutationShardCount = 64
+
+var (
+	tokenCacheMutationGate   sync.RWMutex
+	tokenCacheMutationSeed   = maphash.MakeSeed()
+	tokenCacheMutationShards [tokenCacheMutationShardCount]sync.RWMutex
+)
+
+func tokenCacheMutationLock(key string) *sync.RWMutex {
+	index := maphash.String(tokenCacheMutationSeed, key) % uint64(len(tokenCacheMutationShards))
+	return &tokenCacheMutationShards[index]
+}
 
 func recoverTokenCacheFromDatabase(key string) (*Token, error) {
-	tokenCacheMutationMu.Lock()
-	defer tokenCacheMutationMu.Unlock()
+	tokenCacheMutationGate.RLock()
+	defer tokenCacheMutationGate.RUnlock()
+	cacheLock := tokenCacheMutationLock(key)
+	cacheLock.Lock()
+	defer cacheLock.Unlock()
 
 	tx := DB.Begin()
 	if tx.Error != nil {
@@ -584,8 +600,11 @@ func reconcileTokenMutationCommitError(token *Token, expected *Token, deleteCach
 }
 
 func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(*gorm.DB, int64) error) error {
-	tokenCacheMutationMu.RLock()
-	defer tokenCacheMutationMu.RUnlock()
+	tokenCacheMutationGate.RLock()
+	defer tokenCacheMutationGate.RUnlock()
+	cacheLock := tokenCacheMutationLock(token.Key)
+	cacheLock.RLock()
+	defer cacheLock.RUnlock()
 
 	tx := DB.Begin()
 	if tx.Error != nil {
@@ -882,8 +901,8 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 		return 0, errors.New("ids 不能为空！")
 	}
 
-	tokenCacheMutationMu.RLock()
-	defer tokenCacheMutationMu.RUnlock()
+	tokenCacheMutationGate.Lock()
+	defer tokenCacheMutationGate.Unlock()
 
 	tx := DB.Begin()
 	if tx.Error != nil {
@@ -894,6 +913,7 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 	slices.Sort(sortedIDs)
 	sortedIDs = slices.Compact(sortedIDs)
 	tokens := make([]Token, 0, len(sortedIDs))
+	lockedIDs := make([]int, 0, len(sortedIDs))
 	for _, id := range sortedIDs {
 		var token Token
 		err := lockForUpdate(tx).
@@ -909,6 +929,7 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 			return 0, err
 		}
 		tokens = append(tokens, token)
+		lockedIDs = append(lockedIDs, token.Id)
 	}
 	cacheMutations := make([]tokenCacheMutation, 0, len(tokens))
 	for _, token := range tokens {
@@ -927,16 +948,18 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 		cacheMutations = append(cacheMutations, tokenCacheMutation{id: token.Id, key: token.Key, generation: generation})
 	}
 
-	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Delete(&Token{}).Error; err != nil {
-		if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
-			return 0, errors.Join(err, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
-		}
-		for _, mutation := range cacheMutations {
-			if rollbackErr := rollbackTokenCacheMutation(mutation.key, mutation.generation); rollbackErr != nil {
-				common.SysError("failed to roll back token cache fence: " + rollbackErr.Error())
+	if len(lockedIDs) > 0 {
+		if err := tx.Where("user_id = ? AND id IN (?)", userId, lockedIDs).Delete(&Token{}).Error; err != nil {
+			if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+				return 0, errors.Join(err, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
 			}
+			for _, mutation := range cacheMutations {
+				if rollbackErr := rollbackTokenCacheMutation(mutation.key, mutation.generation); rollbackErr != nil {
+					common.SysError("failed to roll back token cache fence: " + rollbackErr.Error())
+				}
+			}
+			return 0, err
 		}
-		return 0, err
 	}
 
 	if err := commitTokenMutationTransaction(tx); err != nil {
