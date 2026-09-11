@@ -547,6 +547,31 @@ func TestStaleTokenFinalizerCannotRebuildMissingGeneration(t *testing.T) {
 	assert.EqualValues(t, 4, cached.CacheGeneration)
 }
 
+func TestTokenCacheRecoversAfterCompleteRedisReset(t *testing.T) {
+	truncateTables(t)
+	useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:          7,
+		Key:             "token-complete-redis-reset",
+		Name:            "complete-redis-reset",
+		Status:          common.TokenStatusDisabled,
+		ExpiredTime:     -1,
+		RemainQuota:     100,
+		UnlimitedQuota:  true,
+		CacheGeneration: 4,
+	}
+	require.NoError(t, token.Insert())
+
+	loaded, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, common.TokenStatusDisabled, loaded.Status)
+	assert.EqualValues(t, 4, loaded.CacheGeneration)
+	cached, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, common.TokenStatusDisabled, cached.Status)
+	assert.EqualValues(t, 4, cached.CacheGeneration)
+}
+
 func TestSecondTokenWriterDoesNotSkipFirstFinalization(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)
@@ -1191,6 +1216,7 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 					keyPrefix + "-commit",
 					keyPrefix + "-batch-delete",
 					keyPrefix + "-missing-generation",
+					keyPrefix + "-redis-reset",
 				}
 				for _, key := range keys {
 					_ = common.RDB.Del(
@@ -1371,6 +1397,29 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 				assert.Equal(t, 30, cached.RemainQuota)
 				assert.Equal(t, 70, cached.UsedQuota)
 				assert.EqualValues(t, 2, cached.CacheGeneration)
+			})
+
+			t.Run("complete redis reset restores database generation", func(t *testing.T) {
+				token := Token{
+					UserId:          7,
+					Key:             keyPrefix + "-redis-reset",
+					Name:            "configured-db-redis-reset",
+					Status:          common.TokenStatusDisabled,
+					ExpiredTime:     -1,
+					RemainQuota:     100,
+					UnlimitedQuota:  true,
+					CacheGeneration: 4,
+				}
+				require.NoError(t, token.Insert())
+
+				loaded, err := GetTokenByKey(token.Key, false)
+				require.NoError(t, err)
+				assert.Equal(t, common.TokenStatusDisabled, loaded.Status)
+				assert.EqualValues(t, 4, loaded.CacheGeneration)
+				cached, err := cacheGetTokenByKey(token.Key)
+				require.NoError(t, err)
+				assert.Equal(t, common.TokenStatusDisabled, cached.Status)
+				assert.EqualValues(t, 4, cached.CacheGeneration)
 			})
 		})
 	}

@@ -286,6 +286,37 @@ return 1`
 	return nil
 }
 
+// restoreTokenCacheGenerationForColdCache restores the durable database
+// generation only when Redis has lost all state for the token. Existing hashes
+// are never trusted without their generation key because they may be stale.
+func restoreTokenCacheGenerationForColdCache(key string, generation int64) (bool, error) {
+	if !common.RedisEnabled || key == "" || generation < 0 || generation%2 != 0 {
+		return false, nil
+	}
+	const script = `
+if redis.call('EXISTS', KEYS[2]) == 1 or redis.call('EXISTS', KEYS[3]) == 1 then
+  return 0
+end
+local currentValue = redis.call('GET', KEYS[1])
+if currentValue then
+  local current = tonumber(currentValue)
+  if current == nil or current % 2 ~= 0 or current > tonumber(ARGV[1]) then
+    return 0
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1])
+return 1`
+	result, err := common.RDB.Eval(context.Background(), script, []string{
+		getTokenCacheGenerationKey(key),
+		getTokenCachePendingFenceKey(key),
+		getTokenCacheKey(key),
+	}, generation).Int()
+	if err != nil {
+		return false, err
+	}
+	return result == 1, nil
+}
+
 // invalidateTokenCache advances a stable generation by two for database
 // changes fenced elsewhere, such as user revocation. An unresolved odd
 // generation remains fail-closed for its owning mutation to finalize.
@@ -331,7 +362,6 @@ local expected = tonumber(ARGV[23])
 local database = tonumber(ARGV[24])
 local current = tonumber(redis.call('GET', KEYS[3]) or '0')
 if current < database then
-  redis.call('SET', KEYS[3], database)
   return 0
 end
 if current ~= expected or current % 2 ~= 0 or redis.call('EXISTS', KEYS[2]) == 1 then

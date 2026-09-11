@@ -412,7 +412,8 @@ func getTokenByKeyAcrossGeneration(key string) (*Token, error) {
 			return nil, readErr
 		}
 		if loaded.CacheGeneration > expectedGeneration && loaded.CacheGeneration%2 == 0 {
-			if finishErr := commitTokenCacheMutation(*loaded, loaded.CacheGeneration-1); finishErr != nil {
+			restored, restoreErr := restoreTokenCacheGenerationForColdCache(key, loaded.CacheGeneration)
+			if restoreErr != nil || !restored {
 				return nil, errTokenCacheMutationPending
 			}
 			continue
