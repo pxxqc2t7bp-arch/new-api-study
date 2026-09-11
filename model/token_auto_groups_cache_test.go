@@ -805,8 +805,8 @@ func TestTokenDeletePostCommitErrorDoesNotRestoreCachedToken(t *testing.T) {
 
 	err := token.Delete()
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrTokenMutationCommitted)
 	assert.ErrorIs(t, err, postCommitErr)
+	assert.NotErrorIs(t, err, ErrTokenMutationCommitted)
 
 	var stored Token
 	assert.ErrorIs(t, DB.First(&stored, token.Id).Error, gorm.ErrRecordNotFound)
@@ -1081,9 +1081,10 @@ func TestTokenUpdateWithoutRedisAdvancesDatabaseGeneration(t *testing.T) {
 
 func TestTokenCommitAcknowledgementLossWithoutRedisReturnsObservedOutcome(t *testing.T) {
 	tests := []struct {
-		name   string
-		mutate func(*Token) error
-		verify func(*testing.T, Token)
+		name    string
+		mutate  func(*Token) error
+		verify  func(*testing.T, Token)
+		wantErr bool
 	}{
 		{
 			name: "update",
@@ -1103,6 +1104,7 @@ func TestTokenCommitAcknowledgementLossWithoutRedisReturnsObservedOutcome(t *tes
 			mutate: func(token *Token) error {
 				return token.Delete()
 			},
+			wantErr: true,
 			verify: func(t *testing.T, token Token) {
 				t.Helper()
 				var stored Token
@@ -1134,7 +1136,14 @@ func TestTokenCommitAcknowledgementLossWithoutRedisReturnsObservedOutcome(t *tes
 				return commitErr
 			})
 
-			require.NoError(t, test.mutate(&token))
+			err := test.mutate(&token)
+			if test.wantErr {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, commitErr)
+				assert.NotErrorIs(t, err, ErrTokenMutationCommitted)
+			} else {
+				require.NoError(t, err)
+			}
 			test.verify(t, token)
 		})
 	}
@@ -1231,7 +1240,7 @@ func TestTokenCommitAcknowledgementLossWithoutRedisDoesNotClaimAnotherMutation(t
 	)
 }
 
-func TestBatchDeleteCommitAcknowledgementLossWithoutRedisReturnsObservedSuccess(t *testing.T) {
+func TestBatchDeleteCommitAcknowledgementLossWithoutRedisRemainsFailClosed(t *testing.T) {
 	truncateTables(t)
 	previousRedisEnabled := common.RedisEnabled
 	common.RedisEnabled = false
@@ -1254,8 +1263,10 @@ func TestBatchDeleteCommitAcknowledgementLossWithoutRedisReturnsObservedSuccess(
 	})
 
 	count, err := BatchDeleteTokens([]int{token.Id}, token.UserId)
-	require.NoError(t, err)
-	assert.Equal(t, 1, count)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, commitErr)
+	assert.NotErrorIs(t, err, ErrTokenMutationCommitted)
+	assert.Zero(t, count)
 	var stored Token
 	assert.ErrorIs(t, DB.First(&stored, token.Id).Error, gorm.ErrRecordNotFound)
 }
@@ -1310,13 +1321,12 @@ func TestBatchDeleteTokensFinalizesEveryCommittedMutation(t *testing.T) {
 
 func TestBatchDeleteCommitErrorRemainsFailClosed(t *testing.T) {
 	tests := []struct {
-		name          string
-		commit        bool
-		wantCommitted int
-		wantCached    bool
+		name       string
+		commit     bool
+		wantCached bool
 	}{
-		{name: "committed", commit: true, wantCommitted: 1, wantCached: false},
-		{name: "outcome uncertain", commit: false, wantCommitted: 0, wantCached: true},
+		{name: "committed", commit: true, wantCached: false},
+		{name: "outcome uncertain", commit: false, wantCached: true},
 	}
 
 	for _, test := range tests {
@@ -1348,10 +1358,10 @@ func TestBatchDeleteCommitErrorRemainsFailClosed(t *testing.T) {
 			committed, err := BatchDeleteTokens([]int{token.Id}, token.UserId)
 			require.Error(t, err)
 			assert.ErrorIs(t, err, commitErr)
-			assert.Equal(t, test.wantCommitted, committed)
+			assert.NotErrorIs(t, err, ErrTokenMutationCommitted)
+			assert.Zero(t, committed)
 			assert.Equal(t, test.wantCached, common.RDB.Exists(t.Context(), getTokenCacheKey(token.Key)).Val() == 1)
-			if test.wantCommitted > 0 {
-				assert.ErrorIs(t, err, ErrTokenMutationCommitted)
+			if test.commit {
 				var stored Token
 				assert.ErrorIs(t, DB.First(&stored, token.Id).Error, gorm.ErrRecordNotFound)
 			} else {
@@ -1570,7 +1580,7 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 				assert.Equal(t, 70, cached.UsedQuota)
 			})
 
-			t.Run("batch delete acknowledgement loss finalizes committed delete", func(t *testing.T) {
+			t.Run("batch delete acknowledgement loss remains fail closed", func(t *testing.T) {
 				token := Token{
 					UserId:         7,
 					Key:            keyPrefix + "-batch-delete",
@@ -1590,9 +1600,9 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 				})
 				count, err := BatchDeleteTokens([]int{token.Id}, token.UserId)
 				require.Error(t, err)
-				assert.ErrorIs(t, err, ErrTokenMutationCommitted)
 				assert.ErrorIs(t, err, commitErr)
-				assert.Equal(t, 1, count)
+				assert.NotErrorIs(t, err, ErrTokenMutationCommitted)
+				assert.Zero(t, count)
 
 				var stored Token
 				assert.ErrorIs(t, db.First(&stored, token.Id).Error, gorm.ErrRecordNotFound)

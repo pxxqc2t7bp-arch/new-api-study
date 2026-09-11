@@ -550,14 +550,16 @@ func (err *TokenMutationCommittedError) CommittedCount() int {
 func reconcileTokenMutationCommitError(token *Token, expected *Token, deleteCache bool, generation int64, commitErr error) error {
 	stored, readErr := getTokenByKeyFromDB(token.Key)
 	if deleteCache && errors.Is(readErr, gorm.ErrRecordNotFound) {
-		if generation == 0 {
-			return nil
+		causes := []error{
+			commitErr,
+			errors.New("token delete outcome is uncertain because the deleted row has no mutation identity"),
 		}
-		finalizeErr := commitTokenCacheDeleteMutation(token.Key, generation)
-		return &TokenMutationCommittedError{
-			Count: 1,
-			Cause: errors.Join(commitErr, finalizeErr),
+		if generation > 0 {
+			if finalizeErr := commitTokenCacheDeleteMutation(token.Key, generation); finalizeErr != nil {
+				causes = append(causes, finalizeErr)
+			}
 		}
+		return errors.Join(causes...)
 	}
 	if readErr == nil && !deleteCache && expected != nil &&
 		stored.Id == expected.Id &&
@@ -849,16 +851,14 @@ type tokenCacheMutation struct {
 }
 
 func reconcileBatchTokenDeleteCommit(cacheMutations []tokenCacheMutation, commitErr error) (int, error) {
-	committedCount := 0
-	cacheSyncRequired := false
+	observedMissing := 0
 	causes := []error{commitErr}
 	for _, mutation := range cacheMutations {
-		cacheSyncRequired = cacheSyncRequired || mutation.generation > 0
 		var stored Token
 		readErr := DB.Where(&Token{Id: mutation.id, Key: mutation.key}).First(&stored).Error
 		switch {
 		case errors.Is(readErr, gorm.ErrRecordNotFound):
-			committedCount++
+			observedMissing++
 			if finalizeErr := commitTokenCacheDeleteMutation(mutation.key, mutation.generation); finalizeErr != nil {
 				causes = append(causes, finalizeErr)
 			}
@@ -866,14 +866,12 @@ func reconcileBatchTokenDeleteCommit(cacheMutations []tokenCacheMutation, commit
 			causes = append(causes, fmt.Errorf("failed to reconcile deleted token %d: %w", mutation.id, readErr))
 		}
 	}
-	if committedCount == len(cacheMutations) && !cacheSyncRequired {
-		return committedCount, nil
-	}
-	if committedCount > 0 {
-		return committedCount, &TokenMutationCommittedError{
-			Count: committedCount,
-			Cause: errors.Join(causes...),
-		}
+	if observedMissing > 0 {
+		causes = append(causes, fmt.Errorf(
+			"batch token delete outcome is uncertain because %d of %d rows are absent without mutation identities",
+			observedMissing,
+			len(cacheMutations),
+		))
 	}
 	return 0, errors.Join(causes...)
 }
