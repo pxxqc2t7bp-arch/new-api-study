@@ -388,14 +388,19 @@ func getTokenByKeyAcrossGeneration(key string) (*Token, error) {
 		if pending {
 			switch {
 			case errors.Is(readErr, gorm.ErrRecordNotFound):
-				if finishErr := finishTokenCacheMutation(key, expectedGeneration); finishErr != nil {
+				if finishErr := commitTokenCacheDeleteMutation(key, expectedGeneration); finishErr != nil {
 					return nil, errTokenCacheMutationPending
 				}
 				continue
 			case readErr != nil:
 				return nil, readErr
 			case loaded.CacheGeneration == expectedGeneration+1:
-				if finishErr := finishTokenCacheMutation(key, expectedGeneration); finishErr != nil {
+				if finishErr := commitTokenCacheMutation(*loaded, expectedGeneration); finishErr != nil {
+					return nil, errTokenCacheMutationPending
+				}
+				continue
+			case expectedGeneration > 0 && loaded.CacheGeneration == expectedGeneration-1:
+				if finishErr := rollbackTokenCacheMutation(key, expectedGeneration); finishErr != nil {
 					return nil, errTokenCacheMutationPending
 				}
 				continue
@@ -410,8 +415,11 @@ func getTokenByKeyAcrossGeneration(key string) (*Token, error) {
 		if cacheErr != nil {
 			return nil, fmt.Errorf("failed to init token cache: %w", cacheErr)
 		}
-		if code != 0 {
+		if code == 1 {
 			return loaded, nil
+		}
+		if code == 2 {
+			return cacheGetTokenByKey(key)
 		}
 	}
 	return nil, errTokenCacheMutationPending
@@ -462,8 +470,9 @@ func (err *TokenMutationCommittedError) CommittedCount() int {
 	return err.Count
 }
 
-func mutateTokenMetadata(key string, minimumGeneration int64, mutation func(int64) error) error {
-	generation, err := beginTokenCacheMutation(key, minimumGeneration)
+func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(int64) error) error {
+	minimumGeneration := token.CacheGeneration
+	generation, err := beginTokenCacheMutation(token.Key, minimumGeneration)
 	if err != nil {
 		return err
 	}
@@ -472,20 +481,27 @@ func mutateTokenMetadata(key string, minimumGeneration int64, mutation func(int6
 		committedGeneration = generation + 1
 	}
 	if err := mutation(committedGeneration); err != nil {
-		if rollbackErr := rollbackTokenCacheMutation(key, generation); rollbackErr != nil {
+		token.CacheGeneration = minimumGeneration
+		if rollbackErr := rollbackTokenCacheMutation(token.Key, generation); rollbackErr != nil {
 			return errors.Join(err, fmt.Errorf("failed to roll back token cache fence: %w", rollbackErr))
 		}
 		return err
 	}
-	if err := commitTokenCacheMutation(key, generation); err != nil {
-		return &TokenMutationCommittedError{Count: 1, Cause: err}
+	var finalizeErr error
+	if deleteCache {
+		finalizeErr = commitTokenCacheDeleteMutation(token.Key, generation)
+	} else {
+		finalizeErr = commitTokenCacheMutation(*token, generation)
+	}
+	if finalizeErr != nil {
+		return &TokenMutationCommittedError{Count: 1, Cause: finalizeErr}
 	}
 	return nil
 }
 
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (token *Token) Update() (err error) {
-	return mutateTokenMetadata(token.Key, token.CacheGeneration, func(committedGeneration int64) error {
+	return mutateTokenMetadata(token, false, func(committedGeneration int64) error {
 		token.CacheGeneration = committedGeneration
 		return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
 			"model_limits_enabled", "model_limits", "allow_ips", "stream_recovery_enabled", "group",
@@ -495,7 +511,7 @@ func (token *Token) Update() (err error) {
 }
 
 func (token *Token) SelectUpdate() (err error) {
-	return mutateTokenMetadata(token.Key, token.CacheGeneration, func(committedGeneration int64) error {
+	return mutateTokenMetadata(token, false, func(committedGeneration int64) error {
 		token.CacheGeneration = committedGeneration
 		// Select is required so disabled/exhausted zero values are persisted.
 		return DB.Model(token).Select("status", "cache_generation").Updates(token).Error
@@ -503,7 +519,7 @@ func (token *Token) SelectUpdate() (err error) {
 }
 
 func (token *Token) Delete() (err error) {
-	return mutateTokenMetadata(token.Key, token.CacheGeneration, func(int64) error {
+	return mutateTokenMetadata(token, true, func(int64) error {
 		return DB.Delete(token).Error
 	})
 }
@@ -671,7 +687,7 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 
 	var finalizationErrors []error
 	for _, mutation := range cacheMutations {
-		if err := commitTokenCacheMutation(mutation.key, mutation.generation); err != nil {
+		if err := commitTokenCacheDeleteMutation(mutation.key, mutation.generation); err != nil {
 			finalizationErrors = append(finalizationErrors, err)
 		}
 	}

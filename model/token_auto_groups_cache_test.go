@@ -104,13 +104,93 @@ func TestTokenUpdateSynchronouslyNarrowsPreheatedAutoGroupsCache(t *testing.T) {
 
 	require.NoError(t, token.SetAutoGroups([]string{"vip"}))
 	require.NoError(t, token.Update())
-	// Update 是限制性变更：写库前删除缓存并设置 fence。缓存不再提供旧的
-	// 宽分组值，下一次读取必须看到收紧后的分组。
-	_, cacheErr := cacheGetTokenByKey(token.Key)
-	require.Error(t, cacheErr, "the pre-update cache entry must be invalidated")
+	cached, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.JSONEq(t, `["vip"]`, cached.AutoGroups)
 	reloaded, err := GetTokenByKey(token.Key, false)
 	require.NoError(t, err)
 	assert.JSONEq(t, `["vip"]`, reloaded.AutoGroups)
+}
+
+func TestTokenPolicyUpdatePreservesLiveCachedQuota(t *testing.T) {
+	truncateTables(t)
+	useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:                   7,
+		Key:                      "token-policy-live-quota",
+		Name:                     "policy-live-quota",
+		Status:                   common.TokenStatusEnabled,
+		ExpiredTime:              -1,
+		RemainQuota:              100,
+		AllowedRoutingStrategies: `["stable","economy"]`,
+		DefaultRoutingStrategy:   "economy",
+		DefaultConversionPolicy:  "allow",
+		AllowLossyConversion:     true,
+	}
+	require.NoError(t, token.Insert())
+	require.NoError(t, cacheSetTokenForTest(token))
+	result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
+
+	token.AllowedRoutingStrategies = `["stable"]`
+	token.DefaultRoutingStrategy = "stable"
+	token.DefaultConversionPolicy = "strict"
+	token.AllowLossyConversion = false
+	require.NoError(t, token.Update())
+
+	var stored Token
+	require.NoError(t, DB.First(&stored, token.Id).Error)
+	assert.Equal(t, 100, stored.RemainQuota)
+	assert.Zero(t, stored.UsedQuota)
+	assert.Equal(t, "stable", stored.DefaultRoutingStrategy)
+	assert.Equal(t, "strict", stored.DefaultConversionPolicy)
+
+	generation, pending, err := getTokenCacheGenerationState(token.Key)
+	require.NoError(t, err)
+	require.False(t, pending)
+	code, err := cacheInitToken(stored, generation)
+	require.NoError(t, err)
+	require.Equal(t, 2, code)
+
+	reloaded, err := GetTokenByKey(token.Key, true)
+	require.NoError(t, err)
+	assert.Equal(t, 30, reloaded.RemainQuota)
+	assert.Equal(t, 70, reloaded.UsedQuota)
+	assert.Equal(t, "stable", reloaded.DefaultRoutingStrategy)
+	assert.JSONEq(t, `["stable"]`, reloaded.AllowedRoutingStrategies)
+	assert.Equal(t, "strict", reloaded.DefaultConversionPolicy)
+	assert.False(t, reloaded.AllowLossyConversion)
+
+	cached, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, 30, cached.RemainQuota)
+	assert.Equal(t, 70, cached.UsedQuota)
+	assert.Equal(t, "stable", cached.DefaultRoutingStrategy)
+	assert.Equal(t, "strict", cached.DefaultConversionPolicy)
+}
+
+func TestTokenPolicyUpdateLeavesColdCacheCold(t *testing.T) {
+	truncateTables(t)
+	server := useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:         7,
+		Key:            "token-policy-cold-cache",
+		Name:           "policy-cold-cache",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+
+	token.DefaultRoutingStrategy = "economy"
+	require.NoError(t, token.Update())
+
+	assert.False(t, server.Exists(getTokenCacheKey(token.Key)))
+	var stored Token
+	require.NoError(t, DB.First(&stored, token.Id).Error)
+	assert.Equal(t, "economy", stored.DefaultRoutingStrategy)
 }
 
 func TestTokenMetadataMutationsFailClosedWhenFenceUnavailable(t *testing.T) {
@@ -176,11 +256,15 @@ func TestTokenMutationFailureClearsPendingFenceForUnchangedDatabaseState(t *test
 		Name:                 "fence-db-failure",
 		Status:               common.TokenStatusEnabled,
 		ExpiredTime:          -1,
+		RemainQuota:          100,
 		UnlimitedQuota:       true,
 		AllowLossyConversion: true,
 	}
 	require.NoError(t, token.Insert())
 	require.NoError(t, cacheSetTokenForTest(token))
+	result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
 
 	forcedErr := errors.New("forced token update failure")
 	const callbackName = "test:fail_token_update_after_fence"
@@ -201,19 +285,21 @@ func TestTokenMutationFailureClearsPendingFenceForUnchangedDatabaseState(t *test
 	require.NoError(t, DB.Callback().Update().Remove(callbackName))
 	callbackRegistered = false
 
-	generation, pending, err := getTokenCacheGenerationState(token.Key)
+	_, pending, err := getTokenCacheGenerationState(token.Key)
 	require.NoError(t, err)
-	assert.EqualValues(t, 2, generation)
 	assert.False(t, pending)
 	reloaded, err := GetTokenByKey(token.Key, false)
 	require.NoError(t, err)
 	assert.True(t, reloaded.AllowLossyConversion)
+	assert.Equal(t, 30, reloaded.RemainQuota)
+	assert.Equal(t, 70, reloaded.UsedQuota)
 	assert.True(t, server.Exists(getTokenCacheKey(token.Key)))
 }
 
 func TestTokenReaderReloadsSnapshotAfterConcurrentPolicyCommit(t *testing.T) {
 	truncateTables(t)
 	server := useUserCacheMiniRedis(t)
+	common.SyncFrequency = tokenCacheFenceSeconds * 2
 	token := Token{
 		UserId:                   7,
 		Key:                      "token-policy-race",
@@ -279,23 +365,30 @@ func TestTokenReaderReloadsSnapshotAfterConcurrentPolicyCommit(t *testing.T) {
 	assert.JSONEq(t, `["stable"]`, cached.AllowedRoutingStrategies)
 	assert.Equal(t, "strict", cached.DefaultConversionPolicy)
 	assert.False(t, cached.AllowLossyConversion)
+	assert.Equal(t, 30, cached.RemainQuota)
+	assert.Equal(t, 70, cached.UsedQuota)
 }
 
 func TestTokenMutationFinalizationFailureReportsCommittedAndRejectsStaleReader(t *testing.T) {
 	truncateTables(t)
 	server := useUserCacheMiniRedis(t)
+	common.SyncFrequency = tokenCacheFenceSeconds * 2
 	token := Token{
 		UserId:                 7,
 		Key:                    "token-finalization-failure",
 		Name:                   "finalization-failure",
 		Status:                 common.TokenStatusEnabled,
 		ExpiredTime:            -1,
+		RemainQuota:            100,
 		UnlimitedQuota:         true,
 		DefaultRoutingStrategy: "economy",
 		AllowLossyConversion:   true,
 	}
 	require.NoError(t, token.Insert())
 	require.NoError(t, cacheSetTokenForTest(token))
+	result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
 
 	snapshotRead := make(chan struct{})
 	releaseReader := make(chan struct{})
@@ -347,6 +440,8 @@ func TestTokenMutationFinalizationFailureReportsCommittedAndRejectsStaleReader(t
 	require.NoError(t, err)
 	assert.Equal(t, "stable", reconciled.DefaultRoutingStrategy)
 	assert.False(t, reconciled.AllowLossyConversion)
+	assert.Equal(t, 30, reconciled.RemainQuota)
+	assert.Equal(t, 70, reconciled.UsedQuota)
 
 	close(releaseReader)
 	loaded := <-readerResult
@@ -362,6 +457,8 @@ func TestTokenMutationFinalizationFailureReportsCommittedAndRejectsStaleReader(t
 	require.NoError(t, err)
 	assert.Equal(t, "stable", cached.DefaultRoutingStrategy)
 	assert.False(t, cached.AllowLossyConversion)
+	assert.Equal(t, 30, cached.RemainQuota)
+	assert.Equal(t, 70, cached.UsedQuota)
 }
 
 func TestTokenMutationRestoresGenerationFromDatabaseFloor(t *testing.T) {

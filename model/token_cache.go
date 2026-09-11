@@ -64,9 +64,10 @@ func getTokenCacheGenerationState(key string) (int64, bool, error) {
 	return generation, pending, nil
 }
 
-// beginTokenCacheMutation advances the persistent generation from even to odd,
-// publishes an advisory pending marker, and drops the cached hash before the
-// database write. The odd generation remains after the marker expires.
+// beginTokenCacheMutation advances the persistent generation from even to odd
+// and publishes an advisory pending marker before the database write. The odd
+// generation remains after the marker expires, while the fenced hash retains
+// live quota counters for commit or rollback.
 func beginTokenCacheMutation(key string, minimumGeneration int64) (int64, error) {
 	if !common.RedisEnabled || key == "" {
 		return 0, nil
@@ -87,12 +88,10 @@ end
 local generation = current + 1
 redis.call('SET', KEYS[1], generation)
 redis.call('SET', KEYS[2], generation, 'EX', ARGV[1])
-redis.call('DEL', KEYS[3])
 return generation`
 	generation, err := common.RDB.Eval(context.Background(), script, []string{
 		getTokenCacheGenerationKey(key),
 		getTokenCachePendingFenceKey(key),
-		getTokenCacheKey(key),
 	}, tokenCacheFenceSeconds, minimumGeneration).Int64()
 	if err != nil {
 		return 0, err
@@ -103,10 +102,77 @@ return generation`
 	return generation, nil
 }
 
-// finishTokenCacheMutation advances the persistent generation from odd to
-// even after either commit or rollback. Advancing at both boundaries rejects
-// readers that started before the mutation and readers that overlapped it.
-func finishTokenCacheMutation(key string, generation int64) error {
+// commitTokenCacheMutation atomically publishes committed metadata into an
+// existing complete hash without replacing its live quota counters. A cold or
+// incomplete hash remains absent so a later read can initialize it from DB.
+func commitTokenCacheMutation(token Token, generation int64) error {
+	if !common.RedisEnabled || token.Key == "" || generation == 0 {
+		return nil
+	}
+	allowIps := ""
+	if token.AllowIps != nil {
+		allowIps = *token.AllowIps
+	}
+	const script = `
+local incoming = tonumber(ARGV[1])
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+if current < incoming then
+  return 0
+end
+if current == incoming then
+  if current % 2 == 0 then
+    return 0
+  end
+  current = current + 1
+  if redis.call('EXISTS', KEYS[3]) == 1 then
+    if tonumber(redis.call('HGET', KEYS[3], 'Id') or '0') == tonumber(ARGV[2])
+      and redis.call('HEXISTS', KEYS[3], 'RemainQuota') == 1
+      and redis.call('HEXISTS', KEYS[3], 'UsedQuota') == 1 then
+      redis.call('HSET', KEYS[3],
+        'Status', ARGV[3], 'Name', ARGV[4], 'ExpiredTime', ARGV[5],
+        'UnlimitedQuota', ARGV[6], 'ModelLimitsEnabled', ARGV[7],
+        'ModelLimits', ARGV[8], 'AllowIps', ARGV[9],
+        'StreamRecoveryEnabled', ARGV[10], 'Group', ARGV[11],
+        'CrossGroupRetry', ARGV[12], 'AutoGroups', ARGV[13],
+        'DefaultRoutingStrategy', ARGV[14],
+        'AllowedRoutingStrategies', ARGV[15],
+        'DefaultConversionPolicy', ARGV[16],
+        'AllowLossyConversion', ARGV[17],
+        'CacheGeneration', current)
+      redis.call('EXPIRE', KEYS[3], ARGV[18])
+    else
+      redis.call('DEL', KEYS[3])
+    end
+  end
+  redis.call('SET', KEYS[1], current)
+end
+if tonumber(redis.call('GET', KEYS[2]) or '0') == incoming then
+  redis.call('DEL', KEYS[2])
+end
+return 1`
+	result, err := common.RDB.Eval(context.Background(), script, []string{
+		getTokenCacheGenerationKey(token.Key),
+		getTokenCachePendingFenceKey(token.Key),
+		getTokenCacheKey(token.Key),
+	},
+		generation, token.Id, token.Status, token.Name, token.ExpiredTime,
+		strconv.FormatBool(token.UnlimitedQuota), strconv.FormatBool(token.ModelLimitsEnabled),
+		token.ModelLimits, allowIps, strconv.FormatBool(token.StreamRecoveryEnabled),
+		token.Group, strconv.FormatBool(token.CrossGroupRetry), token.AutoGroups,
+		token.DefaultRoutingStrategy, token.AllowedRoutingStrategies,
+		token.DefaultConversionPolicy, strconv.FormatBool(token.AllowLossyConversion),
+		tokenCacheTTLSeconds(),
+	).Int64()
+	if err != nil {
+		return err
+	}
+	if result == 0 {
+		return fmt.Errorf("token cache generation changed before finalization")
+	}
+	return nil
+}
+
+func commitTokenCacheDeleteMutation(key string, generation int64) error {
 	if !common.RedisEnabled || key == "" || generation == 0 {
 		return nil
 	}
@@ -120,14 +186,13 @@ if current == incoming then
   if current % 2 == 0 then
     return 0
   end
-  current = current + 1
-  redis.call('SET', KEYS[1], current)
+  redis.call('SET', KEYS[1], current + 1)
   redis.call('DEL', KEYS[3])
 end
 if tonumber(redis.call('GET', KEYS[2]) or '0') == incoming then
   redis.call('DEL', KEYS[2])
 end
-return current`
+return 1`
 	result, err := common.RDB.Eval(context.Background(), script, []string{
 		getTokenCacheGenerationKey(key),
 		getTokenCachePendingFenceKey(key),
@@ -137,17 +202,42 @@ return current`
 		return err
 	}
 	if result == 0 {
-		return fmt.Errorf("token cache generation changed before finalization")
+		return fmt.Errorf("token cache generation changed before delete finalization")
 	}
 	return nil
 }
 
-func commitTokenCacheMutation(key string, generation int64) error {
-	return finishTokenCacheMutation(key, generation)
-}
-
 func rollbackTokenCacheMutation(key string, generation int64) error {
-	return finishTokenCacheMutation(key, generation)
+	if !common.RedisEnabled || key == "" || generation == 0 {
+		return nil
+	}
+	const script = `
+local incoming = tonumber(ARGV[1])
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+if current < incoming then
+  return 0
+end
+if current == incoming then
+  if current % 2 == 0 then
+    return 0
+  end
+  redis.call('SET', KEYS[1], current - 1)
+end
+if tonumber(redis.call('GET', KEYS[2]) or '0') == incoming then
+  redis.call('DEL', KEYS[2])
+end
+return 1`
+	result, err := common.RDB.Eval(context.Background(), script, []string{
+		getTokenCacheGenerationKey(key),
+		getTokenCachePendingFenceKey(key),
+	}, generation).Int64()
+	if err != nil {
+		return err
+	}
+	if result == 0 {
+		return fmt.Errorf("token cache generation changed before rollback")
+	}
+	return nil
 }
 
 // invalidateTokenCache advances a stable generation by two for database
@@ -191,8 +281,8 @@ func cacheInitToken(token Token, expectedGeneration int64) (int, error) {
 		allowIps = *token.AllowIps
 	}
 	const script = `
-local expected = tonumber(ARGV[22])
-local database = tonumber(ARGV[23])
+local expected = tonumber(ARGV[23])
+local database = tonumber(ARGV[24])
 local current = tonumber(redis.call('GET', KEYS[3]) or '0')
 if current < database then
   redis.call('SET', KEYS[3], database)
@@ -206,19 +296,20 @@ if redis.call('EXISTS', KEYS[1]) == 1 then
   if cached ~= expected then
     return 0
   end
-  redis.call('EXPIRE', KEYS[1], ARGV[21])
+  redis.call('EXPIRE', KEYS[1], ARGV[22])
   return 2
 end
 redis.call('HSET', KEYS[1],
   'Id', ARGV[1], 'UserId', ARGV[2], 'Status', ARGV[3], 'Name', ARGV[4],
   'CreatedTime', ARGV[5], 'AccessedTime', ARGV[6], 'ExpiredTime', ARGV[7],
   'UnlimitedQuota', ARGV[8], 'ModelLimitsEnabled', ARGV[9], 'ModelLimits', ARGV[10],
-  'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13],
-  'AutoGroups', ARGV[14], 'RemainQuota', ARGV[15], 'UsedQuota', ARGV[16],
-  'DefaultRoutingStrategy', ARGV[17], 'AllowedRoutingStrategies', ARGV[18],
-  'DefaultConversionPolicy', ARGV[19], 'AllowLossyConversion', ARGV[20],
-  'CacheGeneration', ARGV[22])
-redis.call('EXPIRE', KEYS[1], ARGV[21])
+  'AllowIps', ARGV[11], 'StreamRecoveryEnabled', ARGV[12],
+  'Group', ARGV[13], 'CrossGroupRetry', ARGV[14],
+  'AutoGroups', ARGV[15], 'RemainQuota', ARGV[16], 'UsedQuota', ARGV[17],
+  'DefaultRoutingStrategy', ARGV[18], 'AllowedRoutingStrategies', ARGV[19],
+  'DefaultConversionPolicy', ARGV[20], 'AllowLossyConversion', ARGV[21],
+  'CacheGeneration', ARGV[23])
+redis.call('EXPIRE', KEYS[1], ARGV[22])
 return 1`
 
 	return common.RDB.Eval(context.Background(), script, []string{
@@ -229,7 +320,8 @@ return 1`
 		token.Id, token.UserId, token.Status, token.Name,
 		token.CreatedTime, token.AccessedTime, token.ExpiredTime,
 		strconv.FormatBool(token.UnlimitedQuota), strconv.FormatBool(token.ModelLimitsEnabled),
-		token.ModelLimits, allowIps, token.Group, strconv.FormatBool(token.CrossGroupRetry),
+		token.ModelLimits, allowIps, strconv.FormatBool(token.StreamRecoveryEnabled),
+		token.Group, strconv.FormatBool(token.CrossGroupRetry),
 		token.AutoGroups, token.RemainQuota, token.UsedQuota,
 		token.DefaultRoutingStrategy, token.AllowedRoutingStrategies,
 		token.DefaultConversionPolicy, strconv.FormatBool(token.AllowLossyConversion),
