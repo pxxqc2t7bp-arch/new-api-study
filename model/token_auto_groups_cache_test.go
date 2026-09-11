@@ -81,6 +81,33 @@ func replaceTokenMutationCommitForTest(t *testing.T, commit func(*gorm.DB) error
 	})
 }
 
+func useConfiguredTokenMetadataRedis(t *testing.T) {
+	t.Helper()
+	addr := strings.TrimSpace(os.Getenv("TEST_REDIS_ADDR"))
+	if addr == "" {
+		useUserCacheMiniRedis(t)
+		return
+	}
+
+	previousRedisEnabled := common.RedisEnabled
+	previousRDB := common.RDB
+	previousSyncFrequency := common.SyncFrequency
+	client := redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: os.Getenv("TEST_REDIS_PASSWORD"),
+	})
+	require.NoError(t, client.Ping(t.Context()).Err())
+	common.RedisEnabled = true
+	common.RDB = client
+	common.SyncFrequency = 2
+	t.Cleanup(func() {
+		_ = client.Close()
+		common.RedisEnabled = previousRedisEnabled
+		common.RDB = previousRDB
+		common.SyncFrequency = previousSyncFrequency
+	})
+}
+
 func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 	useUserCacheMiniRedis(t)
 	token := Token{
@@ -959,12 +986,29 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 				common.BatchUpdateEnabled = previousBatchUpdate
 				initCol()
 			})
-			useUserCacheMiniRedis(t)
+			useConfiguredTokenMetadataRedis(t)
+			keyPrefix := "configured-db-" + test.name + "-" + common.GetTimeString()
+			t.Cleanup(func() {
+				keys := []string{
+					keyPrefix + "-quota",
+					keyPrefix + "-rollback",
+					keyPrefix + "-commit",
+					keyPrefix + "-batch-delete",
+				}
+				for _, key := range keys {
+					_ = common.RDB.Del(
+						t.Context(),
+						getTokenCacheKey(key),
+						getTokenCacheGenerationKey(key),
+						getTokenCachePendingFenceKey(key),
+					).Err()
+				}
+			})
 
 			t.Run("commit preserves reservations and applies quota delta", func(t *testing.T) {
 				token := Token{
 					UserId:      7,
-					Key:         "configured-db-quota-" + test.name,
+					Key:         keyPrefix + "-quota",
 					Name:        "configured-db-quota",
 					Status:      common.TokenStatusEnabled,
 					ExpiredTime: -1,
@@ -990,7 +1034,7 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 			t.Run("statement failure rolls back transaction and fence", func(t *testing.T) {
 				token := Token{
 					UserId:         7,
-					Key:            "configured-db-rollback-" + test.name,
+					Key:            keyPrefix + "-rollback",
 					Name:           "configured-db-rollback",
 					Status:         common.TokenStatusEnabled,
 					ExpiredTime:    -1,
@@ -1002,8 +1046,10 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 
 				forcedErr := errors.New("forced configured database update failure")
 				callbackName := "test:configured_database_failure_" + test.name
-				require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+				var updatedRows int64
+				require.NoError(t, db.Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
 					if tx.Statement.Table == "tokens" {
+						updatedRows = tx.Statement.RowsAffected
 						tx.AddError(forcedErr)
 					}
 				}))
@@ -1019,6 +1065,7 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 				require.NoError(t, db.Callback().Update().Remove(callbackName))
 				callbackRegistered = false
 
+				assert.EqualValues(t, 1, updatedRows, "the injected failure must run after the SQL update")
 				var stored Token
 				require.NoError(t, db.First(&stored, token.Id).Error)
 				assert.Equal(t, common.TokenStatusEnabled, stored.Status)
@@ -1030,7 +1077,7 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 			t.Run("commit acknowledgement loss finalizes committed update", func(t *testing.T) {
 				token := Token{
 					UserId:         7,
-					Key:            "configured-db-commit-" + test.name,
+					Key:            keyPrefix + "-commit",
 					Name:           "configured-db-commit",
 					Status:         common.TokenStatusEnabled,
 					ExpiredTime:    -1,
@@ -1062,7 +1109,7 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 			t.Run("batch delete acknowledgement loss finalizes committed delete", func(t *testing.T) {
 				token := Token{
 					UserId:         7,
-					Key:            "configured-db-batch-delete-" + test.name,
+					Key:            keyPrefix + "-batch-delete",
 					Name:           "configured-db-batch-delete",
 					Status:         common.TokenStatusEnabled,
 					ExpiredTime:    -1,
