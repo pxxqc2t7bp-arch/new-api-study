@@ -448,6 +448,10 @@ func (token *Token) Insert() error {
 
 var ErrTokenMutationCommitted = errors.New("token database mutation committed but cache synchronization failed")
 
+var commitTokenMutationTransaction = func(tx *gorm.DB) error {
+	return tx.Commit().Error
+}
+
 type TokenMutationCommittedError struct {
 	Count int
 	Cause error
@@ -469,9 +473,9 @@ func (err *TokenMutationCommittedError) CommittedCount() int {
 	return err.Count
 }
 
-func reconcileTokenMutationError(token *Token, deleteCache bool, generation, previousGeneration int64, mutationErr error) error {
+func reconcileTokenMutationCommitError(token *Token, deleteCache bool, generation int64, commitErr error) error {
 	if generation == 0 {
-		return mutationErr
+		return commitErr
 	}
 
 	stored, readErr := getTokenByKeyFromDB(token.Key)
@@ -479,7 +483,7 @@ func reconcileTokenMutationError(token *Token, deleteCache bool, generation, pre
 		finalizeErr := commitTokenCacheDeleteMutation(token.Key, generation)
 		return &TokenMutationCommittedError{
 			Count: 1,
-			Cause: errors.Join(mutationErr, finalizeErr),
+			Cause: errors.Join(commitErr, finalizeErr),
 		}
 	}
 	if readErr == nil && !deleteCache && stored.Id == token.Id && stored.CacheGeneration == generation+1 {
@@ -487,23 +491,16 @@ func reconcileTokenMutationError(token *Token, deleteCache bool, generation, pre
 		finalizeErr := commitTokenCacheMutation(*stored, generation)
 		return &TokenMutationCommittedError{
 			Count: 1,
-			Cause: errors.Join(mutationErr, finalizeErr),
+			Cause: errors.Join(commitErr, finalizeErr),
 		}
-	}
-	if readErr == nil && stored.Id == token.Id && stored.CacheGeneration == previousGeneration {
-		token.CacheGeneration = previousGeneration
-		if rollbackErr := rollbackTokenCacheMutation(token.Key, generation); rollbackErr != nil {
-			return errors.Join(mutationErr, fmt.Errorf("failed to roll back token cache fence: %w", rollbackErr))
-		}
-		return mutationErr
 	}
 	if readErr != nil && !errors.Is(readErr, gorm.ErrRecordNotFound) {
-		return errors.Join(mutationErr, fmt.Errorf("failed to reconcile token database mutation: %w", readErr))
+		return errors.Join(commitErr, fmt.Errorf("failed to reconcile token database mutation: %w", readErr))
 	}
-	return errors.Join(mutationErr, errors.New("token database mutation outcome is uncertain"))
+	return errors.Join(commitErr, errors.New("token database mutation outcome is uncertain"))
 }
 
-func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(int64) error) error {
+func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(*gorm.DB, int64) error) error {
 	minimumGeneration := token.CacheGeneration
 	generation, beginErr := beginTokenCacheMutation(token.Key, minimumGeneration)
 	if beginErr != nil {
@@ -513,8 +510,26 @@ func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(int64) er
 	if generation > 0 {
 		committedGeneration = generation + 1
 	}
-	if mutationErr := mutation(committedGeneration); mutationErr != nil {
-		return reconcileTokenMutationError(token, deleteCache, generation, minimumGeneration, mutationErr)
+	tx := DB.Begin()
+	if tx.Error != nil {
+		token.CacheGeneration = minimumGeneration
+		if rollbackErr := rollbackTokenCacheMutation(token.Key, generation); rollbackErr != nil {
+			return errors.Join(tx.Error, fmt.Errorf("failed to roll back token cache fence: %w", rollbackErr))
+		}
+		return tx.Error
+	}
+	if mutationErr := mutation(tx, committedGeneration); mutationErr != nil {
+		if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+			return errors.Join(mutationErr, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
+		}
+		token.CacheGeneration = minimumGeneration
+		if rollbackErr := rollbackTokenCacheMutation(token.Key, generation); rollbackErr != nil {
+			return errors.Join(mutationErr, fmt.Errorf("failed to roll back token cache fence: %w", rollbackErr))
+		}
+		return mutationErr
+	}
+	if commitErr := commitTokenMutationTransaction(tx); commitErr != nil {
+		return reconcileTokenMutationCommitError(token, deleteCache, generation, commitErr)
 	}
 	if generation == 0 {
 		return nil
@@ -548,9 +563,9 @@ func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(int64) er
 
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (token *Token) Update() (err error) {
-	return mutateTokenMetadata(token, false, func(committedGeneration int64) error {
+	return mutateTokenMetadata(token, false, func(tx *gorm.DB, committedGeneration int64) error {
 		token.CacheGeneration = committedGeneration
-		return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
+		return tx.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
 			"model_limits_enabled", "model_limits", "allow_ips", "stream_recovery_enabled", "group",
 			"cross_group_retry", "auto_groups", "default_routing_strategy", "allowed_routing_strategies",
 			"default_conversion_policy", "allow_lossy_conversion", "cache_generation").Updates(token).Error
@@ -558,16 +573,16 @@ func (token *Token) Update() (err error) {
 }
 
 func (token *Token) SelectUpdate() (err error) {
-	return mutateTokenMetadata(token, false, func(committedGeneration int64) error {
+	return mutateTokenMetadata(token, false, func(tx *gorm.DB, committedGeneration int64) error {
 		token.CacheGeneration = committedGeneration
 		// Select is required so disabled/exhausted zero values are persisted.
-		return DB.Model(token).Select("status", "cache_generation").Updates(token).Error
+		return tx.Model(token).Select("status", "cache_generation").Updates(token).Error
 	})
 }
 
 func (token *Token) Delete() (err error) {
-	return mutateTokenMetadata(token, true, func(int64) error {
-		return DB.Delete(token).Error
+	return mutateTokenMetadata(token, true, func(tx *gorm.DB, _ int64) error {
+		return tx.Delete(token).Error
 	})
 }
 
@@ -701,10 +716,6 @@ func reconcileBatchTokenDeleteCommit(cacheMutations []tokenCacheMutation, commit
 			}
 		case readErr != nil:
 			causes = append(causes, fmt.Errorf("failed to reconcile deleted token %d: %w", mutation.id, readErr))
-		default:
-			if rollbackErr := rollbackTokenCacheMutation(mutation.key, mutation.generation); rollbackErr != nil {
-				causes = append(causes, fmt.Errorf("failed to roll back token %d cache fence: %w", mutation.id, rollbackErr))
-			}
 		}
 	}
 	if committedCount > 0 {
@@ -733,19 +744,23 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 	for _, token := range tokens {
 		generation, err := beginTokenCacheMutation(token.Key, token.CacheGeneration)
 		if err != nil {
+			if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+				return 0, errors.Join(err, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
+			}
 			for _, mutation := range cacheMutations {
 				if rollbackErr := rollbackTokenCacheMutation(mutation.key, mutation.generation); rollbackErr != nil {
 					common.SysError("failed to roll back token cache fence: " + rollbackErr.Error())
 				}
 			}
-			tx.Rollback()
 			return 0, err
 		}
 		cacheMutations = append(cacheMutations, tokenCacheMutation{id: token.Id, key: token.Key, generation: generation})
 	}
 
 	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Delete(&Token{}).Error; err != nil {
-		tx.Rollback()
+		if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+			return 0, errors.Join(err, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
+		}
 		for _, mutation := range cacheMutations {
 			if rollbackErr := rollbackTokenCacheMutation(mutation.key, mutation.generation); rollbackErr != nil {
 				common.SysError("failed to roll back token cache fence: " + rollbackErr.Error())
@@ -754,7 +769,7 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 		return 0, err
 	}
 
-	if err := tx.Commit().Error; err != nil {
+	if err := commitTokenMutationTransaction(tx); err != nil {
 		return reconcileBatchTokenDeleteCommit(cacheMutations, err)
 	}
 

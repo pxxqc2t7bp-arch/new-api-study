@@ -66,6 +66,15 @@ func (*blockRedisEvalHook) AfterProcessPipeline(context.Context, []redis.Cmder) 
 	return nil
 }
 
+func replaceTokenMutationCommitForTest(t *testing.T, commit func(*gorm.DB) error) {
+	t.Helper()
+	previous := commitTokenMutationTransaction
+	commitTokenMutationTransaction = commit
+	t.Cleanup(func() {
+		commitTokenMutationTransaction = previous
+	})
+}
+
 func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 	useUserCacheMiniRedis(t)
 	token := Token{
@@ -457,19 +466,11 @@ func TestTokenPostCommitErrorDoesNotRestoreEnabledCache(t *testing.T) {
 	require.NoError(t, cacheSetTokenForTest(token))
 
 	postCommitErr := errors.New("simulated lost commit acknowledgement")
-	const callbackName = "test:post_commit_error"
-	require.NoError(t, DB.Callback().Update().
-		After("gorm:commit_or_rollback_transaction").
-		Register(callbackName, func(tx *gorm.DB) {
-			if tx.Statement.Table == "tokens" {
-				tx.AddError(postCommitErr)
-			}
-		}))
-	callbackRegistered := true
-	t.Cleanup(func() {
-		if callbackRegistered {
-			_ = DB.Callback().Update().Remove(callbackName)
+	replaceTokenMutationCommitForTest(t, func(tx *gorm.DB) error {
+		if err := tx.Commit().Error; err != nil {
+			return err
 		}
+		return postCommitErr
 	})
 
 	token.Status = common.TokenStatusDisabled
@@ -477,8 +478,6 @@ func TestTokenPostCommitErrorDoesNotRestoreEnabledCache(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrTokenMutationCommitted)
 	assert.ErrorIs(t, err, postCommitErr)
-	require.NoError(t, DB.Callback().Update().Remove(callbackName))
-	callbackRegistered = false
 
 	var stored Token
 	require.NoError(t, DB.First(&stored, token.Id).Error)
@@ -503,33 +502,60 @@ func TestTokenDeletePostCommitErrorDoesNotRestoreCachedToken(t *testing.T) {
 	require.NoError(t, cacheSetTokenForTest(token))
 
 	postCommitErr := errors.New("simulated lost delete commit acknowledgement")
-	const callbackName = "test:delete_post_commit_error"
-	require.NoError(t, DB.Callback().Delete().
-		After("gorm:commit_or_rollback_transaction").
-		Register(callbackName, func(tx *gorm.DB) {
-			if tx.Statement.Table == "tokens" {
-				tx.AddError(postCommitErr)
-			}
-		}))
-	callbackRegistered := true
-	t.Cleanup(func() {
-		if callbackRegistered {
-			_ = DB.Callback().Delete().Remove(callbackName)
+	replaceTokenMutationCommitForTest(t, func(tx *gorm.DB) error {
+		if err := tx.Commit().Error; err != nil {
+			return err
 		}
+		return postCommitErr
 	})
 
 	err := token.Delete()
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrTokenMutationCommitted)
 	assert.ErrorIs(t, err, postCommitErr)
-	require.NoError(t, DB.Callback().Delete().Remove(callbackName))
-	callbackRegistered = false
 
 	var stored Token
 	assert.ErrorIs(t, DB.First(&stored, token.Id).Error, gorm.ErrRecordNotFound)
 	_, err = ValidateUserToken(token.Key)
 	assert.ErrorIs(t, err, ErrTokenInvalid)
 	assert.False(t, server.Exists(getTokenCacheKey(token.Key)))
+}
+
+func TestTokenCommitErrorWithOldDatabaseStateRemainsFenced(t *testing.T) {
+	truncateTables(t)
+	useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:         7,
+		Key:            "token-uncertain-commit",
+		Name:           "uncertain-commit",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+	require.NoError(t, cacheSetTokenForTest(token))
+
+	commitErr := errors.New("simulated uncertain commit")
+	replaceTokenMutationCommitForTest(t, func(tx *gorm.DB) error {
+		require.NoError(t, tx.Rollback().Error)
+		return commitErr
+	})
+
+	token.Status = common.TokenStatusDisabled
+	err := token.SelectUpdate()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, commitErr)
+
+	var stored Token
+	require.NoError(t, DB.First(&stored, token.Id).Error)
+	assert.Equal(t, common.TokenStatusEnabled, stored.Status)
+	_, readErr := GetTokenByKey(token.Key, false)
+	assert.ErrorIs(t, readErr, errTokenCacheMutationPending)
+	generation, pending, stateErr := getTokenCacheGenerationState(token.Key)
+	require.NoError(t, stateErr)
+	assert.EqualValues(t, 1, generation)
+	assert.True(t, pending)
 }
 
 func TestTokenReaderReloadsSnapshotAfterConcurrentPolicyCommit(t *testing.T) {
@@ -806,15 +832,15 @@ func TestBatchDeleteTokensFinalizesEveryCommittedMutation(t *testing.T) {
 	assert.Zero(t, remaining)
 }
 
-func TestBatchDeleteCommitErrorReconcilesDatabaseOutcome(t *testing.T) {
+func TestBatchDeleteCommitErrorRemainsFailClosed(t *testing.T) {
 	tests := []struct {
 		name          string
-		deleteFromDB  bool
+		commit        bool
 		wantCommitted int
 		wantCached    bool
 	}{
-		{name: "committed", deleteFromDB: true, wantCommitted: 1, wantCached: false},
-		{name: "rolled back", deleteFromDB: false, wantCommitted: 0, wantCached: true},
+		{name: "committed", commit: true, wantCommitted: 1, wantCached: false},
+		{name: "outcome uncertain", commit: false, wantCommitted: 0, wantCached: true},
 	}
 
 	for _, test := range tests {
@@ -832,26 +858,31 @@ func TestBatchDeleteCommitErrorReconcilesDatabaseOutcome(t *testing.T) {
 			}
 			require.NoError(t, token.Insert())
 			require.NoError(t, cacheSetTokenForTest(token))
-			generation, err := beginTokenCacheMutation(token.Key, token.CacheGeneration)
-			require.NoError(t, err)
-			if test.deleteFromDB {
-				require.NoError(t, DB.Delete(&token).Error)
-			}
 
 			commitErr := errors.New("simulated batch commit acknowledgement loss")
-			committed, err := reconcileBatchTokenDeleteCommit(
-				[]tokenCacheMutation{{id: token.Id, key: token.Key, generation: generation}},
-				commitErr,
-			)
+			replaceTokenMutationCommitForTest(t, func(tx *gorm.DB) error {
+				if test.commit {
+					require.NoError(t, tx.Commit().Error)
+				} else {
+					require.NoError(t, tx.Rollback().Error)
+				}
+				return commitErr
+			})
+
+			committed, err := BatchDeleteTokens([]int{token.Id}, token.UserId)
 			require.Error(t, err)
 			assert.ErrorIs(t, err, commitErr)
 			assert.Equal(t, test.wantCommitted, committed)
 			assert.Equal(t, test.wantCached, common.RDB.Exists(t.Context(), getTokenCacheKey(token.Key)).Val() == 1)
 			if test.wantCommitted > 0 {
 				assert.ErrorIs(t, err, ErrTokenMutationCommitted)
+				var stored Token
+				assert.ErrorIs(t, DB.First(&stored, token.Id).Error, gorm.ErrRecordNotFound)
 			} else {
-				_, validateErr := ValidateUserToken(token.Key)
-				assert.NoError(t, validateErr)
+				var stored Token
+				require.NoError(t, DB.First(&stored, token.Id).Error)
+				_, readErr := GetTokenByKey(token.Key, false)
+				assert.ErrorIs(t, readErr, errTokenCacheMutationPending)
 			}
 		})
 	}
