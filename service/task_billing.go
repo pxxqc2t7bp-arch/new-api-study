@@ -65,6 +65,7 @@ func LogTaskConsumption(c *gin.Context, info *relaycommon.RelayInfo, task *model
 			other.SetPublic("usage_facts", snap.UsageFacts)
 		}
 	}
+	AppendRelayLogAdminInfo(c, info, other)
 	appendTaskLogInfo(task, other)
 	attachQuotaSaturation(c, info, other)
 	model.RecordConsumeLog(c, info.UserId, model.RecordConsumeLogParams{

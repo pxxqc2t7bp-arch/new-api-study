@@ -487,7 +487,7 @@ func reconcileTokenMutationCommitError(token *Token, deleteCache bool, generatio
 		}
 	}
 	if readErr == nil && !deleteCache && stored.Id == token.Id && stored.CacheGeneration == generation+1 {
-		token.CacheGeneration = stored.CacheGeneration
+		*token = *stored
 		finalizeErr := commitTokenCacheMutation(*stored, generation)
 		return &TokenMutationCommittedError{
 			Count: 1,
@@ -554,7 +554,7 @@ func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(*gorm.DB,
 			Cause: errors.New("committed token cache generation could not be verified"),
 		}
 	}
-	token.CacheGeneration = stored.CacheGeneration
+	*token = *stored
 	if err := commitTokenCacheMutation(*stored, generation); err != nil {
 		return &TokenMutationCommittedError{Count: 1, Cause: err}
 	}
@@ -563,12 +563,33 @@ func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(*gorm.DB,
 
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (token *Token) Update() (err error) {
+	return token.update(nil)
+}
+
+// UpdateWithQuotaDelta applies an administrator-requested quota adjustment
+// relative to the snapshot they edited, preserving quota writes that committed
+// after that snapshot was read.
+func (token *Token) UpdateWithQuotaDelta(quotaDelta int64) error {
+	return token.update(&quotaDelta)
+}
+
+func (token *Token) update(quotaDelta *int64) error {
 	return mutateTokenMetadata(token, false, func(tx *gorm.DB, committedGeneration int64) error {
 		token.CacheGeneration = committedGeneration
-		return tx.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
+		fields := []string{"name", "status", "expired_time", "unlimited_quota",
 			"model_limits_enabled", "model_limits", "allow_ips", "stream_recovery_enabled", "group",
 			"cross_group_retry", "auto_groups", "default_routing_strategy", "allowed_routing_strategies",
-			"default_conversion_policy", "allow_lossy_conversion", "cache_generation").Updates(token).Error
+			"default_conversion_policy", "allow_lossy_conversion", "cache_generation"}
+		if quotaDelta == nil {
+			fields = append(fields, "remain_quota")
+		}
+		if err := tx.Model(token).Select(fields).Updates(token).Error; err != nil {
+			return err
+		}
+		if quotaDelta != nil && *quotaDelta != 0 {
+			return tx.Model(token).UpdateColumn("remain_quota", gorm.Expr("remain_quota + ?", *quotaDelta)).Error
+		}
+		return nil
 	})
 }
 

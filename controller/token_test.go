@@ -868,6 +868,66 @@ func TestUpdateTokenStatusOnlyPreservesConcurrentPolicyUpdate(t *testing.T) {
 	assert.False(t, updated.AllowLossyConversion)
 }
 
+func TestUpdateTokenPreservesConcurrentQuotaWrite(t *testing.T) {
+	tests := []struct {
+		name           string
+		requestedQuota int
+		expectedRemain int
+	}{
+		{name: "policy only", requestedQuota: 100, expectedRemain: 30},
+		{name: "explicit increase", requestedQuota: 150, expectedRemain: 80},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := setupTokenControllerTestDB(t)
+			token := seedToken(t, db, 1, "concurrent-quota-token", "concurrent-quota-key")
+
+			interleaved := false
+			callbackName := "test:interleave_token_quota_update_" + strings.ReplaceAll(test.name, " ", "_")
+			require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if interleaved || tx.Statement.Table != "tokens" {
+					return
+				}
+				interleaved = true
+				result := db.Model(&model.Token{}).Where("id = ?", token.Id).Updates(map[string]any{
+					"remain_quota": 30,
+					"used_quota":   70,
+				})
+				if result.Error != nil {
+					tx.AddError(result.Error)
+				}
+			}))
+			t.Cleanup(func() {
+				_ = db.Callback().Query().Remove(callbackName)
+			})
+
+			body := map[string]any{
+				"id":                       token.Id,
+				"name":                     token.Name,
+				"status":                   common.TokenStatusEnabled,
+				"expired_time":             -1,
+				"remain_quota":             test.requestedQuota,
+				"unlimited_quota":          true,
+				"group":                    "default",
+				"cross_group_retry":        false,
+				"model_limits_enabled":     false,
+				"default_routing_strategy": "stable",
+			}
+			ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, token.UserId)
+			UpdateToken(ctx)
+
+			require.True(t, interleaved)
+			require.True(t, decodeAPIResponse(t, recorder).Success)
+			var updated model.Token
+			require.NoError(t, db.First(&updated, token.Id).Error)
+			assert.Equal(t, test.expectedRemain, updated.RemainQuota)
+			assert.Equal(t, 70, updated.UsedQuota)
+			assert.Equal(t, "stable", updated.DefaultRoutingStrategy)
+		})
+	}
+}
+
 func TestTokenMutationControllersReportCommittedCacheSyncPending(t *testing.T) {
 	assertCommittedResponse := func(t *testing.T, ctx *gin.Context, recorder *httptest.ResponseRecorder, count int) tokenAPIResponse {
 		t.Helper()

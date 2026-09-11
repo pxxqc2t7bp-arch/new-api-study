@@ -508,6 +508,7 @@ func UpdateToken(c *gin.Context) {
 	}
 	params["name"] = cleanToken.Name
 	previous := *cleanToken
+	quotaDelta := int64(token.RemainQuota) - int64(previous.RemainQuota)
 	if token.Status == common.TokenStatusEnabled {
 		if cleanToken.Status == common.TokenStatusExpired && cleanToken.ExpiredTime <= common.GetTimestamp() && cleanToken.ExpiredTime != -1 {
 			common.ApiErrorI18n(c, i18n.MsgTokenExpiredCannotEnable)
@@ -547,7 +548,7 @@ func UpdateToken(c *gin.Context) {
 	if statusOnly != "" {
 		err = cleanToken.SelectUpdate()
 	} else {
-		err = cleanToken.Update()
+		err = cleanToken.UpdateWithQuotaDelta(quotaDelta)
 	}
 	mutationCommitted := errors.Is(err, model.ErrTokenMutationCommitted)
 	if err == nil || mutationCommitted {
@@ -562,7 +563,7 @@ func UpdateToken(c *gin.Context) {
 			}{
 				{"name", previous.Name != cleanToken.Name},
 				{"expired_time", previous.ExpiredTime != cleanToken.ExpiredTime},
-				{"remain_quota", previous.RemainQuota != cleanToken.RemainQuota},
+				{"remain_quota", quotaDelta != 0},
 				{"unlimited_quota", previous.UnlimitedQuota != cleanToken.UnlimitedQuota},
 				{"model_limits_enabled", previous.ModelLimitsEnabled != cleanToken.ModelLimitsEnabled},
 				{"model_limits", previous.ModelLimits != cleanToken.ModelLimits},

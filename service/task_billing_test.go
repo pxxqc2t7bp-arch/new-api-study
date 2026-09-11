@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -380,6 +381,45 @@ func TestLogTaskConsumptionWithoutSnapshotKeepsRatioMode(t *testing.T) {
 	assert.NotContains(t, other, "usage_facts")
 	assert.Contains(t, log.Content, "计算参数：")
 	assert.Contains(t, log.Content, "size: 2.00")
+}
+
+func TestLogTaskConsumptionIncludesRequestPolicyAudit(t *testing.T) {
+	truncate(t)
+	const userID, channelID = 42, 42
+	seedUser(t, userID, 10_000)
+	seedChannel(t, channelID)
+
+	task := makeTask(userID, channelID, 100, 0, BillingSourceWallet, 0)
+	info := &relaycommon.RelayInfo{
+		UserId:           userID,
+		TokenId:          0,
+		OriginModelName:  "task-plugin-model",
+		UsingGroup:       "default",
+		RoutingStrategy:  types.RoutingStrategyLatency,
+		ConversionPolicy: relaytypes.ConversionLossPolicySafe,
+		ChannelMeta:      &relaycommon.ChannelMeta{ChannelId: channelID},
+		TaskRelayInfo:    &relaycommon.TaskRelayInfo{Action: "GENERATE"},
+		PriceData: types.PriceData{
+			ModelPrice:     0.02,
+			Quota:          100,
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+		},
+	}
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ctx.Set("token_name", "test_token")
+	LogTaskConsumption(ctx, info, task)
+	log := getLastLog(t)
+	require.NotNil(t, log)
+
+	var other map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
+	adminInfo, ok := other["admin_info"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "latency", adminInfo["routing_strategy"])
+	assert.Equal(t, "safe", adminInfo["conversion_policy"])
 }
 
 func TestTaskBillingOtherSeparatesPluginAndRootDiagnostics(t *testing.T) {

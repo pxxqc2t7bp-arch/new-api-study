@@ -1019,16 +1019,24 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 				result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
 				require.NoError(t, err)
 				require.Equal(t, cacheQuotaOK, result)
+				require.NoError(t, db.Model(&Token{}).Where("id = ?", token.Id).Updates(map[string]any{
+					"remain_quota": 30,
+					"used_quota":   70,
+				}).Error)
 
-				token.RemainQuota = 10
+				token.RemainQuota = 150
 				token.DefaultRoutingStrategy = "stable"
-				require.NoError(t, token.Update())
+				require.NoError(t, token.UpdateWithQuotaDelta(50))
 
 				cached, err := cacheGetTokenByKey(token.Key)
 				require.NoError(t, err)
-				assert.Equal(t, -60, cached.RemainQuota)
+				assert.Equal(t, 80, cached.RemainQuota)
 				assert.Equal(t, 70, cached.UsedQuota)
 				assert.Equal(t, "stable", cached.DefaultRoutingStrategy)
+				var stored Token
+				require.NoError(t, db.First(&stored, token.Id).Error)
+				assert.Equal(t, 80, stored.RemainQuota)
+				assert.Equal(t, 70, stored.UsedQuota)
 			})
 
 			t.Run("statement failure rolls back transaction and fence", func(t *testing.T) {
