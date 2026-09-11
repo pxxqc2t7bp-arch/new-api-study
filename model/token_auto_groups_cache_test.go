@@ -441,6 +441,67 @@ func TestTokenReaderDoesNotRollbackActiveMetadataMutation(t *testing.T) {
 	assert.Equal(t, common.TokenStatusDisabled, loadedAfterCommit.Status)
 }
 
+func TestTokenCacheMissingGenerationDoesNotAcceptStaleHash(t *testing.T) {
+	truncateTables(t)
+	useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:         7,
+		Key:            "token-missing-generation-stale-hash",
+		Name:           "missing-generation-stale-hash",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+	require.NoError(t, cacheSetTokenForTest(token))
+
+	require.NoError(t, DB.Model(&token).Updates(map[string]any{
+		"status":           common.TokenStatusDisabled,
+		"cache_generation": 2,
+	}).Error)
+	require.NoError(t, common.RDB.Del(t.Context(), getTokenCacheGenerationKey(token.Key)).Err())
+
+	loaded, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, common.TokenStatusDisabled, loaded.Status)
+	assert.EqualValues(t, 2, loaded.CacheGeneration)
+}
+
+func TestTokenCommitRestoresMissingGenerationKey(t *testing.T) {
+	truncateTables(t)
+	useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:         7,
+		Key:            "token-commit-missing-generation",
+		Name:           "commit-missing-generation",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+	require.NoError(t, cacheSetTokenForTest(token))
+	result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
+
+	generation, err := beginTokenCacheMutation(token.Key, token.CacheGeneration)
+	require.NoError(t, err)
+	token.Status = common.TokenStatusDisabled
+	token.CacheGeneration = generation + 1
+	require.NoError(t, DB.Model(&token).Select("status", "cache_generation").Updates(&token).Error)
+	require.NoError(t, common.RDB.Del(t.Context(), getTokenCacheGenerationKey(token.Key)).Err())
+
+	require.NoError(t, commitTokenCacheMutation(token, generation))
+	loaded, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, common.TokenStatusDisabled, loaded.Status)
+	assert.Equal(t, 30, loaded.RemainQuota)
+	assert.Equal(t, 70, loaded.UsedQuota)
+	assert.EqualValues(t, 2, loaded.CacheGeneration)
+}
+
 func TestSecondTokenWriterDoesNotSkipFirstFinalization(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)
@@ -994,6 +1055,7 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 					keyPrefix + "-rollback",
 					keyPrefix + "-commit",
 					keyPrefix + "-batch-delete",
+					keyPrefix + "-missing-generation",
 				}
 				for _, key := range keys {
 					_ = common.RDB.Del(
@@ -1142,6 +1204,38 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 				assert.ErrorIs(t, db.First(&stored, token.Id).Error, gorm.ErrRecordNotFound)
 				_, err = cacheGetTokenByKey(token.Key)
 				assert.Error(t, err)
+			})
+
+			t.Run("commit restores missing redis generation", func(t *testing.T) {
+				token := Token{
+					UserId:         7,
+					Key:            keyPrefix + "-missing-generation",
+					Name:           "configured-db-missing-generation",
+					Status:         common.TokenStatusEnabled,
+					ExpiredTime:    -1,
+					RemainQuota:    100,
+					UnlimitedQuota: true,
+				}
+				require.NoError(t, token.Insert())
+				require.NoError(t, cacheSetTokenForTest(token))
+				result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
+				require.NoError(t, err)
+				require.Equal(t, cacheQuotaOK, result)
+
+				generation, err := beginTokenCacheMutation(token.Key, token.CacheGeneration)
+				require.NoError(t, err)
+				token.Status = common.TokenStatusDisabled
+				token.CacheGeneration = generation + 1
+				require.NoError(t, db.Model(&token).Select("status", "cache_generation").Updates(&token).Error)
+				require.NoError(t, common.RDB.Del(t.Context(), getTokenCacheGenerationKey(token.Key)).Err())
+
+				require.NoError(t, commitTokenCacheMutation(token, generation))
+				cached, err := cacheGetTokenByKey(token.Key)
+				require.NoError(t, err)
+				assert.Equal(t, common.TokenStatusDisabled, cached.Status)
+				assert.Equal(t, 30, cached.RemainQuota)
+				assert.Equal(t, 70, cached.UsedQuota)
+				assert.EqualValues(t, 2, cached.CacheGeneration)
 			})
 		})
 	}

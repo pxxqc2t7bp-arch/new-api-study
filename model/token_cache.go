@@ -37,8 +37,9 @@ const tokenCacheFenceSeconds = 10
 var errTokenCacheMutationPending = errors.New("token metadata update is pending")
 
 type tokenCacheGenerationState struct {
-	generation    int64
-	pendingMarker bool
+	generation        int64
+	generationPresent bool
+	pendingMarker     bool
 }
 
 func loadTokenCacheGenerationState(key string) (tokenCacheGenerationState, error) {
@@ -53,6 +54,7 @@ func loadTokenCacheGenerationState(key string) (tokenCacheGenerationState, error
 
 	state := tokenCacheGenerationState{}
 	if values[0] != nil {
+		state.generationPresent = true
 		state.generation, err = strconv.ParseInt(fmt.Sprint(values[0]), 10, 64)
 		if err != nil || state.generation < 0 {
 			return tokenCacheGenerationState{}, fmt.Errorf("invalid token cache generation")
@@ -129,7 +131,8 @@ func commitTokenCacheMutation(token Token, generation int64) error {
 local incoming = tonumber(ARGV[1])
 local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 if current < incoming then
-  return 0
+  current = incoming
+  redis.call('SET', KEYS[1], current)
 end
 if current == incoming then
   if current % 2 == 0 then
@@ -203,7 +206,8 @@ func commitTokenCacheDeleteMutation(key string, generation int64) error {
 local incoming = tonumber(ARGV[1])
 local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 if current < incoming then
-  return 0
+  current = incoming
+  redis.call('SET', KEYS[1], current)
 end
 if current == incoming then
   if current % 2 == 0 then
@@ -238,7 +242,8 @@ func rollbackTokenCacheMutation(key string, generation int64) error {
 local incoming = tonumber(ARGV[1])
 local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 if current < incoming then
-  return 0
+  current = incoming
+  redis.call('SET', KEYS[1], current)
 end
 if current == incoming then
   if current % 2 == 0 then
@@ -309,6 +314,7 @@ local database = tonumber(ARGV[24])
 local current = tonumber(redis.call('GET', KEYS[3]) or '0')
 if current < database then
   redis.call('SET', KEYS[3], database)
+  redis.call('DEL', KEYS[1])
   return 0
 end
 if current ~= expected or current % 2 ~= 0 or redis.call('EXISTS', KEYS[2]) == 1 then
@@ -319,9 +325,11 @@ if redis.call('EXISTS', KEYS[1]) == 1 then
   if cached ~= expected then
     return 0
   end
+  redis.call('SET', KEYS[3], expected)
   redis.call('EXPIRE', KEYS[1], ARGV[22])
   return 2
 end
+redis.call('SET', KEYS[3], expected)
 redis.call('HSET', KEYS[1],
   'Id', ARGV[1], 'UserId', ARGV[2], 'Status', ARGV[3], 'Name', ARGV[4],
   'CreatedTime', ARGV[5], 'AccessedTime', ARGV[6], 'ExpiredTime', ARGV[7],
@@ -357,25 +365,31 @@ func cacheGetTokenByKey(key string) (*Token, error) {
 	if !common.RedisEnabled {
 		return nil, fmt.Errorf("redis is not enabled")
 	}
-	beforeGeneration, pending, err := getTokenCacheGenerationState(key)
+	beforeState, err := loadTokenCacheGenerationState(key)
 	if err != nil {
 		return nil, err
 	}
-	if pending {
+	if !beforeState.generationPresent {
+		return nil, fmt.Errorf("token cache generation is missing")
+	}
+	if beforeState.pendingMarker || beforeState.generation%2 != 0 {
 		return nil, errTokenCacheMutationPending
 	}
 	var token Token
 	if cacheErr := common.RedisHGetObj(getTokenCacheKey(key), &token); cacheErr != nil {
 		return nil, cacheErr
 	}
-	afterGeneration, pending, err := getTokenCacheGenerationState(key)
+	afterState, err := loadTokenCacheGenerationState(key)
 	if err != nil {
 		return nil, err
 	}
-	if pending {
+	if !afterState.generationPresent {
+		return nil, fmt.Errorf("token cache generation is missing")
+	}
+	if afterState.pendingMarker || afterState.generation%2 != 0 {
 		return nil, errTokenCacheMutationPending
 	}
-	if beforeGeneration != afterGeneration || token.CacheGeneration != afterGeneration {
+	if beforeState.generation != afterState.generation || token.CacheGeneration != afterState.generation {
 		return nil, fmt.Errorf("token cache generation is stale")
 	}
 	if token.Id <= 0 {
