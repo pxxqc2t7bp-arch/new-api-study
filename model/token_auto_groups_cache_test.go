@@ -984,6 +984,35 @@ func TestTokenCommitAcknowledgementLossWithoutRedisReturnsObservedOutcome(t *tes
 	}
 }
 
+func TestBatchDeleteCommitAcknowledgementLossWithoutRedisReturnsObservedSuccess(t *testing.T) {
+	truncateTables(t)
+	previousRedisEnabled := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = previousRedisEnabled })
+	token := Token{
+		UserId:         7,
+		Key:            "token-batch-no-redis-commit",
+		Name:           "batch-no-redis-commit",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+
+	commitErr := errors.New("simulated no-redis batch commit acknowledgement loss")
+	replaceTokenMutationCommitForTest(t, func(tx *gorm.DB) error {
+		require.NoError(t, tx.Commit().Error)
+		return commitErr
+	})
+
+	count, err := BatchDeleteTokens([]int{token.Id}, token.UserId)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count)
+	var stored Token
+	assert.ErrorIs(t, DB.First(&stored, token.Id).Error, gorm.ErrRecordNotFound)
+}
+
 func TestBatchDeleteTokensFinalizesEveryCommittedMutation(t *testing.T) {
 	truncateTables(t)
 	server := useUserCacheMiniRedis(t)

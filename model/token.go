@@ -751,8 +751,10 @@ type tokenCacheMutation struct {
 
 func reconcileBatchTokenDeleteCommit(cacheMutations []tokenCacheMutation, commitErr error) (int, error) {
 	committedCount := 0
+	cacheSyncRequired := false
 	causes := []error{commitErr}
 	for _, mutation := range cacheMutations {
+		cacheSyncRequired = cacheSyncRequired || mutation.generation > 0
 		var stored Token
 		readErr := DB.Where(&Token{Id: mutation.id, Key: mutation.key}).First(&stored).Error
 		switch {
@@ -764,6 +766,9 @@ func reconcileBatchTokenDeleteCommit(cacheMutations []tokenCacheMutation, commit
 		case readErr != nil:
 			causes = append(causes, fmt.Errorf("failed to reconcile deleted token %d: %w", mutation.id, readErr))
 		}
+	}
+	if committedCount == len(cacheMutations) && !cacheSyncRequired {
+		return committedCount, nil
 	}
 	if committedCount > 0 {
 		return committedCount, &TokenMutationCommittedError{
