@@ -373,7 +373,7 @@ func GetTokenById(id int) (*Token, error) {
 
 func getTokenByKeyFromDB(key string) (*Token, error) {
 	token := &Token{}
-	if err := DB.Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
+	if err := DB.Where(&Token{Key: key}).First(token).Error; err != nil {
 		return nil, err
 	}
 	return token, nil
@@ -541,7 +541,7 @@ func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(*gorm.DB,
 	var expected *Token
 	if !deleteCache {
 		expected = &Token{}
-		if readErr := tx.Where(commonKeyCol+" = ?", token.Key).First(expected).Error; readErr != nil {
+		if readErr := tx.Where(&Token{Key: token.Key}).First(expected).Error; readErr != nil {
 			if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
 				return errors.Join(readErr, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
 			}
