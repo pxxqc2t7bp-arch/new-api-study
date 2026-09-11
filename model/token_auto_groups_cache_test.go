@@ -3,14 +3,20 @@ package model
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -884,6 +890,204 @@ func TestBatchDeleteCommitErrorRemainsFailClosed(t *testing.T) {
 				_, readErr := GetTokenByKey(token.Key, false)
 				assert.ErrorIs(t, readErr, errTokenCacheMutationPending)
 			}
+		})
+	}
+}
+
+func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
+	tests := []struct {
+		name      string
+		env       string
+		dbType    common.DatabaseType
+		dialector func(string) gorm.Dialector
+	}{
+		{
+			name:   "sqlite",
+			dbType: common.DatabaseTypeSQLite,
+			dialector: func(dsn string) gorm.Dialector {
+				return sqlite.Open(dsn)
+			},
+		},
+		{
+			name:   "mysql",
+			env:    "TEST_MYSQL_DSN",
+			dbType: common.DatabaseTypeMySQL,
+			dialector: func(dsn string) gorm.Dialector {
+				return mysql.Open(dsn)
+			},
+		},
+		{
+			name:   "postgres",
+			env:    "TEST_POSTGRES_DSN",
+			dbType: common.DatabaseTypePostgreSQL,
+			dialector: func(dsn string) gorm.Dialector {
+				return postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dsn := filepath.Join(t.TempDir(), "token-metadata.db")
+			if test.env != "" {
+				dsn = strings.TrimSpace(os.Getenv(test.env))
+				if dsn == "" {
+					t.Skip(test.env + " is not configured")
+				}
+			}
+			db, err := gorm.Open(test.dialector(dsn), &gorm.Config{})
+			require.NoError(t, err)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = sqlDB.Close() })
+			if test.env != "" && db.Migrator().HasTable(&Token{}) {
+				t.Skip("refusing to run token transaction test against a database with an existing tokens table")
+			}
+			require.NoError(t, db.AutoMigrate(&Token{}))
+
+			previousDB, previousLogDB := DB, LOG_DB
+			previousMainType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+			previousBatchUpdate := common.BatchUpdateEnabled
+			DB, LOG_DB = db, db
+			common.SetDatabaseTypes(test.dbType, test.dbType)
+			common.BatchUpdateEnabled = false
+			initCol()
+			t.Cleanup(func() {
+				_ = db.Migrator().DropTable(&Token{})
+				DB, LOG_DB = previousDB, previousLogDB
+				common.SetDatabaseTypes(previousMainType, previousLogType)
+				common.BatchUpdateEnabled = previousBatchUpdate
+				initCol()
+			})
+			useUserCacheMiniRedis(t)
+
+			t.Run("commit preserves reservations and applies quota delta", func(t *testing.T) {
+				token := Token{
+					UserId:      7,
+					Key:         "configured-db-quota-" + test.name,
+					Name:        "configured-db-quota",
+					Status:      common.TokenStatusEnabled,
+					ExpiredTime: -1,
+					RemainQuota: 100,
+				}
+				require.NoError(t, token.Insert())
+				require.NoError(t, cacheSetTokenForTest(token))
+				result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
+				require.NoError(t, err)
+				require.Equal(t, cacheQuotaOK, result)
+
+				token.RemainQuota = 10
+				token.DefaultRoutingStrategy = "stable"
+				require.NoError(t, token.Update())
+
+				cached, err := cacheGetTokenByKey(token.Key)
+				require.NoError(t, err)
+				assert.Equal(t, -60, cached.RemainQuota)
+				assert.Equal(t, 70, cached.UsedQuota)
+				assert.Equal(t, "stable", cached.DefaultRoutingStrategy)
+			})
+
+			t.Run("statement failure rolls back transaction and fence", func(t *testing.T) {
+				token := Token{
+					UserId:         7,
+					Key:            "configured-db-rollback-" + test.name,
+					Name:           "configured-db-rollback",
+					Status:         common.TokenStatusEnabled,
+					ExpiredTime:    -1,
+					RemainQuota:    100,
+					UnlimitedQuota: true,
+				}
+				require.NoError(t, token.Insert())
+				require.NoError(t, cacheSetTokenForTest(token))
+
+				forcedErr := errors.New("forced configured database update failure")
+				callbackName := "test:configured_database_failure_" + test.name
+				require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+					if tx.Statement.Table == "tokens" {
+						tx.AddError(forcedErr)
+					}
+				}))
+				callbackRegistered := true
+				t.Cleanup(func() {
+					if callbackRegistered {
+						_ = db.Callback().Update().Remove(callbackName)
+					}
+				})
+
+				token.Status = common.TokenStatusDisabled
+				assert.ErrorIs(t, token.SelectUpdate(), forcedErr)
+				require.NoError(t, db.Callback().Update().Remove(callbackName))
+				callbackRegistered = false
+
+				var stored Token
+				require.NoError(t, db.First(&stored, token.Id).Error)
+				assert.Equal(t, common.TokenStatusEnabled, stored.Status)
+				cached, err := cacheGetTokenByKey(token.Key)
+				require.NoError(t, err)
+				assert.Equal(t, common.TokenStatusEnabled, cached.Status)
+			})
+
+			t.Run("commit acknowledgement loss finalizes committed update", func(t *testing.T) {
+				token := Token{
+					UserId:         7,
+					Key:            "configured-db-commit-" + test.name,
+					Name:           "configured-db-commit",
+					Status:         common.TokenStatusEnabled,
+					ExpiredTime:    -1,
+					RemainQuota:    100,
+					UnlimitedQuota: true,
+				}
+				require.NoError(t, token.Insert())
+				require.NoError(t, cacheSetTokenForTest(token))
+
+				commitErr := errors.New("forced configured database commit acknowledgement loss")
+				replaceTokenMutationCommitForTest(t, func(tx *gorm.DB) error {
+					require.NoError(t, tx.Commit().Error)
+					return commitErr
+				})
+				token.Status = common.TokenStatusDisabled
+				err := token.SelectUpdate()
+				require.Error(t, err)
+				assert.ErrorIs(t, err, ErrTokenMutationCommitted)
+				assert.ErrorIs(t, err, commitErr)
+
+				var stored Token
+				require.NoError(t, db.First(&stored, token.Id).Error)
+				assert.Equal(t, common.TokenStatusDisabled, stored.Status)
+				cached, err := cacheGetTokenByKey(token.Key)
+				require.NoError(t, err)
+				assert.Equal(t, common.TokenStatusDisabled, cached.Status)
+			})
+
+			t.Run("batch delete acknowledgement loss finalizes committed delete", func(t *testing.T) {
+				token := Token{
+					UserId:         7,
+					Key:            "configured-db-batch-delete-" + test.name,
+					Name:           "configured-db-batch-delete",
+					Status:         common.TokenStatusEnabled,
+					ExpiredTime:    -1,
+					RemainQuota:    100,
+					UnlimitedQuota: true,
+				}
+				require.NoError(t, token.Insert())
+				require.NoError(t, cacheSetTokenForTest(token))
+
+				commitErr := errors.New("forced configured database batch commit acknowledgement loss")
+				replaceTokenMutationCommitForTest(t, func(tx *gorm.DB) error {
+					require.NoError(t, tx.Commit().Error)
+					return commitErr
+				})
+				count, err := BatchDeleteTokens([]int{token.Id}, token.UserId)
+				require.Error(t, err)
+				assert.ErrorIs(t, err, ErrTokenMutationCommitted)
+				assert.ErrorIs(t, err, commitErr)
+				assert.Equal(t, 1, count)
+
+				var stored Token
+				assert.ErrorIs(t, db.First(&stored, token.Id).Error, gorm.ErrRecordNotFound)
+				_, err = cacheGetTokenByKey(token.Key)
+				assert.Error(t, err)
+			})
 		})
 	}
 }
