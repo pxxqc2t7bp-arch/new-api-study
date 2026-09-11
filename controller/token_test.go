@@ -307,6 +307,19 @@ func getTokenAutoGroupsColumnType(t *testing.T, db *gorm.DB, dialect string) str
 	}
 }
 
+func requireTokenPolicyColumns(t *testing.T, db *gorm.DB) {
+	t.Helper()
+
+	for _, column := range []string{
+		"default_routing_strategy",
+		"allowed_routing_strategies",
+		"default_conversion_policy",
+		"allow_lossy_conversion",
+	} {
+		require.Truef(t, db.Migrator().HasColumn(&model.Token{}, column), "expected tokens.%s column", column)
+	}
+}
+
 func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect string, managedTokensTable *bool) {
 	t.Helper()
 
@@ -354,49 +367,75 @@ func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect strin
 	if got := getTokenAutoGroupsColumnType(t, db, dialect); got != "text" {
 		t.Fatalf("expected migrated auto_groups column type text, got %q", got)
 	}
+	requireTokenPolicyColumns(t, db)
 
 	var migratedToken model.Token
-	if err := db.First(&migratedToken, "name = ?", "legacy-token").Error; err != nil {
-		t.Fatalf("failed to load migrated token row: %v", err)
-	}
-	if migratedToken.Key != legacyKey {
-		t.Fatalf("expected migrated token key %q, got %q", legacyKey, migratedToken.Key)
-	}
-	if migratedToken.Name != "legacy-token" {
-		t.Fatalf("expected migrated token name to be preserved, got %q", migratedToken.Name)
-	}
-	if migratedToken.AutoGroups != "" {
-		t.Fatalf("expected legacy token to inherit global Auto groups, got %q", migratedToken.AutoGroups)
-	}
+	require.NoError(t, db.First(&migratedToken, "name = ?", "legacy-token").Error)
+	assert.Equal(t, 7, migratedToken.UserId)
+	assert.Equal(t, legacyKey, migratedToken.Key)
+	assert.Equal(t, common.TokenStatusEnabled, migratedToken.Status)
+	assert.Equal(t, "legacy-token", migratedToken.Name)
+	assert.EqualValues(t, 1, migratedToken.CreatedTime)
+	assert.EqualValues(t, 1, migratedToken.AccessedTime)
+	assert.EqualValues(t, -1, migratedToken.ExpiredTime)
+	assert.Equal(t, 100, migratedToken.RemainQuota)
+	assert.True(t, migratedToken.UnlimitedQuota)
+	assert.False(t, migratedToken.ModelLimitsEnabled)
+	assert.Empty(t, migratedToken.ModelLimits)
+	require.NotNil(t, migratedToken.AllowIps)
+	assert.Empty(t, *migratedToken.AllowIps)
+	assert.Zero(t, migratedToken.UsedQuota)
+	assert.Equal(t, "default", migratedToken.Group)
+	assert.False(t, migratedToken.CrossGroupRetry)
+	assert.Empty(t, migratedToken.AutoGroups)
+	assert.Empty(t, migratedToken.DefaultRoutingStrategy)
+	assert.Empty(t, migratedToken.AllowedRoutingStrategies)
+	assert.Empty(t, migratedToken.DefaultConversionPolicy)
+	assert.False(t, migratedToken.AllowLossyConversion)
+
+	runtimePolicy := migratedToken
+	require.NoError(t, runtimePolicy.NormalizeRequestPolicySettings())
+	assert.Equal(t, "stable", runtimePolicy.DefaultRoutingStrategy)
+	assert.JSONEq(t, `["stable"]`, runtimePolicy.AllowedRoutingStrategies)
+	assert.Equal(t, "strict", runtimePolicy.DefaultConversionPolicy)
+	assert.False(t, runtimePolicy.AllowLossyConversion)
+
+	migrateTokenControllerTestDB(t, db)
+
+	var remigratedToken model.Token
+	require.NoError(t, db.First(&remigratedToken, migratedToken.Id).Error)
+	assert.Equal(t, migratedToken, remigratedToken)
 
 	inserted := model.Token{
-		UserId:             8,
-		Name:               "long-token",
-		Key:                longKey,
-		Status:             common.TokenStatusEnabled,
-		CreatedTime:        1,
-		AccessedTime:       1,
-		ExpiredTime:        -1,
-		RemainQuota:        200,
-		UnlimitedQuota:     true,
-		ModelLimitsEnabled: false,
-		ModelLimits:        "",
-		AllowIps:           common.GetPointer(""),
-		UsedQuota:          0,
-		Group:              "default",
-		CrossGroupRetry:    false,
+		UserId:                   8,
+		Name:                     "long-token",
+		Key:                      longKey,
+		Status:                   common.TokenStatusEnabled,
+		CreatedTime:              1,
+		AccessedTime:             1,
+		ExpiredTime:              -1,
+		RemainQuota:              200,
+		UnlimitedQuota:           true,
+		ModelLimitsEnabled:       false,
+		ModelLimits:              "",
+		AllowIps:                 common.GetPointer(""),
+		UsedQuota:                0,
+		Group:                    "default",
+		CrossGroupRetry:          false,
+		DefaultRoutingStrategy:   "latency",
+		AllowedRoutingStrategies: `["latency","economy"]`,
+		DefaultConversionPolicy:  "allow",
+		AllowLossyConversion:     true,
 	}
-	if err := db.Create(&inserted).Error; err != nil {
-		t.Fatalf("failed to insert long token after migration: %v", err)
-	}
+	require.NoError(t, db.Create(&inserted).Error)
 
 	var fetched model.Token
-	if err := db.First(&fetched, "id = ?", inserted.Id).Error; err != nil {
-		t.Fatalf("failed to fetch long token after migration: %v", err)
-	}
-	if fetched.Key != longKey {
-		t.Fatalf("expected long token key %q, got %q", longKey, fetched.Key)
-	}
+	require.NoError(t, db.First(&fetched, "id = ?", inserted.Id).Error)
+	assert.Equal(t, longKey, fetched.Key)
+	assert.Equal(t, inserted.DefaultRoutingStrategy, fetched.DefaultRoutingStrategy)
+	assert.Equal(t, inserted.AllowedRoutingStrategies, fetched.AllowedRoutingStrategies)
+	assert.Equal(t, inserted.DefaultConversionPolicy, fetched.DefaultConversionPolicy)
+	assert.Equal(t, inserted.AllowLossyConversion, fetched.AllowLossyConversion)
 }
 
 func TestTokenAutoMigrateUsesVarchar128KeyColumn(t *testing.T) {
@@ -408,6 +447,7 @@ func TestTokenAutoMigrateUsesVarchar128KeyColumn(t *testing.T) {
 	if got := getSQLiteColumnType(t, db, "tokens", "auto_groups"); got != "text" {
 		t.Fatalf("expected auto_groups column type text, got %q", got)
 	}
+	requireTokenPolicyColumns(t, db)
 }
 
 func TestTokenMigrationFromChar48ToVarchar128(t *testing.T) {
