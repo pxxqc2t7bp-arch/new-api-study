@@ -11,10 +11,10 @@ type Options struct {
 	Gemini GeminiOptions
 
 	// ToolLossPolicy controls whether a cross-protocol conversion may omit or
-	// approximate built-in-tool semantics. The zero value uses the allow
-	// policy: conversion succeeds and every loss is returned as a diagnostic.
-	// safe/strict rejection is request-phase opt-in only; response and stream
-	// conversion never reject regardless of this field.
+	// approximate protocol semantics. The zero value uses the strict
+	// phase-one policy. Safe and allow require an explicit host authorization;
+	// every permitted loss is returned as a diagnostic. Response and stream
+	// conversion report diagnostics but do not reject.
 	ToolLossPolicy types.ConversionLossPolicy
 
 	// OpenRouterDialect marks the upstream as OpenRouter's OpenAI-compatible
@@ -103,7 +103,7 @@ func (o *Options) ShouldPreserveEffortTail(modelName string) bool {
 
 func (o *Options) EffectiveToolLossPolicy() types.ConversionLossPolicy {
 	if o == nil || o.ToolLossPolicy == "" {
-		return types.ConversionLossPolicyAllow
+		return types.ConversionLossPolicyStrict
 	}
 	return o.ToolLossPolicy
 }

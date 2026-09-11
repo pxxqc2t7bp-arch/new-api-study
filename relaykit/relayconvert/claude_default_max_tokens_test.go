@@ -9,6 +9,7 @@ import (
 	sharedclaude "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/shared/claude"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -82,19 +83,20 @@ func TestClaudeDefaultMaxTokensPresence(t *testing.T) {
 				assert.Equal(t, clientMaxTokens, *got.MaxTokens)
 			})
 
-			t.Run("client zero same as absent, hook fills", func(t *testing.T) {
+			t.Run("client zero remains explicit with hook", func(t *testing.T) {
 				clientMaxTokens := uint(0)
 				got, err := converter.convert(t, claudeDefaultsMeta(func(string) int { return 512 }), &clientMaxTokens)
 				require.NoError(t, err)
 				require.NotNil(t, got.MaxTokens)
-				assert.Equal(t, uint(512), *got.MaxTokens)
+				assert.Zero(t, *got.MaxTokens)
 			})
 
-			t.Run("client zero same as absent, no hook fails", func(t *testing.T) {
+			t.Run("client zero remains explicit without hook", func(t *testing.T) {
 				clientMaxTokens := uint(0)
 				got, err := converter.convert(t, &convmeta.Values{}, &clientMaxTokens)
-				require.ErrorIs(t, err, sharedclaude.ErrMissingMaxTokens)
-				assert.Nil(t, got)
+				require.NoError(t, err)
+				require.NotNil(t, got.MaxTokens)
+				assert.Zero(t, *got.MaxTokens)
 			})
 		})
 	}
@@ -186,7 +188,8 @@ func TestOpenAIChatRequestToClaudeMessagesOmitsEmptyTools(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := OpenAIChatRequestToClaudeMessages(context.Background(), &convmeta.Values{}, test.request)
+			info := &convmeta.Values{Options: &convmeta.Options{ToolLossPolicy: types.ConversionLossPolicyAllow}}
+			got, err := OpenAIChatRequestToClaudeMessages(context.Background(), info, test.request)
 			require.NoError(t, err)
 
 			body, err := kitutil.Marshal(got)

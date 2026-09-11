@@ -269,6 +269,16 @@ func LookupTextConverter(converter string) (TextConverterSpec, bool) {
 	return cloneTextConverterSpec(spec), true
 }
 
+func LookupTextConverterRoute(from types.RelayFormat, to types.RelayFormat) (TextConverterSpec, bool) {
+	requestConverterMu.RLock()
+	converterID, ok := requestConverterRoutes[requestConverterRoute{from: from, to: to}]
+	requestConverterMu.RUnlock()
+	if !ok {
+		return TextConverterSpec{}, false
+	}
+	return LookupTextConverter(converterID)
+}
+
 func registerBuiltinTextConverter(spec TextConverterSpec) {
 	spec.ID = strings.TrimSpace(spec.ID)
 	if spec.ID == "" {

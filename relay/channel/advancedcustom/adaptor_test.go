@@ -829,6 +829,119 @@ func TestAdaptorConvertsGeminiRequestToOpenAIChatUpstream(t *testing.T) {
 	assert.Equal(t, "user", chatReq.Messages[0].Role)
 }
 
+func TestAdaptorConvertsEveryRegisteredOrdinaryProtocolRoute(t *testing.T) {
+	maxTokens := uint(1024)
+	tests := []struct {
+		name         string
+		incomingPath string
+		upstreamPath string
+		converter    string
+		relayFormat  types.RelayFormat
+		convert      func(*Adaptor, *relaycommon.RelayInfo) (any, error)
+		want         any
+	}{
+		{
+			name: "Claude to Responses", incomingPath: "/v1/messages", upstreamPath: "/v1/responses",
+			converter: relayconvert.ConverterClaudeMessagesToOpenAIResponses, relayFormat: types.RelayFormatClaude,
+			convert: func(a *Adaptor, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertClaudeRequest(advancedCustomGinContext("/v1/messages"), info, &dto.ClaudeRequest{
+					Model: "gpt-test", MaxTokens: &maxTokens, Messages: []dto.ClaudeMessage{{Role: "user", Content: "hello"}},
+				})
+			},
+			want: &dto.OpenAIResponsesRequest{},
+		},
+		{
+			name: "Claude to Gemini", incomingPath: "/v1/messages", upstreamPath: "/v1beta/models/{model}:generateContent",
+			converter: relayconvert.ConverterClaudeMessagesToGeminiContent, relayFormat: types.RelayFormatClaude,
+			convert: func(a *Adaptor, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertClaudeRequest(advancedCustomGinContext("/v1/messages"), info, &dto.ClaudeRequest{
+					Model: "gemini-test", MaxTokens: &maxTokens, Messages: []dto.ClaudeMessage{{Role: "user", Content: "hello"}},
+				})
+			},
+			want: &dto.GeminiChatRequest{},
+		},
+		{
+			name: "Gemini to Claude", incomingPath: "/v1beta/models/{model}:generateContent", upstreamPath: "/v1/messages",
+			converter: relayconvert.ConverterGeminiContentToClaudeMessages, relayFormat: types.RelayFormatGemini,
+			convert: func(a *Adaptor, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertGeminiRequest(advancedCustomGinContext("/v1beta/models/gemini-test:generateContent"), info, &dto.GeminiChatRequest{
+					Contents: []dto.GeminiChatContent{{Role: "user", Parts: []dto.GeminiPart{{Text: "hello"}}}},
+				})
+			},
+			want: &dto.ClaudeRequest{},
+		},
+		{
+			name: "Gemini to Responses", incomingPath: "/v1beta/models/{model}:generateContent", upstreamPath: "/v1/responses",
+			converter: relayconvert.ConverterGeminiContentToOpenAIResponses, relayFormat: types.RelayFormatGemini,
+			convert: func(a *Adaptor, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertGeminiRequest(advancedCustomGinContext("/v1beta/models/gemini-test:generateContent"), info, &dto.GeminiChatRequest{
+					Contents: []dto.GeminiChatContent{{Role: "user", Parts: []dto.GeminiPart{{Text: "hello"}}}},
+				})
+			},
+			want: &dto.OpenAIResponsesRequest{},
+		},
+		{
+			name: "Responses to Claude", incomingPath: "/v1/responses", upstreamPath: "/v1/messages",
+			converter: relayconvert.ConverterOpenAIResponsesToClaudeMessages, relayFormat: types.RelayFormatOpenAIResponses,
+			convert: func(a *Adaptor, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertOpenAIResponsesRequest(advancedCustomGinContext("/v1/responses"), info, dto.OpenAIResponsesRequest{
+					Model: "claude-test", MaxOutputTokens: &maxTokens, Input: mustAdvancedCustomRawMessage(t, "hello"),
+				})
+			},
+			want: &dto.ClaudeRequest{},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{
+				IncomingPath: test.incomingPath,
+				UpstreamPath: test.upstreamPath,
+				Converter:    test.converter,
+			}}}
+			require.NoError(t, config.Validate())
+			info := advancedCustomRelayInfo(config)
+			info.RelayFormat = test.relayFormat
+			info.RequestURLPath = test.incomingPath
+
+			converted, err := test.convert(&Adaptor{}, info)
+			require.NoError(t, err)
+			assert.IsType(t, test.want, converted)
+		})
+	}
+}
+
+func TestAdaptorRequiresExplicitAllowForLossyConversion(t *testing.T) {
+	config := &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{
+		IncomingPath: "/v1beta/models/{model}:generateContent",
+		UpstreamPath: "/v1/chat/completions",
+		Converter:    relayconvert.ConverterGeminiContentToOpenAIChat,
+	}}}
+	tools := mustAdvancedCustomRawMessage(t, []map[string]any{{"codeExecution": map[string]any{}}})
+	request := &dto.GeminiChatRequest{
+		Contents: []dto.GeminiChatContent{{Role: "user", Parts: []dto.GeminiPart{{Text: "run this"}}}},
+		Tools:    tools,
+	}
+
+	strictInfo := advancedCustomRelayInfo(config)
+	strictInfo.RelayFormat = types.RelayFormatGemini
+	strictInfo.RequestURLPath = "/v1beta/models/gemini-test:generateContent"
+	_, err := (&Adaptor{}).ConvertGeminiRequest(advancedCustomGinContext(strictInfo.RequestURLPath), strictInfo, request)
+	require.Error(t, err)
+	var loss *types.ConversionLossError
+	require.ErrorAs(t, err, &loss)
+
+	allowInfo := advancedCustomRelayInfo(config)
+	allowInfo.RelayFormat = types.RelayFormatGemini
+	allowInfo.RequestURLPath = "/v1beta/models/gemini-test:generateContent"
+	allowInfo.ChannelOtherSettings.ToolLossPolicy = string(types.ConversionLossPolicyAllow)
+	converted, err := (&Adaptor{}).ConvertGeminiRequest(advancedCustomGinContext(allowInfo.RequestURLPath), allowInfo, request)
+	require.NoError(t, err)
+	assert.IsType(t, &dto.GeneralOpenAIRequest{}, converted)
+	require.NotEmpty(t, allowInfo.ConversionDiagnostics())
+	assert.Equal(t, "unsupported_hosted_tool", allowInfo.ConversionDiagnostics()[0].Code)
+}
+
 func advancedCustomRelayInfo(config *dto.AdvancedCustomConfig) *relaycommon.RelayInfo {
 	return &relaycommon.RelayInfo{
 		RelayFormat:     types.RelayFormatOpenAI,

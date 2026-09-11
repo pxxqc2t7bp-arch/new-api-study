@@ -1,81 +1,97 @@
 {
-  "model": "gpt-test",
-  "system": [
+  "losses": [
     {
-      "type": "text",
-      "text": "You are a helpful assistant."
+      "code": "structured_output_unsupported",
+      "path": "response_format",
+      "message": "Claude conversion does not preserve the OpenAI Chat structured-output configuration",
+      "severity": "warning",
+      "from": "openai",
+      "to": "claude"
     }
   ],
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        {
-          "type": "text",
-          "text": "What is in this image?"
-        },
-        {
-          "type": "image",
-          "source": {
-            "type": "base64",
-            "media_type": "image/png",
-            "data": "aGVsbG8="
-          }
-        }
-      ]
-    },
-    {
-      "role": "assistant",
-      "content": [
-        {
-          "type": "text",
-          "text": "..."
-        },
-        {
-          "type": "tool_use",
-          "id": "call_abc",
-          "name": "get_weather",
-          "input": {
-            "city": "Paris"
-          }
-        }
-      ]
-    },
-    {
-      "role": "user",
-      "content": [
-        {
-          "type": "tool_result",
-          "content": "15 degrees",
-          "tool_use_id": "call_abc"
-        }
-      ]
-    },
-    {
-      "role": "user",
-      "content": "Summarize."
-    }
-  ],
-  "max_tokens": 1024,
-  "stream": true,
-  "tools": [
-    {
-      "name": "get_weather",
-      "description": "Get weather by city",
-      "input_schema": {
-        "properties": {
-          "city": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "city"
-        ],
-        "type": "object"
+  "value": {
+    "model": "gpt-test",
+    "system": [
+      {
+        "type": "text",
+        "text": "You are a helpful assistant."
       }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What is in this image?"
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "aGVsbG8="
+            }
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "..."
+          },
+          {
+            "type": "tool_use",
+            "id": "call_abc",
+            "name": "get_weather",
+            "input": {
+              "city": "Paris"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "content": "15 degrees",
+            "tool_use_id": "call_abc"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": "Summarize."
+      }
+    ],
+    "max_tokens": 1024,
+    "temperature": 0,
+    "top_p": 0,
+    "stream": true,
+    "tools": [
+      {
+        "name": "get_weather",
+        "description": "Get weather by city",
+        "input_schema": {
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "type": "object"
+        }
+      }
+    ],
+    "tool_choice": {
+      "disable_parallel_tool_use": true,
+      "name": "get_weather",
+      "type": "tool"
     }
-  ],
-  "tool_choice": {
-    "type": "auto"
   }
 }

@@ -72,9 +72,9 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 	if len(claudeTools) > 0 {
 		claudeRequest.Tools = claudeTools
 	}
-	if textRequest.MaxCompletionTokens != nil && *textRequest.MaxCompletionTokens > 0 {
+	if textRequest.MaxCompletionTokens != nil {
 		claudeRequest.MaxTokens = kitutil.GetPointer(*textRequest.MaxCompletionTokens)
-	} else if textRequest.MaxTokens != nil && *textRequest.MaxTokens > 0 {
+	} else if textRequest.MaxTokens != nil {
 		claudeRequest.MaxTokens = kitutil.GetPointer(*textRequest.MaxTokens)
 	}
 	if textRequest.TopP != nil {
@@ -83,8 +83,8 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 	if textRequest.TopK != nil {
 		claudeRequest.TopK = kitutil.GetPointer(*textRequest.TopK)
 	}
-	if textRequest.IsStream(nil) {
-		claudeRequest.Stream = kitutil.GetPointer(true)
+	if textRequest.Stream != nil {
+		claudeRequest.Stream = kitutil.GetPointer(*textRequest.Stream)
 	}
 
 	if textRequest.ToolChoice != nil || textRequest.ParallelTooCalls != nil {

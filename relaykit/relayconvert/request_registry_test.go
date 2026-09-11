@@ -36,12 +36,14 @@ func TestRequestConverterRegistryListsSupportedTextConverters(t *testing.T) {
 				ConverterClaudeMessagesToOpenAIChat,
 				ConverterOpenAIChatToGeminiContent,
 			},
+			advancedCustom: true,
 		},
 		{
-			converter: requestConverterClaudeToResponses,
-			from:      types.RelayFormatClaude,
-			to:        types.RelayFormatOpenAIResponses,
-			quality:   RequestConverterQualityFair,
+			converter:      requestConverterClaudeToResponses,
+			from:           types.RelayFormatClaude,
+			to:             types.RelayFormatOpenAIResponses,
+			quality:        RequestConverterQualityFair,
+			advancedCustom: true,
 		},
 		{
 			converter: requestConverterGeminiToClaude,
@@ -52,6 +54,7 @@ func TestRequestConverterRegistryListsSupportedTextConverters(t *testing.T) {
 				ConverterGeminiContentToOpenAIChat,
 				ConverterOpenAIChatToClaudeMessages,
 			},
+			advancedCustom: true,
 		},
 		{
 			converter: requestConverterGeminiToResponses,
@@ -62,12 +65,14 @@ func TestRequestConverterRegistryListsSupportedTextConverters(t *testing.T) {
 				ConverterGeminiContentToOpenAIChat,
 				ConverterOpenAIChatToOpenAIResponses,
 			},
+			advancedCustom: true,
 		},
 		{
-			converter: requestConverterResponsesToClaude,
-			from:      types.RelayFormatOpenAIResponses,
-			to:        types.RelayFormatClaude,
-			quality:   RequestConverterQualityFair,
+			converter:      requestConverterResponsesToClaude,
+			from:           types.RelayFormatOpenAIResponses,
+			to:             types.RelayFormatClaude,
+			quality:        RequestConverterQualityFair,
+			advancedCustom: true,
 		},
 		{
 			converter:      ConverterOpenAIResponsesToGemini,
@@ -230,12 +235,14 @@ func TestConvertRequestClaudeToResponsesDropsIncompatibleContextManagement(t *te
 		}),
 	}
 
-	result, err := ConvertRequest(nil, nil, types.RelayFormatOpenAIResponses, req)
+	info := &convmeta.Values{Options: &convmeta.Options{ToolLossPolicy: types.ConversionLossPolicyAllow}}
+	result, err := ConvertRequest(nil, info, types.RelayFormatOpenAIResponses, req)
 
 	require.NoError(t, err)
 	responsesReq, ok := result.Value.(*dto.OpenAIResponsesRequest)
 	require.True(t, ok)
 	assert.Empty(t, responsesReq.ContextManagement)
+	assert.True(t, hasConversionDiagnosticCode(result.Diagnostics, "session_reference_unsupported"))
 }
 
 func TestConvertRequestClaudeAdaptiveThinkingPreservesEffort(t *testing.T) {
@@ -304,6 +311,7 @@ func TestConvertRequestViaExecutesExplicitPath(t *testing.T) {
 
 func TestConvertRequestResponsesToGeminiAppliesResponsesPreprocess(t *testing.T) {
 	info := &convmeta.Values{
+		Options:             &convmeta.Options{ToolLossPolicy: types.ConversionLossPolicyAllow},
 		ConversionChain:     []types.RelayFormat{types.RelayFormatOpenAIResponses},
 		ChannelMetaAttached: true,
 		UpstreamModelName:   "gemini-test",

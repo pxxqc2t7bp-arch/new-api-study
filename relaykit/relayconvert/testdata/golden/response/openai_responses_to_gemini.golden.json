@@ -1,36 +1,40 @@
 {
   "losses": null,
   "value": {
-    "id": "resp_fixed",
-    "type": "message",
-    "role": "assistant",
-    "content": [
+    "candidates": [
       {
-        "type": "thinking",
-        "thinking": "Deep thought."
-      },
-      {
-        "type": "text",
-        "text": "The answer is 42."
-      },
-      {
-        "type": "tool_use",
-        "id": "call_abc",
-        "name": "get_weather",
-        "input": {
-          "city": "Paris"
-        }
+        "content": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "The answer is 42."
+            },
+            {
+              "functionCall": {
+                "id": "call_abc",
+                "name": "get_weather",
+                "args": {
+                  "city": "Paris"
+                }
+              }
+            }
+          ]
+        },
+        "finishReason": "STOP",
+        "index": 0,
+        "safetyRatings": []
       }
     ],
-    "stop_reason": "tool_use",
-    "model": "gpt-test",
-    "usage": {
-      "input_tokens": 10,
-      "cache_creation_input_tokens": 0,
-      "cache_read_input_tokens": 0,
-      "output_tokens": 5,
-      "claude_cache_creation_5_m_tokens": 0,
-      "claude_cache_creation_1_h_tokens": 0,
+    "usageMetadata": {
+      "promptTokenCount": 10,
+      "toolUsePromptTokenCount": 0,
+      "candidatesTokenCount": 5,
+      "totalTokenCount": 15,
+      "thoughtsTokenCount": 0,
+      "cachedContentTokenCount": 0,
+      "promptTokensDetails": null,
+      "toolUsePromptTokensDetails": null,
+      "candidatesTokensDetails": null,
       "billing_usage": {
         "source": "oai_responses",
         "semantic": "openai",

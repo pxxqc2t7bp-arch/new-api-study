@@ -1,7 +1,16 @@
 {
-  "losses": null,
+  "losses": [
+    {
+      "code": "structured_output_unsupported",
+      "path": "output_format",
+      "message": "Claude structured-output configuration is not portable across protocols",
+      "severity": "warning",
+      "from": "claude",
+      "to": "openai"
+    }
+  ],
   "value": {
-    "model": "gpt-test",
+    "model": "claude-test",
     "messages": [
       {
         "role": "system",
@@ -11,12 +20,15 @@
         "role": "user",
         "content": [
           {
-            "text": "What is in this image?",
-            "type": "text"
+            "type": "text",
+            "text": "What is in this image?"
           },
           {
-            "image_url": "https://example.com/cat.png",
-            "type": "image_url"
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/png;base64,aGVsbG8=",
+              "MimeType": ""
+            }
           }
         ]
       },
@@ -25,7 +37,7 @@
         "content": null,
         "tool_calls": [
           {
-            "id": "call_abc",
+            "id": "toolu_abc",
             "type": "function",
             "function": {
               "name": "get_weather",
@@ -37,34 +49,15 @@
       {
         "role": "tool",
         "content": "15 degrees",
-        "tool_call_id": "call_abc"
+        "name": "get_weather",
+        "tool_call_id": "toolu_abc"
       }
     ],
-    "stream": true,
-    "max_completion_tokens": 1024,
+    "stream": false,
+    "max_tokens": 1024,
     "temperature": 0,
     "top_p": 0,
-    "response_format": {
-      "type": "json_schema",
-      "json_schema": {
-        "name": "weather",
-        "schema": {
-          "additionalProperties": false,
-          "properties": {
-            "summary": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "summary"
-          ],
-          "type": "object"
-        },
-        "strict": true,
-        "type": "json_schema"
-      }
-    },
-    "parallel_tool_calls": false,
+    "parallel_tool_calls": true,
     "tools": [
       {
         "type": "function",

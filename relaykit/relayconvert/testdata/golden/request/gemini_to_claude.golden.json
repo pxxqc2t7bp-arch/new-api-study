@@ -2,15 +2,15 @@
   "losses": [
     {
       "code": "structured_output_unsupported",
-      "path": "text.format",
-      "message": "Claude conversion does not preserve the OpenAI Responses structured-output configuration",
+      "path": "generationConfig.responseSchema",
+      "message": "Gemini structured-output configuration is not portable across protocols",
       "severity": "warning",
-      "from": "openai_responses",
+      "from": "gemini",
       "to": "claude"
     }
   ],
   "value": {
-    "model": "gpt-test",
+    "model": "upstream-model",
     "system": [
       {
         "type": "text",
@@ -39,11 +39,23 @@
         "role": "assistant",
         "content": [
           {
+            "type": "text",
+            "text": "..."
+          },
+          {
             "type": "tool_use",
             "id": "call_abc",
             "name": "get_weather",
             "input": {
               "city": "Paris"
+            }
+          },
+          {
+            "type": "tool_use",
+            "id": "call_xyz",
+            "name": "get_weather",
+            "input": {
+              "city": "London"
             }
           }
         ]
@@ -53,8 +65,13 @@
         "content": [
           {
             "type": "tool_result",
-            "content": "15 degrees",
+            "content": "{\"result\":\"15 degrees\"}",
             "tool_use_id": "call_abc"
+          },
+          {
+            "type": "tool_result",
+            "content": "{\"result\":\"12 degrees\"}",
+            "tool_use_id": "call_xyz"
           }
         ]
       }
@@ -62,7 +79,7 @@
     "max_tokens": 1024,
     "temperature": 0,
     "top_p": 0,
-    "stream": true,
+    "stream": false,
     "tools": [
       {
         "name": "get_weather",
@@ -77,12 +94,10 @@
             "city"
           ],
           "type": "object"
-        },
-        "strict": true
+        }
       }
     ],
     "tool_choice": {
-      "disable_parallel_tool_use": true,
       "name": "get_weather",
       "type": "tool"
     }

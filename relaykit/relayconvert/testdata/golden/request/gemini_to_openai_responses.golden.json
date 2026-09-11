@@ -1,7 +1,16 @@
 {
-  "losses": null,
+  "losses": [
+    {
+      "code": "structured_output_unsupported",
+      "path": "generationConfig.responseSchema",
+      "message": "Gemini structured-output configuration is not portable across protocols",
+      "severity": "warning",
+      "from": "gemini",
+      "to": "openai_responses"
+    }
+  ],
   "value": {
-    "model": "gpt-test",
+    "model": "upstream-model",
     "input": [
       {
         "content": [
@@ -10,7 +19,7 @@
             "type": "input_text"
           },
           {
-            "image_url": "https://example.com/cat.png",
+            "image_url": "data:image/png;base64,aGVsbG8=",
             "type": "input_image"
           }
         ],
@@ -27,39 +36,26 @@
         "type": "function_call"
       },
       {
+        "arguments": "{\"city\":\"London\"}",
+        "call_id": "call_xyz",
+        "name": "get_weather",
+        "type": "function_call"
+      },
+      {
         "call_id": "call_abc",
-        "output": "15 degrees",
+        "output": "{\"result\":\"15 degrees\"}",
         "type": "function_call_output"
       },
       {
-        "content": "Summarize.",
-        "role": "user"
+        "call_id": "call_xyz",
+        "output": "{\"result\":\"12 degrees\"}",
+        "type": "function_call_output"
       }
     ],
     "instructions": "You are a helpful assistant.",
     "max_output_tokens": 1024,
-    "parallel_tool_calls": false,
-    "stream": true,
+    "stream": false,
     "temperature": 0,
-    "text": {
-      "format": {
-        "name": "weather",
-        "schema": {
-          "additionalProperties": false,
-          "properties": {
-            "summary": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "summary"
-          ],
-          "type": "object"
-        },
-        "strict": true,
-        "type": "json_schema"
-      }
-    },
     "tool_choice": {
       "name": "get_weather",
       "type": "function"

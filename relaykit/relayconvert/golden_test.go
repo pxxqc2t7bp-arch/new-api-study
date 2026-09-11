@@ -7,6 +7,7 @@ package relayconvert
 // before comparison so the snapshots are deterministic.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -18,7 +19,9 @@ import (
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
+	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -54,9 +57,11 @@ func normalizeVolatile(data []byte) []byte {
 
 func marshalGolden(t *testing.T, value any) []byte {
 	t.Helper()
-	data, err := json.MarshalIndent(value, "", "  ")
+	data, err := kitutil.Marshal(value)
 	require.NoError(t, err)
-	return append(normalizeVolatile(data), '\n')
+	var indented bytes.Buffer
+	require.NoError(t, json.Indent(&indented, data, "", "  "))
+	return append(normalizeVolatile(indented.Bytes()), '\n')
 }
 
 func checkGolden(t *testing.T, name string, got []byte) {
@@ -72,29 +77,8 @@ func checkGolden(t *testing.T, name string, got []byte) {
 	require.Equal(t, string(want), string(got), "conversion output drifted from golden snapshot %s", path)
 }
 
-func checkStreamEventsGolden(t *testing.T, name string, events []any) {
-	t.Helper()
-	got := marshalGolden(t, map[string]any{"events": events})
-	path := filepath.Join(goldenDir, name+".golden.json")
-	if *updateGolden {
-		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-		require.NoError(t, os.WriteFile(path, got, 0o644))
-		return
-	}
-
-	wantData, err := os.ReadFile(path)
-	require.NoError(t, err, "golden file missing, run: cd relaykit && GOWORK=off go test ./relayconvert -run TestGolden -update")
-	var wantSnapshot map[string]json.RawMessage
-	require.NoError(t, json.Unmarshal(wantData, &wantSnapshot))
-	wantEvents, ok := wantSnapshot["events"]
-	require.True(t, ok, "stream golden snapshot %s has no events", path)
-	want := marshalGolden(t, map[string]json.RawMessage{"events": wantEvents})
-	require.Equal(t, string(want), string(got), "conversion events drifted from golden snapshot %s", path)
-}
-
-// goldenInfo mirrors the host's default converter options (new-api's
-// model_setting defaults at the time the snapshots were recorded) so the
-// golden files stay comparable across the extraction.
+// goldenInfo explicitly authorizes loss reporting so every matrix route can
+// snapshot both its converted value and any non-portable semantics.
 func goldenInfo() convmeta.Meta {
 	return &convmeta.Values{
 		ChannelMetaAttached: true,
@@ -103,6 +87,7 @@ func goldenInfo() convmeta.Meta {
 			LastMessagesType: convmeta.LastMessageTypeNone,
 		},
 		Options: &convmeta.Options{
+			ToolLossPolicy: types.ConversionLossPolicyAllow,
 			Gemini: convmeta.GeminiOptions{
 				ThinkingAdapterBudgetTokensPercentage: 0.6,
 				FunctionCallThoughtSignatureEnabled:   true,
@@ -124,6 +109,9 @@ func fixtureRequests() map[types.RelayFormat]any {
 	mustUnmarshalFixture(`{
 		"model": "gpt-test",
 		"max_tokens": 1024,
+		"temperature": 0,
+		"top_p": 0,
+		"parallel_tool_calls": false,
 		"stream": true,
 		"messages": [
 			{"role": "system", "content": "You are a helpful assistant."},
@@ -136,14 +124,63 @@ func fixtureRequests() map[types.RelayFormat]any {
 			{"role": "user", "content": "Summarize."}
 		],
 		"tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather by city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
-		"tool_choice": "auto"
+		"tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+		"response_format": {"type": "json_schema", "json_schema": {"name": "weather", "strict": true, "schema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"], "additionalProperties": false}}}
 	}`, openai)
+
+	claude := &dto.ClaudeRequest{}
+	mustUnmarshalFixture(`{
+		"model": "claude-test",
+		"max_tokens": 1024,
+		"temperature": 0,
+		"top_p": 0,
+		"stream": false,
+		"system": "You are a helpful assistant.",
+		"messages": [
+			{"role": "user", "content": [
+				{"type": "text", "text": "What is in this image?"},
+				{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}}
+			]},
+			{"role": "assistant", "content": [
+				{"type": "tool_use", "id": "toolu_abc", "name": "get_weather", "input": {"city": "Paris"}}
+			]},
+			{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_abc", "content": "15 degrees"}]}
+		],
+		"tools": [{"name": "get_weather", "description": "Get weather by city", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}, "strict": true}],
+		"tool_choice": {"type": "tool", "name": "get_weather", "disable_parallel_tool_use": false},
+		"output_format": {"type": "json_schema", "schema": {"type": "object", "properties": {"summary": {"type": "string"}}}}
+	}`, claude)
+
+	gemini := &dto.GeminiChatRequest{}
+	mustUnmarshalFixture(`{
+		"contents": [
+			{"role": "user", "parts": [
+				{"text": "What is in this image?"},
+				{"inlineData": {"mimeType": "image/png", "data": "aGVsbG8="}}
+			]},
+			{"role": "model", "parts": [
+				{"functionCall": {"id": "call_abc", "name": "get_weather", "args": {"city": "Paris"}}},
+				{"functionCall": {"id": "call_xyz", "name": "get_weather", "args": {"city": "London"}}}
+			]},
+			{"role": "user", "parts": [
+				{"functionResponse": {"id": "call_abc", "name": "get_weather", "response": {"result": "15 degrees"}}},
+				{"functionResponse": {"id": "call_xyz", "name": "get_weather", "response": {"result": "12 degrees"}}}
+			]}
+		],
+		"systemInstruction": {"parts": [{"text": "You are a helpful assistant."}]},
+		"tools": [{"functionDeclarations": [{"name": "get_weather", "description": "Get weather by city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]}],
+		"toolConfig": {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["get_weather"]}},
+		"generationConfig": {"maxOutputTokens": 1024, "temperature": 0, "topP": 0, "responseMimeType": "application/json", "responseSchema": {"type": "object", "properties": {"summary": {"type": "string"}}}}
+	}`, gemini)
 
 	responses := &dto.OpenAIResponsesRequest{}
 	mustUnmarshalFixture(`{
 		"model": "gpt-test",
 		"stream": true,
 		"max_output_tokens": 1024,
+		"temperature": 0,
+		"top_p": 0,
+		"parallel_tool_calls": false,
 		"instructions": "You are a helpful assistant.",
 		"input": [
 			{"type": "message", "role": "user", "content": [
@@ -153,11 +190,15 @@ func fixtureRequests() map[types.RelayFormat]any {
 			{"type": "function_call", "call_id": "call_abc", "name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
 			{"type": "function_call_output", "call_id": "call_abc", "output": "15 degrees"}
 		],
-		"tools": [{"type": "function", "name": "get_weather", "description": "Get weather by city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+		"tools": [{"type": "function", "name": "get_weather", "description": "Get weather by city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}, "strict": true}],
+		"tool_choice": {"type": "function", "name": "get_weather"},
+		"text": {"format": {"type": "json_schema", "name": "weather", "strict": true, "schema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"], "additionalProperties": false}}}
 	}`, responses)
 
 	return map[types.RelayFormat]any{
 		types.RelayFormatOpenAI:          openai,
+		types.RelayFormatClaude:          claude,
+		types.RelayFormatGemini:          gemini,
 		types.RelayFormatOpenAIResponses: responses,
 	}
 }
@@ -289,17 +330,8 @@ func allFormats() []types.RelayFormat {
 
 func TestGoldenRequestConversionMatrix(t *testing.T) {
 	requests := fixtureRequests()
-	fromFormats := []types.RelayFormat{
-		types.RelayFormatOpenAI,
-		types.RelayFormatOpenAIResponses,
-	}
-	toFormats := []types.RelayFormat{
-		types.RelayFormatOpenAI,
-		types.RelayFormatClaude,
-		types.RelayFormatOpenAIResponses,
-	}
-	for _, from := range fromFormats {
-		for _, to := range toFormats {
+	for _, from := range allFormats() {
+		for _, to := range allFormats() {
 			if from == to {
 				continue
 			}
@@ -310,7 +342,10 @@ func TestGoldenRequestConversionMatrix(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				result, err := ConvertRequest(nil, goldenInfo(), to, deepCopyFixture(t, requests[from]))
 				require.NoError(t, err)
-				checkGolden(t, name, marshalGolden(t, result.Value))
+				checkGolden(t, name, marshalGolden(t, map[string]any{
+					"value":  result.Value,
+					"losses": result.Diagnostics,
+				}))
 			})
 		}
 	}
@@ -320,15 +355,17 @@ func TestGoldenResponseConversionMatrix(t *testing.T) {
 	responses := fixtureResponses()
 	for _, from := range allFormats() {
 		for _, to := range allFormats() {
-			if from == to || to == types.RelayFormatGemini ||
-				(from == types.RelayFormatOpenAI && to == types.RelayFormatClaude) {
+			if from == to {
 				continue
 			}
 			name := fmt.Sprintf("response/%s_to_%s", from, to)
 			t.Run(name, func(t *testing.T) {
 				result, err := ConvertResponse(nil, goldenInfo(), to, deepCopyFixture(t, responses[from]))
 				require.NoError(t, err)
-				checkGolden(t, name, marshalGolden(t, result.Value))
+				checkGolden(t, name, marshalGolden(t, map[string]any{
+					"value":  result.Value,
+					"losses": result.Diagnostics,
+				}))
 			})
 		}
 	}
@@ -364,12 +401,110 @@ func TestGoldenStreamConversionMatrix(t *testing.T) {
 					outputs = append(outputs, r.Value)
 				}
 
-				// Billing usage has private, cross-module acceptance coverage. Keep
-				// the public golden focused on client-visible stream events.
-				checkStreamEventsGolden(t, name, outputs)
+				checkGolden(t, name, marshalGolden(t, map[string]any{
+					"events": outputs,
+					"usage":  state.Usage(),
+					"losses": state.Diagnostics(),
+				}))
 			})
 		}
 	}
+}
+
+func TestGoldenConversionErrors(t *testing.T) {
+	stateful := &dto.OpenAIResponsesRequest{
+		Model:              "gpt-test",
+		Input:              rawJSON(`"hello"`),
+		PreviousResponseID: "resp_previous",
+	}
+	_, statefulErr := ConvertRequest(context.Background(), goldenInfo(), types.RelayFormatOpenAI, stateful)
+	require.Error(t, statefulErr)
+
+	tools := rawJSON(`[{"codeExecution":{}}]`)
+	lossy := &dto.GeminiChatRequest{
+		Contents: []dto.GeminiChatContent{{
+			Role:  "user",
+			Parts: []dto.GeminiPart{{Text: "run this"}},
+		}},
+		Tools: tools,
+	}
+	strictInfo := goldenInfo().(*convmeta.Values)
+	strictInfo.Options.ToolLossPolicy = types.ConversionLossPolicyStrict
+	result, lossErr := ConvertRequest(context.Background(), strictInfo, types.RelayFormatOpenAI, lossy)
+	require.Error(t, lossErr)
+	require.NotNil(t, result)
+
+	checkGolden(t, "errors/request_rejections", marshalGolden(t, map[string]any{
+		"session_reference": map[string]any{
+			"error": statefulErr.Error(),
+		},
+		"strict_vendor_tool": map[string]any{
+			"error":  lossErr.Error(),
+			"losses": result.Diagnostics,
+		},
+	}))
+}
+
+func TestGoldenExplicitZeroScalars(t *testing.T) {
+	zeroTokens := uint(0)
+	zeroFloat := float64(0)
+	falseValue := false
+	info := &convmeta.Values{
+		Options: &convmeta.Options{
+			ToolLossPolicy: types.ConversionLossPolicyAllow,
+			Claude: convmeta.ClaudeOptions{
+				DefaultMaxTokens: func(string) int { return 2048 },
+			},
+		},
+	}
+
+	chatResult, err := ConvertRequest(context.Background(), info, types.RelayFormatClaude, &dto.GeneralOpenAIRequest{
+		Model:       "claude-test",
+		MaxTokens:   &zeroTokens,
+		Temperature: &zeroFloat,
+		TopP:        &zeroFloat,
+		Stream:      &falseValue,
+		Messages:    []dto.Message{{Role: "user", Content: "hello"}},
+	})
+	require.NoError(t, err)
+	chatClaude := chatResult.Value.(*dto.ClaudeRequest)
+	require.NotNil(t, chatClaude.MaxTokens)
+	require.Zero(t, *chatClaude.MaxTokens)
+	require.NotNil(t, chatClaude.Stream)
+	require.False(t, *chatClaude.Stream)
+
+	responsesResult, err := ConvertRequest(context.Background(), info, types.RelayFormatClaude, &dto.OpenAIResponsesRequest{
+		Model:           "claude-test",
+		Input:           rawJSON(`"hello"`),
+		MaxOutputTokens: &zeroTokens,
+		Temperature:     &zeroFloat,
+		TopP:            &zeroFloat,
+		Stream:          &falseValue,
+	})
+	require.NoError(t, err)
+	responsesClaude := responsesResult.Value.(*dto.ClaudeRequest)
+	require.NotNil(t, responsesClaude.MaxTokens)
+	require.Zero(t, *responsesClaude.MaxTokens)
+	require.NotNil(t, responsesClaude.Stream)
+	require.False(t, *responsesClaude.Stream)
+
+	absentResult, err := ConvertRequest(context.Background(), info, types.RelayFormatClaude, &dto.GeneralOpenAIRequest{
+		Model:    "claude-test",
+		Messages: []dto.Message{{Role: "user", Content: "hello"}},
+	})
+	require.NoError(t, err)
+	absentClaude := absentResult.Value.(*dto.ClaudeRequest)
+	require.NotNil(t, absentClaude.MaxTokens)
+	assert.Equal(t, uint(2048), *absentClaude.MaxTokens)
+	assert.Nil(t, absentClaude.Temperature)
+	assert.Nil(t, absentClaude.TopP)
+	assert.Nil(t, absentClaude.Stream)
+
+	checkGolden(t, "request/explicit_zero_to_claude", marshalGolden(t, map[string]any{
+		"openai_chat":      chatResult.Value,
+		"openai_responses": responsesResult.Value,
+		"absent_defaults":  absentResult.Value,
+	}))
 }
 
 // ---------------------------------------------------------------------------
@@ -384,48 +519,48 @@ func rawJSON(s string) json.RawMessage {
 // between subtests (JSON round-trip through the concrete type).
 func deepCopyFixture(t *testing.T, v any) any {
 	t.Helper()
-	data, err := json.Marshal(v)
+	data, err := kitutil.Marshal(v)
 	require.NoError(t, err)
 	switch v.(type) {
 	case *dto.GeneralOpenAIRequest:
 		out := &dto.GeneralOpenAIRequest{}
-		require.NoError(t, json.Unmarshal(data, out))
+		require.NoError(t, kitutil.Unmarshal(data, out))
 		return out
 	case *dto.ClaudeRequest:
 		out := &dto.ClaudeRequest{}
-		require.NoError(t, json.Unmarshal(data, out))
+		require.NoError(t, kitutil.Unmarshal(data, out))
 		return out
 	case *dto.GeminiChatRequest:
 		out := &dto.GeminiChatRequest{}
-		require.NoError(t, json.Unmarshal(data, out))
+		require.NoError(t, kitutil.Unmarshal(data, out))
 		return out
 	case *dto.OpenAIResponsesRequest:
 		out := &dto.OpenAIResponsesRequest{}
-		require.NoError(t, json.Unmarshal(data, out))
+		require.NoError(t, kitutil.Unmarshal(data, out))
 		return out
 	case *dto.OpenAITextResponse:
 		out := &dto.OpenAITextResponse{}
-		require.NoError(t, json.Unmarshal(data, out))
+		require.NoError(t, kitutil.Unmarshal(data, out))
 		return out
 	case *dto.ClaudeResponse:
 		out := &dto.ClaudeResponse{}
-		require.NoError(t, json.Unmarshal(data, out))
+		require.NoError(t, kitutil.Unmarshal(data, out))
 		return out
 	case *dto.GeminiChatResponse:
 		out := &dto.GeminiChatResponse{}
-		require.NoError(t, json.Unmarshal(data, out))
+		require.NoError(t, kitutil.Unmarshal(data, out))
 		return out
 	case *dto.OpenAIResponsesResponse:
 		out := &dto.OpenAIResponsesResponse{}
-		require.NoError(t, json.Unmarshal(data, out))
+		require.NoError(t, kitutil.Unmarshal(data, out))
 		return out
 	case *dto.ChatCompletionsStreamResponse:
 		out := &dto.ChatCompletionsStreamResponse{}
-		require.NoError(t, json.Unmarshal(data, out))
+		require.NoError(t, kitutil.Unmarshal(data, out))
 		return out
 	case *dto.ResponsesStreamResponse:
 		out := &dto.ResponsesStreamResponse{}
-		require.NoError(t, json.Unmarshal(data, out))
+		require.NoError(t, kitutil.Unmarshal(data, out))
 		return out
 	default:
 		t.Fatalf("deepCopyFixture: unsupported fixture type %T", v)
@@ -458,7 +593,7 @@ func responsesStreamChunk(raw string) *dto.ResponsesStreamResponse {
 }
 
 func mustUnmarshalFixture(raw string, out any) {
-	if err := json.Unmarshal([]byte(raw), out); err != nil {
+	if err := kitutil.Unmarshal([]byte(raw), out); err != nil {
 		panic(fmt.Sprintf("bad fixture JSON: %v", err))
 	}
 }

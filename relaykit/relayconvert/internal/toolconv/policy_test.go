@@ -32,7 +32,7 @@ func hasDiagnosticCode(diagnostics []types.ConversionDiagnostic, code string) bo
 	return false
 }
 
-func TestDefaultPolicyAllowsGeminiCodeExecutionToOpenAI(t *testing.T) {
+func TestDefaultPolicyRejectsGeminiCodeExecutionToOpenAI(t *testing.T) {
 	t.Parallel()
 
 	_, set, err := ExtractRequest(types.RelayFormatGemini, geminiCodeExecutionRequest(t))
@@ -43,10 +43,10 @@ func TestDefaultPolicyAllowsGeminiCodeExecutionToOpenAI(t *testing.T) {
 	}
 
 	out, diagnostics, err := AttachRequest(types.RelayFormatOpenAI, target, set, &convmeta.Options{})
-	require.NoError(t, err)
-	require.NotNil(t, out)
+	require.Error(t, err)
+	assert.Nil(t, out)
 	assert.True(t, hasDiagnosticCode(diagnostics, "unsupported_hosted_tool"))
-	assert.Equal(t, types.ConversionLossPolicyAllow, (&convmeta.Options{}).EffectiveToolLossPolicy())
+	assert.Equal(t, types.ConversionLossPolicyStrict, (&convmeta.Options{}).EffectiveToolLossPolicy())
 }
 
 func TestResponsePhaseNeverRejectsEvenUnderStrictPolicy(t *testing.T) {

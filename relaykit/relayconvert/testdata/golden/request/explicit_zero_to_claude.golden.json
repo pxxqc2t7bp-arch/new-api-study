@@ -1,0 +1,43 @@
+{
+  "absent_defaults": {
+    "model": "claude-test",
+    "messages": [
+      {
+        "role": "user",
+        "content": "hello"
+      }
+    ],
+    "max_tokens": 2048
+  },
+  "openai_chat": {
+    "model": "claude-test",
+    "messages": [
+      {
+        "role": "user",
+        "content": "hello"
+      }
+    ],
+    "max_tokens": 0,
+    "temperature": 0,
+    "top_p": 0,
+    "stream": false
+  },
+  "openai_responses": {
+    "model": "claude-test",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ]
+      }
+    ],
+    "max_tokens": 0,
+    "temperature": 0,
+    "top_p": 0,
+    "stream": false
+  }
+}

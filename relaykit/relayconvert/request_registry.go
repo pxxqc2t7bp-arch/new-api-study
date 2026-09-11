@@ -67,22 +67,26 @@ var (
 )
 
 const (
-	requestConverterClaudeToGemini    = "claude_messages_to_gemini_generate_content"
-	requestConverterClaudeToResponses = "claude_messages_to_openai_responses"
-	requestConverterGeminiToClaude    = "gemini_generate_content_to_claude_messages"
-	requestConverterGeminiToResponses = "gemini_generate_content_to_openai_responses"
+	requestConverterClaudeToGemini    = ConverterClaudeMessagesToGeminiContent
+	requestConverterClaudeToResponses = ConverterClaudeMessagesToOpenAIResponses
+	requestConverterGeminiToClaude    = ConverterGeminiContentToClaudeMessages
+	requestConverterGeminiToResponses = ConverterGeminiContentToOpenAIResponses
 	requestConverterResponsesToClaude = ConverterOpenAIResponsesToClaudeMessages
 )
 
 const (
 	ConverterNone                            = "none"
 	ConverterClaudeMessagesToOpenAIChat      = "anthropic_messages_to_openai_chat_completions"
+	ConverterClaudeMessagesToOpenAIResponses = "claude_messages_to_openai_responses"
+	ConverterClaudeMessagesToGeminiContent   = "claude_messages_to_gemini_generate_content"
 	ConverterOpenAIChatToClaudeMessages      = "openai_chat_completions_to_anthropic_messages"
 	ConverterOpenAIChatToOpenAIResponses     = "openai_chat_completions_to_openai_responses"
 	ConverterOpenAIResponsesToOpenAIChat     = "openai_responses_to_openai_chat_completions"
 	ConverterOpenAIResponsesToClaudeMessages = "openai_responses_to_claude_messages"
 	ConverterOpenAIResponsesToGemini         = "openai_responses_to_gemini_generate_content"
 	ConverterGeminiContentToOpenAIChat       = "gemini_generate_content_to_openai_chat_completions"
+	ConverterGeminiContentToClaudeMessages   = "gemini_generate_content_to_claude_messages"
+	ConverterGeminiContentToOpenAIResponses  = "gemini_generate_content_to_openai_responses"
 	ConverterOpenAIChatToGeminiContent       = "openai_chat_completions_to_gemini_generate_content"
 )
 
@@ -241,6 +245,7 @@ func executeRequestSpec(c context.Context, info convmeta.Meta, from types.RelayF
 
 func executeRequestSteps(c context.Context, info convmeta.Meta, from types.RelayFormat, target types.RelayFormat, request any, converter string, quality RequestConverterQuality, specs []RequestConverterSpec) (*RequestResult, error) {
 	c, diagnosticCollector := convdiag.WithCollector(c)
+	requestDiagnostics := toolconv.InspectRequest(from, target, request)
 	current, tools, err := toolconv.ExtractRequest(from, request)
 	if err != nil {
 		return nil, err
@@ -261,7 +266,8 @@ func executeRequestSteps(c context.Context, info convmeta.Meta, from types.Relay
 	}
 
 	current, toolDiagnostics, err := toolconv.AttachRequest(target, current, tools, convmeta.OptionsOf(info))
-	diagnostics := append(diagnosticCollector.Diagnostics(), toolDiagnostics...)
+	diagnostics := append(requestDiagnostics, diagnosticCollector.Diagnostics()...)
+	diagnostics = append(diagnostics, toolDiagnostics...)
 	for i := range diagnostics {
 		if diagnostics[i].From == "" {
 			diagnostics[i].From = from
@@ -271,6 +277,16 @@ func executeRequestSteps(c context.Context, info convmeta.Meta, from types.Relay
 		}
 	}
 	if err != nil {
+		return &RequestResult{
+			Value:       current,
+			From:        from,
+			To:          target,
+			Quality:     quality,
+			Steps:       steps,
+			Diagnostics: diagnostics,
+		}, err
+	}
+	if err := types.RejectConversionLoss(convmeta.OptionsOf(info).EffectiveToolLossPolicy(), diagnostics); err != nil {
 		return &RequestResult{
 			Value:       current,
 			From:        from,
