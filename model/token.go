@@ -726,9 +726,6 @@ func (token *Token) update(quotaDelta *int64) error {
 			"model_limits_enabled", "model_limits", "allow_ips", "stream_recovery_enabled", "group",
 			"cross_group_retry", "auto_groups", "default_routing_strategy", "allowed_routing_strategies",
 			"default_conversion_policy", "allow_lossy_conversion", "cache_generation", "metadata_mutation_id"}
-		if quotaDelta == nil {
-			fields = append(fields, "remain_quota")
-		}
 		if err := tx.Model(token).Select(fields).Updates(token).Error; err != nil {
 			return err
 		}

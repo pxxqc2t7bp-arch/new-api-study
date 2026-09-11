@@ -201,6 +201,10 @@ func TestTokenPolicyUpdatePreservesLiveCachedQuota(t *testing.T) {
 	result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
 	require.NoError(t, err)
 	require.Equal(t, cacheQuotaOK, result)
+	require.NoError(t, DB.Model(&Token{}).Where("id = ?", token.Id).Updates(map[string]any{
+		"remain_quota": 30,
+		"used_quota":   70,
+	}).Error)
 
 	token.AllowedRoutingStrategies = `["stable"]`
 	token.DefaultRoutingStrategy = "stable"
@@ -210,8 +214,8 @@ func TestTokenPolicyUpdatePreservesLiveCachedQuota(t *testing.T) {
 
 	var stored Token
 	require.NoError(t, DB.First(&stored, token.Id).Error)
-	assert.Equal(t, 100, stored.RemainQuota)
-	assert.Zero(t, stored.UsedQuota)
+	assert.Equal(t, 30, stored.RemainQuota)
+	assert.Equal(t, 70, stored.UsedQuota)
 	assert.Equal(t, "stable", stored.DefaultRoutingStrategy)
 	assert.Equal(t, "strict", stored.DefaultConversionPolicy)
 
@@ -267,8 +271,8 @@ func TestTokenQuotaUpdateAppliesDatabaseTotalDeltaToLiveCache(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, cacheQuotaOK, result)
 
-			token.RemainQuota = test.updatedRemainQuota
-			require.NoError(t, token.Update())
+			quotaDelta := int64(test.updatedRemainQuota - token.RemainQuota)
+			require.NoError(t, token.UpdateWithQuotaDelta(quotaDelta))
 
 			cached, err := cacheGetTokenByKey(token.Key)
 			require.NoError(t, err)
