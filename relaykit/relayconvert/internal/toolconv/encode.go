@@ -41,9 +41,6 @@ func AttachRequest(format types.RelayFormat, request any, set Set, options *conv
 		diagnostics[index].From = set.Source
 		diagnostics[index].To = format
 	}
-	if err := types.RejectConversionLoss(options.EffectiveToolLossPolicy(), diagnostics); err != nil {
-		return nil, diagnostics, err
-	}
 	return value, diagnostics, nil
 }
 

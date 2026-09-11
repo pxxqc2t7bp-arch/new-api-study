@@ -84,6 +84,30 @@ func TestConvertRequestSafePolicyReturnsConversionLossError(t *testing.T) {
 	assert.True(t, hasConversionDiagnosticCode(result.Diagnostics, "unsupported_hosted_tool"))
 }
 
+func TestConvertRequestLossErrorIncludesAllRejectedDiagnosticsInOrder(t *testing.T) {
+	t.Parallel()
+
+	tools, err := kitutil.Marshal([]map[string]any{{"codeExecution": map[string]any{}}})
+	require.NoError(t, err)
+	req := &dto.GeminiChatRequest{
+		CachedContent: "cachedContents/session-1",
+		Contents: []dto.GeminiChatContent{
+			{Role: "user", Parts: []dto.GeminiPart{{Text: "run this"}}},
+		},
+		Tools: tools,
+	}
+
+	result, err := ConvertRequest(nil, &convmeta.Values{}, types.RelayFormatOpenAI, req)
+	require.Error(t, err)
+	var loss *types.ConversionLossError
+	require.ErrorAs(t, err, &loss)
+	require.NotNil(t, result)
+	require.Len(t, result.Diagnostics, 2)
+	assert.Equal(t, types.ConversionDiagnosticCodeSessionReferenceUnsupported, result.Diagnostics[0].Code)
+	assert.Equal(t, types.ConversionDiagnosticCodeUnsupportedHostedTool, result.Diagnostics[1].Code)
+	assert.Equal(t, result.Diagnostics, loss.Diagnostics)
+}
+
 func TestConvertRequestDefaultStrictRejectsEncryptedReasoning(t *testing.T) {
 	t.Parallel()
 

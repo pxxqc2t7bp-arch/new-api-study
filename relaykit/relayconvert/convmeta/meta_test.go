@@ -37,3 +37,18 @@ func TestValuesTypedNilMetaIsSafe(t *testing.T) {
 	assert.Empty(t, UpstreamModelName(meta))
 	assert.Zero(t, ChannelTypeOf(meta))
 }
+
+func TestEffectiveToolLossPolicyTreatsUnknownPolicyAsStrict(t *testing.T) {
+	options := &Options{ToolLossPolicy: types.ConversionLossPolicy("unknown")}
+	diagnostics := []types.ConversionDiagnostic{{
+		Code:     types.ConversionDiagnosticCodeStructuredOutputUnsupported,
+		Severity: types.ConversionDiagnosticWarning,
+	}}
+
+	policy := options.EffectiveToolLossPolicy()
+	assert.Equal(t, types.ConversionLossPolicyStrict, policy)
+
+	var loss *types.ConversionLossError
+	require.ErrorAs(t, types.RejectConversionLoss(policy, diagnostics), &loss)
+	assert.Equal(t, diagnostics, loss.Diagnostics)
+}

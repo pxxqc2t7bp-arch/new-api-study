@@ -102,8 +102,13 @@ func (o *Options) ShouldPreserveEffortTail(modelName string) bool {
 }
 
 func (o *Options) EffectiveToolLossPolicy() types.ConversionLossPolicy {
-	if o == nil || o.ToolLossPolicy == "" {
+	if o == nil {
 		return types.ConversionLossPolicyStrict
 	}
-	return o.ToolLossPolicy
+	switch o.ToolLossPolicy {
+	case types.ConversionLossPolicyStrict, types.ConversionLossPolicySafe, types.ConversionLossPolicyAllow:
+		return o.ToolLossPolicy
+	default:
+		return types.ConversionLossPolicyStrict
+	}
 }

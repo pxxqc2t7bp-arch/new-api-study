@@ -32,7 +32,7 @@ func hasDiagnosticCode(diagnostics []types.ConversionDiagnostic, code string) bo
 	return false
 }
 
-func TestDefaultPolicyRejectsGeminiCodeExecutionToOpenAI(t *testing.T) {
+func TestAttachRequestReturnsGeminiCodeExecutionDiagnosticsWithoutEnforcingDefaultPolicy(t *testing.T) {
 	t.Parallel()
 
 	_, set, err := ExtractRequest(types.RelayFormatGemini, geminiCodeExecutionRequest(t))
@@ -43,8 +43,8 @@ func TestDefaultPolicyRejectsGeminiCodeExecutionToOpenAI(t *testing.T) {
 	}
 
 	out, diagnostics, err := AttachRequest(types.RelayFormatOpenAI, target, set, &convmeta.Options{})
-	require.Error(t, err)
-	assert.Nil(t, out)
+	require.NoError(t, err)
+	assert.Same(t, target, out)
 	assert.True(t, hasDiagnosticCode(diagnostics, "unsupported_hosted_tool"))
 	assert.Equal(t, types.ConversionLossPolicyStrict, (&convmeta.Options{}).EffectiveToolLossPolicy())
 }
@@ -78,7 +78,7 @@ func TestResponsePhaseNeverRejectsEvenUnderStrictPolicy(t *testing.T) {
 	require.NotNil(t, out)
 }
 
-func TestSafePolicyRejectsRequestPhaseHostedToolLoss(t *testing.T) {
+func TestAttachRequestReturnsHostedToolDiagnosticsWithoutEnforcingSafePolicy(t *testing.T) {
 	t.Parallel()
 
 	_, set, err := ExtractRequest(types.RelayFormatGemini, geminiCodeExecutionRequest(t))
@@ -88,16 +88,13 @@ func TestSafePolicyRejectsRequestPhaseHostedToolLoss(t *testing.T) {
 		Messages: []dto.Message{{Role: "user", Content: "run this"}},
 	}
 
-	_, diagnostics, err := AttachRequest(
+	out, diagnostics, err := AttachRequest(
 		types.RelayFormatOpenAI,
 		target,
 		set,
 		&convmeta.Options{ToolLossPolicy: types.ConversionLossPolicySafe},
 	)
-	require.Error(t, err)
-	var loss *types.ConversionLossError
-	require.ErrorAs(t, err, &loss)
-	require.NotEmpty(t, loss.Diagnostics)
-	assert.True(t, hasDiagnosticCode(loss.Diagnostics, "unsupported_hosted_tool"))
+	require.NoError(t, err)
+	assert.Same(t, target, out)
 	assert.True(t, hasDiagnosticCode(diagnostics, "unsupported_hosted_tool"))
 }
