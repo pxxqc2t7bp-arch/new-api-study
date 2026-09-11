@@ -129,20 +129,24 @@ func commitTokenCacheMutation(token Token, generation int64) error {
 	}
 	const script = `
 local incoming = tonumber(ARGV[1])
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-if current < incoming then
-  current = incoming
-  redis.call('SET', KEYS[1], current)
-end
-if current == incoming then
-  if current % 2 == 0 then
+local currentValue = redis.call('GET', KEYS[1])
+local pending = tonumber(redis.call('GET', KEYS[2]) or '0')
+if not currentValue then
+  if pending ~= incoming then
     return 0
   end
-  current = current + 1
-  redis.call('SET', KEYS[1], current)
-elseif current ~= incoming + 1 then
+  redis.call('SET', KEYS[1], incoming)
+  currentValue = tostring(incoming)
+end
+local current = tonumber(currentValue)
+if current > incoming then
   return 1
 end
+if current ~= incoming or current % 2 == 0 then
+  return 0
+end
+current = current + 1
+redis.call('SET', KEYS[1], current)
 if redis.call('EXISTS', KEYS[3]) == 1 then
   if tonumber(redis.call('HGET', KEYS[3], 'Id') or '0') == tonumber(ARGV[2])
     and redis.call('HEXISTS', KEYS[3], 'RemainQuota') == 1
@@ -206,18 +210,24 @@ func commitTokenCacheDeleteMutation(key string, generation int64) error {
 	}
 	const script = `
 local incoming = tonumber(ARGV[1])
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-if current < incoming then
-  current = incoming
-  redis.call('SET', KEYS[1], current)
-end
-if current == incoming then
-  if current % 2 == 0 then
+local currentValue = redis.call('GET', KEYS[1])
+local pending = tonumber(redis.call('GET', KEYS[2]) or '0')
+if not currentValue then
+  if pending ~= incoming then
     return 0
   end
-  redis.call('SET', KEYS[1], current + 1)
-  redis.call('DEL', KEYS[3])
+  redis.call('SET', KEYS[1], incoming)
+  currentValue = tostring(incoming)
 end
+local current = tonumber(currentValue)
+if current > incoming then
+  return 1
+end
+if current ~= incoming or current % 2 == 0 then
+  return 0
+end
+redis.call('SET', KEYS[1], current + 1)
+redis.call('DEL', KEYS[3])
 if tonumber(redis.call('GET', KEYS[2]) or '0') == incoming then
   redis.call('DEL', KEYS[2])
 end
@@ -242,17 +252,23 @@ func rollbackTokenCacheMutation(key string, generation int64) error {
 	}
 	const script = `
 local incoming = tonumber(ARGV[1])
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-if current < incoming then
-  current = incoming
-  redis.call('SET', KEYS[1], current)
-end
-if current == incoming then
-  if current % 2 == 0 then
+local currentValue = redis.call('GET', KEYS[1])
+local pending = tonumber(redis.call('GET', KEYS[2]) or '0')
+if not currentValue then
+  if pending ~= incoming then
     return 0
   end
-  redis.call('SET', KEYS[1], current - 1)
+  redis.call('SET', KEYS[1], incoming)
+  currentValue = tostring(incoming)
 end
+local current = tonumber(currentValue)
+if current > incoming then
+  return 1
+end
+if current ~= incoming or current % 2 == 0 then
+  return 0
+end
+redis.call('SET', KEYS[1], current - 1)
 if tonumber(redis.call('GET', KEYS[2]) or '0') == incoming then
   redis.call('DEL', KEYS[2])
 end

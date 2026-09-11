@@ -466,11 +466,15 @@ func TestTokenCacheMissingGenerationDoesNotAcceptStaleHash(t *testing.T) {
 	require.NoError(t, common.RDB.Del(t.Context(), getTokenCacheGenerationKey(token.Key)).Err())
 
 	loaded, err := GetTokenByKey(token.Key, false)
-	require.NoError(t, err)
-	assert.Equal(t, common.TokenStatusDisabled, loaded.Status)
-	assert.Equal(t, 30, loaded.RemainQuota)
-	assert.Equal(t, 70, loaded.UsedQuota)
-	assert.EqualValues(t, 2, loaded.CacheGeneration)
+	assert.ErrorIs(t, err, errTokenCacheMutationPending)
+	assert.Nil(t, loaded)
+
+	var cached Token
+	require.NoError(t, common.RedisHGetObj(getTokenCacheKey(token.Key), &cached))
+	assert.Equal(t, common.TokenStatusEnabled, cached.Status)
+	assert.Equal(t, 30, cached.RemainQuota)
+	assert.Equal(t, 70, cached.UsedQuota)
+	assert.Zero(t, cached.CacheGeneration)
 }
 
 func TestTokenCommitRestoresMissingGenerationKey(t *testing.T) {
@@ -505,6 +509,42 @@ func TestTokenCommitRestoresMissingGenerationKey(t *testing.T) {
 	assert.Equal(t, 30, loaded.RemainQuota)
 	assert.Equal(t, 70, loaded.UsedQuota)
 	assert.EqualValues(t, 2, loaded.CacheGeneration)
+}
+
+func TestStaleTokenFinalizerCannotRebuildMissingGeneration(t *testing.T) {
+	truncateTables(t)
+	useUserCacheMiniRedis(t)
+	oldSnapshot := Token{
+		UserId:          7,
+		Key:             "token-stale-finalizer",
+		Name:            "stale-finalizer",
+		Status:          common.TokenStatusEnabled,
+		ExpiredTime:     -1,
+		RemainQuota:     100,
+		UnlimitedQuota:  true,
+		CacheGeneration: 2,
+	}
+	require.NoError(t, oldSnapshot.Insert())
+
+	current := oldSnapshot
+	current.Status = common.TokenStatusDisabled
+	current.CacheGeneration = 4
+	require.NoError(t, DB.Model(&current).Select("status", "cache_generation").Updates(&current).Error)
+	require.NoError(t, common.RDB.Set(t.Context(), getTokenCacheGenerationKey(current.Key), 4, 0).Err())
+	require.NoError(t, cacheSetTokenForTest(current))
+	require.NoError(t, common.RDB.Del(
+		t.Context(),
+		getTokenCacheGenerationKey(current.Key),
+		getTokenCachePendingFenceKey(current.Key),
+	).Err())
+
+	err := commitTokenCacheMutation(oldSnapshot, 1)
+	require.Error(t, err)
+
+	var cached Token
+	require.NoError(t, common.RedisHGetObj(getTokenCacheKey(current.Key), &cached))
+	assert.Equal(t, common.TokenStatusDisabled, cached.Status)
+	assert.EqualValues(t, 4, cached.CacheGeneration)
 }
 
 func TestSecondTokenWriterDoesNotSkipFirstFinalization(t *testing.T) {
@@ -881,6 +921,67 @@ func TestTokenUpdateWithoutRedisPreservesDatabaseGeneration(t *testing.T) {
 	require.NoError(t, DB.First(&stored, token.Id).Error)
 	assert.EqualValues(t, 6, stored.CacheGeneration)
 	assert.Equal(t, "generation-preserved", stored.Name)
+}
+
+func TestTokenCommitAcknowledgementLossWithoutRedisReturnsObservedOutcome(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Token) error
+		verify func(*testing.T, Token)
+	}{
+		{
+			name: "update",
+			mutate: func(token *Token) error {
+				token.Status = common.TokenStatusDisabled
+				return token.SelectUpdate()
+			},
+			verify: func(t *testing.T, token Token) {
+				t.Helper()
+				var stored Token
+				require.NoError(t, DB.First(&stored, token.Id).Error)
+				assert.Equal(t, common.TokenStatusDisabled, stored.Status)
+			},
+		},
+		{
+			name: "delete",
+			mutate: func(token *Token) error {
+				return token.Delete()
+			},
+			verify: func(t *testing.T, token Token) {
+				t.Helper()
+				var stored Token
+				assert.ErrorIs(t, DB.First(&stored, token.Id).Error, gorm.ErrRecordNotFound)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			truncateTables(t)
+			previousRedisEnabled := common.RedisEnabled
+			common.RedisEnabled = false
+			t.Cleanup(func() { common.RedisEnabled = previousRedisEnabled })
+			token := Token{
+				UserId:         7,
+				Key:            "token-no-redis-commit-" + test.name,
+				Name:           "no-redis-commit-" + test.name,
+				Status:         common.TokenStatusEnabled,
+				ExpiredTime:    -1,
+				RemainQuota:    100,
+				UnlimitedQuota: true,
+			}
+			require.NoError(t, token.Insert())
+
+			commitErr := errors.New("simulated no-redis commit acknowledgement loss")
+			replaceTokenMutationCommitForTest(t, func(tx *gorm.DB) error {
+				require.NoError(t, tx.Commit().Error)
+				return commitErr
+			})
+
+			require.NoError(t, test.mutate(&token))
+			test.verify(t, token)
+		})
+	}
 }
 
 func TestBatchDeleteTokensFinalizesEveryCommittedMutation(t *testing.T) {

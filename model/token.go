@@ -3,6 +3,7 @@ package model
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 
@@ -479,21 +480,23 @@ func (err *TokenMutationCommittedError) CommittedCount() int {
 	return err.Count
 }
 
-func reconcileTokenMutationCommitError(token *Token, deleteCache bool, generation int64, commitErr error) error {
-	if generation == 0 {
-		return commitErr
-	}
-
+func reconcileTokenMutationCommitError(token *Token, expected *Token, deleteCache bool, generation int64, commitErr error) error {
 	stored, readErr := getTokenByKeyFromDB(token.Key)
 	if deleteCache && errors.Is(readErr, gorm.ErrRecordNotFound) {
+		if generation == 0 {
+			return nil
+		}
 		finalizeErr := commitTokenCacheDeleteMutation(token.Key, generation)
 		return &TokenMutationCommittedError{
 			Count: 1,
 			Cause: errors.Join(commitErr, finalizeErr),
 		}
 	}
-	if readErr == nil && !deleteCache && stored.Id == token.Id && stored.CacheGeneration == generation+1 {
+	if readErr == nil && !deleteCache && expected != nil && reflect.DeepEqual(stored, expected) {
 		*token = *stored
+		if generation == 0 {
+			return nil
+		}
 		finalizeErr := commitTokenCacheMutation(*stored, generation)
 		return &TokenMutationCommittedError{
 			Count: 1,
@@ -534,10 +537,27 @@ func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(*gorm.DB,
 		}
 		return mutationErr
 	}
+	var expected *Token
+	if !deleteCache {
+		expected = &Token{}
+		if readErr := tx.Where(commonKeyCol+" = ?", token.Key).First(expected).Error; readErr != nil {
+			if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+				return errors.Join(readErr, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
+			}
+			token.CacheGeneration = minimumGeneration
+			if rollbackErr := rollbackTokenCacheMutation(token.Key, generation); rollbackErr != nil {
+				return errors.Join(readErr, fmt.Errorf("failed to roll back token cache fence: %w", rollbackErr))
+			}
+			return readErr
+		}
+	}
 	if commitErr := commitTokenMutationTransaction(tx); commitErr != nil {
-		return reconcileTokenMutationCommitError(token, deleteCache, generation, commitErr)
+		return reconcileTokenMutationCommitError(token, expected, deleteCache, generation, commitErr)
 	}
 	if generation == 0 {
+		if expected != nil {
+			*token = *expected
+		}
 		return nil
 	}
 	if deleteCache {
