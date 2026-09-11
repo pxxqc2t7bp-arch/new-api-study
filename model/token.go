@@ -39,6 +39,7 @@ type Token struct {
 	DefaultConversionPolicy  string         `json:"default_conversion_policy" gorm:"type:varchar(16)"`
 	AllowLossyConversion     bool           `json:"allow_lossy_conversion"`
 	CacheGeneration          int64          `json:"-" gorm:"bigint;default:0"`
+	MetadataMutationId       string         `json:"-" gorm:"type:char(32)"`
 	DeletedAt                gorm.DeletedAt `gorm:"index"`
 }
 
@@ -561,7 +562,9 @@ func reconcileTokenMutationCommitError(token *Token, expected *Token, deleteCach
 	if readErr == nil && !deleteCache && expected != nil &&
 		stored.Id == expected.Id &&
 		stored.Key == expected.Key &&
-		stored.CacheGeneration == expected.CacheGeneration {
+		stored.CacheGeneration == expected.CacheGeneration &&
+		stored.MetadataMutationId != "" &&
+		stored.MetadataMutationId == expected.MetadataMutationId {
 		*token = *stored
 		if generation == 0 {
 			return nil
@@ -618,11 +621,15 @@ func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(*gorm.DB,
 	if generation > 0 {
 		committedGeneration = generation + 1
 	}
+	if !deleteCache {
+		token.MetadataMutationId = common.GetUUID()
+	}
 	if mutationErr := mutation(tx, committedGeneration); mutationErr != nil {
 		if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
 			return errors.Join(mutationErr, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
 		}
 		token.CacheGeneration = minimumGeneration
+		token.MetadataMutationId = current.MetadataMutationId
 		if rollbackErr := rollbackTokenCacheMutation(token.Key, generation); rollbackErr != nil {
 			return errors.Join(mutationErr, fmt.Errorf("failed to roll back token cache fence: %w", rollbackErr))
 		}
@@ -636,6 +643,7 @@ func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(*gorm.DB,
 				return errors.Join(readErr, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
 			}
 			token.CacheGeneration = minimumGeneration
+			token.MetadataMutationId = current.MetadataMutationId
 			if rollbackErr := rollbackTokenCacheMutation(token.Key, generation); rollbackErr != nil {
 				return errors.Join(readErr, fmt.Errorf("failed to roll back token cache fence: %w", rollbackErr))
 			}
@@ -696,7 +704,7 @@ func (token *Token) update(quotaDelta *int64) error {
 		fields := []string{"name", "status", "expired_time", "unlimited_quota",
 			"model_limits_enabled", "model_limits", "allow_ips", "stream_recovery_enabled", "group",
 			"cross_group_retry", "auto_groups", "default_routing_strategy", "allowed_routing_strategies",
-			"default_conversion_policy", "allow_lossy_conversion", "cache_generation"}
+			"default_conversion_policy", "allow_lossy_conversion", "cache_generation", "metadata_mutation_id"}
 		if quotaDelta == nil {
 			fields = append(fields, "remain_quota")
 		}
@@ -714,7 +722,7 @@ func (token *Token) SelectUpdate() (err error) {
 	return mutateTokenMetadata(token, false, func(tx *gorm.DB, committedGeneration int64) error {
 		token.CacheGeneration = committedGeneration
 		// Select is required so disabled/exhausted zero values are persisted.
-		return tx.Model(token).Select("status", "cache_generation").Updates(token).Error
+		return tx.Model(token).Select("status", "cache_generation", "metadata_mutation_id").Updates(token).Error
 	})
 }
 

@@ -369,6 +369,7 @@ func requireTokenPolicyColumns(t *testing.T, db *gorm.DB) {
 		"allowed_routing_strategies",
 		"default_conversion_policy",
 		"allow_lossy_conversion",
+		"metadata_mutation_id",
 	} {
 		require.Truef(t, db.Migrator().HasColumn(&model.Token{}, column), "expected tokens.%s column", column)
 	}

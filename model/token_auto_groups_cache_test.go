@@ -1177,6 +1177,60 @@ func TestTokenCommitAcknowledgementLossWithoutRedisReconcilesAfterConcurrentQuot
 	assert.EqualValues(t, 2, stored.CacheGeneration)
 }
 
+func assertTokenCommitAcknowledgementLossDoesNotClaimAnotherMutation(t *testing.T, key string) {
+	t.Helper()
+	previousRedisEnabled := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = previousRedisEnabled })
+	token := Token{
+		UserId:         7,
+		Key:            key,
+		Name:           "no-redis-distinct-mutation",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+
+	commitErr := errors.New("simulated rollback before another metadata mutation")
+	defaultCommit := commitTokenMutationTransaction
+	var ambiguousCommit func(*gorm.DB) error
+	ambiguousCommit = func(tx *gorm.DB) error {
+		require.NoError(t, tx.Rollback().Error)
+		commitTokenMutationTransaction = defaultCommit
+		defer func() {
+			commitTokenMutationTransaction = ambiguousCommit
+		}()
+
+		second, err := GetTokenById(token.Id)
+		require.NoError(t, err)
+		second.Status = common.TokenStatusDisabled
+		require.NoError(t, second.SelectUpdate())
+		return commitErr
+	}
+	replaceTokenMutationCommitForTest(t, ambiguousCommit)
+
+	token.Status = common.TokenStatusDisabled
+	err := token.SelectUpdate()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, commitErr)
+	assert.NotErrorIs(t, err, ErrTokenMutationCommitted)
+
+	var stored Token
+	require.NoError(t, DB.First(&stored, token.Id).Error)
+	assert.Equal(t, common.TokenStatusDisabled, stored.Status)
+	assert.EqualValues(t, 2, stored.CacheGeneration)
+}
+
+func TestTokenCommitAcknowledgementLossWithoutRedisDoesNotClaimAnotherMutation(t *testing.T) {
+	truncateTables(t)
+	assertTokenCommitAcknowledgementLossDoesNotClaimAnotherMutation(
+		t,
+		"token-no-redis-distinct-mutation",
+	)
+}
+
 func TestBatchDeleteCommitAcknowledgementLossWithoutRedisReturnsObservedSuccess(t *testing.T) {
 	truncateTables(t)
 	previousRedisEnabled := common.RedisEnabled
@@ -1386,6 +1440,7 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 					keyPrefix + "-missing-generation",
 					keyPrefix + "-redis-reset",
 					keyPrefix + "-reset-during-mutation",
+					keyPrefix + "-distinct-mutation",
 				}
 				for _, key := range keys {
 					_ = common.RDB.Del(
@@ -1604,6 +1659,13 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 				assertRedisResetDuringTokenMutationDoesNotRecacheOldToken(
 					t,
 					keyPrefix+"-reset-during-mutation",
+				)
+			})
+
+			t.Run("commit acknowledgement loss cannot claim another mutation", func(t *testing.T) {
+				assertTokenCommitAcknowledgementLossDoesNotClaimAnotherMutation(
+					t,
+					keyPrefix+"-distinct-mutation",
 				)
 			})
 		})
