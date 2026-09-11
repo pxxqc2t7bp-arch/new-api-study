@@ -36,32 +36,44 @@ const tokenCacheFenceSeconds = 10
 
 var errTokenCacheMutationPending = errors.New("token metadata update is pending")
 
-func getTokenCacheGenerationState(key string) (int64, bool, error) {
+type tokenCacheGenerationState struct {
+	generation    int64
+	pendingMarker bool
+}
+
+func loadTokenCacheGenerationState(key string) (tokenCacheGenerationState, error) {
 	values, err := common.RDB.MGet(
 		context.Background(),
 		getTokenCacheGenerationKey(key),
 		getTokenCachePendingFenceKey(key),
 	).Result()
 	if err != nil {
-		return 0, false, err
+		return tokenCacheGenerationState{}, err
 	}
 
-	var generation int64
+	state := tokenCacheGenerationState{}
 	if values[0] != nil {
-		generation, err = strconv.ParseInt(fmt.Sprint(values[0]), 10, 64)
-		if err != nil || generation < 0 {
-			return 0, false, fmt.Errorf("invalid token cache generation")
+		state.generation, err = strconv.ParseInt(fmt.Sprint(values[0]), 10, 64)
+		if err != nil || state.generation < 0 {
+			return tokenCacheGenerationState{}, fmt.Errorf("invalid token cache generation")
 		}
 	}
-	pending := generation%2 != 0
 	if values[1] != nil {
 		pendingGeneration, parseErr := strconv.ParseInt(fmt.Sprint(values[1]), 10, 64)
 		if parseErr != nil || pendingGeneration <= 0 {
-			return 0, false, fmt.Errorf("invalid token cache pending generation")
+			return tokenCacheGenerationState{}, fmt.Errorf("invalid token cache pending generation")
 		}
-		pending = true
+		state.pendingMarker = true
 	}
-	return generation, pending, nil
+	return state, nil
+}
+
+func getTokenCacheGenerationState(key string) (int64, bool, error) {
+	state, err := loadTokenCacheGenerationState(key)
+	if err != nil {
+		return 0, false, err
+	}
+	return state.generation, state.pendingMarker || state.generation%2 != 0, nil
 }
 
 // beginTokenCacheMutation advances the persistent generation from even to odd
@@ -78,12 +90,12 @@ func beginTokenCacheMutation(key string, minimumGeneration int64) (int64, error)
 	const script = `
 local current = tonumber(redis.call('GET', KEYS[1]) or '0')
 local minimum = tonumber(ARGV[2])
+if current % 2 ~= 0 or redis.call('EXISTS', KEYS[2]) == 1 then
+  return 0
+end
 if current < minimum then
   current = minimum
   redis.call('SET', KEYS[1], current)
-end
-if current % 2 ~= 0 or redis.call('EXISTS', KEYS[2]) == 1 then
-  return 0
 end
 local generation = current + 1
 redis.call('SET', KEYS[1], generation)
@@ -128,18 +140,28 @@ if current == incoming then
     if tonumber(redis.call('HGET', KEYS[3], 'Id') or '0') == tonumber(ARGV[2])
       and redis.call('HEXISTS', KEYS[3], 'RemainQuota') == 1
       and redis.call('HEXISTS', KEYS[3], 'UsedQuota') == 1 then
-      redis.call('HSET', KEYS[3],
-        'Status', ARGV[3], 'Name', ARGV[4], 'ExpiredTime', ARGV[5],
-        'UnlimitedQuota', ARGV[6], 'ModelLimitsEnabled', ARGV[7],
-        'ModelLimits', ARGV[8], 'AllowIps', ARGV[9],
-        'StreamRecoveryEnabled', ARGV[10], 'Group', ARGV[11],
-        'CrossGroupRetry', ARGV[12], 'AutoGroups', ARGV[13],
-        'DefaultRoutingStrategy', ARGV[14],
-        'AllowedRoutingStrategies', ARGV[15],
-        'DefaultConversionPolicy', ARGV[16],
-        'AllowLossyConversion', ARGV[17],
-        'CacheGeneration', current)
-      redis.call('EXPIRE', KEYS[3], ARGV[18])
+      local cachedRemain = tonumber(redis.call('HGET', KEYS[3], 'RemainQuota'))
+      local cachedUsed = tonumber(redis.call('HGET', KEYS[3], 'UsedQuota'))
+      local databaseRemain = tonumber(ARGV[18])
+      local databaseUsed = tonumber(ARGV[19])
+      if cachedRemain == nil or cachedUsed == nil or databaseRemain == nil or databaseUsed == nil then
+        redis.call('DEL', KEYS[3])
+      else
+        local quotaDelta = (databaseRemain + databaseUsed) - (cachedRemain + cachedUsed)
+        redis.call('HINCRBY', KEYS[3], 'RemainQuota', quotaDelta)
+        redis.call('HSET', KEYS[3],
+          'Status', ARGV[3], 'Name', ARGV[4], 'ExpiredTime', ARGV[5],
+          'UnlimitedQuota', ARGV[6], 'ModelLimitsEnabled', ARGV[7],
+          'ModelLimits', ARGV[8], 'AllowIps', ARGV[9],
+          'StreamRecoveryEnabled', ARGV[10], 'Group', ARGV[11],
+          'CrossGroupRetry', ARGV[12], 'AutoGroups', ARGV[13],
+          'DefaultRoutingStrategy', ARGV[14],
+          'AllowedRoutingStrategies', ARGV[15],
+          'DefaultConversionPolicy', ARGV[16],
+          'AllowLossyConversion', ARGV[17],
+          'CacheGeneration', current)
+        redis.call('EXPIRE', KEYS[3], ARGV[20])
+      end
     else
       redis.call('DEL', KEYS[3])
     end
@@ -161,6 +183,7 @@ return 1`
 		token.Group, strconv.FormatBool(token.CrossGroupRetry), token.AutoGroups,
 		token.DefaultRoutingStrategy, token.AllowedRoutingStrategies,
 		token.DefaultConversionPolicy, strconv.FormatBool(token.AllowLossyConversion),
+		token.RemainQuota, token.UsedQuota,
 		tokenCacheTTLSeconds(),
 	).Int64()
 	if err != nil {

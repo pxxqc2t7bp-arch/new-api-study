@@ -20,6 +20,13 @@ type failRedisEvalHook struct {
 	err       error
 }
 
+type blockRedisEvalHook struct {
+	callCount atomic.Int64
+	blockAt   int64
+	reached   chan struct{}
+	release   chan struct{}
+}
+
 func (h *failRedisEvalHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
 	if cmd.Name() == "eval" && h.callCount.Add(1) == h.failAt {
 		return ctx, h.err
@@ -36,6 +43,26 @@ func (*failRedisEvalHook) BeforeProcessPipeline(ctx context.Context, _ []redis.C
 }
 
 func (*failRedisEvalHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
+	return nil
+}
+
+func (h *blockRedisEvalHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	if cmd.Name() == "eval" && h.callCount.Add(1) == h.blockAt {
+		close(h.reached)
+		<-h.release
+	}
+	return ctx, nil
+}
+
+func (*blockRedisEvalHook) AfterProcess(context.Context, redis.Cmder) error {
+	return nil
+}
+
+func (*blockRedisEvalHook) BeforeProcessPipeline(ctx context.Context, _ []redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (*blockRedisEvalHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
 	return nil
 }
 
@@ -170,6 +197,45 @@ func TestTokenPolicyUpdatePreservesLiveCachedQuota(t *testing.T) {
 	assert.Equal(t, "strict", cached.DefaultConversionPolicy)
 }
 
+func TestTokenQuotaUpdateAppliesDatabaseTotalDeltaToLiveCache(t *testing.T) {
+	tests := []struct {
+		name               string
+		updatedRemainQuota int
+		wantRemainQuota    int
+	}{
+		{name: "decrease", updatedRemainQuota: 10, wantRemainQuota: -60},
+		{name: "increase", updatedRemainQuota: 150, wantRemainQuota: 80},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			truncateTables(t)
+			useUserCacheMiniRedis(t)
+			token := Token{
+				UserId:      7,
+				Key:         "token-quota-update-" + test.name,
+				Name:        "quota-update-" + test.name,
+				Status:      common.TokenStatusEnabled,
+				ExpiredTime: -1,
+				RemainQuota: 100,
+			}
+			require.NoError(t, token.Insert())
+			require.NoError(t, cacheSetTokenForTest(token))
+			result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
+			require.NoError(t, err)
+			require.Equal(t, cacheQuotaOK, result)
+
+			token.RemainQuota = test.updatedRemainQuota
+			require.NoError(t, token.Update())
+
+			cached, err := cacheGetTokenByKey(token.Key)
+			require.NoError(t, err)
+			assert.Equal(t, test.wantRemainQuota, cached.RemainQuota)
+			assert.Equal(t, 70, cached.UsedQuota)
+		})
+	}
+}
+
 func TestTokenPolicyUpdateLeavesColdCacheCold(t *testing.T) {
 	truncateTables(t)
 	server := useUserCacheMiniRedis(t)
@@ -294,6 +360,176 @@ func TestTokenMutationFailureClearsPendingFenceForUnchangedDatabaseState(t *test
 	assert.Equal(t, 30, reloaded.RemainQuota)
 	assert.Equal(t, 70, reloaded.UsedQuota)
 	assert.True(t, server.Exists(getTokenCacheKey(token.Key)))
+}
+
+func TestTokenReaderDoesNotRollbackActiveMetadataMutation(t *testing.T) {
+	truncateTables(t)
+	useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:         7,
+		Key:            "token-active-generation-race",
+		Name:           "active-generation-race",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+	require.NoError(t, cacheSetTokenForTest(token))
+
+	generation, err := beginTokenCacheMutation(token.Key, token.CacheGeneration)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, generation)
+
+	loadedDuringWrite, readErr := GetTokenByKey(token.Key, false)
+	assert.ErrorIs(t, readErr, errTokenCacheMutationPending)
+	assert.Nil(t, loadedDuringWrite)
+	currentGeneration, pending, stateErr := getTokenCacheGenerationState(token.Key)
+	require.NoError(t, stateErr)
+	assert.EqualValues(t, generation, currentGeneration)
+	assert.True(t, pending)
+
+	token.Status = common.TokenStatusDisabled
+	token.CacheGeneration = generation + 1
+	require.NoError(t, DB.Model(&token).Select("status", "cache_generation").Updates(&token).Error)
+	require.NoError(t, commitTokenCacheMutation(token, generation))
+
+	loadedAfterCommit, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, common.TokenStatusDisabled, loadedAfterCommit.Status)
+}
+
+func TestSecondTokenWriterDoesNotSkipFirstFinalization(t *testing.T) {
+	truncateTables(t)
+	useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:      7,
+		Key:         "token-concurrent-writer",
+		Name:        "before",
+		Status:      common.TokenStatusEnabled,
+		ExpiredTime: -1,
+		RemainQuota: 100,
+	}
+	require.NoError(t, token.Insert())
+	require.NoError(t, cacheSetTokenForTest(token))
+
+	hook := &blockRedisEvalHook{
+		blockAt: 2,
+		reached: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	common.RDB.AddHook(hook)
+
+	first := token
+	first.Name = "first"
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- first.Update()
+	}()
+	<-hook.reached
+
+	second, err := GetTokenById(token.Id)
+	require.NoError(t, err)
+	second.Name = "second"
+	assert.ErrorIs(t, second.Update(), errTokenCacheMutationPending)
+
+	close(hook.release)
+	require.NoError(t, <-firstResult)
+
+	loaded, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, "first", loaded.Name)
+}
+
+func TestTokenPostCommitErrorDoesNotRestoreEnabledCache(t *testing.T) {
+	truncateTables(t)
+	useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:         7,
+		Key:            "token-post-commit-error",
+		Name:           "post-commit-error",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+	require.NoError(t, cacheSetTokenForTest(token))
+
+	postCommitErr := errors.New("simulated lost commit acknowledgement")
+	const callbackName = "test:post_commit_error"
+	require.NoError(t, DB.Callback().Update().
+		After("gorm:commit_or_rollback_transaction").
+		Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table == "tokens" {
+				tx.AddError(postCommitErr)
+			}
+		}))
+	callbackRegistered := true
+	t.Cleanup(func() {
+		if callbackRegistered {
+			_ = DB.Callback().Update().Remove(callbackName)
+		}
+	})
+
+	token.Status = common.TokenStatusDisabled
+	err := token.SelectUpdate()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTokenMutationCommitted)
+	assert.ErrorIs(t, err, postCommitErr)
+	require.NoError(t, DB.Callback().Update().Remove(callbackName))
+	callbackRegistered = false
+
+	var stored Token
+	require.NoError(t, DB.First(&stored, token.Id).Error)
+	require.Equal(t, common.TokenStatusDisabled, stored.Status)
+	_, err = ValidateUserToken(token.Key)
+	assert.ErrorIs(t, err, ErrTokenInvalid)
+}
+
+func TestTokenDeletePostCommitErrorDoesNotRestoreCachedToken(t *testing.T) {
+	truncateTables(t)
+	server := useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:         7,
+		Key:            "token-delete-post-commit-error",
+		Name:           "delete-post-commit-error",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+	require.NoError(t, cacheSetTokenForTest(token))
+
+	postCommitErr := errors.New("simulated lost delete commit acknowledgement")
+	const callbackName = "test:delete_post_commit_error"
+	require.NoError(t, DB.Callback().Delete().
+		After("gorm:commit_or_rollback_transaction").
+		Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table == "tokens" {
+				tx.AddError(postCommitErr)
+			}
+		}))
+	callbackRegistered := true
+	t.Cleanup(func() {
+		if callbackRegistered {
+			_ = DB.Callback().Delete().Remove(callbackName)
+		}
+	})
+
+	err := token.Delete()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTokenMutationCommitted)
+	assert.ErrorIs(t, err, postCommitErr)
+	require.NoError(t, DB.Callback().Delete().Remove(callbackName))
+	callbackRegistered = false
+
+	var stored Token
+	assert.ErrorIs(t, DB.First(&stored, token.Id).Error, gorm.ErrRecordNotFound)
+	_, err = ValidateUserToken(token.Key)
+	assert.ErrorIs(t, err, ErrTokenInvalid)
+	assert.False(t, server.Exists(getTokenCacheKey(token.Key)))
 }
 
 func TestTokenReaderReloadsSnapshotAfterConcurrentPolicyCommit(t *testing.T) {
@@ -568,6 +804,57 @@ func TestBatchDeleteTokensFinalizesEveryCommittedMutation(t *testing.T) {
 	var remaining int64
 	require.NoError(t, DB.Model(&Token{}).Where("id IN ?", []int{tokens[0].Id, tokens[1].Id}).Count(&remaining).Error)
 	assert.Zero(t, remaining)
+}
+
+func TestBatchDeleteCommitErrorReconcilesDatabaseOutcome(t *testing.T) {
+	tests := []struct {
+		name          string
+		deleteFromDB  bool
+		wantCommitted int
+		wantCached    bool
+	}{
+		{name: "committed", deleteFromDB: true, wantCommitted: 1, wantCached: false},
+		{name: "rolled back", deleteFromDB: false, wantCommitted: 0, wantCached: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			truncateTables(t)
+			useUserCacheMiniRedis(t)
+			token := Token{
+				UserId:         7,
+				Key:            "token-batch-commit-" + test.name,
+				Name:           "batch-commit-" + test.name,
+				Status:         common.TokenStatusEnabled,
+				ExpiredTime:    -1,
+				RemainQuota:    100,
+				UnlimitedQuota: true,
+			}
+			require.NoError(t, token.Insert())
+			require.NoError(t, cacheSetTokenForTest(token))
+			generation, err := beginTokenCacheMutation(token.Key, token.CacheGeneration)
+			require.NoError(t, err)
+			if test.deleteFromDB {
+				require.NoError(t, DB.Delete(&token).Error)
+			}
+
+			commitErr := errors.New("simulated batch commit acknowledgement loss")
+			committed, err := reconcileBatchTokenDeleteCommit(
+				[]tokenCacheMutation{{id: token.Id, key: token.Key, generation: generation}},
+				commitErr,
+			)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, commitErr)
+			assert.Equal(t, test.wantCommitted, committed)
+			assert.Equal(t, test.wantCached, common.RDB.Exists(t.Context(), getTokenCacheKey(token.Key)).Val() == 1)
+			if test.wantCommitted > 0 {
+				assert.ErrorIs(t, err, ErrTokenMutationCommitted)
+			} else {
+				_, validateErr := ValidateUserToken(token.Key)
+				assert.NoError(t, validateErr)
+			}
+		})
+	}
 }
 
 func TestTokenMutationCommitsFenceAfterPendingGenerationExpires(t *testing.T) {
