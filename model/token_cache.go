@@ -139,37 +139,39 @@ if current == incoming then
     return 0
   end
   current = current + 1
-  if redis.call('EXISTS', KEYS[3]) == 1 then
-    if tonumber(redis.call('HGET', KEYS[3], 'Id') or '0') == tonumber(ARGV[2])
-      and redis.call('HEXISTS', KEYS[3], 'RemainQuota') == 1
-      and redis.call('HEXISTS', KEYS[3], 'UsedQuota') == 1 then
-      local cachedRemain = tonumber(redis.call('HGET', KEYS[3], 'RemainQuota'))
-      local cachedUsed = tonumber(redis.call('HGET', KEYS[3], 'UsedQuota'))
-      local databaseRemain = tonumber(ARGV[18])
-      local databaseUsed = tonumber(ARGV[19])
-      if cachedRemain == nil or cachedUsed == nil or databaseRemain == nil or databaseUsed == nil then
-        redis.call('DEL', KEYS[3])
-      else
-        local quotaDelta = (databaseRemain + databaseUsed) - (cachedRemain + cachedUsed)
-        redis.call('HINCRBY', KEYS[3], 'RemainQuota', quotaDelta)
-        redis.call('HSET', KEYS[3],
-          'Status', ARGV[3], 'Name', ARGV[4], 'ExpiredTime', ARGV[5],
-          'UnlimitedQuota', ARGV[6], 'ModelLimitsEnabled', ARGV[7],
-          'ModelLimits', ARGV[8], 'AllowIps', ARGV[9],
-          'StreamRecoveryEnabled', ARGV[10], 'Group', ARGV[11],
-          'CrossGroupRetry', ARGV[12], 'AutoGroups', ARGV[13],
-          'DefaultRoutingStrategy', ARGV[14],
-          'AllowedRoutingStrategies', ARGV[15],
-          'DefaultConversionPolicy', ARGV[16],
-          'AllowLossyConversion', ARGV[17],
-          'CacheGeneration', current)
-        redis.call('EXPIRE', KEYS[3], ARGV[20])
-      end
-    else
-      redis.call('DEL', KEYS[3])
-    end
-  end
   redis.call('SET', KEYS[1], current)
+elseif current ~= incoming + 1 then
+  return 1
+end
+if redis.call('EXISTS', KEYS[3]) == 1 then
+  if tonumber(redis.call('HGET', KEYS[3], 'Id') or '0') == tonumber(ARGV[2])
+    and redis.call('HEXISTS', KEYS[3], 'RemainQuota') == 1
+    and redis.call('HEXISTS', KEYS[3], 'UsedQuota') == 1 then
+    local cachedRemain = tonumber(redis.call('HGET', KEYS[3], 'RemainQuota'))
+    local cachedUsed = tonumber(redis.call('HGET', KEYS[3], 'UsedQuota'))
+    local databaseRemain = tonumber(ARGV[18])
+    local databaseUsed = tonumber(ARGV[19])
+    if cachedRemain == nil or cachedUsed == nil or databaseRemain == nil or databaseUsed == nil then
+      redis.call('DEL', KEYS[3])
+    else
+      local quotaDelta = (databaseRemain + databaseUsed) - (cachedRemain + cachedUsed)
+      redis.call('HINCRBY', KEYS[3], 'RemainQuota', quotaDelta)
+      redis.call('HSET', KEYS[3],
+        'Status', ARGV[3], 'Name', ARGV[4], 'ExpiredTime', ARGV[5],
+        'UnlimitedQuota', ARGV[6], 'ModelLimitsEnabled', ARGV[7],
+        'ModelLimits', ARGV[8], 'AllowIps', ARGV[9],
+        'StreamRecoveryEnabled', ARGV[10], 'Group', ARGV[11],
+        'CrossGroupRetry', ARGV[12], 'AutoGroups', ARGV[13],
+        'DefaultRoutingStrategy', ARGV[14],
+        'AllowedRoutingStrategies', ARGV[15],
+        'DefaultConversionPolicy', ARGV[16],
+        'AllowLossyConversion', ARGV[17],
+        'CacheGeneration', current)
+      redis.call('EXPIRE', KEYS[3], ARGV[20])
+    end
+  else
+    redis.call('DEL', KEYS[3])
+  end
 end
 if tonumber(redis.call('GET', KEYS[2]) or '0') == incoming then
   redis.call('DEL', KEYS[2])
@@ -314,7 +316,6 @@ local database = tonumber(ARGV[24])
 local current = tonumber(redis.call('GET', KEYS[3]) or '0')
 if current < database then
   redis.call('SET', KEYS[3], database)
-  redis.call('DEL', KEYS[1])
   return 0
 end
 if current ~= expected or current % 2 ~= 0 or redis.call('EXISTS', KEYS[2]) == 1 then

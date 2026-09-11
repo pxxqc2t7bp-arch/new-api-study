@@ -410,6 +410,12 @@ func getTokenByKeyAcrossGeneration(key string) (*Token, error) {
 		if readErr != nil {
 			return nil, readErr
 		}
+		if loaded.CacheGeneration > expectedGeneration && loaded.CacheGeneration%2 == 0 {
+			if finishErr := commitTokenCacheMutation(*loaded, loaded.CacheGeneration-1); finishErr != nil {
+				return nil, errTokenCacheMutationPending
+			}
+			continue
+		}
 		code, cacheErr := cacheInitToken(*loaded, expectedGeneration)
 		if cacheErr != nil {
 			return nil, fmt.Errorf("failed to init token cache: %w", cacheErr)

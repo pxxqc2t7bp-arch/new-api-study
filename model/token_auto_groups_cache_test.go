@@ -455,6 +455,9 @@ func TestTokenCacheMissingGenerationDoesNotAcceptStaleHash(t *testing.T) {
 	}
 	require.NoError(t, token.Insert())
 	require.NoError(t, cacheSetTokenForTest(token))
+	result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
 
 	require.NoError(t, DB.Model(&token).Updates(map[string]any{
 		"status":           common.TokenStatusDisabled,
@@ -465,6 +468,8 @@ func TestTokenCacheMissingGenerationDoesNotAcceptStaleHash(t *testing.T) {
 	loaded, err := GetTokenByKey(token.Key, false)
 	require.NoError(t, err)
 	assert.Equal(t, common.TokenStatusDisabled, loaded.Status)
+	assert.Equal(t, 30, loaded.RemainQuota)
+	assert.Equal(t, 70, loaded.UsedQuota)
 	assert.EqualValues(t, 2, loaded.CacheGeneration)
 }
 
