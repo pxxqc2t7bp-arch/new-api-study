@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -13,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func setupRealtimeTicketControllerTest(t *testing.T) *gin.Engine {
@@ -143,6 +145,18 @@ func TestIssueRealtimeTicketRejectsInvalidBindings(t *testing.T) {
 			},
 			wantStatus: http.StatusBadRequest,
 		},
+		{
+			name: "malformed token routing policy",
+			token: model.Token{
+				UserId: 7, Status: common.TokenStatusEnabled, ExpiredTime: -1,
+				RemainQuota: 100, DefaultRoutingStrategy: "stable",
+				AllowedRoutingStrategies: `["stable"`,
+			},
+			body: func(token model.Token) string {
+				return fmt.Sprintf(`{"token_id":%d,"model":"gpt-realtime"}`, token.Id)
+			},
+			wantStatus: http.StatusInternalServerError,
+		},
 	}
 
 	for _, test := range tests {
@@ -157,4 +171,37 @@ func TestIssueRealtimeTicketRejectsInvalidBindings(t *testing.T) {
 			assert.NotContains(t, response.Body.String(), test.token.Key)
 		})
 	}
+}
+
+func TestIssueRealtimeTicketReportsTokenDatabaseFailure(t *testing.T) {
+	router := setupRealtimeTicketControllerTest(t)
+	token := model.Token{
+		UserId:                   7,
+		Key:                      "realtimeticketdatabasefailure",
+		Name:                     "database-failure",
+		Status:                   common.TokenStatusEnabled,
+		ExpiredTime:              -1,
+		RemainQuota:              100,
+		DefaultRoutingStrategy:   "stable",
+		AllowedRoutingStrategies: `["stable"]`,
+	}
+	require.NoError(t, token.Insert())
+
+	forcedErr := fmt.Errorf("forced realtime ticket token lookup failure")
+	var intercepted atomic.Bool
+	const callbackName = "test:fail_realtime_ticket_issue_lookup"
+	require.NoError(t, model.DB.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "tokens" && intercepted.CompareAndSwap(false, true) {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		_ = model.DB.Callback().Query().Remove(callbackName)
+	})
+
+	response := issueRealtimeTicketRequest(t, router, fmt.Sprintf(
+		`{"token_id":%d,"model":"gpt-realtime"}`,
+		token.Id,
+	))
+	assert.Equal(t, http.StatusInternalServerError, response.Code)
 }

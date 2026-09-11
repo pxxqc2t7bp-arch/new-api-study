@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type realtimeTicketRequest struct {
@@ -34,7 +35,11 @@ func IssueRealtimeTicket(c *gin.Context) {
 	userId := c.GetInt("id")
 	token, err := model.GetTokenByIds(request.TokenId, userId)
 	if err != nil {
-		writeRealtimeTicketError(c, http.StatusNotFound, "token not found")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeRealtimeTicketError(c, http.StatusNotFound, "token not found")
+		} else {
+			writeRealtimeTicketError(c, http.StatusInternalServerError, "failed to load token")
+		}
 		return
 	}
 	validated, err := model.ValidateUserToken(token.Key)
@@ -83,7 +88,7 @@ func IssueRealtimeTicket(c *gin.Context) {
 func realtimeTicketRoutingStrategy(token *model.Token, requested string) (hosttypes.RoutingStrategy, int, error) {
 	allowed, err := token.GetAllowedRoutingStrategies()
 	if err != nil {
-		allowed = []string{string(hosttypes.RoutingStrategyStable)}
+		return "", http.StatusInternalServerError, errors.New("token routing policy is invalid")
 	}
 	requested = strings.TrimSpace(requested)
 	if requested != "" {
@@ -97,9 +102,13 @@ func realtimeTicketRoutingStrategy(token *model.Token, requested string) (hostty
 		return strategy, 0, nil
 	}
 
-	strategy, ok := hosttypes.ParseRoutingStrategy(token.DefaultRoutingStrategy)
+	defaultStrategy := strings.TrimSpace(token.DefaultRoutingStrategy)
+	if defaultStrategy == "" {
+		defaultStrategy = string(hosttypes.RoutingStrategyStable)
+	}
+	strategy, ok := hosttypes.ParseRoutingStrategy(defaultStrategy)
 	if !ok || !slices.Contains(allowed, string(strategy)) {
-		return hosttypes.RoutingStrategyStable, 0, nil
+		return "", http.StatusInternalServerError, errors.New("token routing policy is invalid")
 	}
 	return strategy, 0, nil
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 const (
@@ -33,23 +34,19 @@ func RealtimeAuth() gin.HandlerFunc {
 		}
 
 		modelName := strings.TrimSpace(c.Query("model"))
-		ticket, err := model.ConsumeRealtimeTicket(raw, modelName)
+		ticket, err := model.GetRealtimeTicket(raw, modelName)
 		if err != nil {
-			if isRealtimeTicketClientError(err) {
-				abortWithOpenAiMessage(c, http.StatusUnauthorized, "invalid realtime ticket")
-			} else {
-				abortWithOpenAiMessage(
-					c,
-					http.StatusInternalServerError,
-					common.TranslateMessage(c, i18n.MsgDatabaseError),
-				)
-			}
+			abortRealtimeTicketError(c, err)
 			return
 		}
 
 		token, err := model.GetTokenByIds(ticket.TokenId, ticket.UserId)
 		if err != nil {
-			abortWithOpenAiMessage(c, http.StatusUnauthorized, "invalid realtime ticket")
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				abortWithOpenAiMessage(c, http.StatusUnauthorized, "invalid realtime ticket")
+			} else {
+				abortRealtimeTicketError(c, err)
+			}
 			return
 		}
 		token, err = model.ValidateUserToken(token.Key)
@@ -78,9 +75,26 @@ func RealtimeAuth() gin.HandlerFunc {
 		if !setupValidatedTokenContext(c, token) {
 			return
 		}
-		common.SetContextKey(c, constant.ContextKeyRoutingStrategy, ticket.RoutingStrategy)
+		consumed, err := model.ConsumeRealtimeTicket(raw, modelName)
+		if err != nil {
+			abortRealtimeTicketError(c, err)
+			return
+		}
+		common.SetContextKey(c, constant.ContextKeyRoutingStrategy, consumed.RoutingStrategy)
 		c.Next()
 	}
+}
+
+func abortRealtimeTicketError(c *gin.Context, err error) {
+	if isRealtimeTicketClientError(err) {
+		abortWithOpenAiMessage(c, http.StatusUnauthorized, "invalid realtime ticket")
+		return
+	}
+	abortWithOpenAiMessage(
+		c,
+		http.StatusInternalServerError,
+		common.TranslateMessage(c, i18n.MsgDatabaseError),
+	)
 }
 
 func isRealtimeTicketClientError(err error) bool {

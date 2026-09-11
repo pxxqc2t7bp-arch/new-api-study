@@ -89,7 +89,7 @@ func TestRealtimeRelayRouteConsumesTicketBeforeDistribution(t *testing.T) {
 	)
 	engine.ServeHTTP(response, request)
 
-	assert.NotEqual(t, http.StatusUnauthorized, response.Code)
+	assert.Equal(t, http.StatusServiceUnavailable, response.Code)
 	_, err = model.ConsumeRealtimeTicket(raw, "gpt-realtime")
 	assert.ErrorIs(t, err, model.ErrAuthFlowConsumed)
 }
@@ -103,5 +103,5 @@ func TestRealtimeRelayRoutePreservesNativeBearerAuthentication(t *testing.T) {
 	request.Header.Set("Authorization", "Bearer "+token.Key)
 	engine.ServeHTTP(response, request)
 
-	assert.NotEqual(t, http.StatusUnauthorized, response.Code)
+	assert.Equal(t, http.StatusServiceUnavailable, response.Code)
 }

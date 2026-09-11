@@ -74,39 +74,69 @@ func CreateRealtimeTicket(input RealtimeTicketCreate) (string, *RealtimeTicket, 
 }
 
 func ConsumeRealtimeTicket(raw string, modelName string) (*RealtimeTicket, error) {
-	if !strings.HasPrefix(raw, RealtimeTicketPrefix) {
-		return nil, ErrAuthFlowInvalid
-	}
-	raw = strings.TrimPrefix(raw, RealtimeTicketPrefix)
-	modelName = strings.TrimSpace(modelName)
-	if raw == "" || modelName == "" {
-		return nil, ErrAuthFlowInvalid
+	raw, modelName, err := normalizeRealtimeTicketInput(raw, modelName)
+	if err != nil {
+		return nil, err
 	}
 
-	var (
-		payload  realtimeTicketPayload
-		strategy hosttypes.RoutingStrategy
-	)
-	flow, err := ConsumeAuthFlowWithAction(
+	var ticket *RealtimeTicket
+	_, err = ConsumeAuthFlowWithAction(
 		raw,
 		AuthFlowMatch{Purpose: AuthFlowPurposeRealtimeTicket},
 		func(_ *gorm.DB, flow *AuthFlow) error {
-			if err := common.UnmarshalJsonStr(flow.Payload, &payload); err != nil {
-				return ErrAuthFlowInvalid
-			}
-			if flow.UserId <= 0 || payload.TokenId <= 0 || payload.Model != modelName {
-				return ErrRealtimeTicketBinding
-			}
-			var ok bool
-			strategy, ok = hosttypes.ParseRoutingStrategy(string(payload.RoutingStrategy))
-			if !ok {
-				return ErrAuthFlowInvalid
-			}
-			return nil
+			var parseErr error
+			ticket, parseErr = realtimeTicketFromAuthFlow(flow, modelName)
+			return parseErr
 		},
 	)
 	if err != nil {
 		return nil, err
+	}
+	return ticket, nil
+}
+
+func GetRealtimeTicket(raw string, modelName string) (*RealtimeTicket, error) {
+	raw, modelName, err := normalizeRealtimeTicketInput(raw, modelName)
+	if err != nil {
+		return nil, err
+	}
+	flow, err := GetAuthFlow(raw, AuthFlowMatch{Purpose: AuthFlowPurposeRealtimeTicket})
+	if err != nil {
+		return nil, err
+	}
+	return realtimeTicketFromAuthFlow(flow, modelName)
+}
+
+func normalizeRealtimeTicketInput(raw string, modelName string) (string, string, error) {
+	if !strings.HasPrefix(raw, RealtimeTicketPrefix) {
+		return "", "", ErrAuthFlowInvalid
+	}
+	raw = strings.TrimPrefix(raw, RealtimeTicketPrefix)
+	modelName = strings.TrimSpace(modelName)
+	if raw == "" || modelName == "" {
+		return "", "", ErrAuthFlowInvalid
+	}
+	return raw, modelName, nil
+}
+
+func realtimeTicketFromAuthFlow(flow *AuthFlow, modelName string) (*RealtimeTicket, error) {
+	if flow == nil {
+		return nil, ErrAuthFlowInvalid
+	}
+	var (
+		payload  realtimeTicketPayload
+		strategy hosttypes.RoutingStrategy
+	)
+	if err := common.UnmarshalJsonStr(flow.Payload, &payload); err != nil {
+		return nil, ErrAuthFlowInvalid
+	}
+	if flow.UserId <= 0 || payload.TokenId <= 0 || payload.Model != modelName {
+		return nil, ErrRealtimeTicketBinding
+	}
+	var ok bool
+	strategy, ok = hosttypes.ParseRoutingStrategy(string(payload.RoutingStrategy))
+	if !ok {
+		return nil, ErrAuthFlowInvalid
 	}
 	return &RealtimeTicket{
 		UserId:          flow.UserId,

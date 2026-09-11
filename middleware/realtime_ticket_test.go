@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -220,6 +221,30 @@ func TestRealtimeAuthRevalidatesTokenAndRoutingPolicy(t *testing.T) {
 			assert.Equal(t, http.StatusUnauthorized, response.Code)
 		})
 	}
+}
+
+func TestRealtimeAuthDoesNotConsumeTicketOnTransientTokenLookupFailure(t *testing.T) {
+	user, token := setupRealtimeTicketMiddlewareTest(t)
+	router := realtimeAuthTestRouter(t)
+	ticket := createRealtimeTicketForMiddlewareTest(t, user, token)
+
+	transientErr := fmt.Errorf("temporary token database failure")
+	var intercepted atomic.Bool
+	const callbackName = "test:fail_realtime_ticket_token_lookup"
+	require.NoError(t, model.DB.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "tokens" && intercepted.CompareAndSwap(false, true) {
+			tx.AddError(transientErr)
+		}
+	}))
+	failed := httptest.NewRecorder()
+	requestPath := "/v1/realtime?model=gpt-realtime&ticket=" + url.QueryEscape(ticket)
+	router.ServeHTTP(failed, httptest.NewRequest(http.MethodGet, requestPath, nil))
+	require.Equal(t, http.StatusInternalServerError, failed.Code)
+	require.NoError(t, model.DB.Callback().Query().Remove(callbackName))
+
+	retried := httptest.NewRecorder()
+	router.ServeHTTP(retried, httptest.NewRequest(http.MethodGet, requestPath, nil))
+	assert.Equal(t, http.StatusOK, retried.Code)
 }
 
 func TestRealtimeAuthPreservesNativeSDKAuthenticationAndScrubsSubprotocolKey(t *testing.T) {
