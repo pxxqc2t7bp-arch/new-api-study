@@ -572,6 +572,95 @@ func TestTokenCacheRecoversAfterCompleteRedisReset(t *testing.T) {
 	assert.EqualValues(t, 4, cached.CacheGeneration)
 }
 
+func assertRedisResetDuringTokenMutationDoesNotRecacheOldToken(t *testing.T, key string) {
+	t.Helper()
+	token := Token{
+		UserId:         7,
+		Key:            key,
+		Name:           "reset-during-mutation",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+	require.NoError(t, cacheSetTokenForTest(token))
+
+	updateReached := make(chan struct{})
+	releaseUpdate := make(chan struct{})
+	var intercepted atomic.Bool
+	const callbackName = "test:block_update_during_redis_reset"
+	require.NoError(t, DB.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "tokens" && intercepted.CompareAndSwap(false, true) {
+			close(updateReached)
+			<-releaseUpdate
+		}
+	}))
+	t.Cleanup(func() {
+		_ = DB.Callback().Update().Remove(callbackName)
+	})
+
+	token.Status = common.TokenStatusDisabled
+	updateResult := make(chan error, 1)
+	go func() {
+		updateResult <- token.SelectUpdate()
+	}()
+	<-updateReached
+	require.NoError(t, common.RDB.Del(
+		t.Context(),
+		getTokenCacheKey(token.Key),
+		getTokenCacheGenerationKey(token.Key),
+		getTokenCachePendingFenceKey(token.Key),
+	).Err())
+
+	type readResult struct {
+		token *Token
+		err   error
+	}
+	readerStarted := make(chan struct{})
+	readerResult := make(chan readResult, 1)
+	go func() {
+		close(readerStarted)
+		loaded, err := GetTokenByKey(token.Key, false)
+		readerResult <- readResult{token: loaded, err: err}
+	}()
+	<-readerStarted
+	var early *readResult
+	select {
+	case result := <-readerResult:
+		early = &result
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseUpdate)
+	writerErr := <-updateResult
+	assert.True(t,
+		writerErr == nil || errors.Is(writerErr, ErrTokenMutationCommitted),
+		"unexpected writer result: %v",
+		writerErr,
+	)
+	if early != nil && early.err == nil && early.token != nil {
+		assert.NotEqual(t, common.TokenStatusEnabled, early.token.Status,
+			"reader returned stale token before metadata transaction completed")
+	} else if early == nil {
+		result := <-readerResult
+		require.NoError(t, result.err)
+		require.NotNil(t, result.token)
+		assert.Equal(t, common.TokenStatusDisabled, result.token.Status)
+	}
+
+	loaded, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	require.NotNil(t, loaded)
+	assert.Equal(t, common.TokenStatusDisabled, loaded.Status)
+}
+
+func TestRedisResetDuringTokenMutationDoesNotRecacheOldToken(t *testing.T) {
+	truncateTables(t)
+	useUserCacheMiniRedis(t)
+	assertRedisResetDuringTokenMutationDoesNotRecacheOldToken(t, "token-reset-during-mutation")
+}
+
 func TestSecondTokenWriterDoesNotSkipFirstFinalization(t *testing.T) {
 	truncateTables(t)
 	useUserCacheMiniRedis(t)
@@ -1217,6 +1306,7 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 					keyPrefix + "-batch-delete",
 					keyPrefix + "-missing-generation",
 					keyPrefix + "-redis-reset",
+					keyPrefix + "-reset-during-mutation",
 				}
 				for _, key := range keys {
 					_ = common.RDB.Del(
@@ -1420,6 +1510,13 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, common.TokenStatusDisabled, cached.Status)
 				assert.EqualValues(t, 4, cached.CacheGeneration)
+			})
+
+			t.Run("redis reset during metadata mutation never recaches old token", func(t *testing.T) {
+				assertRedisResetDuringTokenMutationDoesNotRecacheOldToken(
+					t,
+					keyPrefix+"-reset-during-mutation",
+				)
 			})
 		})
 	}
