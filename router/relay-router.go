@@ -99,6 +99,9 @@ func SetRelayRouter(router *gin.Engine) {
 		ordinaryRouter.POST("/chat/completions", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAI)
 		})
+		ordinaryRouter.POST("/responses/compact", func(c *gin.Context) {
+			controller.Relay(c, types.RelayFormatOpenAIResponsesCompaction)
+		})
 		ordinaryRouter.POST("/models/*path", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatGemini)
 		})
@@ -107,11 +110,6 @@ func SetRelayRouter(router *gin.Engine) {
 		//http router
 		httpRouter := relayV1Router.Group("")
 		httpRouter.Use(middleware.ModelRequestRateLimit(), middleware.Distribute())
-
-		// response related routes
-		httpRouter.POST("/responses/compact", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIResponsesCompaction)
-		})
 
 		// alpha search related routes (Codex standalone web search)
 		httpRouter.POST("/alpha/search", func(c *gin.Context) {

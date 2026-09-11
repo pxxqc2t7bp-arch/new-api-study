@@ -369,24 +369,68 @@ func GetTokenById(id int) (*Token, error) {
 	return &token, err
 }
 
+func getTokenByKeyFromDB(key string) (*Token, error) {
+	token := &Token{}
+	if err := DB.Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
+		return nil, err
+	}
+	return token, nil
+}
+
+func getTokenByKeyAcrossFence(key string) (*Token, error) {
+	for range 3 {
+		beforeState, beforeGeneration, err := getTokenCacheFenceState(key)
+		if err != nil {
+			return nil, err
+		}
+		if beforeState == tokenCacheFencePending {
+			return nil, errTokenCacheMutationPending
+		}
+		loaded, readErr := getTokenByKeyFromDB(key)
+		if readErr != nil {
+			return nil, readErr
+		}
+		afterState, afterGeneration, err := getTokenCacheFenceState(key)
+		if err != nil {
+			return nil, err
+		}
+		if afterState == tokenCacheFencePending {
+			return nil, errTokenCacheMutationPending
+		}
+		if beforeState == afterState && beforeGeneration == afterGeneration {
+			return loaded, nil
+		}
+	}
+	return nil, errTokenCacheMutationPending
+}
+
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 	if !fromDB && common.RedisEnabled {
-		// Try Redis first
 		token, err := cacheGetTokenByKey(key)
 		if err == nil {
 			return token, nil
 		}
-		// Don't return error - fall through to DB
+		if errors.Is(err, errTokenCacheMutationPending) {
+			return nil, err
+		}
+		if errors.Is(err, errTokenCacheMutationCommitted) {
+			return getTokenByKeyAcrossFence(key)
+		}
 	}
-	token = &Token{}
-	if err = DB.Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
+	token, err = getTokenByKeyFromDB(key)
+	if err != nil {
 		return nil, err
 	}
 	if common.RedisEnabled {
 		// 冷缓存时用数据库快照初始化；已存在的哈希只刷新 TTL，
-		// 避免快照覆盖 Redis 中已被原子预扣的余额。初始化失败不影响本次读取。
-		if _, cacheErr := cacheInitToken(*token); cacheErr != nil {
-			common.SysLog("failed to init token cache: " + cacheErr.Error())
+		// 避免快照覆盖 Redis 中已被原子预扣的余额。Redis 协调失败时
+		// 无法排除并发权限变更，因此本次读取失败关闭。
+		code, cacheErr := cacheInitToken(*token)
+		if cacheErr != nil {
+			return nil, fmt.Errorf("failed to init token cache: %w", cacheErr)
+		}
+		if code == 0 {
+			return getTokenByKeyAcrossFence(key)
 		}
 	}
 	return token, nil
@@ -398,31 +442,44 @@ func (token *Token) Insert() error {
 	return err
 }
 
+func mutateTokenMetadata(key string, mutation func() error) error {
+	generation, err := beginTokenCacheMutation(key)
+	if err != nil {
+		return err
+	}
+	if err := mutation(); err != nil {
+		if rollbackErr := rollbackTokenCacheMutation(key, generation); rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("failed to roll back token cache fence: %w", rollbackErr))
+		}
+		return err
+	}
+	if err := commitTokenCacheMutation(key, generation); err != nil {
+		return fmt.Errorf("failed to commit token cache fence: %w", err)
+	}
+	return nil
+}
+
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (token *Token) Update() (err error) {
-	// 写库前失效缓存并设置 fence，防止并发读者把过期快照重新写回缓存。
-	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		common.SysLog("failed to invalidate token cache before update: " + cacheErr.Error())
-	}
-	return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
-		"model_limits_enabled", "model_limits", "allow_ips", "stream_recovery_enabled", "group",
-		"cross_group_retry", "auto_groups", "default_routing_strategy", "allowed_routing_strategies",
-		"default_conversion_policy", "allow_lossy_conversion").Updates(token).Error
+	return mutateTokenMetadata(token.Key, func() error {
+		return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
+			"model_limits_enabled", "model_limits", "allow_ips", "stream_recovery_enabled", "group",
+			"cross_group_retry", "auto_groups", "default_routing_strategy", "allowed_routing_strategies",
+			"default_conversion_policy", "allow_lossy_conversion").Updates(token).Error
+	})
 }
 
 func (token *Token) SelectUpdate() (err error) {
-	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		common.SysLog("failed to invalidate token cache before status update: " + cacheErr.Error())
-	}
-	// This can update zero values
-	return DB.Model(token).Select("accessed_time", "status").Updates(token).Error
+	return mutateTokenMetadata(token.Key, func() error {
+		// Select is required so disabled/exhausted zero values are persisted.
+		return DB.Model(token).Select("status").Updates(token).Error
+	})
 }
 
 func (token *Token) Delete() (err error) {
-	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		common.SysLog("failed to invalidate token cache before delete: " + cacheErr.Error())
-	}
-	return DB.Delete(token).Error
+	return mutateTokenMetadata(token.Key, func() error {
+		return DB.Delete(token).Error
+	})
 }
 
 func (token *Token) IsModelLimitsEnabled() bool {
@@ -548,19 +605,49 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 		tx.Rollback()
 		return 0, err
 	}
-	if err := invalidateTokensCache(tokens); err != nil {
-		common.SysLog("failed to invalidate token cache before batch delete: " + err.Error())
+	type cacheMutation struct {
+		key        string
+		generation int64
+	}
+	cacheMutations := make([]cacheMutation, 0, len(tokens))
+	for _, token := range tokens {
+		generation, err := beginTokenCacheMutation(token.Key)
+		if err != nil {
+			for _, mutation := range cacheMutations {
+				if rollbackErr := rollbackTokenCacheMutation(mutation.key, mutation.generation); rollbackErr != nil {
+					common.SysError("failed to roll back token cache fence: " + rollbackErr.Error())
+				}
+			}
+			tx.Rollback()
+			return 0, err
+		}
+		cacheMutations = append(cacheMutations, cacheMutation{key: token.Key, generation: generation})
 	}
 
 	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Delete(&Token{}).Error; err != nil {
 		tx.Rollback()
+		for _, mutation := range cacheMutations {
+			if rollbackErr := rollbackTokenCacheMutation(mutation.key, mutation.generation); rollbackErr != nil {
+				common.SysError("failed to roll back token cache fence: " + rollbackErr.Error())
+			}
+		}
 		return 0, err
 	}
 
 	if err := tx.Commit().Error; err != nil {
+		for _, mutation := range cacheMutations {
+			if rollbackErr := rollbackTokenCacheMutation(mutation.key, mutation.generation); rollbackErr != nil {
+				common.SysError("failed to roll back token cache fence: " + rollbackErr.Error())
+			}
+		}
 		return 0, err
 	}
 
+	for _, mutation := range cacheMutations {
+		if err := commitTokenCacheMutation(mutation.key, mutation.generation); err != nil {
+			return len(tokens), err
+		}
+	}
 	return len(tokens), nil
 }
 
@@ -601,7 +688,7 @@ func invalidateTokensCache(tokens []Token) error {
 		if t.Key == "" {
 			continue
 		}
-		if err := invalidateTokenCacheForMutation(t.Key); err != nil && firstErr == nil {
+		if err := invalidateTokenCache(t.Key); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

@@ -2,9 +2,9 @@ package model
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
-	"time"
 
 	"github.com/QuantumNous/new-api/common"
 )
@@ -16,6 +16,12 @@ func getTokenCacheKey(key string) string {
 func getTokenCacheFenceKey(key string) string {
 	return fmt.Sprintf("token:fence:%s", common.GenerateHMAC(key))
 }
+
+func getTokenCachePendingFenceKey(key string) string {
+	return fmt.Sprintf("token:fence:pending:%s", common.GenerateHMAC(key))
+}
+
+const tokenCacheFenceGenerationKey = "token:fence:generation"
 
 func tokenCacheTTLSeconds() int {
 	ttl := common.RedisKeyCacheSeconds()
@@ -32,19 +38,129 @@ func tokenCacheTTLSeconds() int {
 // While the fence exists readers simply serve the database without caching.
 const tokenCacheFenceSeconds = 10
 
-// invalidateTokenCacheForMutation is called before a token metadata mutation
-// writes to the database: it raises the fence and drops the cached hash so no
-// reader can act on (or re-publish) the pre-mutation state.
-func invalidateTokenCacheForMutation(key string) error {
+var errTokenCacheMutationPending = errors.New("token metadata update is pending")
+
+var errTokenCacheMutationCommitted = errors.New("token metadata was recently updated")
+
+type tokenCacheFenceState int
+
+const (
+	tokenCacheFenceNone tokenCacheFenceState = iota
+	tokenCacheFencePending
+	tokenCacheFenceCommitted
+)
+
+func getTokenCacheFenceState(key string) (tokenCacheFenceState, int64, error) {
+	values, err := common.RDB.MGet(
+		context.Background(),
+		getTokenCachePendingFenceKey(key),
+		getTokenCacheFenceKey(key),
+	).Result()
+	if err != nil {
+		return tokenCacheFenceNone, 0, err
+	}
+	for index, value := range values {
+		if value == nil {
+			continue
+		}
+		generation, err := strconv.ParseInt(fmt.Sprint(value), 10, 64)
+		if err != nil || generation <= 0 {
+			return tokenCacheFenceNone, 0, fmt.Errorf("invalid token cache fence generation")
+		}
+		if index == 0 {
+			return tokenCacheFencePending, generation, nil
+		}
+		return tokenCacheFenceCommitted, generation, nil
+	}
+	return tokenCacheFenceNone, 0, nil
+}
+
+// beginTokenCacheMutation atomically publishes a pending generation and drops
+// the cached hash before a metadata write can reach the database.
+func beginTokenCacheMutation(key string) (int64, error) {
+	if !common.RedisEnabled || key == "" {
+		return 0, nil
+	}
+	const script = `
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return 0
+end
+local generation = redis.call('INCR', KEYS[3])
+redis.call('SET', KEYS[1], generation, 'EX', ARGV[1])
+redis.call('DEL', KEYS[2])
+return generation`
+	generation, err := common.RDB.Eval(context.Background(), script, []string{
+		getTokenCachePendingFenceKey(key),
+		getTokenCacheKey(key),
+		tokenCacheFenceGenerationKey,
+	}, tokenCacheFenceSeconds).Int64()
+	if err != nil {
+		return 0, err
+	}
+	if generation == 0 {
+		return 0, errTokenCacheMutationPending
+	}
+	return generation, nil
+}
+
+// commitTokenCacheMutation promotes a pending generation to a bounded
+// committed marker. Readers bypass Redis until it expires, so delayed
+// pre-mutation snapshots cannot repopulate the hash.
+func commitTokenCacheMutation(key string, generation int64) error {
+	if !common.RedisEnabled || key == "" || generation == 0 {
+		return nil
+	}
+	const script = `
+local incoming = tonumber(ARGV[1])
+local pending = tonumber(redis.call('GET', KEYS[1]) or '0')
+local committed = tonumber(redis.call('GET', KEYS[2]) or '0')
+if committed < incoming then
+  redis.call('SET', KEYS[2], incoming, 'EX', ARGV[2])
+else
+  redis.call('EXPIRE', KEYS[2], ARGV[2])
+end
+if pending == incoming then
+  redis.call('DEL', KEYS[1])
+end
+redis.call('DEL', KEYS[3])
+return 1`
+	return common.RDB.Eval(context.Background(), script, []string{
+		getTokenCachePendingFenceKey(key),
+		getTokenCacheFenceKey(key),
+		getTokenCacheKey(key),
+	}, generation, tokenCacheFenceSeconds).Err()
+}
+
+func rollbackTokenCacheMutation(key string, generation int64) error {
+	if !common.RedisEnabled || key == "" || generation == 0 {
+		return nil
+	}
+	const script = `
+if tonumber(redis.call('GET', KEYS[1]) or '0') == tonumber(ARGV[1]) then
+  redis.call('DEL', KEYS[1])
+end
+return 1`
+	return common.RDB.Eval(context.Background(), script,
+		[]string{getTokenCachePendingFenceKey(key)}, generation,
+	).Err()
+}
+
+// invalidateTokenCache publishes an already-committed generation for database
+// changes whose transaction was fenced elsewhere, such as user revocation.
+func invalidateTokenCache(key string) error {
 	if !common.RedisEnabled || key == "" {
 		return nil
 	}
-	ctx := context.Background()
-	err := common.RDB.Set(ctx, getTokenCacheFenceKey(key), 1, time.Duration(tokenCacheFenceSeconds)*time.Second).Err()
-	if err != nil {
-		return err
-	}
-	return common.RDB.Del(ctx, getTokenCacheKey(key)).Err()
+	const script = `
+local generation = redis.call('INCR', KEYS[3])
+redis.call('SET', KEYS[1], generation, 'EX', ARGV[1])
+redis.call('DEL', KEYS[2])
+return generation`
+	return common.RDB.Eval(context.Background(), script, []string{
+		getTokenCacheFenceKey(key),
+		getTokenCacheKey(key),
+		tokenCacheFenceGenerationKey,
+	}, tokenCacheFenceSeconds).Err()
 }
 
 // cacheInitToken publishes a database snapshot only when no mutation fence is
@@ -62,7 +178,7 @@ func cacheInitToken(token Token) (int, error) {
 		allowIps = *token.AllowIps
 	}
 	const script = `
-if redis.call('EXISTS', KEYS[2]) == 1 then
+if redis.call('EXISTS', KEYS[2]) == 1 or redis.call('EXISTS', KEYS[3]) == 1 then
   return 0
 end
 if redis.call('EXISTS', KEYS[1]) == 1 then
@@ -81,7 +197,9 @@ redis.call('EXPIRE', KEYS[1], ARGV[21])
 return 1`
 
 	return common.RDB.Eval(context.Background(), script, []string{
-		getTokenCacheKey(token.Key), getTokenCacheFenceKey(token.Key),
+		getTokenCacheKey(token.Key),
+		getTokenCachePendingFenceKey(token.Key),
+		getTokenCacheFenceKey(token.Key),
 	},
 		token.Id, token.UserId, token.Status, token.Name,
 		token.CreatedTime, token.AccessedTime, token.ExpiredTime,
@@ -99,9 +217,29 @@ func cacheGetTokenByKey(key string) (*Token, error) {
 	if !common.RedisEnabled {
 		return nil, fmt.Errorf("redis is not enabled")
 	}
-	var token Token
-	if err := common.RedisHGetObj(getTokenCacheKey(key), &token); err != nil {
+	state, _, err := getTokenCacheFenceState(key)
+	if err != nil {
 		return nil, err
+	}
+	switch state {
+	case tokenCacheFencePending:
+		return nil, errTokenCacheMutationPending
+	case tokenCacheFenceCommitted:
+		return nil, errTokenCacheMutationCommitted
+	}
+	var token Token
+	if cacheErr := common.RedisHGetObj(getTokenCacheKey(key), &token); cacheErr != nil {
+		return nil, cacheErr
+	}
+	state, _, err = getTokenCacheFenceState(key)
+	if err != nil {
+		return nil, err
+	}
+	switch state {
+	case tokenCacheFencePending:
+		return nil, errTokenCacheMutationPending
+	case tokenCacheFenceCommitted:
+		return nil, errTokenCacheMutationCommitted
 	}
 	if token.Id <= 0 {
 		return nil, fmt.Errorf("token cache is incomplete")

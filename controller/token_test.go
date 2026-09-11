@@ -751,6 +751,53 @@ func TestUpdateTokenValidatesPersistsAndPreservesRequestPolicy(t *testing.T) {
 	assert.True(t, rejected.AllowLossyConversion)
 }
 
+func TestUpdateTokenStatusOnlyPreservesConcurrentPolicyUpdate(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	token := seedToken(t, db, 1, "status-policy-token", "status-policy-key")
+	token.DefaultRoutingStrategy = "economy"
+	token.AllowedRoutingStrategies = `["stable","economy"]`
+	token.DefaultConversionPolicy = "allow"
+	token.AllowLossyConversion = true
+	require.NoError(t, db.Save(token).Error)
+
+	interleaved := false
+	const callbackName = "test:interleave_status_only_policy_update"
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if interleaved || tx.Statement.Table != "tokens" {
+			return
+		}
+		interleaved = true
+		result := db.Exec(
+			"UPDATE tokens SET accessed_time = ?, default_routing_strategy = ?, allowed_routing_strategies = ?, default_conversion_policy = ?, allow_lossy_conversion = ? WHERE id = ?",
+			99, "stable", `["stable"]`, "strict", false, token.Id,
+		)
+		if result.Error != nil {
+			tx.AddError(result.Error)
+		}
+	}))
+	t.Cleanup(func() {
+		_ = db.Callback().Query().Remove(callbackName)
+	})
+
+	body := map[string]any{
+		"id":     token.Id,
+		"status": common.TokenStatusDisabled,
+	}
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?status_only=true", body, 1)
+	UpdateToken(ctx)
+
+	require.True(t, interleaved)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+	var updated model.Token
+	require.NoError(t, db.First(&updated, token.Id).Error)
+	assert.Equal(t, common.TokenStatusDisabled, updated.Status)
+	assert.EqualValues(t, 99, updated.AccessedTime)
+	assert.Equal(t, "stable", updated.DefaultRoutingStrategy)
+	assert.JSONEq(t, `["stable"]`, updated.AllowedRoutingStrategies)
+	assert.Equal(t, "strict", updated.DefaultConversionPolicy)
+	assert.False(t, updated.AllowLossyConversion)
+}
+
 func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	token := seedToken(t, db, 1, "owned-token", "owner1234token5678")

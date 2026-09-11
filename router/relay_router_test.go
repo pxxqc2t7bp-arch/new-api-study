@@ -118,6 +118,7 @@ func TestOrdinaryProtocolRoutesRejectInvalidPolicyBeforeDistribution(t *testing.
 	}{
 		{name: "Chat", path: "/v1/chat/completions", headerName: "Authorization"},
 		{name: "Responses", path: "/v1/responses", headerName: "Authorization"},
+		{name: "Responses compact", path: "/v1/responses/compact", headerName: "Authorization"},
 		{name: "Claude", path: "/v1/messages", headerName: "x-api-key"},
 		{name: "Gemini", path: "/v1beta/models/gemini-test:generateContent", headerName: "x-goog-api-key"},
 	}
