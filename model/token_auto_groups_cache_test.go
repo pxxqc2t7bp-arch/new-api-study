@@ -995,6 +995,7 @@ func TestTokenMutationRestoresGenerationFromDatabaseFloor(t *testing.T) {
 	require.NoError(t, common.RDB.Del(t.Context(), getTokenCacheGenerationKey(token.Key)).Err())
 	assert.False(t, server.Exists(getTokenCacheGenerationKey(token.Key)))
 
+	token.CacheGeneration = 0
 	token.DefaultRoutingStrategy = "stable"
 	require.NoError(t, token.Update())
 	assert.EqualValues(t, 4, token.CacheGeneration)
