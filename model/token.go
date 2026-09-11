@@ -37,6 +37,7 @@ type Token struct {
 	AllowedRoutingStrategies string         `json:"-" gorm:"type:text"`
 	DefaultConversionPolicy  string         `json:"default_conversion_policy" gorm:"type:varchar(16)"`
 	AllowLossyConversion     bool           `json:"allow_lossy_conversion"`
+	CacheGeneration          int64          `json:"-" gorm:"bigint;default:0"`
 	DeletedAt                gorm.DeletedAt `gorm:"index"`
 }
 
@@ -377,27 +378,39 @@ func getTokenByKeyFromDB(key string) (*Token, error) {
 	return token, nil
 }
 
-func getTokenByKeyAcrossFence(key string) (*Token, error) {
+func getTokenByKeyAcrossGeneration(key string) (*Token, error) {
 	for range 3 {
-		beforeState, beforeGeneration, err := getTokenCacheFenceState(key)
+		expectedGeneration, pending, err := getTokenCacheGenerationState(key)
 		if err != nil {
 			return nil, err
 		}
-		if beforeState == tokenCacheFencePending {
-			return nil, errTokenCacheMutationPending
-		}
 		loaded, readErr := getTokenByKeyFromDB(key)
+		if pending {
+			switch {
+			case errors.Is(readErr, gorm.ErrRecordNotFound):
+				if finishErr := finishTokenCacheMutation(key, expectedGeneration); finishErr != nil {
+					return nil, errTokenCacheMutationPending
+				}
+				continue
+			case readErr != nil:
+				return nil, readErr
+			case loaded.CacheGeneration == expectedGeneration+1:
+				if finishErr := finishTokenCacheMutation(key, expectedGeneration); finishErr != nil {
+					return nil, errTokenCacheMutationPending
+				}
+				continue
+			default:
+				return nil, errTokenCacheMutationPending
+			}
+		}
 		if readErr != nil {
 			return nil, readErr
 		}
-		afterState, afterGeneration, err := getTokenCacheFenceState(key)
-		if err != nil {
-			return nil, err
+		code, cacheErr := cacheInitToken(*loaded, expectedGeneration)
+		if cacheErr != nil {
+			return nil, fmt.Errorf("failed to init token cache: %w", cacheErr)
 		}
-		if afterState == tokenCacheFencePending {
-			return nil, errTokenCacheMutationPending
-		}
-		if beforeState == afterState && beforeGeneration == afterGeneration {
+		if code != 0 {
 			return loaded, nil
 		}
 	}
@@ -411,29 +424,13 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 			return token, nil
 		}
 		if errors.Is(err, errTokenCacheMutationPending) {
-			return nil, err
+			return getTokenByKeyAcrossGeneration(key)
 		}
-		if errors.Is(err, errTokenCacheMutationCommitted) {
-			return getTokenByKeyAcrossFence(key)
-		}
-	}
-	token, err = getTokenByKeyFromDB(key)
-	if err != nil {
-		return nil, err
 	}
 	if common.RedisEnabled {
-		// 冷缓存时用数据库快照初始化；已存在的哈希只刷新 TTL，
-		// 避免快照覆盖 Redis 中已被原子预扣的余额。Redis 协调失败时
-		// 无法排除并发权限变更，因此本次读取失败关闭。
-		code, cacheErr := cacheInitToken(*token)
-		if cacheErr != nil {
-			return nil, fmt.Errorf("failed to init token cache: %w", cacheErr)
-		}
-		if code == 0 {
-			return getTokenByKeyAcrossFence(key)
-		}
+		return getTokenByKeyAcrossGeneration(key)
 	}
-	return token, nil
+	return getTokenByKeyFromDB(key)
 }
 
 func (token *Token) Insert() error {
@@ -442,42 +439,71 @@ func (token *Token) Insert() error {
 	return err
 }
 
-func mutateTokenMetadata(key string, mutation func() error) error {
-	generation, err := beginTokenCacheMutation(key)
+var ErrTokenMutationCommitted = errors.New("token database mutation committed but cache synchronization failed")
+
+type TokenMutationCommittedError struct {
+	Count int
+	Cause error
+}
+
+func (err *TokenMutationCommittedError) Error() string {
+	return fmt.Sprintf("%s (committed_count=%d): %v", ErrTokenMutationCommitted, err.Count, err.Cause)
+}
+
+func (err *TokenMutationCommittedError) Unwrap() error {
+	return err.Cause
+}
+
+func (*TokenMutationCommittedError) Is(target error) bool {
+	return target == ErrTokenMutationCommitted
+}
+
+func (err *TokenMutationCommittedError) CommittedCount() int {
+	return err.Count
+}
+
+func mutateTokenMetadata(key string, minimumGeneration int64, mutation func(int64) error) error {
+	generation, err := beginTokenCacheMutation(key, minimumGeneration)
 	if err != nil {
 		return err
 	}
-	if err := mutation(); err != nil {
+	committedGeneration := minimumGeneration
+	if generation > 0 {
+		committedGeneration = generation + 1
+	}
+	if err := mutation(committedGeneration); err != nil {
 		if rollbackErr := rollbackTokenCacheMutation(key, generation); rollbackErr != nil {
 			return errors.Join(err, fmt.Errorf("failed to roll back token cache fence: %w", rollbackErr))
 		}
 		return err
 	}
 	if err := commitTokenCacheMutation(key, generation); err != nil {
-		return fmt.Errorf("failed to commit token cache fence: %w", err)
+		return &TokenMutationCommittedError{Count: 1, Cause: err}
 	}
 	return nil
 }
 
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (token *Token) Update() (err error) {
-	return mutateTokenMetadata(token.Key, func() error {
+	return mutateTokenMetadata(token.Key, token.CacheGeneration, func(committedGeneration int64) error {
+		token.CacheGeneration = committedGeneration
 		return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
 			"model_limits_enabled", "model_limits", "allow_ips", "stream_recovery_enabled", "group",
 			"cross_group_retry", "auto_groups", "default_routing_strategy", "allowed_routing_strategies",
-			"default_conversion_policy", "allow_lossy_conversion").Updates(token).Error
+			"default_conversion_policy", "allow_lossy_conversion", "cache_generation").Updates(token).Error
 	})
 }
 
 func (token *Token) SelectUpdate() (err error) {
-	return mutateTokenMetadata(token.Key, func() error {
+	return mutateTokenMetadata(token.Key, token.CacheGeneration, func(committedGeneration int64) error {
+		token.CacheGeneration = committedGeneration
 		// Select is required so disabled/exhausted zero values are persisted.
-		return DB.Model(token).Select("status").Updates(token).Error
+		return DB.Model(token).Select("status", "cache_generation").Updates(token).Error
 	})
 }
 
 func (token *Token) Delete() (err error) {
-	return mutateTokenMetadata(token.Key, func() error {
+	return mutateTokenMetadata(token.Key, token.CacheGeneration, func(int64) error {
 		return DB.Delete(token).Error
 	})
 }
@@ -611,7 +637,7 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 	}
 	cacheMutations := make([]cacheMutation, 0, len(tokens))
 	for _, token := range tokens {
-		generation, err := beginTokenCacheMutation(token.Key)
+		generation, err := beginTokenCacheMutation(token.Key, token.CacheGeneration)
 		if err != nil {
 			for _, mutation := range cacheMutations {
 				if rollbackErr := rollbackTokenCacheMutation(mutation.key, mutation.generation); rollbackErr != nil {
@@ -643,9 +669,16 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 		return 0, err
 	}
 
+	var finalizationErrors []error
 	for _, mutation := range cacheMutations {
 		if err := commitTokenCacheMutation(mutation.key, mutation.generation); err != nil {
-			return len(tokens), err
+			finalizationErrors = append(finalizationErrors, err)
+		}
+	}
+	if len(finalizationErrors) > 0 {
+		return len(tokens), &TokenMutationCommittedError{
+			Count: len(tokens),
+			Cause: errors.Join(finalizationErrors...),
 		}
 	}
 	return len(tokens), nil

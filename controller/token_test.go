@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -11,15 +12,19 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -28,9 +33,15 @@ import (
 )
 
 type tokenAPIResponse struct {
-	Success bool            `json:"success"`
-	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data"`
+	Success          bool            `json:"success"`
+	Message          string          `json:"message"`
+	Code             string          `json:"code"`
+	Committed        bool            `json:"committed"`
+	CommittedCount   int             `json:"committed_count"`
+	CacheSyncPending bool            `json:"cache_sync_pending"`
+	Recoverable      bool            `json:"recoverable"`
+	RetryMutation    bool            `json:"retry_mutation"`
+	Data             json.RawMessage `json:"data"`
 }
 
 type tokenPageResponse struct {
@@ -51,6 +62,31 @@ type tokenKeyResponse struct {
 type sqliteColumnInfo struct {
 	Name string `gorm:"column:name"`
 	Type string `gorm:"column:type"`
+}
+
+type controllerFailRedisEvalHook struct {
+	callCount atomic.Int64
+	failAt    int64
+	err       error
+}
+
+func (h *controllerFailRedisEvalHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	if cmd.Name() == "eval" && h.callCount.Add(1) == h.failAt {
+		return ctx, h.err
+	}
+	return ctx, nil
+}
+
+func (*controllerFailRedisEvalHook) AfterProcess(context.Context, redis.Cmder) error {
+	return nil
+}
+
+func (*controllerFailRedisEvalHook) BeforeProcessPipeline(ctx context.Context, _ []redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (*controllerFailRedisEvalHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
+	return nil
 }
 
 type legacyToken struct {
@@ -116,6 +152,24 @@ func setupTokenControllerTestDB(t *testing.T) *gorm.DB {
 	db := openTokenControllerTestDB(t)
 	migrateTokenControllerTestDB(t, db)
 	return db
+}
+
+func useTokenControllerMiniRedis(t *testing.T) *miniredis.Miniredis {
+	t.Helper()
+	server := miniredis.RunT(t)
+	oldRedisEnabled := common.RedisEnabled
+	oldRDB := common.RDB
+	oldSyncFrequency := common.SyncFrequency
+	common.RedisEnabled = true
+	common.SyncFrequency = 2
+	common.RDB = redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() {
+		_ = common.RDB.Close()
+		common.RedisEnabled = oldRedisEnabled
+		common.RDB = oldRDB
+		common.SyncFrequency = oldSyncFrequency
+	})
+	return server
 }
 
 func openTokenControllerExternalDB(t *testing.T, dialect string, dsn string) (*gorm.DB, *bool) {
@@ -318,6 +372,7 @@ func requireTokenPolicyColumns(t *testing.T, db *gorm.DB) {
 	} {
 		require.Truef(t, db.Migrator().HasColumn(&model.Token{}, column), "expected tokens.%s column", column)
 	}
+	require.True(t, db.Migrator().HasColumn(&model.Token{}, "cache_generation"))
 }
 
 func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect string, managedTokensTable *bool) {
@@ -392,6 +447,7 @@ func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect strin
 	assert.Empty(t, migratedToken.AllowedRoutingStrategies)
 	assert.Empty(t, migratedToken.DefaultConversionPolicy)
 	assert.False(t, migratedToken.AllowLossyConversion)
+	assert.Zero(t, migratedToken.CacheGeneration)
 
 	runtimePolicy := migratedToken
 	require.NoError(t, runtimePolicy.NormalizeRequestPolicySettings())
@@ -426,8 +482,10 @@ func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect strin
 		AllowedRoutingStrategies: `["latency","economy"]`,
 		DefaultConversionPolicy:  "allow",
 		AllowLossyConversion:     true,
+		CacheGeneration:          42,
 	}
 	require.NoError(t, db.Create(&inserted).Error)
+	migrateTokenControllerTestDB(t, db)
 
 	var fetched model.Token
 	require.NoError(t, db.First(&fetched, "id = ?", inserted.Id).Error)
@@ -436,6 +494,7 @@ func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect strin
 	assert.Equal(t, inserted.AllowedRoutingStrategies, fetched.AllowedRoutingStrategies)
 	assert.Equal(t, inserted.DefaultConversionPolicy, fetched.DefaultConversionPolicy)
 	assert.Equal(t, inserted.AllowLossyConversion, fetched.AllowLossyConversion)
+	assert.EqualValues(t, 42, fetched.CacheGeneration)
 }
 
 func TestTokenAutoMigrateUsesVarchar128KeyColumn(t *testing.T) {
@@ -448,6 +507,17 @@ func TestTokenAutoMigrateUsesVarchar128KeyColumn(t *testing.T) {
 		t.Fatalf("expected auto_groups column type text, got %q", got)
 	}
 	requireTokenPolicyColumns(t, db)
+
+	token := model.Token{UserId: 1, Key: "cache-generation-default", Name: "cache-generation-default"}
+	require.NoError(t, db.Create(&token).Error)
+	var stored model.Token
+	require.NoError(t, db.First(&stored, token.Id).Error)
+	assert.Zero(t, stored.CacheGeneration)
+
+	require.NoError(t, db.Model(&stored).Update("cache_generation", 8).Error)
+	migrateTokenControllerTestDB(t, db)
+	require.NoError(t, db.First(&stored, token.Id).Error)
+	assert.EqualValues(t, 8, stored.CacheGeneration)
 }
 
 func TestTokenMigrationFromChar48ToVarchar128(t *testing.T) {
@@ -796,6 +866,121 @@ func TestUpdateTokenStatusOnlyPreservesConcurrentPolicyUpdate(t *testing.T) {
 	assert.JSONEq(t, `["stable"]`, updated.AllowedRoutingStrategies)
 	assert.Equal(t, "strict", updated.DefaultConversionPolicy)
 	assert.False(t, updated.AllowLossyConversion)
+}
+
+func TestTokenMutationControllersReportCommittedCacheSyncPending(t *testing.T) {
+	assertCommittedResponse := func(t *testing.T, ctx *gin.Context, recorder *httptest.ResponseRecorder, count int) tokenAPIResponse {
+		t.Helper()
+		assert.Equal(t, http.StatusAccepted, recorder.Code)
+		response := decodeAPIResponse(t, recorder)
+		assert.True(t, response.Success)
+		assert.Equal(t, "token_cache_sync_pending", response.Code)
+		assert.True(t, response.Committed)
+		assert.Equal(t, count, response.CommittedCount)
+		assert.True(t, response.CacheSyncPending)
+		assert.True(t, response.Recoverable)
+		assert.False(t, response.RetryMutation)
+		assert.True(t, common.GetContextKeyBool(ctx, constant.ContextKeyTokenAuditSucceeded))
+		params, ok := common.GetContextKeyType[model.AuditFields](ctx, constant.ContextKeyTokenAuditParams)
+		require.True(t, ok)
+		assert.Equal(t, count, params["committed_count"])
+		assert.Equal(t, true, params["cache_sync_pending"])
+		return response
+	}
+
+	t.Run("precommit fence failure", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		server := useTokenControllerMiniRedis(t)
+		token := seedToken(t, db, 1, "before-precommit-failure", "precommit-failure-key")
+		server.SetError("ERR token cache unavailable")
+
+		body := map[string]any{
+			"id":              token.Id,
+			"name":            "must-not-commit",
+			"expired_time":    -1,
+			"remain_quota":    100,
+			"unlimited_quota": true,
+			"group":           "default",
+		}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, token.UserId)
+		UpdateToken(ctx)
+
+		assert.Equal(t, http.StatusOK, recorder.Code)
+		response := decodeAPIResponse(t, recorder)
+		assert.False(t, response.Success)
+		assert.False(t, response.Committed)
+		assert.Empty(t, response.Code)
+		assert.False(t, common.GetContextKeyBool(ctx, constant.ContextKeyTokenAuditSucceeded))
+		var stored model.Token
+		require.NoError(t, db.First(&stored, token.Id).Error)
+		assert.Equal(t, "before-precommit-failure", stored.Name)
+	})
+
+	t.Run("update", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		useTokenControllerMiniRedis(t)
+		token := seedToken(t, db, 1, "before-committed-update", "committed-update-key")
+		finalizationErr := errors.New("forced update cache finalization failure")
+		common.RDB.AddHook(&controllerFailRedisEvalHook{failAt: 2, err: finalizationErr})
+
+		body := map[string]any{
+			"id":              token.Id,
+			"name":            "after-committed-update",
+			"expired_time":    -1,
+			"remain_quota":    100,
+			"unlimited_quota": true,
+			"group":           "default",
+		}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, token.UserId)
+		UpdateToken(ctx)
+
+		response := assertCommittedResponse(t, ctx, recorder, 1)
+		assert.NotEmpty(t, response.Data)
+		var stored model.Token
+		require.NoError(t, db.First(&stored, token.Id).Error)
+		assert.Equal(t, "after-committed-update", stored.Name)
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		useTokenControllerMiniRedis(t)
+		token := seedToken(t, db, 1, "committed-delete", "committed-delete-key")
+		finalizationErr := errors.New("forced delete cache finalization failure")
+		common.RDB.AddHook(&controllerFailRedisEvalHook{failAt: 2, err: finalizationErr})
+
+		ctx, recorder := newAuthenticatedContext(t, http.MethodDelete, "/api/token/"+strconv.Itoa(token.Id), nil, token.UserId)
+		ctx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(token.Id)}}
+		DeleteToken(ctx)
+
+		assertCommittedResponse(t, ctx, recorder, 1)
+		var count int64
+		require.NoError(t, db.Model(&model.Token{}).Where("id = ?", token.Id).Count(&count).Error)
+		assert.Zero(t, count)
+	})
+
+	t.Run("batch delete", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		useTokenControllerMiniRedis(t)
+		first := seedToken(t, db, 1, "committed-batch-first", "committed-batch-first-key")
+		second := seedToken(t, db, 1, "committed-batch-second", "committed-batch-second-key")
+		finalizationErr := errors.New("forced batch cache finalization failure")
+		hook := &controllerFailRedisEvalHook{failAt: 3, err: finalizationErr}
+		common.RDB.AddHook(hook)
+
+		body := TokenBatch{Ids: []int{first.Id, second.Id}}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/batch", body, first.UserId)
+		DeleteTokenBatch(ctx)
+
+		response := assertCommittedResponse(t, ctx, recorder, 2)
+		assert.JSONEq(t, `2`, string(response.Data))
+		assert.EqualValues(t, 4, hook.callCount.Load())
+		params, ok := common.GetContextKeyType[model.AuditFields](ctx, constant.ContextKeyTokenAuditParams)
+		require.True(t, ok)
+		assert.Equal(t, 2, params["count"])
+		var count int64
+		require.NoError(t, db.Model(&model.Token{}).Where("id IN ?", []int{first.Id, second.Id}).Count(&count).Error)
+		assert.Zero(t, count)
+	})
 }
 
 func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {

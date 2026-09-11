@@ -1,16 +1,43 @@
 package model
 
 import (
+	"context"
 	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+type failRedisEvalHook struct {
+	callCount atomic.Int64
+	failAt    int64
+	err       error
+}
+
+func (h *failRedisEvalHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	if cmd.Name() == "eval" && h.callCount.Add(1) == h.failAt {
+		return ctx, h.err
+	}
+	return ctx, nil
+}
+
+func (*failRedisEvalHook) AfterProcess(context.Context, redis.Cmder) error {
+	return nil
+}
+
+func (*failRedisEvalHook) BeforeProcessPipeline(ctx context.Context, _ []redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (*failRedisEvalHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
+	return nil
+}
 
 func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 	useUserCacheMiniRedis(t)
@@ -174,7 +201,10 @@ func TestTokenMutationFailureClearsPendingFenceForUnchangedDatabaseState(t *test
 	require.NoError(t, DB.Callback().Update().Remove(callbackName))
 	callbackRegistered = false
 
-	assert.False(t, server.Exists(getTokenCacheFenceKey(token.Key)))
+	generation, pending, err := getTokenCacheGenerationState(token.Key)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, generation)
+	assert.False(t, pending)
 	reloaded, err := GetTokenByKey(token.Key, false)
 	require.NoError(t, err)
 	assert.True(t, reloaded.AllowLossyConversion)
@@ -183,7 +213,7 @@ func TestTokenMutationFailureClearsPendingFenceForUnchangedDatabaseState(t *test
 
 func TestTokenReaderReloadsSnapshotAfterConcurrentPolicyCommit(t *testing.T) {
 	truncateTables(t)
-	useUserCacheMiniRedis(t)
+	server := useUserCacheMiniRedis(t)
 	token := Token{
 		UserId:                   7,
 		Key:                      "token-policy-race",
@@ -233,6 +263,7 @@ func TestTokenReaderReloadsSnapshotAfterConcurrentPolicyCommit(t *testing.T) {
 	token.DefaultConversionPolicy = "strict"
 	token.AllowLossyConversion = false
 	require.NoError(t, token.Update())
+	server.FastForward(time.Duration(tokenCacheFenceSeconds+1) * time.Second)
 	close(releaseReader)
 
 	loaded := <-readerResult
@@ -242,8 +273,204 @@ func TestTokenReaderReloadsSnapshotAfterConcurrentPolicyCommit(t *testing.T) {
 	assert.JSONEq(t, `["stable"]`, loaded.token.AllowedRoutingStrategies)
 	assert.Equal(t, "strict", loaded.token.DefaultConversionPolicy)
 	assert.False(t, loaded.token.AllowLossyConversion)
-	assert.Zero(t, common.RDB.Exists(t.Context(), getTokenCacheKey(token.Key)).Val(),
-		"a stale DB snapshot must not repopulate the token hash after commit")
+	cached, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, "stable", cached.DefaultRoutingStrategy)
+	assert.JSONEq(t, `["stable"]`, cached.AllowedRoutingStrategies)
+	assert.Equal(t, "strict", cached.DefaultConversionPolicy)
+	assert.False(t, cached.AllowLossyConversion)
+}
+
+func TestTokenMutationFinalizationFailureReportsCommittedAndRejectsStaleReader(t *testing.T) {
+	truncateTables(t)
+	server := useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:                 7,
+		Key:                    "token-finalization-failure",
+		Name:                   "finalization-failure",
+		Status:                 common.TokenStatusEnabled,
+		ExpiredTime:            -1,
+		UnlimitedQuota:         true,
+		DefaultRoutingStrategy: "economy",
+		AllowLossyConversion:   true,
+	}
+	require.NoError(t, token.Insert())
+	require.NoError(t, cacheSetTokenForTest(token))
+
+	snapshotRead := make(chan struct{})
+	releaseReader := make(chan struct{})
+	var intercepted atomic.Bool
+	const callbackName = "test:block_stale_token_reader_during_finalization_failure"
+	require.NoError(t, DB.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "tokens" && intercepted.CompareAndSwap(false, true) {
+			close(snapshotRead)
+			<-releaseReader
+		}
+	}))
+	t.Cleanup(func() {
+		_ = DB.Callback().Query().Remove(callbackName)
+	})
+
+	type readResult struct {
+		token *Token
+		err   error
+	}
+	readerResult := make(chan readResult, 1)
+	go func() {
+		loaded, readErr := GetTokenByKey(token.Key, true)
+		readerResult <- readResult{token: loaded, err: readErr}
+	}()
+	<-snapshotRead
+
+	finalizationErr := errors.New("forced token cache finalization failure")
+	hook := &failRedisEvalHook{failAt: 2, err: finalizationErr}
+	common.RDB.AddHook(hook)
+	token.DefaultRoutingStrategy = "stable"
+	token.AllowLossyConversion = false
+	mutationErr := token.Update()
+	require.Error(t, mutationErr)
+	assert.ErrorIs(t, mutationErr, finalizationErr)
+	var committedOutcome interface {
+		CommittedCount() int
+	}
+	if assert.ErrorAs(t, mutationErr, &committedOutcome) {
+		assert.Equal(t, 1, committedOutcome.CommittedCount())
+	}
+
+	var stored Token
+	require.NoError(t, DB.First(&stored, token.Id).Error)
+	assert.Equal(t, "stable", stored.DefaultRoutingStrategy)
+	assert.False(t, stored.AllowLossyConversion)
+
+	server.FastForward(time.Duration(tokenCacheFenceSeconds+1) * time.Second)
+	reconciled, err := GetTokenByKey(token.Key, false)
+	require.NoError(t, err)
+	assert.Equal(t, "stable", reconciled.DefaultRoutingStrategy)
+	assert.False(t, reconciled.AllowLossyConversion)
+
+	close(releaseReader)
+	loaded := <-readerResult
+	require.NoError(t, loaded.err)
+	require.NotNil(t, loaded.token)
+	assert.Equal(t, "stable", loaded.token.DefaultRoutingStrategy)
+	assert.False(t, loaded.token.AllowLossyConversion)
+	generation, pending, err := getTokenCacheGenerationState(token.Key)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, generation)
+	assert.False(t, pending)
+	cached, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, "stable", cached.DefaultRoutingStrategy)
+	assert.False(t, cached.AllowLossyConversion)
+}
+
+func TestTokenMutationRestoresGenerationFromDatabaseFloor(t *testing.T) {
+	truncateTables(t)
+	server := useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:         7,
+		Key:            "token-generation-database-floor",
+		Name:           "generation-database-floor",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+
+	token.DefaultRoutingStrategy = "economy"
+	require.NoError(t, token.Update())
+	assert.EqualValues(t, 2, token.CacheGeneration)
+	require.NoError(t, common.RDB.Del(t.Context(), getTokenCacheGenerationKey(token.Key)).Err())
+	assert.False(t, server.Exists(getTokenCacheGenerationKey(token.Key)))
+
+	token.DefaultRoutingStrategy = "stable"
+	require.NoError(t, token.Update())
+	assert.EqualValues(t, 4, token.CacheGeneration)
+	generation, pending, err := getTokenCacheGenerationState(token.Key)
+	require.NoError(t, err)
+	assert.EqualValues(t, 4, generation)
+	assert.False(t, pending)
+
+	var stored Token
+	require.NoError(t, DB.First(&stored, token.Id).Error)
+	assert.EqualValues(t, 4, stored.CacheGeneration)
+	assert.Equal(t, "stable", stored.DefaultRoutingStrategy)
+}
+
+func TestTokenUpdateWithoutRedisPreservesDatabaseGeneration(t *testing.T) {
+	truncateTables(t)
+	oldRedisEnabled := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() {
+		common.RedisEnabled = oldRedisEnabled
+	})
+
+	token := Token{
+		UserId:          7,
+		Key:             "token-generation-without-redis",
+		Name:            "generation-without-redis",
+		Status:          common.TokenStatusEnabled,
+		ExpiredTime:     -1,
+		UnlimitedQuota:  true,
+		CacheGeneration: 6,
+	}
+	require.NoError(t, token.Insert())
+
+	token.Name = "generation-preserved"
+	require.NoError(t, token.Update())
+
+	var stored Token
+	require.NoError(t, DB.First(&stored, token.Id).Error)
+	assert.EqualValues(t, 6, stored.CacheGeneration)
+	assert.Equal(t, "generation-preserved", stored.Name)
+}
+
+func TestBatchDeleteTokensFinalizesEveryCommittedMutation(t *testing.T) {
+	truncateTables(t)
+	server := useUserCacheMiniRedis(t)
+	tokens := []Token{
+		{
+			UserId:         7,
+			Key:            "token-batch-finalization-first",
+			Name:           "batch-finalization-first",
+			Status:         common.TokenStatusEnabled,
+			ExpiredTime:    -1,
+			UnlimitedQuota: true,
+		},
+		{
+			UserId:         7,
+			Key:            "token-batch-finalization-second",
+			Name:           "batch-finalization-second",
+			Status:         common.TokenStatusEnabled,
+			ExpiredTime:    -1,
+			UnlimitedQuota: true,
+		},
+	}
+	for i := range tokens {
+		require.NoError(t, tokens[i].Insert())
+		require.NoError(t, cacheSetTokenForTest(tokens[i]))
+	}
+
+	finalizationErr := errors.New("forced first batch finalization failure")
+	hook := &failRedisEvalHook{failAt: 3, err: finalizationErr}
+	common.RDB.AddHook(hook)
+	count, err := BatchDeleteTokens([]int{tokens[0].Id, tokens[1].Id}, tokens[0].UserId)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, finalizationErr)
+	assert.Equal(t, 2, count)
+	var committedOutcome interface {
+		CommittedCount() int
+	}
+	if assert.ErrorAs(t, err, &committedOutcome) {
+		assert.Equal(t, 2, committedOutcome.CommittedCount())
+	}
+	assert.EqualValues(t, 4, hook.callCount.Load(), "both committed token fences must be finalized")
+	assert.False(t, server.Exists(getTokenCachePendingFenceKey(tokens[1].Key)))
+
+	var remaining int64
+	require.NoError(t, DB.Model(&Token{}).Where("id IN ?", []int{tokens[0].Id, tokens[1].Id}).Count(&remaining).Error)
+	assert.Zero(t, remaining)
 }
 
 func TestTokenMutationCommitsFenceAfterPendingGenerationExpires(t *testing.T) {
@@ -291,14 +518,17 @@ func TestTokenMutationCommitsFenceAfterPendingGenerationExpires(t *testing.T) {
 		ExpiredTime:          token.ExpiredTime,
 		UnlimitedQuota:       token.UnlimitedQuota,
 		AllowLossyConversion: true,
-	})
+	}, 0)
 	require.NoError(t, err)
-	require.Equal(t, 1, code)
+	require.Zero(t, code)
 	close(releaseUpdate)
 
 	require.NoError(t, <-updateResult)
 	assert.False(t, server.Exists(getTokenCacheKey(token.Key)))
-	assert.True(t, server.Exists(getTokenCacheFenceKey(token.Key)))
+	generation, pending, err := getTokenCacheGenerationState(token.Key)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, generation)
+	assert.False(t, pending)
 	reloaded, err := GetTokenByKey(token.Key, false)
 	require.NoError(t, err)
 	assert.False(t, reloaded.AllowLossyConversion)
@@ -307,6 +537,13 @@ func TestTokenMutationCommitsFenceAfterPendingGenerationExpires(t *testing.T) {
 // cacheSetTokenForTest 以测试身份写入完整 token 缓存（含额度字段），
 // 模拟“已水合”的缓存状态。
 func cacheSetTokenForTest(token Token) error {
-	_, err := cacheInitToken(token)
+	generation, pending, err := getTokenCacheGenerationState(token.Key)
+	if err != nil {
+		return err
+	}
+	if pending {
+		return errTokenCacheMutationPending
+	}
+	_, err = cacheInitToken(token, generation)
 	return err
 }

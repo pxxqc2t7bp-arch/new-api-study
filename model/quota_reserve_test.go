@@ -235,7 +235,7 @@ func TestTokenCacheInitPreservesLiveQuotaAndFenceBlocksStaleSnapshot(t *testing.
 	require.Equal(t, cacheQuotaOK, result)
 
 	// 已存在的哈希只刷新 TTL：数据库快照不得覆盖已被原子预扣的余额。
-	code, err := cacheInitToken(stale)
+	code, err := cacheInitToken(stale, 0)
 	require.NoError(t, err)
 	assert.Equal(t, 2, code)
 	cached, err := cacheGetTokenByKey(token.Key)
@@ -244,13 +244,13 @@ func TestTokenCacheInitPreservesLiveQuotaAndFenceBlocksStaleSnapshot(t *testing.
 
 	// 变更期间：fence 删除缓存并拦截并发读者手中的过期快照。
 	require.NoError(t, invalidateTokenCache(token.Key))
-	code, err = cacheInitToken(stale)
+	code, err = cacheInitToken(stale, 0)
 	require.NoError(t, err)
 	assert.Zero(t, code, "the pre-mutation snapshot must not be published while fenced")
 	_, err = cacheGetTokenByKey(token.Key)
 	assert.Error(t, err)
 
-	// fence 过期后可重新从数据库水合。
+	// 后续读者使用当前 generation 从数据库重新水合。
 	server.FastForward(time.Duration(tokenCacheFenceSeconds+1) * time.Second)
 	fresh, err := GetTokenByKey(token.Key, false)
 	require.NoError(t, err)

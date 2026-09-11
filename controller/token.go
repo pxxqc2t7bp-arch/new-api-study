@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -35,6 +36,26 @@ func (input *tokenAutoGroupsInput) UnmarshalJSON(data []byte) error {
 type tokenRoutingStrategiesInput struct {
 	Set        bool
 	Strategies []string
+}
+
+func respondTokenCacheSyncPending(c *gin.Context, err error, data any) bool {
+	var committedErr *model.TokenMutationCommittedError
+	if !errors.As(err, &committedErr) {
+		return false
+	}
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
+	c.JSON(http.StatusAccepted, gin.H{
+		"success":            true,
+		"message":            "database mutation committed; token cache synchronization pending",
+		"code":               "token_cache_sync_pending",
+		"committed":          true,
+		"committed_count":    committedErr.CommittedCount(),
+		"cache_sync_pending": true,
+		"recoverable":        true,
+		"retry_mutation":     false,
+		"data":               data,
+	})
+	return true
 }
 
 func (input *tokenRoutingStrategiesInput) UnmarshalJSON(data []byte) error {
@@ -436,6 +457,11 @@ func DeleteToken(c *gin.Context) {
 	params["id"], params["name"] = token.Id, token.Name
 	err = token.Delete()
 	if err != nil {
+		if respondTokenCacheSyncPending(c, err, nil) {
+			params["committed_count"] = 1
+			params["cache_sync_pending"] = true
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
@@ -523,40 +549,48 @@ func UpdateToken(c *gin.Context) {
 	} else {
 		err = cleanToken.Update()
 	}
+	mutationCommitted := errors.Is(err, model.ErrTokenMutationCommitted)
+	if err == nil || mutationCommitted {
+		params["name"] = cleanToken.Name
+		if statusOnly != "" {
+			params["from"], params["to"] = previous.Status, cleanToken.Status
+		} else {
+			changedFields := []string{}
+			for _, field := range []struct {
+				name    string
+				changed bool
+			}{
+				{"name", previous.Name != cleanToken.Name},
+				{"expired_time", previous.ExpiredTime != cleanToken.ExpiredTime},
+				{"remain_quota", previous.RemainQuota != cleanToken.RemainQuota},
+				{"unlimited_quota", previous.UnlimitedQuota != cleanToken.UnlimitedQuota},
+				{"model_limits_enabled", previous.ModelLimitsEnabled != cleanToken.ModelLimitsEnabled},
+				{"model_limits", previous.ModelLimits != cleanToken.ModelLimits},
+				{"allow_ips", (previous.AllowIps == nil) != (cleanToken.AllowIps == nil) ||
+					(previous.AllowIps != nil && cleanToken.AllowIps != nil && *previous.AllowIps != *cleanToken.AllowIps)},
+				{"group", previous.Group != cleanToken.Group},
+				{"cross_group_retry", previous.CrossGroupRetry != cleanToken.CrossGroupRetry},
+				{"auto_groups", previous.AutoGroups != cleanToken.AutoGroups},
+				{"default_routing_strategy", previous.DefaultRoutingStrategy != cleanToken.DefaultRoutingStrategy},
+				{"allowed_routing_strategies", previous.AllowedRoutingStrategies != cleanToken.AllowedRoutingStrategies},
+				{"default_conversion_policy", previous.DefaultConversionPolicy != cleanToken.DefaultConversionPolicy},
+				{"allow_lossy_conversion", previous.AllowLossyConversion != cleanToken.AllowLossyConversion},
+			} {
+				if field.changed {
+					changedFields = append(changedFields, field.name)
+				}
+			}
+			params["changed_fields"] = changedFields
+		}
+	}
 	if err != nil {
+		if respondTokenCacheSyncPending(c, err, buildMaskedTokenResponse(cleanToken)) {
+			params["committed_count"] = 1
+			params["cache_sync_pending"] = true
+			return
+		}
 		common.ApiError(c, err)
 		return
-	}
-	params["name"] = cleanToken.Name
-	if statusOnly != "" {
-		params["from"], params["to"] = previous.Status, cleanToken.Status
-	} else {
-		changedFields := []string{}
-		for _, field := range []struct {
-			name    string
-			changed bool
-		}{
-			{"name", previous.Name != cleanToken.Name},
-			{"expired_time", previous.ExpiredTime != cleanToken.ExpiredTime},
-			{"remain_quota", previous.RemainQuota != cleanToken.RemainQuota},
-			{"unlimited_quota", previous.UnlimitedQuota != cleanToken.UnlimitedQuota},
-			{"model_limits_enabled", previous.ModelLimitsEnabled != cleanToken.ModelLimitsEnabled},
-			{"model_limits", previous.ModelLimits != cleanToken.ModelLimits},
-			{"allow_ips", (previous.AllowIps == nil) != (cleanToken.AllowIps == nil) ||
-				(previous.AllowIps != nil && cleanToken.AllowIps != nil && *previous.AllowIps != *cleanToken.AllowIps)},
-			{"group", previous.Group != cleanToken.Group},
-			{"cross_group_retry", previous.CrossGroupRetry != cleanToken.CrossGroupRetry},
-			{"auto_groups", previous.AutoGroups != cleanToken.AutoGroups},
-			{"default_routing_strategy", previous.DefaultRoutingStrategy != cleanToken.DefaultRoutingStrategy},
-			{"allowed_routing_strategies", previous.AllowedRoutingStrategies != cleanToken.AllowedRoutingStrategies},
-			{"default_conversion_policy", previous.DefaultConversionPolicy != cleanToken.DefaultConversionPolicy},
-			{"allow_lossy_conversion", previous.AllowLossyConversion != cleanToken.AllowLossyConversion},
-		} {
-			if field.changed {
-				changedFields = append(changedFields, field.name)
-			}
-		}
-		params["changed_fields"] = changedFields
 	}
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
 	c.JSON(http.StatusOK, gin.H{
@@ -584,6 +618,12 @@ func DeleteTokenBatch(c *gin.Context) {
 	userId := c.GetInt("id")
 	count, err := model.BatchDeleteTokens(tokenBatch.Ids, userId)
 	if err != nil {
+		if respondTokenCacheSyncPending(c, err, count) {
+			params["count"] = count
+			params["committed_count"] = count
+			params["cache_sync_pending"] = true
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
