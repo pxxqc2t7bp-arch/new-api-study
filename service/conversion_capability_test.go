@@ -31,8 +31,6 @@ func TestOrdinaryConversionCapabilitiesCoverEveryDirectedProtocolPair(t *testing
 			assert.Equal(t, to, capability.To)
 			assert.NotEmpty(t, capability.Converter)
 			assert.NotEmpty(t, capability.Supported)
-			assert.NotEmpty(t, capability.Losses)
-			assert.NotEmpty(t, capability.Rejections)
 		}
 	}
 }
@@ -69,21 +67,70 @@ func TestResolveOrdinaryConversionPolicyRequiresAuthorizationForLossyStrategies(
 	}
 }
 
-func TestOrdinaryConversionCapabilitiesDoNotOverstateStructuredOrParallelSupport(t *testing.T) {
+func TestOrdinaryConversionCapabilitiesUseEmittedDiagnosticCodes(t *testing.T) {
 	t.Parallel()
 
-	chatToResponses, ok := LookupOrdinaryConversionCapability(types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses)
+	capabilities := OrdinaryConversionCapabilities()
+	emittedCodes := []string{
+		types.ConversionDiagnosticCodeStructuredOutputUnsupported,
+		types.ConversionDiagnosticCodeUnsupportedFunctionStrict,
+		types.ConversionDiagnosticCodeUnsupportedParallelToolControl,
+		types.ConversionDiagnosticCodeUnverifiedToolMapping,
+		types.ConversionDiagnosticCodeUnsupportedHostedTool,
+		types.ConversionDiagnosticCodeVendorSpecificToolUnsupported,
+		types.ConversionDiagnosticCodeEncryptedReasoningUnsupported,
+		types.ConversionDiagnosticCodeSessionReferenceUnsupported,
+	}
+	for _, capability := range capabilities {
+		for _, code := range conversionLossCodes(capability.Losses) {
+			assert.Contains(t, emittedCodes, code)
+		}
+		for _, code := range conversionLossCodes(capability.Rejections) {
+			assert.Contains(t, emittedCodes, code)
+		}
+	}
+
+	responsesToGemini, ok := LookupOrdinaryConversionCapability(types.RelayFormatOpenAIResponses, types.RelayFormatGemini)
 	require.True(t, ok)
-	assert.Contains(t, chatToResponses.Supported, ConversionFeatureStructuredOutput)
-	assert.Contains(t, chatToResponses.Supported, ConversionFeatureParallelToolCalls)
-	assert.NotContains(t, conversionLossCodes(chatToResponses.Losses), "structured_output_unsupported")
+	assert.ElementsMatch(t, []string{types.ConversionDiagnosticCodeUnsupportedFunctionStrict}, conversionLossCodes(responsesToGemini.Losses))
+	assert.ElementsMatch(t, []string{
+		types.ConversionDiagnosticCodeEncryptedReasoningUnsupported,
+		types.ConversionDiagnosticCodeUnsupportedHostedTool,
+		types.ConversionDiagnosticCodeUnverifiedToolMapping,
+		types.ConversionDiagnosticCodeUnsupportedParallelToolControl,
+	}, conversionLossCodes(responsesToGemini.Rejections))
 
 	geminiToChat, ok := LookupOrdinaryConversionCapability(types.RelayFormatGemini, types.RelayFormatOpenAI)
 	require.True(t, ok)
-	assert.NotContains(t, geminiToChat.Supported, ConversionFeatureStructuredOutput)
-	assert.NotContains(t, geminiToChat.Supported, ConversionFeatureParallelToolCalls)
-	assert.Contains(t, conversionLossCodes(geminiToChat.Losses), "structured_output_unsupported")
-	assert.Contains(t, conversionLossCodes(geminiToChat.Losses), "parallel_tool_calls_unsupported")
+	assert.ElementsMatch(t, []string{types.ConversionDiagnosticCodeStructuredOutputUnsupported}, conversionLossCodes(geminiToChat.Losses))
+	assert.ElementsMatch(t, []string{
+		types.ConversionDiagnosticCodeEncryptedReasoningUnsupported,
+		types.ConversionDiagnosticCodeSessionReferenceUnsupported,
+		types.ConversionDiagnosticCodeUnsupportedHostedTool,
+	}, conversionLossCodes(geminiToChat.Rejections))
+
+	chatToResponses, ok := LookupOrdinaryConversionCapability(types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses)
+	require.True(t, ok)
+	assert.Empty(t, chatToResponses.Losses)
+	assert.ElementsMatch(t, []string{types.ConversionDiagnosticCodeUnsupportedHostedTool}, conversionLossCodes(chatToResponses.Rejections))
+	assert.Contains(t, chatToResponses.Supported, ConversionFeatureStructuredOutput)
+	assert.Contains(t, chatToResponses.Supported, ConversionFeatureParallelToolCalls)
+}
+
+func TestOrdinaryConversionCapabilitiesAttachDiagnosticsToMatchingFeatures(t *testing.T) {
+	t.Parallel()
+
+	claudeToGemini, ok := LookupOrdinaryConversionCapability(types.RelayFormatClaude, types.RelayFormatGemini)
+	require.True(t, ok)
+
+	assert.Equal(t, ConversionFeatureStructuredOutput, conversionLossByCode(t, claudeToGemini.Losses, types.ConversionDiagnosticCodeStructuredOutputUnsupported).Feature)
+	assert.Equal(t, ConversionFeatureFunctionTools, conversionLossByCode(t, claudeToGemini.Losses, types.ConversionDiagnosticCodeUnsupportedFunctionStrict).Feature)
+	assert.Equal(t, ConversionFeatureParallelToolCalls, conversionLossByCode(t, claudeToGemini.Rejections, types.ConversionDiagnosticCodeUnsupportedParallelToolControl).Feature)
+	assert.Equal(t, ConversionFeatureFunctionTools, conversionLossByCode(t, claudeToGemini.Rejections, types.ConversionDiagnosticCodeUnverifiedToolMapping).Feature)
+	assert.Equal(t, ConversionFeatureFunctionTools, conversionLossByCode(t, claudeToGemini.Rejections, types.ConversionDiagnosticCodeUnsupportedHostedTool).Feature)
+	assert.Equal(t, ConversionFeatureFunctionTools, conversionLossByCode(t, claudeToGemini.Rejections, types.ConversionDiagnosticCodeVendorSpecificToolUnsupported).Feature)
+	assert.Equal(t, ConversionFeatureReasoning, conversionLossByCode(t, claudeToGemini.Rejections, types.ConversionDiagnosticCodeEncryptedReasoningUnsupported).Feature)
+	assert.Equal(t, ConversionFeatureSessionState, conversionLossByCode(t, claudeToGemini.Rejections, types.ConversionDiagnosticCodeSessionReferenceUnsupported).Feature)
 }
 
 func conversionLossCodes(losses []OrdinaryConversionLoss) []string {
@@ -92,4 +139,15 @@ func conversionLossCodes(losses []OrdinaryConversionLoss) []string {
 		codes = append(codes, loss.Code)
 	}
 	return codes
+}
+
+func conversionLossByCode(t *testing.T, losses []OrdinaryConversionLoss, code string) OrdinaryConversionLoss {
+	t.Helper()
+	for _, loss := range losses {
+		if loss.Code == code {
+			return loss
+		}
+	}
+	require.FailNow(t, "missing conversion loss", "code=%s", code)
+	return OrdinaryConversionLoss{}
 }

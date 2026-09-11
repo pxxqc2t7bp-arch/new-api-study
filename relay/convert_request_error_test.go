@@ -17,7 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestOptInSafeToolLossRejectedAsBadRequestWithAdminDiagnostics(t *testing.T) {
+func TestDefaultStrictToolLossRejectedAsBadRequestWithAdminDiagnostics(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
@@ -26,9 +26,6 @@ func TestOptInSafeToolLossRejectedAsBadRequestWithAdminDiagnostics(t *testing.T)
 		OriginModelName: "gpt-4o",
 		ChannelMeta: &relaycommon.ChannelMeta{
 			UpstreamModelName: "gpt-4o",
-			ChannelOtherSettings: dto.ChannelOtherSettings{
-				ToolLossPolicy: string(types.ConversionLossPolicySafe),
-			},
 		},
 	}
 

@@ -893,6 +893,7 @@ func (info *RelayInfo) ConvOptions() *convmeta.Options {
 	claudeSettings := model_setting.GetClaudeSettings()
 	geminiSettings := model_setting.GetGeminiSettings()
 	options := &convmeta.Options{
+		ToolLossPolicy: types.ConversionLossPolicyStrict,
 		Claude: convmeta.ClaudeOptions{
 			ThinkingAdapterEnabled:                claudeSettings.ThinkingAdapterEnabled,
 			ThinkingAdapterBudgetTokensPercentage: claudeSettings.ThinkingAdapterBudgetTokensPercentage,
@@ -910,9 +911,6 @@ func (info *RelayInfo) ConvOptions() *convmeta.Options {
 		PreserveEffortTail:     model_setting.ShouldPreserveEffortTail,
 	}
 	if info != nil {
-		if info.ChannelMeta != nil {
-			options.ToolLossPolicy = types.ConversionLossPolicy(info.ChannelOtherSettings.ToolLossPolicy)
-		}
 		info.convOptions = options
 	}
 	return options

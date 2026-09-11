@@ -87,6 +87,21 @@ func TestRelayInfoMetaTypedNilReceiver(t *testing.T) {
 	assert.NotNil(t, firstOptions.PreserveEffortTail)
 }
 
+func TestRelayInfoConvOptionsDoesNotAuthorizeChannelToolLossPolicy(t *testing.T) {
+	info := &RelayInfo{
+		ChannelMeta: &ChannelMeta{
+			ChannelOtherSettings: dto.ChannelOtherSettings{
+				ToolLossPolicy: string(types.ConversionLossPolicyAllow),
+			},
+		},
+	}
+
+	options := info.ConvOptions()
+
+	assert.Equal(t, types.ConversionLossPolicyStrict, options.ToolLossPolicy)
+	assert.Equal(t, types.ConversionLossPolicyStrict, options.EffectiveToolLossPolicy())
+}
+
 func TestGenRelayInfoCapturesRequestReasoningEffort(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tests := []struct {

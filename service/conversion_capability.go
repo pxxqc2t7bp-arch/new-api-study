@@ -20,6 +20,8 @@ const (
 	ConversionFeatureToolCallsAndResults  OrdinaryConversionFeature = "tool_calls_and_results"
 	ConversionFeatureParallelToolCalls    OrdinaryConversionFeature = "parallel_tool_calls"
 	ConversionFeatureStructuredOutput     OrdinaryConversionFeature = "structured_output"
+	ConversionFeatureReasoning            OrdinaryConversionFeature = "reasoning"
+	ConversionFeatureSessionState         OrdinaryConversionFeature = "session_state"
 	ConversionFeatureUsage                OrdinaryConversionFeature = "usage"
 	ConversionFeatureTerminalStreamEvents OrdinaryConversionFeature = "terminal_stream_events"
 	ConversionFeatureErrors               OrdinaryConversionFeature = "errors"
@@ -60,22 +62,6 @@ var ordinaryConversionSupported = []OrdinaryConversionFeature{
 	ConversionFeatureUsage,
 	ConversionFeatureTerminalStreamEvents,
 	ConversionFeatureErrors,
-}
-
-var ordinaryConversionLosses = []OrdinaryConversionLoss{
-	{
-		Code:        "provider_metadata_reduced",
-		Feature:     ConversionFeatureMultimodalInput,
-		Description: "provider-specific presentation metadata may be normalized to the target protocol",
-	},
-}
-
-var ordinaryConversionRejections = []OrdinaryConversionLoss{
-	{
-		Code:        "vendor_specific_tool_unsupported",
-		Feature:     ConversionFeatureFunctionTools,
-		Description: "vendor-specific hosted tools without a verified target mapping are rejected",
-	},
 }
 
 func OrdinaryConversionCapabilities() []OrdinaryConversionCapability {
@@ -119,38 +105,65 @@ func ResolveOrdinaryConversionPolicy(requested types.ConversionLossPolicy, calle
 
 func ordinaryConversionCapability(spec relayconvert.TextConverterSpec) OrdinaryConversionCapability {
 	supported := append([]OrdinaryConversionFeature(nil), ordinaryConversionSupported...)
-	losses := append([]OrdinaryConversionLoss(nil), ordinaryConversionLosses...)
-	rejections := append([]OrdinaryConversionLoss(nil), ordinaryConversionRejections...)
+	var losses []OrdinaryConversionLoss
+	var rejections []OrdinaryConversionLoss
 
 	if supportsStructuredOutput(spec.From, spec.To) {
 		supported = append(supported, ConversionFeatureStructuredOutput)
 	} else {
 		losses = append(losses, OrdinaryConversionLoss{
-			Code:        "structured_output_unsupported",
+			Code:        types.ConversionDiagnosticCodeStructuredOutputUnsupported,
 			Feature:     ConversionFeatureStructuredOutput,
 			Description: "the target conversion does not preserve the source structured-output dialect",
 		})
 	}
-	if spec.From != types.RelayFormatGemini && spec.To != types.RelayFormatGemini {
+	if supportsParallelToolControl(spec.From, spec.To) {
 		supported = append(supported, ConversionFeatureParallelToolCalls)
-	} else {
-		losses = append(losses, OrdinaryConversionLoss{
-			Code:        "parallel_tool_calls_unsupported",
+	} else if spec.From != types.RelayFormatGemini && spec.To == types.RelayFormatGemini {
+		rejections = append(rejections, OrdinaryConversionLoss{
+			Code:        types.ConversionDiagnosticCodeUnsupportedParallelToolControl,
 			Feature:     ConversionFeatureParallelToolCalls,
 			Description: "Gemini generateContent does not expose an equivalent parallel-tool-call control",
 		})
 	}
-	if spec.From == types.RelayFormatClaude || spec.From == types.RelayFormatGemini {
+
+	if spec.From != types.RelayFormatGemini && spec.To == types.RelayFormatGemini {
+		losses = append(losses, OrdinaryConversionLoss{
+			Code:        types.ConversionDiagnosticCodeUnsupportedFunctionStrict,
+			Feature:     ConversionFeatureFunctionTools,
+			Description: "Gemini generateContent does not expose function strictness",
+		})
+	}
+	rejections = append(rejections, OrdinaryConversionLoss{
+		Code:        types.ConversionDiagnosticCodeUnsupportedHostedTool,
+		Feature:     ConversionFeatureFunctionTools,
+		Description: "the target protocol may not have a verified mapping for a source hosted tool",
+	})
+	if spec.To == types.RelayFormatGemini {
 		rejections = append(rejections, OrdinaryConversionLoss{
-			Code:        "encrypted_reasoning_unsupported",
-			Feature:     ConversionFeatureTextInput,
-			Description: "encrypted or signed provider reasoning state is not portable across protocols",
+			Code:        types.ConversionDiagnosticCodeUnverifiedToolMapping,
+			Feature:     ConversionFeatureFunctionTools,
+			Description: "code execution or URL context semantics do not have a verified Gemini mapping",
+		})
+	}
+	if spec.From == types.RelayFormatClaude {
+		rejections = append(rejections, OrdinaryConversionLoss{
+			Code:        types.ConversionDiagnosticCodeVendorSpecificToolUnsupported,
+			Feature:     ConversionFeatureFunctionTools,
+			Description: "Claude MCP server configuration requires a verified target-protocol mapping",
 		})
 	}
 	if spec.From == types.RelayFormatOpenAIResponses || spec.From == types.RelayFormatClaude || spec.From == types.RelayFormatGemini {
 		rejections = append(rejections, OrdinaryConversionLoss{
-			Code:        "session_reference_unsupported",
-			Feature:     ConversionFeatureTextInput,
+			Code:        types.ConversionDiagnosticCodeEncryptedReasoningUnsupported,
+			Feature:     ConversionFeatureReasoning,
+			Description: "encrypted or signed provider reasoning state is not portable across protocols",
+		})
+	}
+	if spec.From == types.RelayFormatClaude || spec.From == types.RelayFormatGemini {
+		rejections = append(rejections, OrdinaryConversionLoss{
+			Code:        types.ConversionDiagnosticCodeSessionReferenceUnsupported,
+			Feature:     ConversionFeatureSessionState,
 			Description: "provider-owned conversation, continuation, and session references are not portable across protocols",
 		})
 	}
@@ -167,10 +180,14 @@ func ordinaryConversionCapability(spec relayconvert.TextConverterSpec) OrdinaryC
 }
 
 func supportsStructuredOutput(from types.RelayFormat, to types.RelayFormat) bool {
-	if from != types.RelayFormatOpenAI && from != types.RelayFormatOpenAIResponses {
+	switch from {
+	case types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses:
+		return to != types.RelayFormatClaude
+	default:
 		return false
 	}
-	return to == types.RelayFormatOpenAI ||
-		to == types.RelayFormatOpenAIResponses ||
-		to == types.RelayFormatGemini
+}
+
+func supportsParallelToolControl(from types.RelayFormat, to types.RelayFormat) bool {
+	return from != types.RelayFormatGemini && to != types.RelayFormatGemini
 }

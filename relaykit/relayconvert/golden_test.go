@@ -445,6 +445,55 @@ func TestGoldenConversionErrors(t *testing.T) {
 	}))
 }
 
+func TestGoldenProviderErrorEnvelopeConversionMatrix(t *testing.T) {
+	envelopes := make(map[string]any, 12)
+	for _, from := range allFormats() {
+		for _, to := range allFormats() {
+			if from == to {
+				continue
+			}
+
+			sourceError := providerErrorFixture(from)
+			name := fmt.Sprintf("%s_to_%s", from, to)
+			if to == types.RelayFormatClaude {
+				envelopes[name] = map[string]any{
+					"type":  "error",
+					"error": sourceError.ToClaudeError(),
+				}
+			} else {
+				envelopes[name] = map[string]any{
+					"error": sourceError.ToOpenAIError(),
+				}
+			}
+		}
+	}
+
+	require.Len(t, envelopes, 12)
+	got := marshalGolden(t, envelopes)
+	assert.NotContains(t, string(got), "api.secret.example")
+	assert.NotContains(t, string(got), "super-secret")
+	checkGolden(t, "errors/provider_envelopes", got)
+}
+
+func providerErrorFixture(from types.RelayFormat) *types.NewAPIError {
+	message := fmt.Sprintf(
+		"%s upstream rejected https://api.secret.example/v1/models?api_key=super-secret api_key:super-secret",
+		from,
+	)
+	if from == types.RelayFormatClaude {
+		return types.WithClaudeError(types.ClaudeError{
+			Type:    "overloaded_error",
+			Message: message,
+		}, 529)
+	}
+	return types.WithOpenAIError(types.OpenAIError{
+		Message: message,
+		Type:    "invalid_request_error",
+		Param:   "tools[0]",
+		Code:    "invalid_tool",
+	}, 400)
+}
+
 func TestGoldenExplicitZeroScalars(t *testing.T) {
 	zeroTokens := uint(0)
 	zeroFloat := float64(0)

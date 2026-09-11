@@ -36,7 +36,7 @@ func TestRequestConverterRegistryListsSupportedTextConverters(t *testing.T) {
 				ConverterClaudeMessagesToOpenAIChat,
 				ConverterOpenAIChatToGeminiContent,
 			},
-			advancedCustom: true,
+			advancedCustom: false,
 		},
 		{
 			converter:      requestConverterClaudeToResponses,
@@ -54,7 +54,7 @@ func TestRequestConverterRegistryListsSupportedTextConverters(t *testing.T) {
 				ConverterGeminiContentToOpenAIChat,
 				ConverterOpenAIChatToClaudeMessages,
 			},
-			advancedCustom: true,
+			advancedCustom: false,
 		},
 		{
 			converter: requestConverterGeminiToResponses,

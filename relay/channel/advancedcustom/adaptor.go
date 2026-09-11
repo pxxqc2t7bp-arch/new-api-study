@@ -86,8 +86,7 @@ func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayIn
 			return nil, fmt.Errorf("expected OpenAI chat completions request, got %T", result.Value)
 		}
 		return a.convertOpenAICompatibleRequest(c, info, chatRequest)
-	case relayconvert.ConverterClaudeMessagesToOpenAIResponses,
-		relayconvert.ConverterClaudeMessagesToGeminiContent:
+	case relayconvert.ConverterClaudeMessagesToOpenAIResponses:
 		result, err := service.ConvertRequestByID(c, info, converter, request)
 		if err != nil {
 			return nil, err
@@ -117,8 +116,7 @@ func (a *Adaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayIn
 			return nil, fmt.Errorf("expected OpenAI chat completions request, got %T", result.Value)
 		}
 		return a.convertOpenAICompatibleRequest(c, info, chatRequest)
-	case relayconvert.ConverterGeminiContentToClaudeMessages,
-		relayconvert.ConverterGeminiContentToOpenAIResponses:
+	case relayconvert.ConverterGeminiContentToOpenAIResponses:
 		result, err := service.ConvertRequestByID(c, info, converter, request)
 		if err != nil {
 			return nil, err
@@ -333,11 +331,9 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		relayconvert.ConverterGeminiContentToOpenAIChat:
 		return a.openaiAdaptor.DoResponse(c, resp, info)
 	case relayconvert.ConverterOpenAIChatToClaudeMessages,
-		relayconvert.ConverterGeminiContentToClaudeMessages,
 		relayconvert.ConverterOpenAIResponsesToClaudeMessages:
 		return a.claudeAdaptor.DoResponse(c, resp, info)
 	case relayconvert.ConverterOpenAIChatToGeminiContent,
-		relayconvert.ConverterClaudeMessagesToGeminiContent,
 		relayconvert.ConverterOpenAIResponsesToGemini:
 		return a.geminiAdaptor.DoResponse(c, resp, info)
 	case relayconvert.ConverterOpenAIChatToOpenAIResponses,
@@ -514,7 +510,6 @@ func shouldUseGeminiStreamURL(converter string, info *relaycommon.RelayInfo) boo
 	return info != nil &&
 		info.IsStream &&
 		(converter == relayconvert.ConverterOpenAIChatToGeminiContent ||
-			converter == relayconvert.ConverterClaudeMessagesToGeminiContent ||
 			converter == relayconvert.ConverterOpenAIResponsesToGemini)
 }
 
@@ -531,7 +526,6 @@ func useGeminiStreamGenerateContentURL(parsedURL *url.URL) {
 
 func shouldApplyClaudeHeaders(converter string, info *relaycommon.RelayInfo) bool {
 	return converter == relayconvert.ConverterOpenAIChatToClaudeMessages ||
-		converter == relayconvert.ConverterGeminiContentToClaudeMessages ||
 		converter == relayconvert.ConverterOpenAIResponsesToClaudeMessages ||
 		(converter == relayconvert.ConverterNone && info != nil && info.RelayFormat == types.RelayFormatClaude)
 }

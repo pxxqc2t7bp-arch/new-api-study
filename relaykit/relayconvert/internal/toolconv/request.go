@@ -45,7 +45,7 @@ func inspectOpenAIChatRequest(request *dto.GeneralOpenAIRequest, to types.RelayF
 	}
 	return []types.ConversionDiagnostic{requestPresentationLoss(
 		"response_format",
-		"structured_output_unsupported",
+		types.ConversionDiagnosticCodeStructuredOutputUnsupported,
 		"Claude conversion does not preserve the OpenAI Chat structured-output configuration",
 	)}
 }
@@ -58,7 +58,7 @@ func inspectOpenAIResponsesRequest(request *dto.OpenAIResponsesRequest, to types
 	if rawJSONPresent(request.Text) && to == types.RelayFormatClaude {
 		diagnostics = append(diagnostics, requestPresentationLoss(
 			"text.format",
-			"structured_output_unsupported",
+			types.ConversionDiagnosticCodeStructuredOutputUnsupported,
 			"Claude conversion does not preserve the OpenAI Responses structured-output configuration",
 		))
 	}
@@ -71,7 +71,7 @@ func inspectOpenAIResponsesRequest(request *dto.OpenAIResponsesRequest, to types
 				}
 				diagnostics = append(diagnostics, requestSemanticLoss(
 					fmt.Sprintf("input[%d].encrypted_content", index),
-					"encrypted_reasoning_unsupported",
+					types.ConversionDiagnosticCodeEncryptedReasoningUnsupported,
 					"OpenAI Responses encrypted reasoning state is not portable across protocols",
 				))
 			}
@@ -89,28 +89,28 @@ func inspectClaudeRequest(request *dto.ClaudeRequest) []types.ConversionDiagnost
 	if rawJSONPresent(request.ContextManagement) {
 		diagnostics = append(diagnostics, requestSemanticLoss(
 			"context_management",
-			"session_reference_unsupported",
+			types.ConversionDiagnosticCodeSessionReferenceUnsupported,
 			"Claude context management state is not portable across protocols",
 		))
 	}
 	if rawJSONPresent(request.Container) {
 		diagnostics = append(diagnostics, requestSemanticLoss(
 			"container",
-			"session_reference_unsupported",
+			types.ConversionDiagnosticCodeSessionReferenceUnsupported,
 			"Claude container state is not portable across protocols",
 		))
 	}
 	if rawJSONPresent(request.McpServers) {
 		diagnostics = append(diagnostics, requestSemanticLoss(
 			"mcp_servers",
-			"vendor_specific_tool_unsupported",
+			types.ConversionDiagnosticCodeVendorSpecificToolUnsupported,
 			"Claude MCP server configuration requires a verified target-protocol mapping",
 		))
 	}
 	if rawJSONPresent(request.OutputFormat) {
 		diagnostics = append(diagnostics, requestPresentationLoss(
 			"output_format",
-			"structured_output_unsupported",
+			types.ConversionDiagnosticCodeStructuredOutputUnsupported,
 			"Claude structured-output configuration is not portable across protocols",
 		))
 	}
@@ -126,7 +126,7 @@ func inspectClaudeRequest(request *dto.ClaudeRequest) []types.ConversionDiagnost
 			}
 			diagnostics = append(diagnostics, requestSemanticLoss(
 				fmt.Sprintf("messages[%d].content[%d]", messageIndex, blockIndex),
-				"encrypted_reasoning_unsupported",
+				types.ConversionDiagnosticCodeEncryptedReasoningUnsupported,
 				"Claude encrypted or signed reasoning state is not portable across protocols",
 			))
 		}
@@ -142,14 +142,14 @@ func inspectGeminiRequest(request *dto.GeminiChatRequest) []types.ConversionDiag
 	if request.CachedContent != "" {
 		diagnostics = append(diagnostics, requestSemanticLoss(
 			"cachedContent",
-			"session_reference_unsupported",
+			types.ConversionDiagnosticCodeSessionReferenceUnsupported,
 			"Gemini cached content references are not portable across protocols",
 		))
 	}
 	if request.GenerationConfig.ResponseMimeType != "" || request.GenerationConfig.ResponseSchema != nil {
 		diagnostics = append(diagnostics, requestPresentationLoss(
 			"generationConfig.responseSchema",
-			"structured_output_unsupported",
+			types.ConversionDiagnosticCodeStructuredOutputUnsupported,
 			"Gemini structured-output configuration is not portable across protocols",
 		))
 	}
@@ -160,7 +160,7 @@ func inspectGeminiRequest(request *dto.GeminiChatRequest) []types.ConversionDiag
 			}
 			diagnostics = append(diagnostics, requestSemanticLoss(
 				fmt.Sprintf("contents[%d].parts[%d].thoughtSignature", contentIndex, partIndex),
-				"encrypted_reasoning_unsupported",
+				types.ConversionDiagnosticCodeEncryptedReasoningUnsupported,
 				"Gemini thought signatures are not portable across protocols",
 			))
 		}

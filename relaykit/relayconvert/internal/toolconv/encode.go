@@ -91,7 +91,7 @@ func attachOpenAIChatRequest(request any, set Set) (any, []types.ConversionDiagn
 		default:
 			diagnostics = append(diagnostics, semanticLoss(
 				fmt.Sprintf("tools[%d]", index),
-				"unsupported_hosted_tool",
+				types.ConversionDiagnosticCodeUnsupportedHostedTool,
 				fmt.Sprintf("OpenAI Chat Completions cannot represent hosted tool %q", definition.NativeType),
 			))
 		}
@@ -177,7 +177,7 @@ func attachOpenAIResponsesRequest(request any, set Set) (any, []types.Conversion
 			}
 			diagnostics = append(diagnostics, semanticLoss(
 				fmt.Sprintf("tools[%d]", index),
-				"unsupported_hosted_tool",
+				types.ConversionDiagnosticCodeUnsupportedHostedTool,
 				fmt.Sprintf("OpenAI Responses has no verified mapping for hosted tool %q", definition.NativeType),
 			))
 		}
@@ -287,7 +287,7 @@ func attachClaudeRequest(request any, set Set, options *convmeta.Options) (any, 
 			}
 			diagnostics = append(diagnostics, semanticLoss(
 				fmt.Sprintf("tools[%d]", index),
-				"unsupported_hosted_tool",
+				types.ConversionDiagnosticCodeUnsupportedHostedTool,
 				fmt.Sprintf("Claude Messages has no verified mapping for hosted tool %q", definition.NativeType),
 			))
 		}
@@ -365,7 +365,7 @@ func attachGeminiRequest(request any, set Set) (any, []types.ConversionDiagnosti
 			deleteEmptyStrings(function)
 			functions = append(functions, function)
 			if definition.Function.Strict != nil {
-				diagnostics = append(diagnostics, presentationLoss(fmt.Sprintf("tools[%d].strict", index), "unsupported_function_strict", "Gemini does not expose OpenAI function strictness"))
+				diagnostics = append(diagnostics, presentationLoss(fmt.Sprintf("tools[%d].strict", index), types.ConversionDiagnosticCodeUnsupportedFunctionStrict, "Gemini does not expose OpenAI function strictness"))
 			}
 		case KindWebSearch:
 			if set.Source == types.RelayFormatGemini && len(definition.Raw) > 0 {
@@ -385,13 +385,13 @@ func attachGeminiRequest(request any, set Set) (any, []types.ConversionDiagnosti
 				tools = append(tools, map[string]any{"codeExecution": map[string]any{}})
 				continue
 			}
-			diagnostics = append(diagnostics, semanticLoss(fmt.Sprintf("tools[%d]", index), "unverified_tool_mapping", "code execution semantics differ across providers"))
+			diagnostics = append(diagnostics, semanticLoss(fmt.Sprintf("tools[%d]", index), types.ConversionDiagnosticCodeUnverifiedToolMapping, "code execution semantics differ across providers"))
 		case KindURLContext:
 			if set.Source == types.RelayFormatGemini || definition.NativeType == "urlContext" {
 				tools = append(tools, map[string]any{"urlContext": map[string]any{}})
 				continue
 			}
-			diagnostics = append(diagnostics, semanticLoss(fmt.Sprintf("tools[%d]", index), "unverified_tool_mapping", "URL context has no verified mapping from the source protocol"))
+			diagnostics = append(diagnostics, semanticLoss(fmt.Sprintf("tools[%d]", index), types.ConversionDiagnosticCodeUnverifiedToolMapping, "URL context has no verified mapping from the source protocol"))
 		default:
 			if set.Source == types.RelayFormatGemini && len(definition.Raw) > 0 {
 				var tool map[string]any
@@ -424,7 +424,7 @@ func attachGeminiRequest(request any, set Set) (any, []types.ConversionDiagnosti
 			}
 			diagnostics = append(diagnostics, semanticLoss(
 				fmt.Sprintf("tools[%d]", index),
-				"unsupported_hosted_tool",
+				types.ConversionDiagnosticCodeUnsupportedHostedTool,
 				fmt.Sprintf("Gemini generateContent has no verified mapping for hosted tool %q", definition.NativeType),
 			))
 		}
@@ -445,7 +445,7 @@ func attachGeminiRequest(request any, set Set) (any, []types.ConversionDiagnosti
 	if set.ParallelAllowed != nil && !*set.ParallelAllowed {
 		diagnostics = append(diagnostics, semanticLoss(
 			"parallel_tool_calls",
-			"unsupported_parallel_tool_control",
+			types.ConversionDiagnosticCodeUnsupportedParallelToolControl,
 			"Gemini generateContent does not expose a request field equivalent to parallel_tool_calls",
 		))
 	}

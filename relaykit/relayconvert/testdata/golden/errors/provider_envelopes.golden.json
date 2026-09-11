@@ -1,0 +1,95 @@
+{
+  "claude_to_gemini": {
+    "error": {
+      "message": "claude upstream rejected https://***.example/***/***?api_key=*** api_key:***",
+      "type": "overloaded_error",
+      "param": "",
+      "code": "overloaded_error"
+    }
+  },
+  "claude_to_openai": {
+    "error": {
+      "message": "claude upstream rejected https://***.example/***/***?api_key=*** api_key:***",
+      "type": "overloaded_error",
+      "param": "",
+      "code": "overloaded_error"
+    }
+  },
+  "claude_to_openai_responses": {
+    "error": {
+      "message": "claude upstream rejected https://***.example/***/***?api_key=*** api_key:***",
+      "type": "overloaded_error",
+      "param": "",
+      "code": "overloaded_error"
+    }
+  },
+  "gemini_to_claude": {
+    "error": {
+      "type": "invalid_tool",
+      "message": "gemini upstream rejected https://***.example/***/***?api_key=*** api_key:***"
+    },
+    "type": "error"
+  },
+  "gemini_to_openai": {
+    "error": {
+      "message": "gemini upstream rejected https://***.example/***/***?api_key=*** api_key:***",
+      "type": "invalid_request_error",
+      "param": "tools[0]",
+      "code": "invalid_tool"
+    }
+  },
+  "gemini_to_openai_responses": {
+    "error": {
+      "message": "gemini upstream rejected https://***.example/***/***?api_key=*** api_key:***",
+      "type": "invalid_request_error",
+      "param": "tools[0]",
+      "code": "invalid_tool"
+    }
+  },
+  "openai_responses_to_claude": {
+    "error": {
+      "type": "invalid_tool",
+      "message": "openai_responses upstream rejected https://***.example/***/***?api_key=*** api_key:***"
+    },
+    "type": "error"
+  },
+  "openai_responses_to_gemini": {
+    "error": {
+      "message": "openai_responses upstream rejected https://***.example/***/***?api_key=*** api_key:***",
+      "type": "invalid_request_error",
+      "param": "tools[0]",
+      "code": "invalid_tool"
+    }
+  },
+  "openai_responses_to_openai": {
+    "error": {
+      "message": "openai_responses upstream rejected https://***.example/***/***?api_key=*** api_key:***",
+      "type": "invalid_request_error",
+      "param": "tools[0]",
+      "code": "invalid_tool"
+    }
+  },
+  "openai_to_claude": {
+    "error": {
+      "type": "invalid_tool",
+      "message": "openai upstream rejected https://***.example/***/***?api_key=*** api_key:***"
+    },
+    "type": "error"
+  },
+  "openai_to_gemini": {
+    "error": {
+      "message": "openai upstream rejected https://***.example/***/***?api_key=*** api_key:***",
+      "type": "invalid_request_error",
+      "param": "tools[0]",
+      "code": "invalid_tool"
+    }
+  },
+  "openai_to_openai_responses": {
+    "error": {
+      "message": "openai upstream rejected https://***.example/***/***?api_key=*** api_key:***",
+      "type": "invalid_request_error",
+      "param": "tools[0]",
+      "code": "invalid_tool"
+    }
+  }
+}

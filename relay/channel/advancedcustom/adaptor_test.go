@@ -166,6 +166,29 @@ func TestAdaptorSetupRequestHeaderAddsClaudeDefaultHeaders(t *testing.T) {
 	assert.Equal(t, "2023-06-01", header.Get("anthropic-version"))
 }
 
+func TestAdaptorSetupRequestHeaderAddsClaudeHeadersForResponsesConversion(t *testing.T) {
+	adaptor := &Adaptor{}
+	info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
+		Routes: []dto.AdvancedCustomRoute{{
+			IncomingPath: "/v1/responses",
+			UpstreamPath: "/v1/messages",
+			Converter:    relayconvert.ConverterOpenAIResponsesToClaudeMessages,
+			Auth: &dto.AdvancedCustomRouteAuth{
+				Type:  dto.AdvancedCustomAuthTypeHeader,
+				Name:  "x-api-key",
+				Value: "{api_key}",
+			},
+		}},
+	})
+	info.RelayFormat = types.RelayFormatOpenAIResponses
+	info.RequestURLPath = "/v1/responses"
+	header := http.Header{}
+
+	require.NoError(t, adaptor.SetupRequestHeader(advancedCustomGinContext("/v1/responses"), &header, info))
+	assert.Equal(t, "sk-test", header.Get("x-api-key"))
+	assert.Equal(t, "2023-06-01", header.Get("anthropic-version"))
+}
+
 func TestAdaptorReturnsErrorWhenNoRouteMatchesPath(t *testing.T) {
 	adaptor := &Adaptor{}
 	info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
@@ -829,7 +852,7 @@ func TestAdaptorConvertsGeminiRequestToOpenAIChatUpstream(t *testing.T) {
 	assert.Equal(t, "user", chatReq.Messages[0].Role)
 }
 
-func TestAdaptorConvertsEveryRegisteredOrdinaryProtocolRoute(t *testing.T) {
+func TestAdaptorConvertsEveryAllowedOrdinaryProtocolRoute(t *testing.T) {
 	maxTokens := uint(1024)
 	tests := []struct {
 		name         string
@@ -849,26 +872,6 @@ func TestAdaptorConvertsEveryRegisteredOrdinaryProtocolRoute(t *testing.T) {
 				})
 			},
 			want: &dto.OpenAIResponsesRequest{},
-		},
-		{
-			name: "Claude to Gemini", incomingPath: "/v1/messages", upstreamPath: "/v1beta/models/{model}:generateContent",
-			converter: relayconvert.ConverterClaudeMessagesToGeminiContent, relayFormat: types.RelayFormatClaude,
-			convert: func(a *Adaptor, info *relaycommon.RelayInfo) (any, error) {
-				return a.ConvertClaudeRequest(advancedCustomGinContext("/v1/messages"), info, &dto.ClaudeRequest{
-					Model: "gemini-test", MaxTokens: &maxTokens, Messages: []dto.ClaudeMessage{{Role: "user", Content: "hello"}},
-				})
-			},
-			want: &dto.GeminiChatRequest{},
-		},
-		{
-			name: "Gemini to Claude", incomingPath: "/v1beta/models/{model}:generateContent", upstreamPath: "/v1/messages",
-			converter: relayconvert.ConverterGeminiContentToClaudeMessages, relayFormat: types.RelayFormatGemini,
-			convert: func(a *Adaptor, info *relaycommon.RelayInfo) (any, error) {
-				return a.ConvertGeminiRequest(advancedCustomGinContext("/v1beta/models/gemini-test:generateContent"), info, &dto.GeminiChatRequest{
-					Contents: []dto.GeminiChatContent{{Role: "user", Parts: []dto.GeminiPart{{Text: "hello"}}}},
-				})
-			},
-			want: &dto.ClaudeRequest{},
 		},
 		{
 			name: "Gemini to Responses", incomingPath: "/v1beta/models/{model}:generateContent", upstreamPath: "/v1/responses",
@@ -911,7 +914,7 @@ func TestAdaptorConvertsEveryRegisteredOrdinaryProtocolRoute(t *testing.T) {
 	}
 }
 
-func TestAdaptorRequiresExplicitAllowForLossyConversion(t *testing.T) {
+func TestAdaptorChannelPolicyCannotAuthorizeLossyConversion(t *testing.T) {
 	config := &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{
 		IncomingPath: "/v1beta/models/{model}:generateContent",
 		UpstreamPath: "/v1/chat/completions",
@@ -923,23 +926,18 @@ func TestAdaptorRequiresExplicitAllowForLossyConversion(t *testing.T) {
 		Tools:    tools,
 	}
 
-	strictInfo := advancedCustomRelayInfo(config)
-	strictInfo.RelayFormat = types.RelayFormatGemini
-	strictInfo.RequestURLPath = "/v1beta/models/gemini-test:generateContent"
-	_, err := (&Adaptor{}).ConvertGeminiRequest(advancedCustomGinContext(strictInfo.RequestURLPath), strictInfo, request)
+	info := advancedCustomRelayInfo(config)
+	info.RelayFormat = types.RelayFormatGemini
+	info.RequestURLPath = "/v1beta/models/gemini-test:generateContent"
+	info.ChannelOtherSettings.ToolLossPolicy = string(types.ConversionLossPolicyAllow)
+
+	_, err := (&Adaptor{}).ConvertGeminiRequest(advancedCustomGinContext(info.RequestURLPath), info, request)
+
 	require.Error(t, err)
 	var loss *types.ConversionLossError
 	require.ErrorAs(t, err, &loss)
-
-	allowInfo := advancedCustomRelayInfo(config)
-	allowInfo.RelayFormat = types.RelayFormatGemini
-	allowInfo.RequestURLPath = "/v1beta/models/gemini-test:generateContent"
-	allowInfo.ChannelOtherSettings.ToolLossPolicy = string(types.ConversionLossPolicyAllow)
-	converted, err := (&Adaptor{}).ConvertGeminiRequest(advancedCustomGinContext(allowInfo.RequestURLPath), allowInfo, request)
-	require.NoError(t, err)
-	assert.IsType(t, &dto.GeneralOpenAIRequest{}, converted)
-	require.NotEmpty(t, allowInfo.ConversionDiagnostics())
-	assert.Equal(t, "unsupported_hosted_tool", allowInfo.ConversionDiagnostics()[0].Code)
+	require.NotEmpty(t, info.ConversionDiagnostics())
+	assert.Equal(t, "unsupported_hosted_tool", info.ConversionDiagnostics()[0].Code)
 }
 
 func advancedCustomRelayInfo(config *dto.AdvancedCustomConfig) *relaycommon.RelayInfo {

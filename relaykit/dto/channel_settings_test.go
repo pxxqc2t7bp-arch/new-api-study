@@ -59,6 +59,43 @@ func TestAdvancedCustomValidateResponsesToChatConverterPath(t *testing.T) {
 	}
 }
 
+func TestAdvancedCustomValidateRejectsDiscouragedConverters(t *testing.T) {
+	tests := []struct {
+		name         string
+		incomingPath string
+		upstreamPath string
+		converter    string
+	}{
+		{
+			name:         "Claude to Gemini",
+			incomingPath: "/v1/messages",
+			upstreamPath: "/v1beta/models/{model}:generateContent",
+			converter:    advancedCustomConverterClaudeMessagesToGemini,
+		},
+		{
+			name:         "Gemini to Claude",
+			incomingPath: "/v1beta/models/{model}:generateContent",
+			upstreamPath: "/v1/messages",
+			converter:    advancedCustomConverterGeminiContentToClaude,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := &AdvancedCustomConfig{Routes: []AdvancedCustomRoute{{
+				IncomingPath: test.incomingPath,
+				UpstreamPath: test.upstreamPath,
+				Converter:    test.converter,
+			}}}
+
+			err := config.Validate()
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "converter is not registered")
+		})
+	}
+}
+
 func TestAdvancedCustomValidateModelListRouteConstraints(t *testing.T) {
 	valid := &AdvancedCustomConfig{
 		Routes: []AdvancedCustomRoute{

@@ -87,9 +87,8 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateLastRemovedModels  []string              `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
 	UpstreamModelUpdateIgnoredModels      []string              `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
 	AdvancedCustom                        *AdvancedCustomConfig `json:"advanced_custom,omitempty"`
-	// ToolLossPolicy is a channel-level opt-in for request-phase conversion
-	// loss authorization. Empty follows the default strict policy. Accepted values:
-	// "", "allow", "safe", "strict".
+	// ToolLossPolicy is retained for settings compatibility but does not
+	// authorize request-phase conversion loss.
 	ToolLossPolicy string `json:"tool_loss_policy,omitempty"`
 }
 
@@ -400,14 +399,12 @@ func IsAdvancedCustomConverterAllowed(converter string) bool {
 	case advancedCustomConverterNone,
 		advancedCustomConverterClaudeMessagesToOpenAIChat,
 		advancedCustomConverterClaudeMessagesToResponses,
-		advancedCustomConverterClaudeMessagesToGemini,
 		advancedCustomConverterOpenAIChatToClaudeMessages,
 		advancedCustomConverterOpenAIChatToOpenAIResponses,
 		advancedCustomConverterOpenAIResponsesToOpenAIChat,
 		advancedCustomConverterOpenAIResponsesToClaude,
 		advancedCustomConverterOpenAIResponsesToGemini,
 		advancedCustomConverterGeminiContentToOpenAIChat,
-		advancedCustomConverterGeminiContentToClaude,
 		advancedCustomConverterGeminiContentToResponses,
 		advancedCustomConverterOpenAIChatToGeminiContent:
 		return true
