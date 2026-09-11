@@ -205,3 +205,37 @@ func TestIssueRealtimeTicketReportsTokenDatabaseFailure(t *testing.T) {
 	))
 	assert.Equal(t, http.StatusInternalServerError, response.Code)
 }
+
+func TestIssueRealtimeTicketReportsPersistenceFailure(t *testing.T) {
+	router := setupRealtimeTicketControllerTest(t)
+	token := model.Token{
+		UserId:                   7,
+		Key:                      "realtimeticketpersistencefailure",
+		Name:                     "persistence-failure",
+		Status:                   common.TokenStatusEnabled,
+		ExpiredTime:              -1,
+		RemainQuota:              100,
+		DefaultRoutingStrategy:   "stable",
+		AllowedRoutingStrategies: `["stable"]`,
+	}
+	require.NoError(t, token.Insert())
+
+	forcedErr := fmt.Errorf("forced realtime ticket persistence failure")
+	var intercepted atomic.Bool
+	const callbackName = "test:fail_realtime_ticket_persistence"
+	require.NoError(t, model.DB.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "auth_flows" && intercepted.CompareAndSwap(false, true) {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		_ = model.DB.Callback().Create().Remove(callbackName)
+	})
+
+	response := issueRealtimeTicketRequest(t, router, fmt.Sprintf(
+		`{"token_id":%d,"model":"gpt-realtime"}`,
+		token.Id,
+	))
+	assert.Equal(t, http.StatusInternalServerError, response.Code)
+	assert.NotContains(t, response.Body.String(), token.Key)
+}

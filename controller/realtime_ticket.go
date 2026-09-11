@@ -6,7 +6,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	hosttypes "github.com/QuantumNous/new-api/types"
@@ -70,7 +69,7 @@ func IssueRealtimeTicket(c *gin.Context) {
 		RoutingStrategy: strategy,
 	})
 	if err != nil {
-		common.ApiError(c, err)
+		writeRealtimeTicketError(c, http.StatusInternalServerError, "failed to issue realtime ticket")
 		return
 	}
 
