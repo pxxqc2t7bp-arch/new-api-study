@@ -739,6 +739,47 @@ func TestTokenPostCommitErrorDoesNotRestoreEnabledCache(t *testing.T) {
 	assert.ErrorIs(t, err, ErrTokenInvalid)
 }
 
+func TestTokenPostCommitErrorReconcilesAfterConcurrentQuotaWrite(t *testing.T) {
+	truncateTables(t)
+	useUserCacheMiniRedis(t)
+	token := Token{
+		UserId:         7,
+		Key:            "token-post-commit-concurrent-quota",
+		Name:           "post-commit-concurrent-quota",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+	require.NoError(t, cacheSetTokenForTest(token))
+
+	postCommitErr := errors.New("simulated lost commit acknowledgement after quota write")
+	replaceTokenMutationCommitForTest(t, func(tx *gorm.DB) error {
+		require.NoError(t, tx.Commit().Error)
+		result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
+		require.NoError(t, err)
+		require.Equal(t, cacheQuotaOK, result)
+		require.NoError(t, DB.Model(&Token{}).Where("id = ?", token.Id).Updates(map[string]any{
+			"remain_quota": 30,
+			"used_quota":   70,
+		}).Error)
+		return postCommitErr
+	})
+
+	token.Status = common.TokenStatusDisabled
+	err := token.SelectUpdate()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTokenMutationCommitted)
+	assert.ErrorIs(t, err, postCommitErr)
+
+	cached, err := cacheGetTokenByKey(token.Key)
+	require.NoError(t, err)
+	assert.Equal(t, common.TokenStatusDisabled, cached.Status)
+	assert.Equal(t, 30, cached.RemainQuota)
+	assert.Equal(t, 70, cached.UsedQuota)
+}
+
 func TestTokenDeletePostCommitErrorDoesNotRestoreCachedToken(t *testing.T) {
 	truncateTables(t)
 	server := useUserCacheMiniRedis(t)
@@ -1010,7 +1051,7 @@ func TestTokenMutationRestoresGenerationFromDatabaseFloor(t *testing.T) {
 	assert.Equal(t, "stable", stored.DefaultRoutingStrategy)
 }
 
-func TestTokenUpdateWithoutRedisPreservesDatabaseGeneration(t *testing.T) {
+func TestTokenUpdateWithoutRedisAdvancesDatabaseGeneration(t *testing.T) {
 	truncateTables(t)
 	oldRedisEnabled := common.RedisEnabled
 	common.RedisEnabled = false
@@ -1034,7 +1075,7 @@ func TestTokenUpdateWithoutRedisPreservesDatabaseGeneration(t *testing.T) {
 
 	var stored Token
 	require.NoError(t, DB.First(&stored, token.Id).Error)
-	assert.EqualValues(t, 6, stored.CacheGeneration)
+	assert.EqualValues(t, 8, stored.CacheGeneration)
 	assert.Equal(t, "generation-preserved", stored.Name)
 }
 
@@ -1097,6 +1138,43 @@ func TestTokenCommitAcknowledgementLossWithoutRedisReturnsObservedOutcome(t *tes
 			test.verify(t, token)
 		})
 	}
+}
+
+func TestTokenCommitAcknowledgementLossWithoutRedisReconcilesAfterConcurrentQuotaWrite(t *testing.T) {
+	truncateTables(t)
+	previousRedisEnabled := common.RedisEnabled
+	common.RedisEnabled = false
+	t.Cleanup(func() { common.RedisEnabled = previousRedisEnabled })
+	token := Token{
+		UserId:         7,
+		Key:            "token-no-redis-concurrent-quota",
+		Name:           "no-redis-concurrent-quota",
+		Status:         common.TokenStatusEnabled,
+		ExpiredTime:    -1,
+		RemainQuota:    100,
+		UnlimitedQuota: true,
+	}
+	require.NoError(t, token.Insert())
+
+	commitErr := errors.New("simulated no-redis commit acknowledgement loss after quota write")
+	replaceTokenMutationCommitForTest(t, func(tx *gorm.DB) error {
+		require.NoError(t, tx.Commit().Error)
+		require.NoError(t, DB.Model(&Token{}).Where("id = ?", token.Id).Updates(map[string]any{
+			"remain_quota": 30,
+			"used_quota":   70,
+		}).Error)
+		return commitErr
+	})
+
+	token.Status = common.TokenStatusDisabled
+	require.NoError(t, token.SelectUpdate())
+
+	var stored Token
+	require.NoError(t, DB.First(&stored, token.Id).Error)
+	assert.Equal(t, common.TokenStatusDisabled, stored.Status)
+	assert.Equal(t, 30, stored.RemainQuota)
+	assert.Equal(t, 70, stored.UsedQuota)
+	assert.EqualValues(t, 2, stored.CacheGeneration)
 }
 
 func TestBatchDeleteCommitAcknowledgementLossWithoutRedisReturnsObservedSuccess(t *testing.T) {
@@ -1412,6 +1490,13 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 				commitErr := errors.New("forced configured database commit acknowledgement loss")
 				replaceTokenMutationCommitForTest(t, func(tx *gorm.DB) error {
 					require.NoError(t, tx.Commit().Error)
+					result, err := cacheApplyTokenQuotaDelta(token.Id, token.Key, -70)
+					require.NoError(t, err)
+					require.Equal(t, cacheQuotaOK, result)
+					require.NoError(t, db.Model(&Token{}).Where("id = ?", token.Id).Updates(map[string]any{
+						"remain_quota": 30,
+						"used_quota":   70,
+					}).Error)
 					return commitErr
 				})
 				token.Status = common.TokenStatusDisabled
@@ -1426,6 +1511,8 @@ func TestTokenMetadataTransactionsConfiguredDatabases(t *testing.T) {
 				cached, err := cacheGetTokenByKey(token.Key)
 				require.NoError(t, err)
 				assert.Equal(t, common.TokenStatusDisabled, cached.Status)
+				assert.Equal(t, 30, cached.RemainQuota)
+				assert.Equal(t, 70, cached.UsedQuota)
 			})
 
 			t.Run("batch delete acknowledgement loss finalizes committed delete", func(t *testing.T) {

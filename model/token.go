@@ -3,7 +3,6 @@ package model
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -559,7 +558,10 @@ func reconcileTokenMutationCommitError(token *Token, expected *Token, deleteCach
 			Cause: errors.Join(commitErr, finalizeErr),
 		}
 	}
-	if readErr == nil && !deleteCache && expected != nil && reflect.DeepEqual(stored, expected) {
+	if readErr == nil && !deleteCache && expected != nil &&
+		stored.Id == expected.Id &&
+		stored.Key == expected.Key &&
+		stored.CacheGeneration == expected.CacheGeneration {
 		*token = *stored
 		if generation == 0 {
 			return nil
@@ -596,6 +598,15 @@ func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(*gorm.DB,
 
 	minimumGeneration := current.CacheGeneration
 	token.CacheGeneration = minimumGeneration
+	if minimumGeneration < 0 || minimumGeneration%2 != 0 {
+		if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+			return errors.Join(
+				errors.New("invalid token database cache generation"),
+				fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr),
+			)
+		}
+		return errors.New("invalid token database cache generation")
+	}
 	generation, beginErr := beginTokenCacheMutation(token.Key, minimumGeneration)
 	if beginErr != nil {
 		if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
@@ -603,7 +614,7 @@ func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(*gorm.DB,
 		}
 		return beginErr
 	}
-	committedGeneration := minimumGeneration
+	committedGeneration := minimumGeneration + 2
 	if generation > 0 {
 		committedGeneration = generation + 1
 	}
