@@ -363,18 +363,8 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 func TokenAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		// 先检测是否为ws
-		if c.Request.Header.Get("Sec-WebSocket-Protocol") != "" {
+		if key, ok := takeOpenAIRealtimeAPIKey(c.Request); ok {
 			// Sec-WebSocket-Protocol: realtime, openai-insecure-api-key.sk-xxx, openai-beta.realtime-v1
-			// read sk from Sec-WebSocket-Protocol
-			key := c.Request.Header.Get("Sec-WebSocket-Protocol")
-			parts := strings.SplitSeq(key, ",")
-			for part := range parts {
-				part = strings.TrimSpace(part)
-				if strings.HasPrefix(part, "openai-insecure-api-key") {
-					key = strings.TrimPrefix(part, "openai-insecure-api-key.")
-					break
-				}
-			}
 			c.Request.Header.Set("Authorization", "Bearer "+key)
 		}
 		// 检查path包含/v1/messages 或 /v1/models
@@ -418,12 +408,6 @@ func TokenAuth() func(c *gin.Context) {
 			key = parts[0]
 		}
 		token, err := model.ValidateUserToken(key)
-		if token != nil {
-			id := c.GetInt("id")
-			if id == 0 {
-				c.Set("id", token.UserId)
-			}
-		}
 		if err != nil {
 			if errors.Is(err, model.ErrDatabase) {
 				common.SysLog("TokenAuth ValidateUserToken database error: " + err.Error())
@@ -435,63 +419,77 @@ func TokenAuth() func(c *gin.Context) {
 			}
 			return
 		}
-
-		allowIps := token.GetIpLimits()
-		if len(allowIps) > 0 {
-			clientIp := c.ClientIP()
-			logger.LogDebug(c, "Token has IP restrictions, checking client IP %s", clientIp)
-			ip := net.ParseIP(clientIp)
-			if ip == nil {
-				abortWithOpenAiMessage(c, http.StatusForbidden, "无法解析客户端 IP 地址")
-				return
-			}
-			if common.IsIpInCIDRList(ip, allowIps) == false {
-				abortWithOpenAiMessage(c, http.StatusForbidden, "您的 IP 不在令牌允许访问的列表中", types.ErrorCodeAccessDenied)
-				return
-			}
-			logger.LogDebug(c, "Client IP %s passed the token IP restrictions check", clientIp)
-		}
-
-		userCache, err := model.GetUserCache(token.UserId)
-		if err != nil {
-			common.SysLog(fmt.Sprintf("TokenAuth GetUserCache error for user %d: %v", token.UserId, err))
-			abortWithOpenAiMessage(c, http.StatusInternalServerError,
-				common.TranslateMessage(c, i18n.MsgDatabaseError))
+		if !setupValidatedTokenContext(c, token, parts...) {
 			return
 		}
-		userEnabled := userCache.Status == common.UserStatusEnabled
-		if !userEnabled {
-			abortWithOpenAiMessage(c, http.StatusForbidden, common.TranslateMessage(c, i18n.MsgAuthUserBanned))
-			return
-		}
-
-		userCache.WriteContext(c)
-
-		userGroup := userCache.Group
-		tokenGroup := token.Group
-		if tokenGroup != "" {
-			// check common.UserUsableGroups[userGroup]
-			if _, ok := service.GetUserUsableGroups(userGroup)[tokenGroup]; !ok {
-				abortWithOpenAiMessage(c, http.StatusForbidden, fmt.Sprintf("无权访问 %s 分组", tokenGroup))
-				return
-			}
-			// check group in common.GroupRatio
-			if !ratio_setting.ContainsGroupRatio(tokenGroup) {
-				if tokenGroup != "auto" {
-					abortWithOpenAiMessage(c, http.StatusForbidden, fmt.Sprintf("分组 %s 已被弃用", tokenGroup))
-					return
-				}
-			}
-			userGroup = tokenGroup
-		}
-		common.SetContextKey(c, constant.ContextKeyUsingGroup, userGroup)
-
-		err = SetupContextForToken(c, token, parts...)
-		if err != nil {
-			return
+		if strings.HasPrefix(c.Request.URL.Path, "/v1/realtime") {
+			c.Request.Header.Del("Authorization")
+			c.Request.Header.Del("mj-api-secret")
 		}
 		c.Next()
 	}
+}
+
+func setupValidatedTokenContext(c *gin.Context, token *model.Token, parts ...string) bool {
+	if token == nil {
+		abortWithOpenAiMessage(c, http.StatusUnauthorized, common.TranslateMessage(c, i18n.MsgTokenInvalid))
+		return false
+	}
+	if c.GetInt("id") == 0 {
+		c.Set("id", token.UserId)
+	}
+
+	allowIps := token.GetIpLimits()
+	if len(allowIps) > 0 {
+		clientIp := c.ClientIP()
+		logger.LogDebug(c, "Token has IP restrictions, checking client IP %s", clientIp)
+		ip := net.ParseIP(clientIp)
+		if ip == nil {
+			abortWithOpenAiMessage(c, http.StatusForbidden, "无法解析客户端 IP 地址")
+			return false
+		}
+		if common.IsIpInCIDRList(ip, allowIps) == false {
+			abortWithOpenAiMessage(c, http.StatusForbidden, "您的 IP 不在令牌允许访问的列表中", types.ErrorCodeAccessDenied)
+			return false
+		}
+		logger.LogDebug(c, "Client IP %s passed the token IP restrictions check", clientIp)
+	}
+
+	userCache, err := model.GetUserCache(token.UserId)
+	if err != nil {
+		common.SysLog(fmt.Sprintf("TokenAuth GetUserCache error for user %d: %v", token.UserId, err))
+		abortWithOpenAiMessage(c, http.StatusInternalServerError,
+			common.TranslateMessage(c, i18n.MsgDatabaseError))
+		return false
+	}
+	if userCache.Status != common.UserStatusEnabled {
+		abortWithOpenAiMessage(c, http.StatusForbidden, common.TranslateMessage(c, i18n.MsgAuthUserBanned))
+		return false
+	}
+
+	userCache.WriteContext(c)
+
+	userGroup := userCache.Group
+	tokenGroup := token.Group
+	if tokenGroup != "" {
+		if _, ok := service.GetUserUsableGroups(userGroup)[tokenGroup]; !ok {
+			abortWithOpenAiMessage(c, http.StatusForbidden, fmt.Sprintf("无权访问 %s 分组", tokenGroup))
+			return false
+		}
+		if !ratio_setting.ContainsGroupRatio(tokenGroup) {
+			if tokenGroup != "auto" {
+				abortWithOpenAiMessage(c, http.StatusForbidden, fmt.Sprintf("分组 %s 已被弃用", tokenGroup))
+				return false
+			}
+		}
+		userGroup = tokenGroup
+	}
+	common.SetContextKey(c, constant.ContextKeyUsingGroup, userGroup)
+
+	if err := SetupContextForToken(c, token, parts...); err != nil {
+		return false
+	}
+	return true
 }
 
 func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) error {

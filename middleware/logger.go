@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -34,6 +35,7 @@ func SetUpLogger(server *gin.Engine) {
 		if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") {
 			path, _, _ = strings.Cut(path, "?")
 		}
+		path = redactRealtimeTicketLogQuery(path)
 		return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",
 			param.TimeStamp.Format("2006/01/02 - 15:04:05"),
 			tag,
@@ -45,4 +47,18 @@ func SetUpLogger(server *gin.Engine) {
 			path,
 		)
 	}))
+}
+
+func redactRealtimeTicketLogQuery(path string) string {
+	parsed, err := url.ParseRequestURI(path)
+	if err != nil {
+		return path
+	}
+	query := parsed.Query()
+	if _, ok := query[RealtimeTicketQuery]; !ok {
+		return path
+	}
+	query.Set(RealtimeTicketQuery, "***masked***")
+	parsed.RawQuery = query.Encode()
+	return parsed.RequestURI()
 }

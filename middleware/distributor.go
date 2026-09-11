@@ -603,6 +603,10 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 // model. Exact name, wildcard-normalized name, and routing-normalized name
 // (modifiers and legacy aliases stripped) are all accepted.
 func tokenModelLimitAllows(limit map[string]bool, model string) bool {
+	return TokenModelLimitAllows(limit, model)
+}
+
+func TokenModelLimitAllows(limit map[string]bool, model string) bool {
 	if limit[model] {
 		return true
 	}

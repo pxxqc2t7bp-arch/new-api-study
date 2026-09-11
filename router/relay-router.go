@@ -66,6 +66,8 @@ func SetRelayRouter(router *gin.Engine) {
 	{
 		playgroundRouter.POST("/chat/completions", controller.Playground)
 	}
+	registerRealtimeRelayRoute(router)
+
 	relayV1Router := router.Group("/v1")
 	relayV1Router.Use(middleware.RouteTag("relay"))
 	relayV1Router.Use(middleware.SystemPerformanceCheck())
@@ -75,14 +77,6 @@ func SetRelayRouter(router *gin.Engine) {
 	{
 		streamSessionRouter.GET("/:stream_id", controller.GetStreamRecoverySession)
 		streamSessionRouter.DELETE("/:stream_id", controller.CancelStreamRecoverySession)
-	}
-	{
-		// WebSocket 路由（统一到 Relay）
-		wsRouter := relayV1Router.Group("")
-		wsRouter.Use(middleware.ModelRequestRateLimit(), middleware.Distribute())
-		wsRouter.GET("/realtime", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIRealtime)
-		})
 	}
 	{
 		ordinaryRouter := relayV1Router.Group("")
