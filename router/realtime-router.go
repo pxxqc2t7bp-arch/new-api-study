@@ -26,4 +26,18 @@ func registerRealtimeRelayRoute(router *gin.Engine) {
 	realtimeRouter.GET("/realtime", func(c *gin.Context) {
 		controller.Relay(c, types.RelayFormatOpenAIRealtime)
 	})
+
+	geminiLiveRouter := router.Group("")
+	geminiLiveRouter.Use(middleware.RouteTag("relay"))
+	geminiLiveRouter.Use(middleware.SystemPerformanceCheck())
+	geminiLiveRouter.GET(
+		middleware.GeminiLivePath,
+		middleware.RealtimeAuth(),
+		middleware.GeminiLiveSetup(),
+		middleware.ModelRequestRateLimit(),
+		middleware.Distribute(),
+		func(c *gin.Context) {
+			controller.Relay(c, types.RelayFormatGeminiLive)
+		},
+	)
 }

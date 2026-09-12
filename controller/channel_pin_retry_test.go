@@ -6,9 +6,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
-	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -62,6 +64,27 @@ func TestShouldRetryTaskRelayHonorsPinRetryMode(t *testing.T) {
 		RetryMode: dto.PinRetrySingleAttempt,
 	})
 	assert.False(t, shouldRetryTaskRelay(token, 1, taskErr, 1))
+}
+
+func TestShouldRetryStopsAfterGeminiLiveSetupForwarded(t *testing.T) {
+	upstreamError := types.NewOpenAIError(
+		errors.New("upstream disconnected"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusInternalServerError,
+	)
+	c := newPinRetryContext()
+	assert.True(t, shouldRetry(c, upstreamError, 1))
+
+	common.SetContextKey(c, constant.ContextKeyRealtimeSetupForwarded, true)
+	assert.False(t, shouldRetry(c, upstreamError, 1))
+}
+
+func TestShouldRefundFailedRelayPreservesUncertainRealtimeSettlement(t *testing.T) {
+	c := newPinRetryContext()
+	assert.True(t, shouldRefundFailedRelay(c))
+
+	c.Set("realtime_settlement_uncertain", true)
+	assert.False(t, shouldRefundFailedRelay(c))
 }
 
 func TestSameChannelPinsMergeToStricterRetryMode(t *testing.T) {

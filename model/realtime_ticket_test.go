@@ -83,6 +83,25 @@ func TestRealtimeTicketBindingMismatchDoesNotConsumeTicket(t *testing.T) {
 	assert.Equal(t, "gpt-realtime", consumed.Model)
 }
 
+func TestGetRealtimeTicketClaimsDefersModelBindingWithoutConsuming(t *testing.T) {
+	truncateTables(t)
+	raw, _, err := CreateRealtimeTicket(RealtimeTicketCreate{
+		UserId:          7,
+		TokenId:         11,
+		Model:           "gemini-live-test",
+		RoutingStrategy: hosttypes.RoutingStrategyStable,
+	})
+	require.NoError(t, err)
+
+	claims, err := GetRealtimeTicketClaims(raw)
+	require.NoError(t, err)
+	assert.Equal(t, "gemini-live-test", claims.Model)
+
+	consumed, err := ConsumeRealtimeTicket(raw, "gemini-live-test")
+	require.NoError(t, err)
+	assert.Equal(t, claims.TokenId, consumed.TokenId)
+}
+
 func TestRealtimeTicketConcurrentConsumptionHasOneWinner(t *testing.T) {
 	truncateTables(t)
 	raw, _, err := CreateRealtimeTicket(RealtimeTicketCreate{

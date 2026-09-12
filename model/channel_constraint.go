@@ -13,6 +13,8 @@ var filterEvalOrder = []dto.ChannelFilterKind{
 	dto.FilterTaskPluginIdentity,
 	dto.FilterRoutingAccount,
 	dto.FilterExcludeChannelIDs,
+	dto.FilterChannelTypes,
+	dto.FilterGeminiLive,
 }
 
 // ChannelSatisfiesFilters reports whether ch passes every filter.
@@ -110,6 +112,10 @@ func channelMatchesFilter(ch *Channel, modelName string, filter dto.ChannelFilte
 		return required != "" && strings.TrimSpace(ch.GetOtherSettings().RoutingAccount) == required
 	case dto.FilterExcludeChannelIDs:
 		return !slices.Contains(filter.ExcludedChannelIDs, ch.Id)
+	case dto.FilterChannelTypes:
+		return slices.Contains(filter.AllowedChannelTypes, ch.Type)
+	case dto.FilterGeminiLive:
+		return ch.GetOtherSettings().GeminiLiveEnabled
 	default:
 		return true
 	}

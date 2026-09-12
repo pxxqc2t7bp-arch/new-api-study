@@ -24,6 +24,25 @@ func TestNewTaskAPIRequestInheritsClientCancellation(t *testing.T) {
 	require.ErrorIs(t, upstream.Context().Err(), context.Canceled)
 }
 
+func TestWebSocketDialerForProxy(t *testing.T) {
+	httpDialer, err := websocketDialerForProxy("http://proxy.example:8080")
+	require.NoError(t, err)
+	require.NotNil(t, httpDialer.Proxy)
+	proxyURL, err := httpDialer.Proxy(
+		httptest.NewRequest(http.MethodGet, "https://provider.example", nil),
+	)
+	require.NoError(t, err)
+	require.Equal(t, "http://proxy.example:8080", proxyURL.String())
+
+	socksDialer, err := websocketDialerForProxy("socks5://user:pass@proxy.example:1080")
+	require.NoError(t, err)
+	require.Nil(t, socksDialer.Proxy)
+	require.NotNil(t, socksDialer.NetDialContext)
+
+	_, err = websocketDialerForProxy("ftp://proxy.example")
+	require.Error(t, err)
+}
+
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
 	t.Parallel()
 

@@ -168,7 +168,17 @@ func setupRelayRouterTestDB(t *testing.T) {
 	require.NoError(t, os.Setenv("SQL_DSN", "local"))
 	require.NoError(t, model.InitDB())
 	model.LOG_DB = model.DB
-	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.Token{}, &model.Ability{}))
+	require.NoError(t, model.DB.AutoMigrate(
+		&model.User{},
+		&model.Token{},
+		&model.Channel{},
+		&model.Ability{},
+		&model.UserSubscription{},
+		&model.Log{},
+		&model.UpstreamSource{},
+		&model.UpstreamGroup{},
+		&model.UpstreamManagedRoute{},
+	))
 
 	t.Cleanup(func() {
 		if sqlDB, err := model.DB.DB(); err == nil {

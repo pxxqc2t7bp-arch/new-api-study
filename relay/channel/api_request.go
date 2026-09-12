@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -23,6 +25,7 @@ import (
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/proxy"
 )
 
 // ApplyUpstreamBodyMetadata restores metadata that net/http cannot infer from
@@ -393,7 +396,11 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		targetHeader.Set(key, value)
 	}
 	targetHeader.Set("Content-Type", c.Request.Header.Get("Content-Type"))
-	targetConn, _, err := websocket.DefaultDialer.Dial(fullRequestURL, targetHeader)
+	dialer, err := websocketDialerForProxy(info.ChannelSetting.Proxy)
+	if err != nil {
+		return nil, fmt.Errorf("configure websocket proxy: %w", err)
+	}
+	targetConn, _, err := dialer.DialContext(c.Request.Context(), fullRequestURL, targetHeader)
 	if err != nil {
 		return nil, fmt.Errorf("dial failed to %s: %w", common.SanitizeURLForLog(fullRequestURL), err)
 	}
@@ -401,6 +408,48 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	//all, err := io.ReadAll(requestBody)
 	//err = service.WssString(c, targetConn, string(all))
 	return targetConn, nil
+}
+
+func websocketDialerForProxy(rawProxyURL string) (*websocket.Dialer, error) {
+	dialer := *websocket.DefaultDialer
+	normalized, err := service.NormalizeProxyURL(rawProxyURL)
+	if err != nil {
+		return nil, err
+	}
+	if normalized == "" {
+		return &dialer, nil
+	}
+	proxyURL, err := url.Parse(normalized)
+	if err != nil {
+		return nil, err
+	}
+	switch proxyURL.Scheme {
+	case "http", "https":
+		dialer.Proxy = http.ProxyURL(proxyURL)
+	case "socks5", "socks5h":
+		dialer.Proxy = nil
+		if proxyURL.Scheme == "socks5h" {
+			clone := *proxyURL
+			clone.Scheme = "socks5"
+			proxyURL = &clone
+		}
+		forward := &net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+		proxyDialer, err := proxy.FromURL(proxyURL, forward)
+		if err != nil {
+			return nil, err
+		}
+		contextDialer, ok := proxyDialer.(proxy.ContextDialer)
+		if !ok {
+			return nil, errors.New("SOCKS proxy dialer does not support context cancellation")
+		}
+		dialer.NetDialContext = contextDialer.DialContext
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme: %s", proxyURL.Scheme)
+	}
+	return &dialer, nil
 }
 
 func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) (context.CancelFunc, <-chan struct{}) {

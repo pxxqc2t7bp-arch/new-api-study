@@ -201,7 +201,7 @@ func Distribute() func(c *gin.Context) {
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
 		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
 		c.Next()
-		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
+		if channel != nil && requestSucceeded(c) {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 	}
@@ -530,6 +530,9 @@ func getModelRequest(c *gin.Context) (*ModelRequest, bool, error) {
 			modelRequest.Model = modelName
 		}
 		c.Set("relay_mode", relayMode)
+	} else if c.Request.URL.Path == relayconstant.GeminiLivePath {
+		modelRequest.Model = strings.TrimSpace(c.Query("model"))
+		c.Set("relay_mode", relayconstant.RelayModeGeminiLive)
 	} else if !strings.HasPrefix(c.Request.URL.Path, "/v1/audio/transcriptions") && !strings.Contains(c.Request.Header.Get("Content-Type"), "multipart/form-data") {
 		req, err := getModelFromRequest(c)
 		if err != nil {

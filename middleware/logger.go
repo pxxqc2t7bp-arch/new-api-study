@@ -35,7 +35,7 @@ func SetUpLogger(server *gin.Engine) {
 		if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") {
 			path, _, _ = strings.Cut(path, "?")
 		}
-		path = redactRealtimeTicketLogQuery(path)
+		path = redactRealtimeCredentialLogQuery(path)
 		return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",
 			param.TimeStamp.Format("2006/01/02 - 15:04:05"),
 			tag,
@@ -49,16 +49,23 @@ func SetUpLogger(server *gin.Engine) {
 	}))
 }
 
-func redactRealtimeTicketLogQuery(path string) string {
+func redactRealtimeCredentialLogQuery(path string) string {
 	parsed, err := url.ParseRequestURI(path)
 	if err != nil {
 		return path
 	}
 	query := parsed.Query()
-	if _, ok := query[RealtimeTicketQuery]; !ok {
+	changed := false
+	for _, key := range []string{RealtimeTicketQuery, "key"} {
+		if _, ok := query[key]; !ok {
+			continue
+		}
+		query.Set(key, "***masked***")
+		changed = true
+	}
+	if !changed {
 		return path
 	}
-	query.Set(RealtimeTicketQuery, "***masked***")
 	parsed.RawQuery = query.Encode()
 	return parsed.RequestURI()
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
@@ -176,6 +177,23 @@ func TestTokenModelLimitAllowsExemptAtNameByFullName(t *testing.T) {
 
 	baseOnly := map[string]bool{"opaque": true}
 	assert.False(t, tokenModelLimitAllows(baseOnly, "opaque@sha256:deadbeef"))
+}
+
+func TestGetModelRequestUsesGeminiLiveSetupModel(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(
+		http.MethodGet,
+		GeminiLivePath+"?model=gemini-live-test",
+		nil,
+	)
+
+	request, shouldSelect, err := getModelRequest(c)
+
+	require.NoError(t, err)
+	require.NotNil(t, request)
+	assert.True(t, shouldSelect)
+	assert.Equal(t, "gemini-live-test", request.Model)
+	assert.NotEqual(t, relayconstant.RelayModeUnknown, c.GetInt("relay_mode"))
 }
 
 func TestNoAvailableChannelMessageNamesClaimingTaskPlugin(t *testing.T) {

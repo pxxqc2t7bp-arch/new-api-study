@@ -139,7 +139,8 @@ type RelayInfo struct {
 	// ForcePreConsume 为 true 时禁用 BillingSession 的信任额度旁路，
 	// 强制预扣全额。用于异步任务（视频/音乐生成等），因为请求返回后任务仍在运行，
 	// 必须在提交前锁定全额。
-	ForcePreConsume bool
+	ForcePreConsume        bool
+	StrictQuotaReservation bool
 	// Billing 是计费会话，封装了预扣费/结算/退款的统一生命周期。
 	// 初始免费组可为 nil；若 auto 重试切换到付费组，会在发送前创建。
 	Billing BillingSettler
@@ -411,6 +412,18 @@ func GenRelayInfoWs(c *gin.Context, ws *websocket.Conn) *RelayInfo {
 	return info
 }
 
+func GenRelayInfoGeminiLive(c *gin.Context, ws *websocket.Conn) *RelayInfo {
+	info := genBaseRelayInfo(c, nil)
+	info.RelayFormat = types.RelayFormatGeminiLive
+	info.RelayMode = relayconstant.RelayModeGeminiLive
+	info.ClientWs = ws
+	info.IsStream = true
+	info.ForcePreConsume = true
+	info.StrictQuotaReservation = true
+	common.SetContextKey(c, constant.ContextKeyIsStream, true)
+	return info
+}
+
 func GenRelayInfoClaude(c *gin.Context, request dto.Request) *RelayInfo {
 	info := genBaseRelayInfo(c, request)
 	info.RelayFormat = types.RelayFormatClaude
@@ -661,6 +674,8 @@ func GenRelayInfo(c *gin.Context, relayFormat types.RelayFormat, request dto.Req
 		info = GenRelayInfoImage(c, request)
 	case types.RelayFormatOpenAIRealtime:
 		info = GenRelayInfoWs(c, ws)
+	case types.RelayFormatGeminiLive:
+		info = GenRelayInfoGeminiLive(c, ws)
 	case types.RelayFormatClaude:
 		info = GenRelayInfoClaude(c, request)
 	case types.RelayFormatRerank:

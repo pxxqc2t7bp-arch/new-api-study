@@ -367,6 +367,18 @@ func TokenAuth() func(c *gin.Context) {
 			// Sec-WebSocket-Protocol: realtime, openai-insecure-api-key.sk-xxx, openai-beta.realtime-v1
 			c.Request.Header.Set("Authorization", "Bearer "+key)
 		}
+		if c.Request.URL.Path == GeminiLivePath {
+			key, found, err := takeGeminiLiveAPIKey(c.Request)
+			hasAuthorization := strings.TrimSpace(c.Request.Header.Get("Authorization")) != ""
+			if err != nil || (found && hasAuthorization) {
+				c.Request.Header.Del("Authorization")
+				abortWithOpenAiMessage(c, http.StatusUnauthorized, "ambiguous Gemini Live authentication")
+				return
+			}
+			if found {
+				c.Request.Header.Set("Authorization", "Bearer "+key)
+			}
+		}
 		// 检查path包含/v1/messages 或 /v1/models
 		if strings.Contains(c.Request.URL.Path, "/v1/messages") || strings.Contains(c.Request.URL.Path, "/v1/models") {
 			anthropicKey := c.Request.Header.Get("x-api-key")
@@ -422,9 +434,11 @@ func TokenAuth() func(c *gin.Context) {
 		if !setupValidatedTokenContext(c, token, parts...) {
 			return
 		}
-		if strings.HasPrefix(c.Request.URL.Path, "/v1/realtime") {
+		if strings.HasPrefix(c.Request.URL.Path, "/v1/realtime") ||
+			c.Request.URL.Path == GeminiLivePath {
 			c.Request.Header.Del("Authorization")
 			c.Request.Header.Del("mj-api-secret")
+			c.Request.Header.Del("x-goog-api-key")
 		}
 		c.Next()
 	}

@@ -8,6 +8,7 @@ import (
 
 	rootcommon "github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
@@ -132,6 +133,25 @@ func TestGenRelayInfoDefaultsRequestPolicyWithoutMiddlewareContext(t *testing.T)
 	assert.Equal(t, hosttypes.RoutingStrategyStable, info.RoutingStrategy)
 	assert.Equal(t, types.ConversionLossPolicyStrict, info.ConversionPolicy)
 	assert.Equal(t, types.ConversionLossPolicyStrict, info.ConvOptions().ToolLossPolicy)
+}
+
+func TestGenRelayInfoGeminiLiveForcesSegmentReservation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest("GET", relayconstant.GeminiLivePath, nil)
+
+	info, err := GenRelayInfo(
+		ctx,
+		types.RelayFormatGeminiLive,
+		&dto.BaseRequest{},
+		nil,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, info.ForcePreConsume)
+	assert.True(t, info.StrictQuotaReservation)
+	assert.True(t, info.IsStream)
+	assert.Equal(t, relayconstant.RelayModeGeminiLive, info.RelayMode)
 }
 
 func TestGenRelayInfoCapturesRequestReasoningEffort(t *testing.T) {

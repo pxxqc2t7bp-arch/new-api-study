@@ -27,8 +27,20 @@ const (
 	ContextKeyTokenDefaultConversionPolicy  ContextKey = "token_default_conversion_policy"
 	ContextKeyTokenAllowLossyConversion     ContextKey = "token_allow_lossy_conversion"
 
-	ContextKeyRoutingStrategy  ContextKey = "routing_strategy"
-	ContextKeyConversionPolicy ContextKey = "conversion_policy"
+	ContextKeyRoutingStrategy             ContextKey = "routing_strategy"
+	ContextKeyConversionPolicy            ContextKey = "conversion_policy"
+	ContextKeyRealtimeTicket              ContextKey = "realtime_ticket"
+	ContextKeyRealtimeModel               ContextKey = "realtime_model"
+	ContextKeyRealtimeClientWS            ContextKey = "realtime_client_ws"
+	ContextKeyRealtimeSetup               ContextKey = "realtime_setup"
+	ContextKeyRealtimeMessageType         ContextKey = "realtime_message_type"
+	ContextKeyRealtimeWSOwned             ContextKey = "realtime_ws_owned"
+	ContextKeyRealtimeSetupForwarded      ContextKey = "realtime_setup_forwarded"
+	ContextKeyGeminiLiveUsageEstimated    ContextKey = "gemini_live_usage_estimated"
+	ContextKeyRealtimeQuotaLimit          ContextKey = "realtime_quota_limit"
+	ContextKeyRealtimeWSTerminated        ContextKey = "realtime_ws_terminated"
+	ContextKeyRealtimeFailed              ContextKey = "realtime_failed"
+	ContextKeyRealtimeSettlementUncertain ContextKey = "realtime_settlement_uncertain"
 
 	/* channel related keys */
 	ContextKeyChannelId                ContextKey = "channel_id"

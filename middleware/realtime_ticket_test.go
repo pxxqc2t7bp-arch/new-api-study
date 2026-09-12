@@ -316,3 +316,26 @@ func TestLoggerRedactsRealtimeTicketQuery(t *testing.T) {
 	assert.NotContains(t, output.String(), "never-log-this-ticket")
 	assert.Contains(t, output.String(), "model=gpt-realtime")
 }
+
+func TestLoggerRedactsGeminiLiveKeyQuery(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousWriter := gin.DefaultWriter
+	var output bytes.Buffer
+	gin.DefaultWriter = &output
+	t.Cleanup(func() { gin.DefaultWriter = previousWriter })
+
+	router := gin.New()
+	SetUpLogger(router)
+	router.GET(GeminiLivePath, func(c *gin.Context) {
+		c.Status(http.StatusUnauthorized)
+	})
+	request := httptest.NewRequest(
+		http.MethodGet,
+		GeminiLivePath+"?key=never-log-this-key",
+		nil,
+	)
+	router.ServeHTTP(httptest.NewRecorder(), request)
+
+	assert.NotContains(t, output.String(), "never-log-this-key")
+	assert.Contains(t, output.String(), "key=%2A%2A%2Amasked%2A%2A%2A")
+}

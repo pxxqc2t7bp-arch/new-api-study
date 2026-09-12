@@ -40,6 +40,8 @@ const (
 	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
 	FilterRoutingAccount     ChannelFilterKind = "routing_account"
 	FilterExcludeChannelIDs  ChannelFilterKind = "exclude_channel_ids"
+	FilterChannelTypes       ChannelFilterKind = "channel_types"
+	FilterGeminiLive         ChannelFilterKind = "gemini_live"
 )
 
 type ChannelFilter struct {
@@ -49,6 +51,7 @@ type ChannelFilter struct {
 	TaskPluginChannelTypes []int
 	RoutingAccount         string
 	ExcludedChannelIDs     []int
+	AllowedChannelTypes    []int
 }
 
 type ChannelConstraints struct {

@@ -107,16 +107,39 @@ func GetRealtimeTicket(raw string, modelName string) (*RealtimeTicket, error) {
 	return realtimeTicketFromAuthFlow(flow, modelName)
 }
 
-func normalizeRealtimeTicketInput(raw string, modelName string) (string, string, error) {
-	if !strings.HasPrefix(raw, RealtimeTicketPrefix) {
-		return "", "", ErrAuthFlowInvalid
+func GetRealtimeTicketClaims(raw string) (*RealtimeTicket, error) {
+	raw, err := normalizeRealtimeTicketRaw(raw)
+	if err != nil {
+		return nil, err
 	}
-	raw = strings.TrimPrefix(raw, RealtimeTicketPrefix)
+	flow, err := GetAuthFlow(raw, AuthFlowMatch{Purpose: AuthFlowPurposeRealtimeTicket})
+	if err != nil {
+		return nil, err
+	}
+	return realtimeTicketFromAuthFlow(flow, "")
+}
+
+func normalizeRealtimeTicketInput(raw string, modelName string) (string, string, error) {
+	raw, err := normalizeRealtimeTicketRaw(raw)
+	if err != nil {
+		return "", "", err
+	}
 	modelName = strings.TrimSpace(modelName)
-	if raw == "" || modelName == "" {
+	if modelName == "" {
 		return "", "", ErrAuthFlowInvalid
 	}
 	return raw, modelName, nil
+}
+
+func normalizeRealtimeTicketRaw(raw string) (string, error) {
+	if !strings.HasPrefix(raw, RealtimeTicketPrefix) {
+		return "", ErrAuthFlowInvalid
+	}
+	raw = strings.TrimPrefix(raw, RealtimeTicketPrefix)
+	if raw == "" {
+		return "", ErrAuthFlowInvalid
+	}
+	return raw, nil
 }
 
 func realtimeTicketFromAuthFlow(flow *AuthFlow, modelName string) (*RealtimeTicket, error) {
@@ -130,7 +153,8 @@ func realtimeTicketFromAuthFlow(flow *AuthFlow, modelName string) (*RealtimeTick
 	if err := common.UnmarshalJsonStr(flow.Payload, &payload); err != nil {
 		return nil, ErrAuthFlowInvalid
 	}
-	if flow.UserId <= 0 || payload.TokenId <= 0 || payload.Model != modelName {
+	if flow.UserId <= 0 || payload.TokenId <= 0 ||
+		(modelName != "" && payload.Model != modelName) {
 		return nil, ErrRealtimeTicketBinding
 	}
 	var ok bool

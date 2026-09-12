@@ -95,15 +95,37 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 			return
 		}
 		defer ws.Close()
+	} else if relayFormat == types.RelayFormatGeminiLive {
+		var ok bool
+		ws, ok = common.GetContextKeyType[*websocket.Conn](
+			c,
+			constant.ContextKeyRealtimeClientWS,
+		)
+		if !ok || ws == nil ||
+			!common.GetContextKeyBool(c, constant.ContextKeyRealtimeWSOwned) {
+			logger.LogError(c, "Gemini Live downstream websocket is missing")
+			return
+		}
 	}
 
 	defer func() {
 		if newAPIError != nil {
+			if relayFormat == types.RelayFormatGeminiLive {
+				common.SetContextKey(c, constant.ContextKeyRealtimeFailed, true)
+			}
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				helper.WssError(c, ws, newAPIError.ToOpenAIError())
+			case types.RelayFormatGeminiLive:
+				if !common.GetContextKeyBool(c, constant.ContextKeyRealtimeWSTerminated) {
+					middleware.WriteGeminiLiveError(
+						ws,
+						newAPIError.StatusCode,
+						newAPIError.Error(),
+					)
+				}
 			case types.RelayFormatClaude:
 				c.JSON(newAPIError.StatusCode, gin.H{
 					"type":  "error",
@@ -186,7 +208,7 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 		// Only return quota if downstream failed and quota was actually pre-consumed
 		if newAPIError != nil {
 			newAPIError = service.NormalizeViolationFeeError(newAPIError)
-			if relayInfo.Billing != nil {
+			if relayInfo.Billing != nil && shouldRefundFailedRelay(c) {
 				relayInfo.Billing.Refund(c)
 			}
 			service.ChargeViolationFeeIfNeeded(c, relayInfo, newAPIError)
@@ -272,6 +294,8 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 		switch relayFormat {
 		case types.RelayFormatOpenAIRealtime:
 			newAPIError = relay.WssHelper(c, relayInfo)
+		case types.RelayFormatGeminiLive:
+			newAPIError = relay.GeminiLiveHelper(c, relayInfo)
 		case types.RelayFormatClaude:
 			newAPIError = relay.ClaudeHelper(c, relayInfo)
 		case types.RelayFormatGemini:
@@ -325,6 +349,13 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 			perfmetrics.RecordRelaySample(relayInfo, false, 0)
 		})
 	}
+}
+
+func shouldRefundFailedRelay(c *gin.Context) bool {
+	return !common.GetContextKeyBool(
+		c,
+		constant.ContextKeyRealtimeSettlementUncertain,
+	)
 }
 
 // CountClaudeTokens implements Anthropic's token-counting utility endpoint.
@@ -452,6 +483,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 		}
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
+		return false
+	}
+	if common.GetContextKeyBool(c, constant.ContextKeyRealtimeSetupForwarded) {
 		return false
 	}
 	if types.IsSkipRetryError(openaiErr) {

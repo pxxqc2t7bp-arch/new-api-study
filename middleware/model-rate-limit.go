@@ -124,7 +124,7 @@ func redisRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) g
 		c.Next()
 
 		// 5. 如果请求成功，记录成功请求
-		if c.Writer.Status() < 400 {
+		if requestSucceeded(c) {
 			recordRedisRequest(ctx, rdb, successKey, successMaxCount)
 		}
 	}
@@ -141,8 +141,7 @@ func memoryRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) 
 
 		// 1. 检查总请求数限制（当totalMaxCount为0时跳过）
 		if totalMaxCount > 0 && !inMemoryRateLimiter.Request(totalKey, totalMaxCount, duration) {
-			c.Status(http.StatusTooManyRequests)
-			c.Abort()
+			abortWithOpenAiMessage(c, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
 
@@ -150,8 +149,7 @@ func memoryRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) 
 		// 使用一个临时key来检查限制，这样可以避免实际记录
 		checkKey := successKey + "_check"
 		if !inMemoryRateLimiter.Request(checkKey, successMaxCount, duration) {
-			c.Status(http.StatusTooManyRequests)
-			c.Abort()
+			abortWithOpenAiMessage(c, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		}
 
@@ -159,7 +157,7 @@ func memoryRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) 
 		c.Next()
 
 		// 4. 如果请求成功，记录到实际的成功请求计数中
-		if c.Writer.Status() < 400 {
+		if requestSucceeded(c) {
 			inMemoryRateLimiter.Request(successKey, successMaxCount, duration)
 		}
 	}
