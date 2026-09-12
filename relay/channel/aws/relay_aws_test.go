@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
@@ -317,6 +318,30 @@ func TestAwsHandlersCancelSdkRequestAndSkipRetry(t *testing.T) {
 			assert.Nil(t, result.usage)
 		})
 	}
+}
+
+func TestAwsStreamMarksRecoverySubmissionAtSdkBoundary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	submissionObserved := make(chan bool, 1)
+	client := newAwsTestClient(awsHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+		submissionObserved <- true
+		return nil, errors.New("ambiguous transport failure")
+	}))
+	context := newAwsTestContext(httptest.NewRecorder(), context.Background())
+	common.SetContextKey(context, constant.ContextKeyStreamRecoveryWorker, true)
+	adaptor := &Adaptor{
+		AwsClient: client,
+		AwsReq:    newAwsStreamInput(),
+	}
+
+	apiErr, _ := awsStreamHandler(context, newAwsTestRelayInfo(), adaptor)
+
+	require.NotNil(t, apiErr)
+	assert.True(t, <-submissionObserved)
+	assert.True(t, common.GetContextKeyBool(
+		context,
+		constant.ContextKeyStreamRecoverySubmissionStarted,
+	))
 }
 
 func TestAwsStreamHandlerUsesFinalUpstreamUsage(t *testing.T) {

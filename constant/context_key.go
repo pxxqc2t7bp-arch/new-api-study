@@ -89,10 +89,13 @@ const (
 	ContextKeyLanguage ContextKey = "language"
 	ContextKeyIsStream ContextKey = "is_stream"
 
-	ContextKeyStreamRecoveryWorker ContextKey = "stream_recovery_worker"
-	ContextKeyStreamRecoveryID     ContextKey = "stream_recovery_id"
-	ContextKeyStreamRecoveryRunner ContextKey = "stream_recovery_runner"
-	ContextKeyStreamRecoveryBroker ContextKey = "stream_recovery_broker"
+	ContextKeyStreamRecoveryWorker            ContextKey = "stream_recovery_worker"
+	ContextKeyStreamRecoveryID                ContextKey = "stream_recovery_id"
+	ContextKeyStreamRecoveryRunner            ContextKey = "stream_recovery_runner"
+	ContextKeyStreamRecoveryBroker            ContextKey = "stream_recovery_broker"
+	ContextKeyStreamRecoveryReplayUnsafe      ContextKey = "stream_recovery_replay_unsafe"
+	ContextKeyStreamRecoverySubmissionStarted ContextKey = "stream_recovery_submission_started"
+	ContextKeyStreamRecoveryBillingUncertain  ContextKey = "stream_recovery_billing_uncertain"
 
 	// ContextKeyAuditLogged marks that the current request has already recorded
 	// a manage/operation audit log inside the handler. When set, the admin-audit

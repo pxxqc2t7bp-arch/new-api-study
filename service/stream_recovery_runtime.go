@@ -16,9 +16,10 @@ import (
 )
 
 type StreamRecoveryIdentity struct {
-	DedupeKey     string
-	RequestDigest string
-	QueryIDSource string
+	DedupeKey       string
+	LegacyDedupeKey string
+	RequestDigest   string
+	QueryIDSource   string
 }
 
 type StreamRecoveryRuntime struct {
@@ -34,7 +35,8 @@ var streamRecoveryRuntimeCache struct {
 
 func GetStreamRecoveryRuntime() (*StreamRecoveryRuntime, error) {
 	setting := operation_setting.GetStreamRecoverySetting()
-	if !setting.Enabled {
+	if !setting.Enabled &&
+		setting.IdentityMode != operation_setting.StreamRecoveryIdentityModeDraining {
 		return nil, errors.New("stream recovery is disabled")
 	}
 	if !common.RedisEnabled || common.RDB == nil {
@@ -109,16 +111,28 @@ func BuildStreamRecoveryIdentity(
 		requestPath,
 		modelName,
 		zcodeSessionID,
+		sourceName,
 		identitySource,
-		requestDigest,
 	)
 	if err != nil {
 		return StreamRecoveryIdentity{}, fmt.Errorf("build stream recovery dedupe key: %w", err)
 	}
+	legacyDedupeKey, err := keyring.DedupeKey(
+		strconv.Itoa(tokenID),
+		requestPath,
+		modelName,
+		zcodeSessionID,
+		identitySource,
+		requestDigest,
+	)
+	if err != nil {
+		return StreamRecoveryIdentity{}, fmt.Errorf("build legacy stream recovery dedupe key: %w", err)
+	}
 	return StreamRecoveryIdentity{
-		DedupeKey:     dedupeKey,
-		RequestDigest: requestDigest,
-		QueryIDSource: sourceName,
+		DedupeKey:       dedupeKey,
+		LegacyDedupeKey: legacyDedupeKey,
+		RequestDigest:   requestDigest,
+		QueryIDSource:   sourceName,
 	}, nil
 }
 

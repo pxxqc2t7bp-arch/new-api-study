@@ -115,6 +115,12 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 			}
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
+			if getStreamRecoveryWriter(c) != nil {
+				if err := writeStreamRecoveryRelayError(c, relayFormat, newAPIError); err != nil {
+					logger.LogError(c, "write stream recovery error: "+err.Error())
+				}
+				return
+			}
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
 				helper.WssError(c, ws, newAPIError.ToOpenAIError())
@@ -155,11 +161,6 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
 	}
-	if recoveryWriter := getStreamRecoveryWriter(c); recoveryWriter != nil &&
-		recoveryWriter.Attempt() > 1 {
-		relayInfo.InitChannelMeta(c)
-	}
-
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
 	needCountToken := constant.CountToken
 	// Avoid building huge CombineText (strings.Join) when token counting and sensitive check are both disabled.
@@ -225,6 +226,12 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
 	maxRetries := service.AdaptiveRetryTimes(retryParam)
+	recoveryWriter := getStreamRecoveryWriter(c)
+	recoveryBaseAttempt := 0
+	if recoveryWriter != nil {
+		recoveryBaseAttempt = recoveryWriter.Attempt()
+		maxRetries = capStreamRecoveryRetries(c, maxRetries)
+	}
 	failoverDeadline := time.Now().Add(time.Duration(operation_setting.GetUpstreamOrchestrationSetting().FailoverBudgetSeconds) * time.Second)
 
 	for ; retryParam.GetRetry() <= maxRetries; retryParam.IncreaseRetry() {
@@ -241,8 +248,9 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = channelErr
 			break
 		}
-		if recoveryWriter := getStreamRecoveryWriter(c); recoveryWriter != nil {
-			attempt := retryParam.GetRetry() + 1
+		if recoveryWriter != nil {
+			relayInfo.InitChannelMeta(c)
+			attempt := recoveryBaseAttempt + retryParam.GetRetry()
 			if attempt != recoveryWriter.Attempt() {
 				errorMessage := ""
 				if relayInfo.LastError != nil {
@@ -256,16 +264,20 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 					newAPIError = types.NewError(rotateErr, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
 					break
 				}
-			}
-			if attemptErr := model.StartStreamExecutionAttempt(
-				recoveryWriter.StreamID(),
-				common.GetContextKeyString(c, constant.ContextKeyStreamRecoveryRunner),
-				attempt,
-				channel.Id,
-				c.GetString("channel_fallback_reason"),
-			); attemptErr != nil {
-				newAPIError = types.NewError(attemptErr, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
-				break
+				if attemptErr := model.StartStreamExecutionAttempt(
+					recoveryWriter.StreamID(),
+					common.GetContextKeyString(c, constant.ContextKeyStreamRecoveryRunner),
+					attempt,
+					channel.Id,
+					c.GetString("channel_fallback_reason"),
+				); attemptErr != nil {
+					newAPIError = types.NewError(attemptErr, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+					break
+				}
+				if publishErr := recoveryWriter.PublishAttempt(); publishErr != nil {
+					newAPIError = types.NewError(publishErr, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+					break
+				}
 			}
 			if stateErr := recoveryWriter.MarkAttemptState("running", ""); stateErr != nil {
 				newAPIError = types.NewError(stateErr, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
@@ -288,6 +300,32 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 			}
 			break
 		}
+		if recoveryWriter != nil {
+			body, bytesErr := bodyStorage.Bytes()
+			if bytesErr != nil {
+				newAPIError = types.NewErrorWithStatusCode(
+					bytesErr,
+					types.ErrorCodeReadRequestBodyFailed,
+					http.StatusBadRequest,
+					types.ErrOptionWithSkipRetry(),
+				)
+				break
+			}
+			if safetyErr := updateStreamRecoveryReplaySafetyForAttempt(
+				c,
+				relayFormat,
+				relayInfo,
+				body,
+			); safetyErr != nil {
+				newAPIError = types.NewErrorWithStatusCode(
+					safetyErr,
+					types.ErrorCodeInvalidRequest,
+					http.StatusBadRequest,
+					types.ErrOptionWithSkipRetry(),
+				)
+				break
+			}
+		}
 		c.Request.Body = io.NopCloser(bodyStorage)
 
 		attemptStartedAt := time.Now()
@@ -302,6 +340,13 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = geminiRelayHandler(c, relayInfo)
 		default:
 			newAPIError = relayHandler(c, relayInfo)
+		}
+		if recoveryWriter != nil {
+			markStreamRecoveryConversionUnsafe(
+				c,
+				relayFormat,
+				relayInfo.GetFinalRequestRelayFormat(),
+			)
 		}
 		if newAPIError == nil {
 			if recoveryWriter := getStreamRecoveryWriter(c); recoveryWriter != nil &&
@@ -334,7 +379,15 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
 		c.Set("channel_fallback_reason", fmt.Sprintf("status_%d:%s", newAPIError.StatusCode, newAPIError.GetErrorCode()))
 
-		if !shouldRetry(c, newAPIError, maxRetries-retryParam.GetRetry()) {
+		retry, replacement := retryDecision(
+			c,
+			newAPIError,
+			maxRetries-retryParam.GetRetry(),
+		)
+		if replacement != nil {
+			newAPIError = replacement
+		}
+		if !retry {
 			break
 		}
 	}
@@ -352,6 +405,23 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 }
 
 func shouldRefundFailedRelay(c *gin.Context) bool {
+	if writer := getStreamRecoveryWriter(c); writer != nil &&
+		(writer.HasBusinessOutput() ||
+			(common.GetContextKeyString(
+				c,
+				constant.ContextKeyStreamRecoveryReplayUnsafe,
+			) != "" &&
+				common.GetContextKeyBool(
+					c,
+					constant.ContextKeyStreamRecoverySubmissionStarted,
+				))) {
+		common.SetContextKey(
+			c,
+			constant.ContextKeyStreamRecoveryBillingUncertain,
+			true,
+		)
+		return false
+	}
 	return !common.GetContextKeyBool(
 		c,
 		constant.ContextKeyRealtimeSettlementUncertain,
@@ -473,47 +543,67 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 }
 
 func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
+	retry, _ := retryDecision(c, openaiErr, retryTimes)
+	return retry
+}
+
+func retryDecision(
+	c *gin.Context,
+	openaiErr *types.NewAPIError,
+	retryTimes int,
+) (bool, *types.NewAPIError) {
 	if openaiErr == nil {
-		return false
+		return false, nil
 	}
 	if c != nil && c.Writer != nil && c.Writer.Written() {
 		recoveryWriter := getStreamRecoveryWriter(c)
-		if recoveryWriter == nil || recoveryWriter.Terminal() {
-			return false
+		if recoveryWriter == nil ||
+			recoveryWriter.HasBusinessOutput() ||
+			recoveryWriter.Terminal() {
+			return false, nil
 		}
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
-		return false
+		return false, nil
 	}
 	if common.GetContextKeyBool(c, constant.ContextKeyRealtimeSetupForwarded) {
-		return false
+		return false, nil
 	}
 	if types.IsSkipRetryError(openaiErr) {
-		return false
+		return false, nil
 	}
+	retry := false
 	if c != nil && service.IsManagedChannel(c.GetInt("channel_id")) {
-		return retryTimes > 0 && service.ShouldRecordManagedRouteFailure(openaiErr)
+		retry = retryTimes > 0 && service.ShouldRecordManagedRouteFailure(openaiErr)
+	} else if types.IsChannelError(openaiErr) {
+		retry = true
+	} else if retryTimes > 0 && !service.GetChannelConstraints(c).SuppressesRetry() {
+		code := openaiErr.StatusCode
+		switch {
+		case code >= 200 && code < 300:
+			retry = false
+		case code < 100 || code > 599:
+			retry = true
+		case operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()):
+			retry = false
+		default:
+			retry = operation_setting.ShouldRetryByStatusCode(code)
+		}
 	}
-	if types.IsChannelError(openaiErr) {
-		return true
+	if !retry {
+		return false, nil
 	}
-	if retryTimes <= 0 {
-		return false
+	if getStreamRecoveryWriter(c) == nil {
+		return true, nil
 	}
-	if service.GetChannelConstraints(c).SuppressesRetry() {
-		return false
+	reason := common.GetContextKeyString(
+		c,
+		constant.ContextKeyStreamRecoveryReplayUnsafe,
+	)
+	if reason == "" {
+		return true, nil
 	}
-	code := openaiErr.StatusCode
-	if code >= 200 && code < 300 {
-		return false
-	}
-	if code < 100 || code > 599 {
-		return true
-	}
-	if operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
-		return false
-	}
-	return operation_setting.ShouldRetryByStatusCode(code)
+	return false, newStatefulReplayUnsafeAPIError(reason)
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {

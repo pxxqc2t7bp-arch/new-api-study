@@ -36,10 +36,13 @@ func streamRecoveryTerminalError(
 			http.StatusBadGateway,
 		)
 	}
-	if writer.Terminal() {
+	if writer.Terminal() && !writer.FailedTerminal() {
 		return nil
 	}
 	message := "stream ended without a protocol terminal event"
+	if writer.FailedTerminal() {
+		message = "stream ended with a protocol error event"
+	}
 	if info != nil && info.StreamStatus != nil {
 		message = info.StreamStatus.Summary()
 	}

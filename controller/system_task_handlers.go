@@ -28,6 +28,7 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(upstreamProbeHandler{})
 	service.RegisterSystemTaskHandler(upstreamReconcileHandler{})
 	service.RegisterSystemTaskHandler(upstreamDailyHandler{})
+	service.RegisterSystemTaskHandler(streamRecoveryReconcileHandler{})
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and
@@ -293,6 +294,48 @@ func (upstreamDailyHandler) NewPayload() any { return nil }
 
 func (upstreamDailyHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	summary, err := service.RunUpstreamDailyMaintenance(ctx, time.Now())
+	status := model.SystemTaskStatusSucceeded
+	if err != nil {
+		status = model.SystemTaskStatusFailed
+	}
+	finishSystemTaskHandler(task, runnerID, status, summary, err)
+}
+
+type streamRecoveryReconcileHandler struct{}
+
+func (streamRecoveryReconcileHandler) Type() string {
+	return model.SystemTaskTypeStreamRecoveryReconcile
+}
+
+func (streamRecoveryReconcileHandler) Enabled() bool {
+	setting := operation_setting.GetStreamRecoverySetting()
+	return setting.Enabled ||
+		setting.IdentityMode == operation_setting.StreamRecoveryIdentityModeDraining
+}
+
+func (streamRecoveryReconcileHandler) Interval() time.Duration {
+	return 15 * time.Second
+}
+
+func (streamRecoveryReconcileHandler) NewPayload() any {
+	return nil
+}
+
+func (streamRecoveryReconcileHandler) Run(
+	ctx context.Context,
+	task *model.SystemTask,
+	runnerID string,
+) {
+	runtime, err := service.GetStreamRecoveryRuntime()
+	summary := streamRecoveryReconcileSummary{}
+	if err == nil {
+		summary, err = reconcileExpiredStreamExecutions(
+			ctx,
+			runtime.Store,
+			common.GetTimestamp(),
+			100,
+		)
+	}
 	status := model.SystemTaskStatusSucceeded
 	if err != nil {
 		status = model.SystemTaskStatusFailed

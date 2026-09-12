@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -15,7 +17,118 @@ var (
 	ErrStreamRecoveryStoreUnavailable = errors.New("stream recovery store is unavailable")
 	ErrStreamRecoveryEventLimit       = errors.New("stream recovery event limit exceeded")
 	ErrStreamRecoveryByteLimit        = errors.New("stream recovery byte limit exceeded")
+	ErrStreamRecoveryFrameNotFound    = errors.New("stream recovery frame not found")
+	ErrStreamRecoveryFrameChanged     = errors.New("stream recovery frame changed")
 )
+
+var appendStreamRecoveryFrameScript = redis.NewScript(`
+if redis.call("HEXISTS", KEYS[4], ARGV[1]) == 1 then
+  return redis.error_reply("STREAM_RECOVERY_SEQUENCE_EXISTS")
+end
+local size = tonumber(redis.call("GET", KEYS[2]) or "0")
+local next_size = size + tonumber(ARGV[6])
+if next_size > tonumber(ARGV[7]) then
+  return ""
+end
+local generation = redis.call("INCR", KEYS[3])
+local redis_id = ARGV[1] .. "-" .. generation
+redis.call(
+  "XADD",
+  KEYS[1],
+  "MAXLEN",
+  "~",
+  ARGV[8],
+  redis_id,
+  "sequence",
+  ARGV[1],
+  "kind",
+  ARGV[2],
+  "data",
+  ARGV[3],
+  "terminal",
+  ARGV[4],
+  "rollback_token",
+  ARGV[5]
+)
+redis.call("HSET", KEYS[4], ARGV[1], ARGV[5] .. "|" .. redis_id)
+redis.call("SET", KEYS[2], next_size)
+redis.call("PEXPIRE", KEYS[1], ARGV[9])
+redis.call("PEXPIRE", KEYS[2], ARGV[9])
+redis.call("PEXPIRE", KEYS[3], ARGV[9])
+redis.call("PEXPIRE", KEYS[4], ARGV[9])
+return redis_id
+`)
+
+var rollbackStreamRecoveryFrameScript = redis.NewScript(`
+local owner = redis.call("HGET", KEYS[3], ARGV[1])
+if owner == false then
+  if ARGV[3] ~= "" or ARGV[2] ~= ARGV[1] .. "-0" then
+    return 0
+  end
+elseif owner ~= ARGV[3] .. "|" .. ARGV[2] then
+  return -1
+end
+local entries = redis.call("XRANGE", KEYS[1], ARGV[2], ARGV[2], "COUNT", 1)
+if #entries ~= 1 then
+  return 0
+end
+local fields = entries[1][2]
+local rollback_token = nil
+for index = 1, #fields, 2 do
+  if fields[index] == "rollback_token" then
+    rollback_token = fields[index + 1]
+    break
+  end
+end
+if owner ~= false and rollback_token ~= ARGV[3] then
+  return -1
+end
+local removed = redis.call("XDEL", KEYS[1], ARGV[2])
+if removed == 1 then
+  redis.call("HDEL", KEYS[3], ARGV[1])
+  local size = redis.call("DECRBY", KEYS[2], ARGV[4])
+  if size < 0 then
+    redis.call("SET", KEYS[2], 0)
+  end
+end
+return removed
+`)
+
+var sealStreamRecoveryFrameScript = redis.NewScript(`
+local sealed_owner = "sealed|" .. ARGV[2]
+local owner = redis.call("HGET", KEYS[2], ARGV[1])
+local already_sealed = owner == sealed_owner
+if owner == false then
+  if ARGV[3] ~= "" then
+    return -1
+  end
+elseif not already_sealed and owner ~= ARGV[3] .. "|" .. ARGV[2] then
+  return -1
+end
+local entries = redis.call("XRANGE", KEYS[1], ARGV[2], ARGV[2], "COUNT", 1)
+if #entries ~= 1 then
+  return 0
+end
+local fields = entries[1][2]
+local sequence = string.match(ARGV[2], "^(%d+)-")
+local rollback_token = ""
+for index = 1, #fields, 2 do
+  if fields[index] == "sequence" then
+    sequence = fields[index + 1]
+  elseif fields[index] == "rollback_token" then
+    rollback_token = fields[index + 1]
+  end
+end
+if sequence ~= ARGV[1] then
+  return -1
+end
+if rollback_token ~= ARGV[3] then
+  return -1
+end
+redis.call("HSET", KEYS[2], ARGV[1], sealed_owner)
+redis.call("PEXPIRE", KEYS[2], ARGV[4])
+return 1
+`)
 
 type StreamRecoveryStoreConfig struct {
 	TTL                  time.Duration
@@ -24,10 +137,12 @@ type StreamRecoveryStoreConfig struct {
 }
 
 type StreamRecoveryFrame struct {
-	Sequence int64
-	Kind     string
-	Data     []byte
-	Terminal bool
+	Sequence      int64
+	Kind          string
+	Data          []byte
+	Terminal      bool
+	RollbackToken string
+	RedisID       string
 }
 
 type StreamRecoveryAttemptState struct {
@@ -119,23 +234,34 @@ func (store *StreamRecoveryStore) AppendFrame(
 	attempt int,
 	frame StreamRecoveryFrame,
 ) error {
+	_, err := store.AppendFrameForRollback(ctx, streamID, attempt, frame)
+	return err
+}
+
+func (store *StreamRecoveryStore) AppendFrameForRollback(
+	ctx context.Context,
+	streamID string,
+	attempt int,
+	frame StreamRecoveryFrame,
+) (StreamRecoveryFrame, error) {
 	if frame.Sequence <= 0 {
-		return errors.New("stream recovery frame sequence must be positive")
+		return StreamRecoveryFrame{}, errors.New(
+			"stream recovery frame sequence must be positive",
+		)
 	}
 	if frame.Sequence > store.config.MaxEventsPerAttempt {
-		return ErrStreamRecoveryEventLimit
+		return StreamRecoveryFrame{}, ErrStreamRecoveryEventLimit
 	}
+	rollbackTokenBytes := make([]byte, 32)
+	if _, err := rand.Read(rollbackTokenBytes); err != nil {
+		return StreamRecoveryFrame{}, fmt.Errorf(
+			"generate stream recovery rollback token: %w",
+			err,
+		)
+	}
+	frame.RollbackToken = hex.EncodeToString(rollbackTokenBytes)
 
 	sizeKey := store.sizeKey(streamID)
-	size, err := store.client.IncrBy(ctx, sizeKey, int64(len(frame.Data))).Result()
-	if err != nil {
-		return err
-	}
-	if size > store.config.MaxBytesPerExecution {
-		_ = store.client.DecrBy(ctx, sizeKey, int64(len(frame.Data))).Err()
-		return ErrStreamRecoveryByteLimit
-	}
-
 	streamKey := store.eventsKey(streamID, attempt)
 	terminal := "0"
 	if frame.Terminal {
@@ -146,29 +272,155 @@ func (store *StreamRecoveryStore) AppendFrame(
 		streamRecoveryFrameAAD(streamID, attempt, frame.Sequence),
 	)
 	if err != nil {
-		_ = store.client.DecrBy(ctx, sizeKey, int64(len(frame.Data))).Err()
-		return err
+		return StreamRecoveryFrame{}, err
 	}
-	err = store.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: streamKey,
-		ID:     fmt.Sprintf("%d-0", frame.Sequence),
-		MaxLen: store.config.MaxEventsPerAttempt,
-		Approx: true,
-		Values: map[string]any{
-			"kind":     frame.Kind,
-			"data":     encrypted,
-			"terminal": terminal,
+	redisID, err := appendStreamRecoveryFrameScript.Run(
+		ctx,
+		store.client,
+		[]string{
+			streamKey,
+			sizeKey,
+			store.generationKey(streamID, attempt),
+			store.sequenceOwnerKey(streamID, attempt),
 		},
-	}).Err()
+		frame.Sequence,
+		frame.Kind,
+		encrypted,
+		terminal,
+		frame.RollbackToken,
+		len(frame.Data),
+		store.config.MaxBytesPerExecution,
+		store.config.MaxEventsPerAttempt,
+		store.config.TTL.Milliseconds(),
+	).Text()
 	if err != nil {
-		_ = store.client.DecrBy(ctx, sizeKey, int64(len(frame.Data))).Err()
+		if strings.Contains(err.Error(), "STREAM_RECOVERY_SEQUENCE_EXISTS") {
+			return StreamRecoveryFrame{}, ErrStreamRecoveryFrameChanged
+		}
+		return StreamRecoveryFrame{}, err
+	}
+	if redisID == "" {
+		return StreamRecoveryFrame{}, ErrStreamRecoveryByteLimit
+	}
+	frame.RedisID = redisID
+	return frame, nil
+}
+
+func (store *StreamRecoveryStore) RollbackFrame(
+	ctx context.Context,
+	streamID string,
+	attempt int,
+	frame StreamRecoveryFrame,
+) error {
+	if frame.Sequence <= 0 {
+		return errors.New("stream recovery frame sequence must be positive")
+	}
+	if frame.RedisID == "" {
+		return ErrStreamRecoveryFrameChanged
+	}
+	removed, err := rollbackStreamRecoveryFrameScript.Run(
+		ctx,
+		store.client,
+		[]string{
+			store.eventsKey(streamID, attempt),
+			store.sizeKey(streamID),
+			store.sequenceOwnerKey(streamID, attempt),
+		},
+		frame.Sequence,
+		frame.RedisID,
+		frame.RollbackToken,
+		len(frame.Data),
+	).Int64()
+	if err != nil {
 		return err
 	}
-	pipe := store.client.TxPipeline()
-	pipe.Expire(ctx, streamKey, store.config.TTL)
-	pipe.Expire(ctx, sizeKey, store.config.TTL)
-	_, err = pipe.Exec(ctx)
-	return err
+	if removed == -1 {
+		return ErrStreamRecoveryFrameChanged
+	}
+	if removed != 1 {
+		return ErrStreamRecoveryFrameNotFound
+	}
+	return nil
+}
+
+func (store *StreamRecoveryStore) SealFrame(
+	ctx context.Context,
+	streamID string,
+	attempt int,
+	frame StreamRecoveryFrame,
+) error {
+	if frame.Sequence <= 0 {
+		return errors.New("stream recovery frame sequence must be positive")
+	}
+	if frame.RedisID == "" {
+		return ErrStreamRecoveryFrameChanged
+	}
+	sealed, err := sealStreamRecoveryFrameScript.Run(
+		ctx,
+		store.client,
+		[]string{
+			store.eventsKey(streamID, attempt),
+			store.sequenceOwnerKey(streamID, attempt),
+		},
+		frame.Sequence,
+		frame.RedisID,
+		frame.RollbackToken,
+		store.config.TTL.Milliseconds(),
+	).Int64()
+	if err != nil {
+		return err
+	}
+	if sealed == -1 {
+		return ErrStreamRecoveryFrameChanged
+	}
+	if sealed != 1 {
+		return ErrStreamRecoveryFrameNotFound
+	}
+	return nil
+}
+
+func (store *StreamRecoveryStore) HasBusinessOutputThrough(
+	ctx context.Context,
+	streamID string,
+	attempt int,
+	throughSequence int64,
+) (bool, bool, error) {
+	if throughSequence <= 0 {
+		return false, true, nil
+	}
+	var afterSequence int64
+	expectedSequence := int64(1)
+	for afterSequence < throughSequence {
+		limit := min(int64(256), throughSequence-afterSequence)
+		frames, err := store.ReadFrames(
+			ctx,
+			streamID,
+			attempt,
+			afterSequence,
+			limit,
+		)
+		if err != nil {
+			return false, false, err
+		}
+		if len(frames) == 0 {
+			return false, false, nil
+		}
+		for _, frame := range frames {
+			if frame.Sequence != expectedSequence ||
+				frame.Sequence > throughSequence {
+				return false, false, nil
+			}
+			if StreamRecoveryFrameHasBusinessData(frame.Data) {
+				return true, true, nil
+			}
+			afterSequence = frame.Sequence
+			expectedSequence++
+			if afterSequence == throughSequence {
+				return false, true, nil
+			}
+		}
+	}
+	return false, true, nil
 }
 
 func (store *StreamRecoveryStore) ReadFrames(
@@ -183,7 +435,7 @@ func (store *StreamRecoveryStore) ReadFrames(
 	}
 	start := "-"
 	if afterSequence > 0 {
-		start = fmt.Sprintf("(%d-0", afterSequence)
+		start = fmt.Sprintf("(%d-%d", afterSequence, ^uint64(0))
 	}
 	messages, err := store.client.XRangeN(
 		ctx,
@@ -215,7 +467,7 @@ func (store *StreamRecoveryStore) WaitFrames(
 ) ([]StreamRecoveryFrame, error) {
 	lastID := "0-0"
 	if afterSequence > 0 {
-		lastID = fmt.Sprintf("%d-0", afterSequence)
+		lastID = fmt.Sprintf("%d-%d", afterSequence, ^uint64(0))
 	}
 	results, err := store.client.XRead(ctx, &redis.XReadArgs{
 		Streams: []string{store.eventsKey(streamID, attempt), lastID},
@@ -318,6 +570,8 @@ func (store *StreamRecoveryStore) DeleteExecution(
 			keys,
 			store.eventsKey(streamID, attempt),
 			store.attemptStateKey(streamID, attempt),
+			store.generationKey(streamID, attempt),
+			store.sequenceOwnerKey(streamID, attempt),
 		)
 	}
 	return store.client.Del(ctx, keys...).Err()
@@ -336,9 +590,15 @@ func (store *StreamRecoveryStore) decodeStreamRecoveryFrame(
 	attempt int,
 	message redis.XMessage,
 ) (StreamRecoveryFrame, error) {
-	sequenceText, _, ok := strings.Cut(message.ID, "-")
+	sequenceText, ok := redisString(message.Values["sequence"])
 	if !ok {
-		return StreamRecoveryFrame{}, fmt.Errorf("invalid stream recovery event id %q", message.ID)
+		sequenceText, _, ok = strings.Cut(message.ID, "-")
+		if !ok {
+			return StreamRecoveryFrame{}, fmt.Errorf(
+				"invalid stream recovery event id %q",
+				message.ID,
+			)
+		}
 	}
 	sequence, err := strconv.ParseInt(sequenceText, 10, 64)
 	if err != nil {
@@ -357,11 +617,14 @@ func (store *StreamRecoveryStore) decodeStreamRecoveryFrame(
 	}
 	kind, _ := redisString(message.Values["kind"])
 	terminal, _ := redisString(message.Values["terminal"])
+	rollbackToken, _ := redisString(message.Values["rollback_token"])
 	return StreamRecoveryFrame{
-		Sequence: sequence,
-		Kind:     kind,
-		Data:     plaintext,
-		Terminal: terminal == "1",
+		Sequence:      sequence,
+		Kind:          kind,
+		Data:          plaintext,
+		Terminal:      terminal == "1",
+		RollbackToken: rollbackToken,
+		RedisID:       message.ID,
 	}, nil
 }
 
@@ -394,4 +657,12 @@ func (store *StreamRecoveryStore) publicAttemptKey(streamID string) string {
 
 func (store *StreamRecoveryStore) sizeKey(streamID string) string {
 	return "newapi:stream:v1:" + streamID + ":bytes"
+}
+
+func (store *StreamRecoveryStore) generationKey(streamID string, attempt int) string {
+	return fmt.Sprintf("newapi:stream:v1:%s:attempt:%d:generation", streamID, attempt)
+}
+
+func (store *StreamRecoveryStore) sequenceOwnerKey(streamID string, attempt int) string {
+	return fmt.Sprintf("newapi:stream:v1:%s:attempt:%d:owners", streamID, attempt)
 }
