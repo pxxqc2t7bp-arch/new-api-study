@@ -47,7 +47,7 @@ terminate_active_command() {
 
 cleanup_resources() {
   if ((${#containers[@]} > 0)); then
-    docker rm -f "${containers[@]}" >/dev/null 2>&1 || true
+    docker rm -fv "${containers[@]}" >/dev/null 2>&1 || true
   fi
   if ((${#networks[@]} > 0)); then
     docker network rm "${networks[@]}" >/dev/null 2>&1 || true

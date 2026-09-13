@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -300,10 +301,48 @@ func MigrateAppPluginTables(db *gorm.DB) error {
 	); err != nil {
 		return err
 	}
-	return nil
+	return db.Transaction(func(tx *gorm.DB) error {
+		var routeClaims []AppRouteClaim
+		if err := tx.Where("kind <> ?", "app_key").Find(&routeClaims).Error; err != nil {
+			return err
+		}
+		for _, claim := range routeClaims {
+			expected := appRouteClaim(claim.AppKey, claim.InstallationID, claim.Kind, claim.AbsoluteEndpoint)
+			if claim.ClaimKey == expected.ClaimKey {
+				continue
+			}
+			if err := tx.Model(&AppRouteClaim{}).
+				Where("id = ?", claim.ID).
+				Update("claim_key", expected.ClaimKey).Error; err != nil {
+				return err
+			}
+		}
+
+		var installations []AppInstallation
+		if err := tx.Where("status <> ?", AppInstallationStatusRevoked).
+			Order("id").
+			Find(&installations).Error; err != nil {
+			return err
+		}
+		for _, installation := range installations {
+			claim := appKeyClaim(installation.AppKey, installation.InstallationID)
+			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "claim_key"}}, DoNothing: true}).
+				Create(&claim).Error; err != nil {
+				return err
+			}
+			var stored AppRouteClaim
+			if err := tx.Where("claim_key = ?", claim.ClaimKey).First(&stored).Error; err != nil {
+				return err
+			}
+			if stored.InstallationID != installation.InstallationID || stored.Kind != "app_key" {
+				return ErrAppRouteClaimConflict
+			}
+		}
+		return nil
+	})
 }
 
-// InstallAppVersion persists a request already validated and assembled by the host service.
+// InstallAppVersion persists a trusted host request already validated and assembled by the host service.
 // These checks are defense in depth for cheap cross-field and storage invariants, not a
 // replacement for service.ValidateAppManifest at the external boundary.
 func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencyScope, req AppInstallRequest) (AppInstallResult, error) {
@@ -354,7 +393,19 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 			return nil
 		}
 
-		existing := AppVersion{
+		if req.EntitlementPolicyID != "" {
+			var policyCount int64
+			if err := tx.Model(&AppEntitlementPolicy{}).
+				Where("id = ?", req.EntitlementPolicyID).
+				Count(&policyCount).Error; err != nil {
+				return err
+			}
+			if policyCount != 1 {
+				return fmt.Errorf("%w: entitlement policy not found", ErrAppInstallRequestInvalid)
+			}
+		}
+
+		version := AppVersion{
 			ID:                    appPluginStableID("appver", req.AppKey, req.ManifestVersion),
 			IdentityHash:          appPluginSHA256([]byte(req.AppKey + "\x00" + req.ManifestVersion)),
 			AppKey:                req.AppKey,
@@ -362,35 +413,82 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 			ManifestSHA256:        req.ManifestSHA256,
 			CanonicalManifestJSON: string(req.CanonicalManifestJSON),
 		}
-		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&existing).Error; err != nil {
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&version).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("identity_hash = ?", existing.IdentityHash).First(&existing).Error; err != nil {
+		if err := tx.Where("identity_hash = ?", version.IdentityHash).First(&version).Error; err != nil {
 			return err
 		}
-		if existing.ManifestSHA256 != req.ManifestSHA256 {
+		if version.ManifestSHA256 != req.ManifestSHA256 {
 			return ErrAppVersionConflict
 		}
 
-		installation := AppInstallation{
-			InstallationID:       appPluginStableID("inst", req.AppKey, req.ManifestVersion, req.ManifestSHA256, installationNonce),
-			AppKey:               req.AppKey,
-			AppVersionID:         existing.ID,
-			ManifestVersion:      req.ManifestVersion,
-			ManifestSHA256:       req.ManifestSHA256,
-			BaseURL:              req.BaseURL,
-			EnabledSurfaces:      append(AppStringList(nil), req.EnabledSurfaces...),
-			AllowedParentOrigins: append(AppStringList(nil), req.AllowedParentOrigins...),
-			AllowedOrigins:       append(AppStringList(nil), req.AllowedOrigins...),
-			AllowedUserPolicy:    req.AllowedUserPolicy,
-			NetworkPolicy:        req.NetworkPolicy,
-			EntitlementPolicyID:  req.EntitlementPolicyID,
-			Status:               AppInstallationStatusDisabled,
-			Revision:             1,
-		}
-		if err := tx.Create(&installation).Error; err != nil {
+		candidateInstallationID := appPluginStableID("inst", req.AppKey, req.ManifestVersion, req.ManifestSHA256, installationNonce)
+		ownership := appKeyClaim(req.AppKey, candidateInstallationID)
+		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "claim_key"}}, DoNothing: true}).
+			Create(&ownership).Error; err != nil {
 			return err
 		}
+		ownershipQuery := tx.Where("claim_key = ?", ownership.ClaimKey)
+		if tx.Dialector.Name() != "sqlite" {
+			ownershipQuery = ownershipQuery.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		if err := ownershipQuery.First(&ownership).Error; err != nil {
+			return err
+		}
+		if ownership.AppKey != req.AppKey || ownership.Kind != "app_key" {
+			return ErrAppRouteClaimConflict
+		}
+
+		isNewInstallation := ownership.InstallationID == candidateInstallationID
+		var installation AppInstallation
+		if isNewInstallation {
+			installation = AppInstallation{
+				InstallationID:       candidateInstallationID,
+				AppKey:               req.AppKey,
+				AppVersionID:         version.ID,
+				ManifestVersion:      req.ManifestVersion,
+				ManifestSHA256:       req.ManifestSHA256,
+				BaseURL:              req.BaseURL,
+				EnabledSurfaces:      append(AppStringList(nil), req.EnabledSurfaces...),
+				AllowedParentOrigins: append(AppStringList(nil), req.AllowedParentOrigins...),
+				AllowedOrigins:       append(AppStringList(nil), req.AllowedOrigins...),
+				AllowedUserPolicy:    req.AllowedUserPolicy,
+				NetworkPolicy:        req.NetworkPolicy,
+				EntitlementPolicyID:  req.EntitlementPolicyID,
+				Status:               AppInstallationStatusDisabled,
+				Revision:             1,
+			}
+			if err := tx.Create(&installation).Error; err != nil {
+				return err
+			}
+		} else {
+			installationQuery := tx.Where("installation_id = ?", ownership.InstallationID)
+			if tx.Dialector.Name() != "sqlite" {
+				installationQuery = installationQuery.Clauses(clause.Locking{Strength: "UPDATE"})
+			}
+			if err := installationQuery.First(&installation).Error; err != nil {
+				return err
+			}
+			if installation.Status == AppInstallationStatusRevoked {
+				return ErrAppInstallationRevoked
+			}
+
+			frozen, found, err := findFrozenAppInstallResponse(tx, installation.InstallationID, version.ID)
+			if err != nil {
+				return err
+			}
+			if found {
+				result = frozen
+				return freezeAppInstallIdempotency(tx, scopeHash, claimToken, &result)
+			}
+
+			if err := tx.Where("installation_id = ? AND kind <> ?", installation.InstallationID, "app_key").
+				Delete(&AppRouteClaim{}).Error; err != nil {
+				return err
+			}
+		}
+
 		claims := []AppRouteClaim{
 			appRouteClaim(req.AppKey, installation.InstallationID, "callback", req.CallbackURL),
 			appRouteClaim(req.AppKey, installation.InstallationID, "direct", req.DirectURL),
@@ -408,40 +506,58 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 				return ErrAppRouteClaimConflict
 			}
 		}
-		credential := AppServiceCredential{
-			AppKey:            req.AppKey,
-			InstallationID:    installation.InstallationID,
-			CredentialID:      req.ServiceCredentialID,
-			CredentialHash:    req.ServiceCredentialHash,
-			CredentialVersion: req.ServiceCredentialVersion,
-			Status:            "active",
-			ExpiresAt:         req.ServiceCredentialExpiry,
+
+		if !isNewInstallation {
+			update := tx.Model(&AppInstallation{}).
+				Where("installation_id = ? AND revision = ? AND status <> ?",
+					installation.InstallationID, installation.Revision, AppInstallationStatusRevoked).
+				Updates(map[string]any{
+					"app_version_id":         version.ID,
+					"manifest_version":       req.ManifestVersion,
+					"manifest_sha256":        req.ManifestSHA256,
+					"base_url":               req.BaseURL,
+					"enabled_surfaces":       AppStringList(req.EnabledSurfaces),
+					"allowed_parent_origins": AppStringList(req.AllowedParentOrigins),
+					"allowed_origins":        AppStringList(req.AllowedOrigins),
+					"allowed_user_policy":    req.AllowedUserPolicy,
+					"network_policy":         req.NetworkPolicy,
+					"entitlement_policy_id":  req.EntitlementPolicyID,
+					"status":                 AppInstallationStatusDisabled,
+					"revision":               gorm.Expr("revision + ?", 1),
+				})
+			if update.Error != nil {
+				return update.Error
+			}
+			if update.RowsAffected != 1 {
+				return ErrAppInstallationRevisionConflict
+			}
+			if err := tx.Where("installation_id = ?", installation.InstallationID).First(&installation).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("installation_id = ?", installation.InstallationID).
+				Delete(&AppServiceCredential{}).Error; err != nil {
+				return err
+			}
 		}
-		if err := tx.Create(&credential).Error; err != nil {
-			return err
+
+		credentialSet := AppCredentialMeta{}
+		if appInstallHasServiceCredential(req) {
+			credential := AppServiceCredential{
+				AppKey:            req.AppKey,
+				InstallationID:    installation.InstallationID,
+				CredentialID:      req.ServiceCredentialID,
+				CredentialHash:    req.ServiceCredentialHash,
+				CredentialVersion: req.ServiceCredentialVersion,
+				Status:            "active",
+				ExpiresAt:         req.ServiceCredentialExpiry,
+			}
+			if err := tx.Create(&credential).Error; err != nil {
+				return err
+			}
+			credentialSet = credentialMeta(credential)
 		}
-		result = resultFromInstallation(existing.ID, installation, credentialMeta(credential))
-		responseJSON, digest, err := frozenAppInstallResponse(result)
-		if err != nil {
-			return err
-		}
-		result.ResponseDigest = digest
-		updates := map[string]any{
-			"installation_id": installation.InstallationID,
-			"app_version_id":  existing.ID,
-			"response_json":   responseJSON,
-			"response_digest": digest,
-		}
-		update := tx.Model(&AppInstallationIdempotency{}).
-			Where("scope_hash = ? AND claim_token = ?", scopeHash, claimToken).
-			Updates(updates)
-		if update.Error != nil {
-			return update.Error
-		}
-		if update.RowsAffected != 1 {
-			return ErrAppIdempotencyConflict
-		}
-		return nil
+		result = resultFromInstallation(version.ID, installation, credentialSet)
+		return freezeAppInstallIdempotency(tx, scopeHash, claimToken, &result)
 	})
 	return result, err
 }
@@ -473,10 +589,7 @@ func validateAppInstallRequest(req AppInstallRequest) error {
 	}
 	for _, endpoint := range []string{req.CallbackURL, req.DirectURL, req.EmbeddedURL} {
 		endpointURL, parseErr := url.Parse(endpoint)
-		if parseErr != nil ||
-			!validAppInstallHTTPSURL(endpointURL) ||
-			endpointURL.Host != baseURL.Host ||
-			!strings.HasPrefix(endpointURL.EscapedPath(), baseURL.EscapedPath()) {
+		if parseErr != nil || !validAppInstallEndpoint(baseURL, endpointURL) {
 			return invalid("invalid app endpoint")
 		}
 	}
@@ -496,13 +609,15 @@ func validateAppInstallRequest(req AppInstallRequest) error {
 	if !validAppInstallStringSet(req.NetworkPolicy.AllowHosts, validAppInstallHost) {
 		return invalid("invalid network policy")
 	}
-	if !validAppInstallReference(req.EntitlementPolicyID) {
+	if req.EntitlementPolicyID != "" && !validAppInstallReference(req.EntitlementPolicyID) {
 		return invalid("invalid entitlement policy reference")
 	}
-	if !validAppInstallReference(req.ServiceCredentialID) ||
-		!validAppInstallReference(req.ServiceCredentialVersion) ||
-		req.ServiceCredentialExpiry <= 0 ||
-		!validAppInstallSHA256(req.ServiceCredentialHash) {
+	hasCredential := appInstallHasServiceCredential(req)
+	hasAnyCredentialField := req.ServiceCredentialID != "" ||
+		req.ServiceCredentialVersion != "" ||
+		req.ServiceCredentialExpiry != 0 ||
+		req.ServiceCredentialHash != ""
+	if hasAnyCredentialField && !hasCredential {
 		return invalid("invalid service credential reference")
 	}
 	return nil
@@ -516,6 +631,39 @@ func validAppInstallHTTPSURL(value *url.URL) bool {
 		value.RawQuery == "" &&
 		!value.ForceQuery &&
 		value.Fragment == ""
+}
+
+func validAppInstallEndpoint(baseURL, endpointURL *url.URL) bool {
+	if !validAppInstallHTTPSURL(endpointURL) || endpointURL.Host != baseURL.Host {
+		return false
+	}
+	basePath, err := canonicalAppInstallPath(baseURL)
+	if err != nil {
+		return false
+	}
+	endpointPath, err := canonicalAppInstallPath(endpointURL)
+	if err != nil {
+		return false
+	}
+	return endpointPath == basePath || strings.HasPrefix(endpointPath, strings.TrimSuffix(basePath, "/")+"/")
+}
+
+func canonicalAppInstallPath(value *url.URL) (string, error) {
+	decoded := value.EscapedPath()
+	for {
+		next, err := url.PathUnescape(decoded)
+		if err != nil {
+			return "", err
+		}
+		if next == decoded {
+			break
+		}
+		decoded = next
+	}
+	if strings.ContainsRune(decoded, '\x00') {
+		return "", fmt.Errorf("invalid NUL in path")
+	}
+	return path.Clean("/" + decoded), nil
 }
 
 func validAppInstallOrigin(origin string) bool {
@@ -558,6 +706,13 @@ func validAppInstallSHA256(value string) bool {
 	}
 	_, err := hex.DecodeString(value)
 	return err == nil && value == strings.ToLower(value)
+}
+
+func appInstallHasServiceCredential(req AppInstallRequest) bool {
+	return validAppInstallReference(req.ServiceCredentialID) &&
+		validAppInstallReference(req.ServiceCredentialVersion) &&
+		req.ServiceCredentialExpiry > 0 &&
+		validAppInstallSHA256(req.ServiceCredentialHash)
 }
 
 func CompareAndSwapAppInstallationStatus(ctx context.Context, db *gorm.DB, installationID string, revision int64, status string) (AppInstallation, error) {
@@ -641,7 +796,16 @@ func appRouteClaim(appKey, installationID, kind, endpoint string) AppRouteClaim 
 		InstallationID:   installationID,
 		Kind:             kind,
 		AbsoluteEndpoint: endpoint,
-		ClaimKey:         appPluginSHA256([]byte(endpoint)),
+		ClaimKey:         appPluginSHA256([]byte("route\x00" + endpoint)),
+	}
+}
+
+func appKeyClaim(appKey, installationID string) AppRouteClaim {
+	return AppRouteClaim{
+		AppKey:         appKey,
+		InstallationID: installationID,
+		Kind:           "app_key",
+		ClaimKey:       appPluginSHA256([]byte("app_key\x00" + appKey)),
 	}
 }
 
@@ -679,6 +843,54 @@ func frozenAppInstallResponse(result AppInstallResult) (string, string, error) {
 		return "", "", err
 	}
 	return string(data), appPluginSHA256(data), nil
+}
+
+func findFrozenAppInstallResponse(tx *gorm.DB, installationID, appVersionID string) (AppInstallResult, bool, error) {
+	var frozen AppInstallationIdempotency
+	query := tx.Where("installation_id = ? AND app_version_id = ? AND response_json <> ''", installationID, appVersionID).
+		Order("id").
+		Limit(1).
+		Find(&frozen)
+	if query.Error != nil {
+		return AppInstallResult{}, false, query.Error
+	}
+	if query.RowsAffected == 0 {
+		return AppInstallResult{}, false, nil
+	}
+	var result AppInstallResult
+	if err := common.Unmarshal([]byte(frozen.ResponseJSON), &result); err != nil {
+		return AppInstallResult{}, false, err
+	}
+	result.AppVersionID = frozen.AppVersionID
+	result.ResponseDigest = frozen.ResponseDigest
+	return result, true, nil
+}
+
+func freezeAppInstallIdempotency(tx *gorm.DB, scopeHash, claimToken string, result *AppInstallResult) error {
+	responseJSON, digest, err := frozenAppInstallResponse(*result)
+	if err != nil {
+		return err
+	}
+	if result.ResponseDigest == "" {
+		result.ResponseDigest = digest
+	} else {
+		digest = result.ResponseDigest
+	}
+	update := tx.Model(&AppInstallationIdempotency{}).
+		Where("scope_hash = ? AND claim_token = ?", scopeHash, claimToken).
+		Updates(map[string]any{
+			"installation_id": result.InstallationID,
+			"app_version_id":  result.AppVersionID,
+			"response_json":   responseJSON,
+			"response_digest": digest,
+		})
+	if update.Error != nil {
+		return update.Error
+	}
+	if update.RowsAffected != 1 {
+		return ErrAppIdempotencyConflict
+	}
+	return nil
 }
 
 func appPluginStableID(parts ...string) string {

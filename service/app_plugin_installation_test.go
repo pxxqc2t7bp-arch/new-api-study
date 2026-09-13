@@ -82,6 +82,22 @@ func TestAppInstallationNeverReturnsSecretRef(t *testing.T) {
 	assert.NotContains(t, string(directCredentialJSON), "secret")
 	assert.NotContains(t, string(directCredentialJSON), "app_key")
 	assert.NotContains(t, string(directCredentialJSON), "installation_id")
+
+	t.Run("disabled installation may omit service credential", func(t *testing.T) {
+		cmd := appPluginInstallCommand("credentialless-service", "1.0.0")
+		cmd.ServiceCredential = AppServiceCredentialInput{}
+
+		credentialless, err := svc.Install(context.Background(), cmd)
+		require.NoError(t, err)
+		assert.Equal(t, model.AppInstallationStatusDisabled, credentialless.Status)
+		assert.Equal(t, model.AppCredentialMeta{}, credentialless.ServiceCredentialSet)
+
+		var credentialCount int64
+		require.NoError(t, db.Model(&model.AppServiceCredential{}).
+			Where("installation_id = ?", credentialless.InstallationID).
+			Count(&credentialCount).Error)
+		assert.Zero(t, credentialCount)
+	})
 }
 
 func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
@@ -128,6 +144,31 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 	resp, err := svc.Install(context.Background(), cmdWithPolicy)
 	require.NoError(t, err)
 	assert.Equal(t, policyV1.ID, resp.EntitlementPolicyVersion)
+
+	t.Run("empty policy reference remains empty for a disabled installation", func(t *testing.T) {
+		cmdWithoutPolicy := appPluginInstallCommand("without-policy", "1.0.0")
+		resp, err := svc.Install(context.Background(), cmdWithoutPolicy)
+		require.NoError(t, err)
+		assert.Empty(t, resp.EntitlementPolicyVersion)
+
+		var defaultPolicyCount int64
+		require.NoError(t, db.Model(&model.AppEntitlementPolicy{}).
+			Where("id = ?", "host-default").
+			Count(&defaultPolicyCount).Error)
+		assert.Zero(t, defaultPolicyCount)
+	})
+
+	t.Run("unknown explicit policy fails without persistence", func(t *testing.T) {
+		cmdWithMissingPolicy := appPluginInstallCommand("missing-policy", "1.0.0")
+		cmdWithMissingPolicy.EntitlementPolicyID = "policy_missing"
+		before := appPluginServicePersistenceCounts(t, db)
+
+		_, err := svc.Install(context.Background(), cmdWithMissingPolicy)
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, model.ErrAppInstallRequestInvalid)
+		assert.Equal(t, before, appPluginServicePersistenceCounts(t, db))
+	})
 
 	cmd := appPluginInstallCommand("manifest-policy", "1.0.0")
 	cmd.ManifestJSON = []byte(`{"apiVersion":1,"kind":"app","key":"manifest-policy","name":{"en":"Manifest Policy","zh":"Manifest Policy"},"version":"1.0.0","callbackPath":"/callback","surfaces":{"direct":{"startPath":"/direct"},"embedded":{"startPath":"/embedded"}},"requestedScopes":["identity.read"],"requires":{"taskPlugins":[{"key":"doubao","minimumVersion":"1.2.0"}]},"entitlementPolicy":{"files":["write"]}}`)
@@ -196,6 +237,17 @@ func TestAppInstallationOwnsParentOriginsAndEnabledSurfaces(t *testing.T) {
 	_, err = svc.Install(context.Background(), override)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrManifestCannotOwnHostPolicy)
+
+	t.Run("install service validates the complete manifest before persistence", func(t *testing.T) {
+		invalid := appPluginInstallCommand("service-manifest-boundary", "1.0.0")
+		invalid.ManifestJSON = []byte(`{"apiVersion":1,"kind":"app","key":"service-manifest-boundary","name":{"en":"Invalid","zh":"Invalid"},"version":"1.0.0","callbackPath":"/callback/../outside","surfaces":{"direct":{"startPath":"/direct"},"embedded":{"startPath":"/embedded"}},"requestedScopes":["identity.read"],"requires":{"taskPlugins":[{"key":"doubao","minimumVersion":"1.2.0"}]}}`)
+		before := appPluginServicePersistenceCounts(t, db)
+
+		_, err := svc.Install(context.Background(), invalid)
+
+		require.Error(t, err)
+		assert.Equal(t, before, appPluginServicePersistenceCounts(t, db))
+	})
 
 	t.Run("default dependency checker uses semver prerelease precedence and injected doubao floor", func(t *testing.T) {
 		require.NoError(t, db.AutoMigrate(&model.TaskPlugin{}))
@@ -340,6 +392,21 @@ func sortedMapKeys(fields map[string]any) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func appPluginServicePersistenceCounts(t *testing.T, db *gorm.DB) [5]int64 {
+	t.Helper()
+	var counts [5]int64
+	for i, table := range []any{
+		&model.AppVersion{},
+		&model.AppInstallation{},
+		&model.AppInstallationIdempotency{},
+		&model.AppRouteClaim{},
+		&model.AppServiceCredential{},
+	} {
+		require.NoError(t, db.Model(table).Count(&counts[i]).Error)
+	}
+	return counts
 }
 
 func serviceDigest(value string) string {

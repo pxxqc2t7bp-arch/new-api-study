@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -92,6 +93,10 @@ func TestAppPluginMigrationFreshUpgradeReplay(t *testing.T) {
 		require.NoError(t, oldDB.Where("id = ?", 77).First(&upgraded).Error)
 		assert.Equal(t, "legacy", upgraded.AppKey)
 		assert.Equal(t, "77", upgraded.InstallationID)
+
+		var ownership AppRouteClaim
+		require.NoError(t, oldDB.Where("app_key = ? AND kind = ?", "legacy", "app_key").First(&ownership).Error)
+		assert.Equal(t, upgraded.InstallationID, ownership.InstallationID)
 	})
 }
 
@@ -123,6 +128,7 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 		assertAppPluginModelRuntimeMetadata(t, db)
 	})
 	require.NoError(t, MigrateAppPluginTables(db))
+	seedAppPluginModelPolicy(t, db, "policy-basic")
 
 	t.Run("same scope request hash and content digest replays frozen response with stable IDs", func(t *testing.T) {
 		req := appPluginModelInstallRequest("writer", "1.0.0", "https://apps.example.com/writer/")
@@ -137,6 +143,46 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 		assert.Equal(t, first.InstallationID, second.InstallationID)
 		assert.Equal(t, first.ResponseDigest, second.ResponseDigest)
 		assert.Equal(t, first, second)
+	})
+
+	t.Run("same immutable version replays its original response across idempotency scopes", func(t *testing.T) {
+		for _, differentHostInput := range []bool{false, true} {
+			t.Run(fmt.Sprintf("different_host_input_%t", differentHostInput), func(t *testing.T) {
+				key := fmt.Sprintf("version-replay-%t", differentHostInput)
+				firstRequest := appPluginModelInstallRequest(key, "1.0.0", "https://apps.example.com/"+key+"/")
+				first, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 111, Key: key + "-first"}, firstRequest)
+				require.NoError(t, err)
+
+				replayRequest := firstRequest
+				if differentHostInput {
+					replayRequest.BaseURL = "https://apps.example.com/" + key + "-changed/"
+					replayRequest.CallbackURL = replayRequest.BaseURL + "callback"
+					replayRequest.DirectURL = replayRequest.BaseURL + "direct"
+					replayRequest.EmbeddedURL = replayRequest.BaseURL + "embedded"
+					replayRequest.EnabledSurfaces = []string{"direct"}
+					replayRequest.AllowedOrigins = []string{"https://changed.example.com"}
+					replayRequest.ServiceCredentialID = "changed-" + replayRequest.ServiceCredentialID
+				}
+				replayScope := AppIdempotencyScope{ActorID: 111, Key: key + "-replay"}
+				replayed, err := InstallAppVersion(context.Background(), db, replayScope, replayRequest)
+				require.NoError(t, err)
+				assert.Equal(t, first, replayed)
+
+				replayedAgain, err := InstallAppVersion(context.Background(), db, replayScope, replayRequest)
+				require.NoError(t, err)
+				assert.Equal(t, first, replayedAgain)
+
+				assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppVersion{}, key))
+				assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppInstallation{}, key))
+				assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppServiceCredential{}, key))
+				assert.Equal(t, int64(4), appPluginCountForKey(t, db, &AppRouteClaim{}, key))
+
+				var frozen AppInstallationIdempotency
+				require.NoError(t, db.Where("scope_key = ?", replayScope.Key).First(&frozen).Error)
+				assert.Equal(t, first.InstallationID, frozen.InstallationID)
+				assert.Equal(t, first.ResponseDigest, frozen.ResponseDigest)
+			})
+		}
 	})
 
 	t.Run("same app key and version with different canonical manifest digest is a stable conflict", func(t *testing.T) {
@@ -256,12 +302,19 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 		}{
 			{name: "insecure base URL", mutate: func(req *AppInstallRequest) { req.BaseURL = "http://apps.example.com/plugin/" }},
 			{name: "endpoint outside base URL", mutate: func(req *AppInstallRequest) { req.CallbackURL = "https://evil.example/callback" }},
+			{name: "callback dot traversal", mutate: func(req *AppInstallRequest) { req.CallbackURL = req.BaseURL + "../outside" }},
+			{name: "direct encoded traversal", mutate: func(req *AppInstallRequest) { req.DirectURL = req.BaseURL + "%2e%2e/outside" }},
+			{name: "embedded different origin", mutate: func(req *AppInstallRequest) { req.EmbeddedURL = "https://other.example.com/embedded" }},
+			{name: "embedded different port", mutate: func(req *AppInstallRequest) { req.EmbeddedURL = "https://apps.example.com:8443/app/embedded" }},
+			{name: "endpoint prefix sibling", mutate: func(req *AppInstallRequest) {
+				req.CallbackURL = strings.TrimSuffix(req.BaseURL, "/") + "-outside/callback"
+			}},
 			{name: "unknown enabled surface", mutate: func(req *AppInstallRequest) { req.EnabledSurfaces = []string{"admin"} }},
 			{name: "non-origin parent URL", mutate: func(req *AppInstallRequest) { req.AllowedParentOrigins = []string{"https://console.example.com/path"} }},
 			{name: "insecure allowed origin", mutate: func(req *AppInstallRequest) { req.AllowedOrigins = []string{"http://apps.example.com"} }},
 			{name: "invalid user group reference", mutate: func(req *AppInstallRequest) { req.AllowedUserPolicy.Groups = []string{""} }},
 			{name: "invalid network host reference", mutate: func(req *AppInstallRequest) { req.NetworkPolicy.AllowHosts = []string{"https://api.example.com/path"} }},
-			{name: "missing entitlement policy reference", mutate: func(req *AppInstallRequest) { req.EntitlementPolicyID = "" }},
+			{name: "unknown entitlement policy reference", mutate: func(req *AppInstallRequest) { req.EntitlementPolicyID = "missing-policy" }},
 			{name: "missing credential ID", mutate: func(req *AppInstallRequest) { req.ServiceCredentialID = "" }},
 			{name: "missing credential version", mutate: func(req *AppInstallRequest) { req.ServiceCredentialVersion = "" }},
 			{name: "invalid credential hash", mutate: func(req *AppInstallRequest) { req.ServiceCredentialHash = "not-a-sha256" }},
@@ -282,6 +335,47 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 			})
 		}
 	})
+
+	t.Run("disabled install may omit service credential but rejects partial identity", func(t *testing.T) {
+		credentialless := appPluginModelInstallRequest("credentialless", "1.0.0", "https://apps.example.com/credentialless/")
+		credentialless.ServiceCredentialHash = ""
+		credentialless.ServiceCredentialID = ""
+		credentialless.ServiceCredentialVersion = ""
+		credentialless.ServiceCredentialExpiry = 0
+
+		result, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 19, Key: "credentialless"}, credentialless)
+		require.NoError(t, err)
+		assert.Equal(t, AppCredentialMeta{}, result.ServiceCredentialSet)
+		assert.Equal(t, int64(0), appPluginCountForInstallation(t, db, &AppServiceCredential{}, result.InstallationID))
+
+		partialMutations := []func(*AppInstallRequest){
+			func(req *AppInstallRequest) { req.ServiceCredentialID = "" },
+			func(req *AppInstallRequest) { req.ServiceCredentialVersion = "" },
+			func(req *AppInstallRequest) { req.ServiceCredentialHash = "" },
+			func(req *AppInstallRequest) { req.ServiceCredentialExpiry = 0 },
+		}
+		for i, mutate := range partialMutations {
+			partial := appPluginModelInstallRequest(fmt.Sprintf("partial-credential-%d", i), "1.0.0", fmt.Sprintf("https://apps.example.com/partial-credential-%d/", i))
+			mutate(&partial)
+			before := appPluginPersistenceCounts(t, db)
+
+			_, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 19, Key: fmt.Sprintf("partial-credential-%d", i)}, partial)
+
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrAppInstallRequestInvalid)
+			assert.Equal(t, before, appPluginPersistenceCounts(t, db))
+		}
+	})
+
+	t.Run("disabled install may omit entitlement policy", func(t *testing.T) {
+		req := appPluginModelInstallRequest("policyless", "1.0.0", "https://apps.example.com/policyless/")
+		req.EntitlementPolicyID = ""
+
+		result, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 20, Key: "policyless"}, req)
+
+		require.NoError(t, err)
+		assert.Empty(t, result.EntitlementPolicyVersion)
+	})
 }
 
 func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
@@ -291,6 +385,7 @@ func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 		assertAppPluginModelRuntimeMetadata(t, db)
 	})
 	require.NoError(t, MigrateAppPluginTables(db))
+	seedAppPluginModelPolicy(t, db, "policy-basic")
 
 	first := appPluginModelInstallRequest("routes-one", "1.0.0", "https://apps.example.com/one/")
 	result, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 21, Key: "routes-one"}, first)
@@ -312,6 +407,65 @@ func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 		require.NoError(t, db.Model(table).Where("app_key = ?", "routes-two").Count(&rows).Error)
 		assert.Zero(t, rows)
 	}
+
+	t.Run("new immutable version atomically upgrades the existing installation", func(t *testing.T) {
+		v1 := appPluginModelInstallRequest("atomic-upgrade", "1.0.0", "https://apps.example.com/atomic-upgrade-v1/")
+		created, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 23, Key: "atomic-upgrade-v1"}, v1)
+		require.NoError(t, err)
+		enabled, err := CompareAndSwapAppInstallationStatus(context.Background(), db, created.InstallationID, created.Revision, AppInstallationStatusEnabled)
+		require.NoError(t, err)
+
+		v2 := appPluginModelInstallRequest("atomic-upgrade", "2.0.0", "https://apps.example.com/atomic-upgrade-v2/")
+		v2.EnabledSurfaces = []string{"direct"}
+		v2.AllowedOrigins = []string{"https://v2.example.com"}
+		upgraded, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 23, Key: "atomic-upgrade-v2"}, v2)
+		require.NoError(t, err)
+
+		assert.Equal(t, created.InstallationID, upgraded.InstallationID)
+		assert.Equal(t, enabled.Revision+1, upgraded.Revision)
+		assert.Equal(t, AppInstallationStatusDisabled, upgraded.Status)
+		assert.Equal(t, v2.BaseURL, upgraded.BaseURL)
+		assert.Equal(t, v2.EnabledSurfaces, upgraded.EnabledSurfaces)
+		assert.Equal(t, v2.AllowedOrigins, upgraded.AllowedOrigins)
+		assert.Equal(t, int64(2), appPluginCountForKey(t, db, &AppVersion{}, v2.AppKey))
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppInstallation{}, v2.AppKey))
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppServiceCredential{}, v2.AppKey))
+		assert.Equal(t, int64(4), appPluginCountForKey(t, db, &AppRouteClaim{}, v2.AppKey))
+		for _, endpoint := range []string{v1.CallbackURL, v1.DirectURL, v1.EmbeddedURL} {
+			assert.Equal(t, int64(0), appPluginCountForEndpoint(t, db, endpoint))
+		}
+		for _, endpoint := range []string{v2.CallbackURL, v2.DirectURL, v2.EmbeddedURL} {
+			assert.Equal(t, int64(1), appPluginCountForEndpoint(t, db, endpoint))
+		}
+	})
+
+	t.Run("upgrade route collision rolls back version configuration claims and idempotency", func(t *testing.T) {
+		blocker := appPluginModelInstallRequest("upgrade-blocker", "1.0.0", "https://apps.example.com/rollback-upgrade-v2/")
+		_, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 24, Key: "upgrade-blocker"}, blocker)
+		require.NoError(t, err)
+
+		v1 := appPluginModelInstallRequest("rollback-upgrade", "1.0.0", "https://apps.example.com/rollback-upgrade-v1/")
+		created, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 24, Key: "rollback-upgrade-v1"}, v1)
+		require.NoError(t, err)
+		var before AppInstallation
+		require.NoError(t, db.Where("installation_id = ?", created.InstallationID).First(&before).Error)
+
+		v2 := appPluginModelInstallRequest("rollback-upgrade", "2.0.0", "https://apps.example.com/rollback-upgrade-v2/")
+		_, err = InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 24, Key: "rollback-upgrade-v2"}, v2)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrAppRouteClaimConflict)
+
+		var after AppInstallation
+		require.NoError(t, db.Where("installation_id = ?", created.InstallationID).First(&after).Error)
+		assert.Equal(t, before, after)
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppVersion{}, v1.AppKey))
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppInstallation{}, v1.AppKey))
+		assert.Equal(t, int64(4), appPluginCountForKey(t, db, &AppRouteClaim{}, v1.AppKey))
+		assert.Equal(t, int64(0), appPluginCountForScope(t, db, "rollback-upgrade-v2"))
+		for _, endpoint := range []string{v1.CallbackURL, v1.DirectURL, v1.EmbeddedURL} {
+			assert.Equal(t, int64(1), appPluginCountForEndpoint(t, db, endpoint))
+		}
+	})
 }
 
 func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
@@ -321,6 +475,7 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		assertAppPluginModelRuntimeMetadata(t, db)
 	})
 	require.NoError(t, MigrateAppPluginTables(db))
+	seedAppPluginModelPolicy(t, db, "policy-basic")
 
 	install := appPluginModelInstallRequest("lifecycle", "1.0.0", "https://apps.example.com/lifecycle/")
 	created, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 31, Key: "lifecycle"}, install)
@@ -337,6 +492,7 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 	revoked, err := CompareAndSwapAppInstallationStatus(context.Background(), db, created.InstallationID, disabled.Revision, AppInstallationStatusRevoked)
 	require.NoError(t, err)
 	assert.Equal(t, AppInstallationStatusRevoked, revoked.Status)
+	assert.Equal(t, int64(0), appPluginCountForKey(t, db, &AppRouteClaim{}, install.AppKey))
 
 	_, err = CompareAndSwapAppInstallationStatus(context.Background(), db, created.InstallationID, revoked.Revision, AppInstallationStatusEnabled)
 	require.Error(t, err)
@@ -345,6 +501,7 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 	reinstalled, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 31, Key: "lifecycle-reinstall"}, install)
 	require.NoError(t, err)
 	assert.NotEqual(t, created.InstallationID, reinstalled.InstallationID)
+	assert.Equal(t, int64(4), appPluginCountForKey(t, db, &AppRouteClaim{}, install.AppKey))
 	var generationCount int64
 	require.NoError(t, db.Model(&AppVersion{}).Where("app_key = ? AND manifest_version = ?", "lifecycle", "1.0.0").Count(&generationCount).Error)
 	assert.Equal(t, int64(1), generationCount)
@@ -393,6 +550,49 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 	}
 	assert.Equal(t, 1, successes)
 	assert.Equal(t, 1, conflicts)
+
+	t.Run("concurrent different versions serialize onto one installation", func(t *testing.T) {
+		v1 := appPluginModelInstallRequest("concurrent-upgrade", "1.0.0", "https://apps.example.com/concurrent-upgrade-v1/")
+		created, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 34, Key: "concurrent-upgrade-v1"}, v1)
+		require.NoError(t, err)
+
+		start := make(chan struct{})
+		results := make(chan AppInstallResult, 2)
+		errs := make(chan error, 2)
+		var wg sync.WaitGroup
+		for _, version := range []string{"2.0.0", "3.0.0"} {
+			version := version
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				req := appPluginModelInstallRequest("concurrent-upgrade", version, "https://apps.example.com/concurrent-upgrade-v"+string(version[0])+"/")
+				result, installErr := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 34, Key: "concurrent-upgrade-v" + string(version[0])}, req)
+				results <- result
+				errs <- installErr
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+		close(errs)
+
+		for installErr := range errs {
+			require.NoError(t, installErr)
+		}
+		for result := range results {
+			assert.Equal(t, created.InstallationID, result.InstallationID)
+		}
+		assert.Equal(t, int64(3), appPluginCountForKey(t, db, &AppVersion{}, v1.AppKey))
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppInstallation{}, v1.AppKey))
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppServiceCredential{}, v1.AppKey))
+		assert.Equal(t, int64(4), appPluginCountForKey(t, db, &AppRouteClaim{}, v1.AppKey))
+
+		var final AppInstallation
+		require.NoError(t, db.Where("installation_id = ?", created.InstallationID).First(&final).Error)
+		assert.Equal(t, int64(3), final.Revision)
+		assert.Contains(t, []string{"2.0.0", "3.0.0"}, final.ManifestVersion)
+	})
 }
 
 func openAppPluginModelDB(t *testing.T) *gorm.DB {
@@ -505,6 +705,49 @@ func appPluginPersistenceCounts(t *testing.T, db *gorm.DB) [4]int64 {
 		require.NoError(t, db.Model(table).Count(&counts[i]).Error)
 	}
 	return counts
+}
+
+func appPluginCountForKey(t *testing.T, db *gorm.DB, table any, appKey string) int64 {
+	t.Helper()
+	var count int64
+	require.NoError(t, db.Model(table).Where("app_key = ?", appKey).Count(&count).Error)
+	return count
+}
+
+func appPluginCountForInstallation(t *testing.T, db *gorm.DB, table any, installationID string) int64 {
+	t.Helper()
+	var count int64
+	require.NoError(t, db.Model(table).Where("installation_id = ?", installationID).Count(&count).Error)
+	return count
+}
+
+func appPluginCountForEndpoint(t *testing.T, db *gorm.DB, endpoint string) int64 {
+	t.Helper()
+	var count int64
+	require.NoError(t, db.Model(&AppRouteClaim{}).Where("absolute_endpoint = ?", endpoint).Count(&count).Error)
+	return count
+}
+
+func appPluginCountForScope(t *testing.T, db *gorm.DB, scope string) int64 {
+	t.Helper()
+	var count int64
+	require.NoError(t, db.Model(&AppInstallationIdempotency{}).Where("scope_key = ?", scope).Count(&count).Error)
+	return count
+}
+
+func seedAppPluginModelPolicy(t *testing.T, db *gorm.DB, id string) {
+	t.Helper()
+	key := "fixture-" + id
+	policy := AppEntitlementPolicy{
+		ID:             id,
+		KeyHash:        appPluginDigest(key),
+		VersionKey:     appPluginDigest(key + "-v1"),
+		CreationToken:  appPluginDigest(key + "-creation"),
+		Key:            key,
+		Version:        1,
+		EffectiveRules: AppJSONMap{},
+	}
+	require.NoError(t, db.Where("id = ?", id).FirstOrCreate(&policy).Error)
 }
 
 func appPluginDigest(value string) string {

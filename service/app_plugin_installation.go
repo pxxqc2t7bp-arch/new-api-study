@@ -137,9 +137,9 @@ func (s *AppPluginInstallationService) Install(ctx context.Context, cmd AppInsta
 	}
 	allowedUserPolicy := model.AppAllowedUserPolicy{Groups: normalizeStringSet(cmd.AllowedUserPolicy.Groups)}
 	networkPolicy := model.AppNetworkPolicy{AllowHosts: normalizeStringSet(cmd.NetworkPolicy.AllowHosts), DenyPrivateIPRanges: cmd.NetworkPolicy.DenyPrivateIPRanges}
-	entitlementPolicyID := cmd.EntitlementPolicyID
-	if entitlementPolicyID == "" {
-		entitlementPolicyID = "host-default"
+	serviceCredentialHash := ""
+	if cmd.ServiceCredential.Secret != "" {
+		serviceCredentialHash = serviceDigestBytes([]byte(cmd.ServiceCredential.Secret))
 	}
 	req := model.AppInstallRequest{
 		AppKey:                   manifest.Key,
@@ -155,8 +155,8 @@ func (s *AppPluginInstallationService) Install(ctx context.Context, cmd AppInsta
 		AllowedOrigins:           allowedOrigins,
 		AllowedUserPolicy:        allowedUserPolicy,
 		NetworkPolicy:            networkPolicy,
-		EntitlementPolicyID:      entitlementPolicyID,
-		ServiceCredentialHash:    serviceDigestBytes([]byte(cmd.ServiceCredential.Secret)),
+		EntitlementPolicyID:      cmd.EntitlementPolicyID,
+		ServiceCredentialHash:    serviceCredentialHash,
 		ServiceCredentialID:      cmd.ServiceCredential.ID,
 		ServiceCredentialVersion: cmd.ServiceCredential.Version,
 		ServiceCredentialExpiry:  cmd.ServiceCredential.ExpiresAt,
