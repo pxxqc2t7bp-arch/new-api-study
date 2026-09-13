@@ -34,8 +34,9 @@ const (
 )
 
 var (
-	ErrSubscriptionOrderNotFound      = errors.New("subscription order not found")
-	ErrSubscriptionOrderStatusInvalid = errors.New("subscription order status invalid")
+	ErrSubscriptionOrderNotFound       = errors.New("subscription order not found")
+	ErrSubscriptionOrderStatusInvalid  = errors.New("subscription order status invalid")
+	ErrSubscriptionTargetNotManageable = errors.New("subscription target not manageable")
 )
 
 const (
@@ -707,8 +708,32 @@ func ExpireSubscriptionOrder(tradeNo string, expectedPaymentProvider string) err
 	})
 }
 
+func lockManageableSubscriptionUserTx(tx *gorm.DB, userId int, operatorRole int) (*User, error) {
+	if tx == nil || userId <= 0 {
+		return nil, errors.New("invalid subscription user lookup")
+	}
+	var user User
+	if err := lockForUpdate(tx).
+		Select("id", "role").
+		Where("id = ?", userId).
+		First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrSubscriptionTargetNotManageable
+		}
+		return nil, err
+	}
+	if !common.CanManageUserRole(operatorRole, user.Role) {
+		return nil, ErrSubscriptionTargetNotManageable
+	}
+	return &user, nil
+}
+
 // Admin bind (no payment). Creates a UserSubscription from a plan.
 func AdminBindSubscription(userId int, planId int, sourceNote string) (string, error) {
+	return AdminBindSubscriptionForRole(userId, planId, sourceNote, common.RoleRootUser)
+}
+
+func AdminBindSubscriptionForRole(userId int, planId int, sourceNote string, operatorRole int) (string, error) {
 	if userId <= 0 || planId <= 0 {
 		return "", errors.New("invalid userId or planId")
 	}
@@ -719,8 +744,7 @@ func AdminBindSubscription(userId int, planId int, sourceNote string) (string, e
 	groupChanged := false
 	err = DB.Transaction(func(tx *gorm.DB) error {
 		// 与 CompleteSubscriptionOrder 一致：先锁用户行，再做购买次数检查。
-		var userRow User
-		if err := lockForUpdate(tx).Select("id").Where("id = ?", userId).First(&userRow).Error; err != nil {
+		if _, err := lockManageableSubscriptionUserTx(tx, userId, operatorRole); err != nil {
 			return err
 		}
 		subscription, err := CreateUserSubscriptionFromPlanTx(tx, userId, plan, "admin")
@@ -909,6 +933,49 @@ func GetAllUserSubscriptions(userId int) ([]SubscriptionSummary, error) {
 	return buildSubscriptionSummaries(subs), nil
 }
 
+func GetUserSubscriptionOwnerId(userSubscriptionId int) (int, error) {
+	if userSubscriptionId <= 0 {
+		return 0, errors.New("invalid userSubscriptionId")
+	}
+	var owner struct {
+		UserId int
+	}
+	err := DB.Model(&UserSubscription{}).
+		Select("user_id").
+		Where("id = ?", userSubscriptionId).
+		Take(&owner).Error
+	return owner.UserId, err
+}
+
+func lockManageableUserSubscriptionTx(tx *gorm.DB, userSubscriptionId int, operatorRole int) (*UserSubscription, error) {
+	var owner struct {
+		UserId int
+	}
+	if err := tx.Model(&UserSubscription{}).
+		Select("user_id").
+		Where("id = ?", userSubscriptionId).
+		Take(&owner).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrSubscriptionTargetNotManageable
+		}
+		return nil, err
+	}
+	if _, err := lockManageableSubscriptionUserTx(tx, owner.UserId, operatorRole); err != nil {
+		return nil, err
+	}
+	var sub UserSubscription
+	if err := lockForUpdate(tx).Where("id = ?", userSubscriptionId).First(&sub).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrSubscriptionTargetNotManageable
+		}
+		return nil, err
+	}
+	if sub.UserId != owner.UserId {
+		return nil, ErrSubscriptionTargetNotManageable
+	}
+	return &sub, nil
+}
+
 func buildSubscriptionSummaries(subs []UserSubscription) []SubscriptionSummary {
 	if len(subs) == 0 {
 		return []SubscriptionSummary{}
@@ -925,6 +992,10 @@ func buildSubscriptionSummaries(subs []UserSubscription) []SubscriptionSummary {
 
 // AdminInvalidateUserSubscription marks a user subscription as cancelled and ends it immediately.
 func AdminInvalidateUserSubscription(userSubscriptionId int) (string, error) {
+	return AdminInvalidateUserSubscriptionForRole(userSubscriptionId, common.RoleRootUser)
+}
+
+func AdminInvalidateUserSubscriptionForRole(userSubscriptionId int, operatorRole int) (string, error) {
 	if userSubscriptionId <= 0 {
 		return "", errors.New("invalid userSubscriptionId")
 	}
@@ -933,20 +1004,19 @@ func AdminInvalidateUserSubscription(userSubscriptionId int) (string, error) {
 	downgradeGroup := ""
 	var userId int
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		var sub UserSubscription
-		if err := lockForUpdate(tx).
-			Where("id = ?", userSubscriptionId).First(&sub).Error; err != nil {
+		sub, err := lockManageableUserSubscriptionTx(tx, userSubscriptionId, operatorRole)
+		if err != nil {
 			return err
 		}
 		userId = sub.UserId
-		if err := tx.Model(&sub).Updates(map[string]any{
+		if err := tx.Model(sub).Updates(map[string]any{
 			"status":     "cancelled",
 			"end_time":   now,
 			"updated_at": now,
 		}).Error; err != nil {
 			return err
 		}
-		target, err := downgradeUserGroupForSubscriptionTx(tx, &sub, now)
+		target, err := downgradeUserGroupForSubscriptionTx(tx, sub, now)
 		if err != nil {
 			return err
 		}
@@ -970,6 +1040,10 @@ func AdminInvalidateUserSubscription(userSubscriptionId int) (string, error) {
 
 // AdminDeleteUserSubscription hard-deletes a user subscription.
 func AdminDeleteUserSubscription(userSubscriptionId int) (string, error) {
+	return AdminDeleteUserSubscriptionForRole(userSubscriptionId, common.RoleRootUser)
+}
+
+func AdminDeleteUserSubscriptionForRole(userSubscriptionId int, operatorRole int) (string, error) {
 	if userSubscriptionId <= 0 {
 		return "", errors.New("invalid userSubscriptionId")
 	}
@@ -978,13 +1052,12 @@ func AdminDeleteUserSubscription(userSubscriptionId int) (string, error) {
 	downgradeGroup := ""
 	var userId int
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		var sub UserSubscription
-		if err := lockForUpdate(tx).
-			Where("id = ?", userSubscriptionId).First(&sub).Error; err != nil {
+		sub, err := lockManageableUserSubscriptionTx(tx, userSubscriptionId, operatorRole)
+		if err != nil {
 			return err
 		}
 		userId = sub.UserId
-		target, err := downgradeUserGroupForSubscriptionTx(tx, &sub, now)
+		target, err := downgradeUserGroupForSubscriptionTx(tx, sub, now)
 		if err != nil {
 			return err
 		}
@@ -1069,16 +1142,51 @@ func adminResetUserSubscriptionsByPlanTx(tx *gorm.DB, userId int, plan *Subscrip
 	return buildSubscriptionResetResult(plan, subs, advanceResetTime), nil
 }
 
-func adminResetPlanSubscriptionsTx(tx *gorm.DB, plan *SubscriptionPlan, now int64, advanceResetTime bool) (*SubscriptionResetResult, error) {
+func adminResetPlanSubscriptionsTx(tx *gorm.DB, plan *SubscriptionPlan, now int64, advanceResetTime bool, operatorRole int) (*SubscriptionResetResult, error) {
 	if tx == nil || plan == nil {
 		return nil, errors.New("invalid reset args")
 	}
 	var subs []UserSubscription
-	if err := lockForUpdate(tx).
-		Where("plan_id = ? AND status = ? AND end_time > ?", plan.Id, "active", now).
-		Order("user_id asc, end_time asc, id asc").
-		Find(&subs).Error; err != nil {
-		return nil, err
+	if operatorRole == common.RoleRootUser {
+		if err := lockForUpdate(tx).
+			Where("plan_id = ? AND status = ? AND end_time > ?", plan.Id, "active", now).
+			Order("user_id asc, end_time asc, id asc").
+			Find(&subs).Error; err != nil {
+			return nil, err
+		}
+	} else {
+		var userIds []int
+		if err := tx.Model(&UserSubscription{}).
+			Distinct("user_id").
+			Where("plan_id = ? AND status = ? AND end_time > ?", plan.Id, "active", now).
+			Order("user_id asc").
+			Pluck("user_id", &userIds).Error; err != nil {
+			return nil, err
+		}
+		var users []User
+		if len(userIds) > 0 {
+			if err := lockForUpdate(tx).
+				Select("id", "role").
+				Where("id IN ?", userIds).
+				Order("id asc").
+				Find(&users).Error; err != nil {
+				return nil, err
+			}
+		}
+		manageableUserIds := make([]int, 0, len(users))
+		for _, user := range users {
+			if common.CanManageUserRole(operatorRole, user.Role) {
+				manageableUserIds = append(manageableUserIds, user.Id)
+			}
+		}
+		if len(manageableUserIds) > 0 {
+			if err := lockForUpdate(tx).
+				Where("plan_id = ? AND status = ? AND end_time > ? AND user_id IN ?", plan.Id, "active", now, manageableUserIds).
+				Order("user_id asc, end_time asc, id asc").
+				Find(&subs).Error; err != nil {
+				return nil, err
+			}
+		}
 	}
 	for i := range subs {
 		if err := resetUserSubscriptionTx(tx, &subs[i], plan, now, advanceResetTime); err != nil {
@@ -1089,12 +1197,19 @@ func adminResetPlanSubscriptionsTx(tx *gorm.DB, plan *SubscriptionPlan, now int6
 }
 
 func AdminResetUserSubscriptionsByPlan(userId int, planId int, advanceResetTime bool) (*SubscriptionResetResult, error) {
+	return AdminResetUserSubscriptionsByPlanForRole(userId, planId, advanceResetTime, common.RoleRootUser)
+}
+
+func AdminResetUserSubscriptionsByPlanForRole(userId int, planId int, advanceResetTime bool, operatorRole int) (*SubscriptionResetResult, error) {
 	if userId <= 0 || planId <= 0 {
 		return nil, errors.New("invalid userId or planId")
 	}
 	var result *SubscriptionResetResult
 	now := GetDBTimestamp()
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		if _, err := lockManageableSubscriptionUserTx(tx, userId, operatorRole); err != nil {
+			return err
+		}
 		plan, err := getSubscriptionPlanByIdTx(tx, planId)
 		if err != nil {
 			return err
@@ -1109,6 +1224,10 @@ func AdminResetUserSubscriptionsByPlan(userId int, planId int, advanceResetTime 
 }
 
 func AdminResetPlanSubscriptions(planId int, advanceResetTime bool) (*SubscriptionResetResult, error) {
+	return AdminResetPlanSubscriptionsForRole(planId, advanceResetTime, common.RoleRootUser)
+}
+
+func AdminResetPlanSubscriptionsForRole(planId int, advanceResetTime bool, operatorRole int) (*SubscriptionResetResult, error) {
 	if planId <= 0 {
 		return nil, errors.New("invalid planId")
 	}
@@ -1119,7 +1238,7 @@ func AdminResetPlanSubscriptions(planId int, advanceResetTime bool) (*Subscripti
 		if err != nil {
 			return err
 		}
-		result, err = adminResetPlanSubscriptionsTx(tx, plan, now, advanceResetTime)
+		result, err = adminResetPlanSubscriptionsTx(tx, plan, now, advanceResetTime, operatorRole)
 		return err
 	})
 	if err != nil {

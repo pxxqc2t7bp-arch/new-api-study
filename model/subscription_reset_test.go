@@ -1,13 +1,28 @@
 package model
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func seedSubscriptionResetUser(t *testing.T, id int) {
+	t.Helper()
+	require.NoError(t, DB.Create(&User{
+		Id:       id,
+		Username: fmt.Sprintf("sub-reset-%d", id),
+		Password: "unused-password-hash",
+		Role:     common.RoleCommonUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		AffCode:  fmt.Sprintf("sub-reset-%d", id),
+	}).Error)
+}
 
 func seedSubscriptionResetPlan(t *testing.T, plan *SubscriptionPlan) {
 	t.Helper()
@@ -29,6 +44,8 @@ func getSubscriptionResetSub(t *testing.T, id int) UserSubscription {
 func TestAdminResetUserSubscriptionsByPlanResetsAllActiveMatchesAndAdvancesTime(t *testing.T) {
 	truncateTables(t)
 
+	seedSubscriptionResetUser(t, 101)
+	seedSubscriptionResetUser(t, 102)
 	now := GetDBTimestamp()
 	plan := &SubscriptionPlan{
 		Id:               9101,
@@ -89,6 +106,7 @@ func TestAdminResetUserSubscriptionsByPlanResetsAllActiveMatchesAndAdvancesTime(
 func TestAdminResetUserSubscriptionsByPlanKeepsResetTimes(t *testing.T) {
 	truncateTables(t)
 
+	seedSubscriptionResetUser(t, 201)
 	now := GetDBTimestamp()
 	plan := &SubscriptionPlan{
 		Id:               9301,
@@ -118,6 +136,7 @@ func TestAdminResetUserSubscriptionsByPlanKeepsResetTimes(t *testing.T) {
 func TestAdminResetUserSubscriptionsByPlanNoActiveMatchReturnsError(t *testing.T) {
 	truncateTables(t)
 
+	seedSubscriptionResetUser(t, 301)
 	now := GetDBTimestamp()
 	plan := &SubscriptionPlan{
 		Id:            9401,
@@ -140,6 +159,9 @@ func TestAdminResetUserSubscriptionsByPlanNoActiveMatchReturnsError(t *testing.T
 func TestAdminResetPlanSubscriptionsResetsAllActiveUsers(t *testing.T) {
 	truncateTables(t)
 
+	for _, userId := range []int{401, 402, 403, 404} {
+		seedSubscriptionResetUser(t, userId)
+	}
 	now := GetDBTimestamp()
 	plan := &SubscriptionPlan{
 		Id:               9501,

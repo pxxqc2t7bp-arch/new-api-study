@@ -1,11 +1,13 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -353,6 +355,44 @@ type AdminBindSubscriptionRequest struct {
 	PlanId int `json:"plan_id"`
 }
 
+func requireManageableSubscriptionUser(c *gin.Context, userId int) bool {
+	user, err := model.GetUserById(userId, false)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			common.ApiErrorI18n(c, i18n.MsgUserNoPermissionSameLevel)
+		} else {
+			common.ApiError(c, err)
+		}
+		return false
+	}
+	if !common.CanManageUserRole(c.GetInt("role"), user.Role) {
+		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionSameLevel)
+		return false
+	}
+	return true
+}
+
+func requireManageableUserSubscription(c *gin.Context, userSubscriptionId int) bool {
+	userId, err := model.GetUserSubscriptionOwnerId(userSubscriptionId)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			common.ApiErrorI18n(c, i18n.MsgUserNoPermissionSameLevel)
+		} else {
+			common.ApiError(c, err)
+		}
+		return false
+	}
+	return requireManageableSubscriptionUser(c, userId)
+}
+
+func respondAdminSubscriptionError(c *gin.Context, err error) {
+	if errors.Is(err, model.ErrSubscriptionTargetNotManageable) {
+		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionSameLevel)
+		return
+	}
+	common.ApiError(c, err)
+}
+
 func AdminBindSubscription(c *gin.Context) {
 	if !requirePaymentCompliance(c) {
 		return
@@ -363,9 +403,12 @@ func AdminBindSubscription(c *gin.Context) {
 		common.ApiErrorMsg(c, "参数错误")
 		return
 	}
-	msg, err := model.AdminBindSubscription(req.UserId, req.PlanId, "")
+	if !requireManageableSubscriptionUser(c, req.UserId) {
+		return
+	}
+	msg, err := model.AdminBindSubscriptionForRole(req.UserId, req.PlanId, "", c.GetInt("role"))
 	if err != nil {
-		common.ApiError(c, err)
+		respondAdminSubscriptionError(c, err)
 		return
 	}
 	if msg != "" {
@@ -381,6 +424,9 @@ func AdminListUserSubscriptions(c *gin.Context) {
 	userId, _ := strconv.Atoi(c.Param("id"))
 	if userId <= 0 {
 		common.ApiErrorMsg(c, "无效的用户ID")
+		return
+	}
+	if !requireManageableSubscriptionUser(c, userId) {
 		return
 	}
 	subs, err := model.GetAllUserSubscriptions(userId)
@@ -428,14 +474,17 @@ func AdminCreateUserSubscription(c *gin.Context) {
 		common.ApiErrorMsg(c, "无效的用户ID")
 		return
 	}
+	if !requireManageableSubscriptionUser(c, userId) {
+		return
+	}
 	var req AdminCreateUserSubscriptionRequest
 	if err := c.ShouldBindJSON(&req); err != nil || req.PlanId <= 0 {
 		common.ApiErrorMsg(c, "参数错误")
 		return
 	}
-	msg, err := model.AdminBindSubscription(userId, req.PlanId, "")
+	msg, err := model.AdminBindSubscriptionForRole(userId, req.PlanId, "", c.GetInt("role"))
 	if err != nil {
-		common.ApiError(c, err)
+		respondAdminSubscriptionError(c, err)
 		return
 	}
 	if msg != "" {
@@ -451,6 +500,9 @@ func AdminResetUserSubscriptionsByPlan(c *gin.Context) {
 		common.ApiErrorMsg(c, "无效的用户ID")
 		return
 	}
+	if !requireManageableSubscriptionUser(c, userId) {
+		return
+	}
 	var req AdminResetSubscriptionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ApiErrorMsg(c, "参数错误")
@@ -461,9 +513,9 @@ func AdminResetUserSubscriptionsByPlan(c *gin.Context) {
 		return
 	}
 	advanceResetTime := resolveAdvanceResetTime(req.AdvanceResetTime)
-	result, err := model.AdminResetUserSubscriptionsByPlan(userId, req.PlanId, advanceResetTime)
+	result, err := model.AdminResetUserSubscriptionsByPlanForRole(userId, req.PlanId, advanceResetTime, c.GetInt("role"))
 	if err != nil {
-		common.ApiError(c, err)
+		respondAdminSubscriptionError(c, err)
 		return
 	}
 	recordSubscriptionResetUserLogs(c, result, auditOperatorInfo(c))
@@ -490,7 +542,7 @@ func AdminResetPlanSubscriptions(c *gin.Context) {
 		return
 	}
 	advanceResetTime := resolveAdvanceResetTime(req.AdvanceResetTime)
-	result, err := model.AdminResetPlanSubscriptions(planId, advanceResetTime)
+	result, err := model.AdminResetPlanSubscriptionsForRole(planId, advanceResetTime, c.GetInt("role"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -515,9 +567,12 @@ func AdminInvalidateUserSubscription(c *gin.Context) {
 		common.ApiErrorMsg(c, "无效的订阅ID")
 		return
 	}
-	msg, err := model.AdminInvalidateUserSubscription(subId)
+	if !requireManageableUserSubscription(c, subId) {
+		return
+	}
+	msg, err := model.AdminInvalidateUserSubscriptionForRole(subId, c.GetInt("role"))
 	if err != nil {
-		common.ApiError(c, err)
+		respondAdminSubscriptionError(c, err)
 		return
 	}
 	if msg != "" {
@@ -534,9 +589,12 @@ func AdminDeleteUserSubscription(c *gin.Context) {
 		common.ApiErrorMsg(c, "无效的订阅ID")
 		return
 	}
-	msg, err := model.AdminDeleteUserSubscription(subId)
+	if !requireManageableUserSubscription(c, subId) {
+		return
+	}
+	msg, err := model.AdminDeleteUserSubscriptionForRole(subId, c.GetInt("role"))
 	if err != nil {
-		common.ApiError(c, err)
+		respondAdminSubscriptionError(c, err)
 		return
 	}
 	if msg != "" {
