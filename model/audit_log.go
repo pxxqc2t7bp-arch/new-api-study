@@ -147,7 +147,11 @@ func GetAuditLogs(filter AuditLogFilter, start, limit, viewerRole int) ([]*Audit
 		})))
 	}
 	if viewerRole < common.RoleRootUser {
-		query = query.Where("actor_role IN ?", []int{common.RoleCommonUser, common.RolePluginAdminUser, common.RoleAdminUser})
+		visibleRoles := []int{common.RoleCommonUser, common.RoleAdminUser}
+		if filter.SelfView {
+			visibleRoles = append(visibleRoles, common.RolePluginAdminUser)
+		}
+		query = query.Where("actor_role IN ?", visibleRoles)
 	}
 	if filter.UserId > 0 {
 		query = query.Where("user_id = ?", filter.UserId)

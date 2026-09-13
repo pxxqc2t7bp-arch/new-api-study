@@ -240,6 +240,9 @@ func TestAuditRoleVisibilityAndPermissions(t *testing.T) {
 	rootToken := "root-audit-token"
 	root := &model.User{Username: "root-audit", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1, AccessToken: &rootToken, AffCode: "root-audit"}
 	require.NoError(t, model.DB.Create(root).Error)
+	pluginToken := "plugin-audit-token"
+	pluginAdmin := &model.User{Username: "plugin-audit", Role: common.RolePluginAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1, AccessToken: &pluginToken, AffCode: "plugin-audit"}
+	require.NoError(t, model.DB.Create(pluginAdmin).Error)
 	metadata := model.AuditOther{
 		AdminInfo: &model.AuditAdminInfo{AdminID: 1},
 		RootInfo:  model.AuditFields{"private": "root-only"},
@@ -248,6 +251,7 @@ func TestAuditRoleVisibilityAndPermissions(t *testing.T) {
 		model.RecordAuditLog(nil, model.AuditLog{ActorRole: role, UserId: admin.Id, Username: admin.Username, Category: model.AuditCategorySecurity, RequestId: fmt.Sprintf("role-%d", role), CreatedAt: int64(100 + i), Other: metadata})
 	}
 	model.RecordAuditLog(nil, model.AuditLog{ActorRole: 100, UserId: root.Id, Username: root.Username, Category: model.AuditCategorySecurity, RequestId: "root-owned", Other: metadata})
+	model.RecordAuditLog(nil, model.AuditLog{ActorRole: common.RolePluginAdminUser, UserId: pluginAdmin.Id, Username: pluginAdmin.Username, Category: model.AuditCategorySecurity, RequestId: "plugin-self", CreatedAt: 106, Other: metadata})
 	router := gin.New()
 	router.Use(middleware.RequestId(), middleware.AccessTokenAudit())
 	router.GET("/api/audit", middleware.AdminAuth(), middleware.RequirePermission(authz.AuditRead), GetAuditLogs)
@@ -289,11 +293,24 @@ func TestAuditRoleVisibilityAndPermissions(t *testing.T) {
 			}
 		}
 	}
+	pluginSelf := auditRequest(router, "GET", "/api/audit/self?category=security", pluginToken)
+	require.Equal(t, http.StatusOK, pluginSelf.Code)
+	var pluginResult struct {
+		Data struct {
+			Total int
+			Items []model.AuditLog
+		}
+	}
+	require.NoError(t, common.Unmarshal(pluginSelf.Body.Bytes(), &pluginResult))
+	assert.Equal(t, 1, pluginResult.Data.Total)
+	require.Len(t, pluginResult.Data.Items, 1)
+	assert.Equal(t, common.RolePluginAdminUser, pluginResult.Data.Items[0].ActorRole)
 	rootSelf := auditRequest(router, "GET", "/api/audit/self?category=security", rootToken)
 	assert.Contains(t, rootSelf.Body.String(), `"actor_role":100`)
 	assert.NotContains(t, rootSelf.Body.String(), "admin_info")
 	rootAll := auditRequest(router, "GET", "/api/audit?category=security", rootToken)
-	assert.Contains(t, rootAll.Body.String(), `"total":7`)
+	assert.Contains(t, rootAll.Body.String(), `"total":8`)
+	assert.Contains(t, rootAll.Body.String(), `"actor_role":5`)
 	assert.Contains(t, rootAll.Body.String(), "root-only")
 	require.NoError(t, authz.SetUserPermissions(admin.Id, authz.PermissionsMap{authz.ResourceAudit: {authz.ActionRead: false}}))
 	for _, credential := range []string{pat, jwt} {
@@ -500,18 +517,35 @@ func verifyAuditRoleStorage(t *testing.T) {
 		model.RecordAuditLog(nil, model.AuditLog{ActorRole: role, UserId: 1, Username: "role-owner", CreatedAt: int64(200 + i), Category: model.AuditCategoryOperation, RequestId: fmt.Sprintf("matrix-role-%d", role)})
 	}
 	filter := model.AuditLogFilter{Category: model.AuditCategoryOperation}
-	visible, total, err := model.GetAuditLogs(filter, 0, 20, common.RoleAdminUser)
+	visible, total, err := model.GetAuditLogs(filter, 0, 1, common.RoleAdminUser)
 	require.NoError(t, err)
-	assert.EqualValues(t, 3, total)
-	require.Len(t, visible, 3)
+	assert.EqualValues(t, 2, total)
+	require.Len(t, visible, 1)
 	assert.Equal(t, common.RoleAdminUser, visible[0].ActorRole)
-	assert.Equal(t, common.RolePluginAdminUser, visible[1].ActorRole)
-	assert.Equal(t, common.RoleCommonUser, visible[2].ActorRole)
+	visible, total, err = model.GetAuditLogs(filter, 1, 1, common.RoleAdminUser)
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, total)
+	require.Len(t, visible, 1)
+	assert.Equal(t, common.RoleCommonUser, visible[0].ActorRole)
 	visible, total, err = model.GetAuditLogs(filter, 0, 20, common.RoleCommonUser)
 	require.NoError(t, err)
-	assert.EqualValues(t, 3, total)
-	require.Len(t, visible, 3)
-	assert.Equal(t, common.RolePluginAdminUser, visible[1].ActorRole)
+	assert.EqualValues(t, 2, total)
+	require.Len(t, visible, 2)
+	for _, entry := range visible {
+		assert.NotEqual(t, common.RolePluginAdminUser, entry.ActorRole)
+	}
+	selfFilter := model.AuditLogFilter{SelfView: true, UserId: 1, Category: model.AuditCategoryOperation, RequestId: "matrix-role-5"}
+	visible, total, err = model.GetAuditLogs(selfFilter, 0, 20, common.RolePluginAdminUser)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, total)
+	require.Len(t, visible, 1)
+	assert.Equal(t, common.RolePluginAdminUser, visible[0].ActorRole)
+	filter.RequestId = "matrix-role-5"
+	visible, total, err = model.GetAuditLogs(filter, 0, 20, common.RoleRootUser)
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, total)
+	require.Len(t, visible, 1)
+	assert.Equal(t, common.RolePluginAdminUser, visible[0].ActorRole)
 	filter.RequestId = "matrix-role-100"
 	visible, total, err = model.GetAuditLogs(filter, 0, 20, common.RoleAdminUser)
 	require.NoError(t, err)
