@@ -1156,7 +1156,7 @@ func SoftDeleteUserForRole(userID int, operatorRole int) (*User, error) {
 		if err != nil {
 			return err
 		}
-		return tx.Delete(user).Error
+		return softDeleteUserWithTx(tx, user)
 	}); err != nil {
 		return nil, err
 	}
@@ -1182,20 +1182,23 @@ func (user *User) delete(identity *AuthSessionIdentity) error {
 			if err := ValidateAuthSessionWithTx(tx, *identity); err != nil {
 				return err
 			}
-			var role int
-			if err := tx.Model(&User{}).Where("id = ?", user.Id).Select("role").Scan(&role).Error; err != nil {
-				return err
-			}
-			if role == common.RoleRootUser {
-				return ErrCannotDeleteRootUser
-			}
+		}
+		var storedUser User
+		if err := lockForUpdate(tx.Unscoped()).
+			Select("id", "role").
+			Where("id = ?", user.Id).
+			First(&storedUser).Error; err != nil {
+			return err
+		}
+		if identity != nil && storedUser.Role == common.RoleRootUser {
+			return ErrCannotDeleteRootUser
 		}
 		var err error
 		nextAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
 		if err != nil {
 			return err
 		}
-		return tx.Delete(user).Error
+		return softDeleteUserWithTx(tx, &storedUser)
 	}); err != nil {
 		return err
 	}
@@ -1243,37 +1246,7 @@ func (user *User) hardDelete(operatorRole int) error {
 			return err
 		}
 		if storedUser.Role == common.RolePluginAdminUser {
-			if err := tx.Unscoped().Model(&User{}).Where("id = ?", storedUser.Id).Updates(map[string]any{
-				"username":                nil,
-				"password":                "",
-				"display_name":            "",
-				"status":                  common.UserStatusDisabled,
-				"email":                   "",
-				"github_id":               "",
-				"discord_id":              "",
-				"oidc_id":                 "",
-				"wechat_id":               "",
-				"telegram_id":             "",
-				"access_token":            nil,
-				"access_token_created_at": nil,
-				"quota":                   0,
-				"used_quota":              0,
-				"request_count":           0,
-				"group":                   "",
-				"aff_code":                nil,
-				"aff_count":               0,
-				"aff_quota":               0,
-				"aff_history":             0,
-				"inviter_id":              0,
-				"linux_do_id":             "",
-				"setting":                 "",
-				"remark":                  "",
-				"stripe_customer":         "",
-				"last_login_at":           0,
-			}).Error; err != nil {
-				return err
-			}
-			return tx.Delete(&storedUser).Error
+			return softDeleteUserWithTx(tx, &storedUser)
 		}
 		return tx.Unscoped().Delete(&storedUser).Error
 	})
@@ -1290,6 +1263,42 @@ func (user *User) hardDelete(operatorRole int) error {
 		common.SysError(fmt.Sprintf("failed to invalidate user cache after hard deleting user %d: %v", user.Id, err))
 	}
 	return nil
+}
+
+func softDeleteUserWithTx(tx *gorm.DB, user *User) error {
+	if user.Role == common.RolePluginAdminUser {
+		if err := tx.Unscoped().Model(&User{}).Where("id = ?", user.Id).Updates(map[string]any{
+			"username":                nil,
+			"password":                "",
+			"display_name":            "",
+			"status":                  common.UserStatusDisabled,
+			"email":                   "",
+			"github_id":               "",
+			"discord_id":              "",
+			"oidc_id":                 "",
+			"wechat_id":               "",
+			"telegram_id":             "",
+			"access_token":            nil,
+			"access_token_created_at": nil,
+			"quota":                   0,
+			"used_quota":              0,
+			"request_count":           0,
+			"group":                   "",
+			"aff_code":                nil,
+			"aff_count":               0,
+			"aff_quota":               0,
+			"aff_history":             0,
+			"inviter_id":              0,
+			"linux_do_id":             "",
+			"setting":                 "",
+			"remark":                  "",
+			"stripe_customer":         "",
+			"last_login_at":           0,
+		}).Error; err != nil {
+			return err
+		}
+	}
+	return tx.Delete(user).Error
 }
 
 func deleteUserAuthenticationData(tx *gorm.DB, userId int) error {

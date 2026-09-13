@@ -359,6 +359,119 @@ func assertPluginAdminTombstoneScrubbed(t *testing.T, db *gorm.DB, userID int, c
 	assert.Nil(t, identifiers.AccessToken)
 }
 
+type pluginAdminDeletionFixture struct {
+	user        model.User
+	password    string
+	accessToken string
+	identity    model.AuthSessionIdentity
+}
+
+func createPluginAdminDeletionFixture(t *testing.T, db *gorm.DB, prefix string, createdAt int64) pluginAdminDeletionFixture {
+	t.Helper()
+	password := "plugin-admin-password"
+	passwordHash, err := common.HashAccountPassword(password)
+	require.NoError(t, err)
+	accessToken := prefix + "-pat"
+	accessTokenCreatedAt := createdAt + 1
+	user := model.User{
+		Username: prefix, Password: passwordHash, DisplayName: "Sensitive Name",
+		Role: common.RolePluginAdminUser, Status: common.UserStatusEnabled,
+		Email: prefix + "@example.com", GitHubId: prefix + "-github",
+		DiscordId: prefix + "-discord", OidcId: prefix + "-oidc",
+		WeChatId: prefix + "-wechat", TelegramId: prefix + "-telegram",
+		LinuxDOId: prefix + "-linuxdo", AccessToken: &accessToken,
+		AccessTokenCreatedAt: &accessTokenCreatedAt, Quota: 101, UsedQuota: 202,
+		RequestCount: 303, Group: "sensitive-group", AffCode: prefix + "-aff",
+		AffCount: 4, AffQuota: 505, AffHistoryQuota: 606, InviterId: 707,
+		Setting: `{"notify":"secret"}`, Remark: "sensitive remark",
+		StripeCustomer: "cus_sensitive", CreatedAt: createdAt,
+		LastLoginAt: createdAt + 2, AuthVersion: 1,
+	}
+	require.NoError(t, db.Create(&user).Error)
+	seedAdministrativeDeletionAuthData(t, db, user, prefix)
+	return pluginAdminDeletionFixture{
+		user:        user,
+		password:    password,
+		accessToken: accessToken,
+		identity: model.AuthSessionIdentity{
+			UserID:          user.Id,
+			SessionID:       prefix + "-session",
+			UserAuthVersion: user.AuthVersion,
+			SessionVersion:  1,
+		},
+	}
+}
+
+func assertPluginAdminAuthenticationUnusable(t *testing.T, db *gorm.DB, fixture pluginAdminDeletionFixture) {
+	t.Helper()
+	login := model.User{Username: fixture.user.Username, Password: fixture.password}
+	assert.ErrorIs(t, login.ValidateAndFill(), model.ErrInvalidCredentials)
+	accessTokenUser, err := model.ValidateAccessToken(fixture.accessToken)
+	require.NoError(t, err)
+	assert.Nil(t, accessTokenUser)
+	assert.Error(t, db.Transaction(func(tx *gorm.DB) error {
+		return model.ValidateAuthSessionWithTx(tx, fixture.identity)
+	}))
+	activeSessions, err := model.CountActiveUserSessions(fixture.user.Id, time.Now().Unix())
+	require.NoError(t, err)
+	assert.Zero(t, activeSessions)
+	_, err = model.GetUserCache(fixture.user.Id)
+	assert.Error(t, err)
+}
+
+func TestPluginAdminSoftDeletionScrubsTombstoneAndDisablesAuthentication(t *testing.T) {
+	testCases := []struct {
+		name   string
+		delete func(*testing.T, pluginAdminDeletionFixture)
+	}{
+		{
+			name: "root management delete",
+			delete: func(t *testing.T, fixture pluginAdminDeletionFixture) {
+				response := performUserManagementRequest(
+					t,
+					common.RoleRootUser,
+					http.MethodPost,
+					"/api/user/manage",
+					fmt.Sprintf(`{"id":%d,"action":"delete"}`, fixture.user.Id),
+					nil,
+					ManageUser,
+				)
+				require.Equal(t, http.StatusOK, response.Code)
+				require.Contains(t, response.Body.String(), `"success":true`)
+			},
+		},
+		{
+			name: "session self delete",
+			delete: func(t *testing.T, fixture pluginAdminDeletionFixture) {
+				require.NoError(t, model.DeleteUserForSession(fixture.identity))
+			},
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupAdministrativeDeletionTestDB(t)
+			createdAt := int64(1_700_003_000 + i)
+			fixture := createPluginAdminDeletionFixture(t, db, fmt.Sprintf("plugin-soft-%d", i), createdAt)
+
+			tc.delete(t, fixture)
+
+			assertPluginAdminTombstoneScrubbed(t, db, fixture.user.Id, createdAt, 2)
+			assertPluginAdminAuthenticationUnusable(t, db, fixture)
+			var ownership struct {
+				Id   int
+				Role int
+			}
+			require.NoError(t, db.Unscoped().Model(&model.User{}).
+				Select("id", "role").
+				Where("id = ? AND role = ?", fixture.user.Id, common.RolePluginAdminUser).
+				Take(&ownership).Error)
+			assert.Equal(t, fixture.user.Id, ownership.Id)
+			assert.Equal(t, common.RolePluginAdminUser, ownership.Role)
+		})
+	}
+}
+
 func TestRootDeleteUserRetainsPluginAdminHistoryAndHardDeletesCommonUser(t *testing.T) {
 	t.Run("plugin admin becomes a durable tombstone", func(t *testing.T) {
 		db := setupAdministrativeDeletionTestDB(t)
