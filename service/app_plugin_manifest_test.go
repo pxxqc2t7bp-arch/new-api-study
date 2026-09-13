@@ -58,6 +58,17 @@ func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing
 		assertAppManifestErrorCode(t, []byte(`{"secret":"incomplete"`), AppManifestInvalidErrorCode)
 	})
 
+	t.Run("forbidden field inside schema-invalid value", func(t *testing.T) {
+		raw := mutateAppManifest(t, func(manifest map[string]any) {
+			manifest["callbackPath"] = map[string]any{
+				"nested": map[string]any{
+					"clientSecret": "do-not-disclose-this-value",
+				},
+			}
+		})
+		assertAppManifestErrorCode(t, raw, AppManifestForbiddenFieldErrorCode)
+	})
+
 	t.Run("unknown top-level field", func(t *testing.T) {
 		raw := mutateAppManifest(t, func(manifest map[string]any) {
 			manifest["unknown"] = true
@@ -136,6 +147,19 @@ func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing
 		"proxy",
 		"proxyRules",
 	}
+	forbiddenFields = append(forbiddenFields,
+		"APIKEYValue",
+		"API_KEY_VALUE",
+		"API-KEY-VALUE",
+		"IFRAMEURL",
+		"IFRAME_URL",
+		"IFRAME-URL",
+		"TOKENVALUE",
+		"TOKEN_VALUE",
+		"TOKEN-VALUE",
+		"PRIVATEKEYVALUE",
+		"CLIENTSECRET",
+	)
 	for _, field := range forbiddenFields {
 		t.Run("forbidden nested "+field, func(t *testing.T) {
 			const secretValue = "do-not-disclose-this-value"
@@ -178,6 +202,21 @@ func TestValidateAppManifestLimitsPathsScopesAndSemver(t *testing.T) {
 		raw := append(readAppManifestFixture(t), byte(0xff))
 		assertAppManifestErrorCode(t, raw, AppManifestInvalidErrorCode)
 	})
+
+	for name, path := range map[string]string{
+		"path over 8 KiB":            "/" + strings.Repeat("a", 8192),
+		"path over 16 decode rounds": "/%25252525252525252525252525252541",
+	} {
+		t.Run(name+" accepted", func(t *testing.T) {
+			raw := mutateAppManifest(t, func(manifest map[string]any) {
+				manifest["callbackPath"] = path
+			})
+			require.Less(t, len(raw), AppManifestMaxBytes)
+
+			_, err := ValidateAppManifest(raw)
+			require.NoError(t, err)
+		})
+	}
 
 	t.Run("trailing JSON rejected", func(t *testing.T) {
 		raw := append(readAppManifestFixture(t), []byte("\n{}")...)
@@ -285,6 +324,8 @@ func TestValidateAppManifestLimitsPathsScopesAndSemver(t *testing.T) {
 		"dot traversal":            "/auth/../callback",
 		"encoded traversal":        "/auth/%2e%2e/callback",
 		"double encoded":           "/auth/%252e%252e/callback",
+		"malformed escape":         "/auth/%zz",
+		"nested malformed escape":  "/%25%253241",
 	} {
 		t.Run("callback path "+name, func(t *testing.T) {
 			raw := mutateAppManifest(t, func(manifest map[string]any) {

@@ -15,8 +15,6 @@ const (
 	AppManifestMaxBytes                = 64 * 1024
 	AppManifestInvalidErrorCode        = "app_manifest_invalid"
 	AppManifestForbiddenFieldErrorCode = "app_manifest_forbidden_field"
-	appManifestMaxPathBytes            = 8 * 1024
-	appManifestMaxPathDecodeRounds     = 16
 )
 
 var (
@@ -125,6 +123,9 @@ func ValidateAppManifest(raw []byte) (AppManifest, error) {
 	if err := scanAppManifestJSON(raw); err != nil {
 		return AppManifest{}, err
 	}
+	if err := validateAppManifestJSONSchema(raw); err != nil {
+		return AppManifest{}, err
+	}
 
 	var manifest AppManifest
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -151,7 +152,7 @@ func scanAppManifestJSON(raw []byte) error {
 	if !ok || delim != '{' {
 		return invalidAppManifest("manifest must be one JSON object")
 	}
-	forbidden, err := scanAppManifestObject(decoder, "root")
+	forbidden, err := scanAppManifestObject(decoder)
 	if err != nil {
 		return err
 	}
@@ -164,7 +165,7 @@ func scanAppManifestJSON(raw []byte) error {
 	return nil
 }
 
-func scanAppManifestObject(decoder *json.Decoder, schemaName string) (bool, error) {
+func scanAppManifestObject(decoder *json.Decoder) (bool, error) {
 	seen := make(map[string]struct{})
 	forbidden := false
 	for decoder.More() {
@@ -180,16 +181,11 @@ func scanAppManifestObject(decoder *json.Decoder, schemaName string) (bool, erro
 			return false, invalidAppManifest("manifest contains a duplicate field")
 		}
 		seen[key] = struct{}{}
-		fieldSchema, known := appManifestJSONObjectSchemas[schemaName][key]
 		fieldForbidden := isForbiddenAppManifestField(key)
-		if schemaName != "" && !known && !fieldForbidden {
-			return false, invalidAppManifest("manifest does not match the v1 schema")
-		}
 		if fieldForbidden {
 			forbidden = true
-			fieldSchema = appManifestJSONFieldSchema{}
 		}
-		nestedForbidden, err := scanAppManifestValue(decoder, fieldSchema, fieldForbidden || schemaName == "")
+		nestedForbidden, err := scanAppManifestValue(decoder)
 		if err != nil {
 			return false, err
 		}
@@ -205,11 +201,7 @@ func scanAppManifestObject(decoder *json.Decoder, schemaName string) (bool, erro
 	return forbidden, nil
 }
 
-func scanAppManifestValue(
-	decoder *json.Decoder,
-	schema appManifestJSONFieldSchema,
-	unrestricted bool,
-) (bool, error) {
+func scanAppManifestValue(decoder *json.Decoder) (bool, error) {
 	token, err := decoder.Token()
 	if err != nil {
 		return false, invalidAppManifest("manifest must be valid JSON")
@@ -220,18 +212,11 @@ func scanAppManifestValue(
 	}
 	switch delim {
 	case '{':
-		if unrestricted {
-			return scanAppManifestObject(decoder, "")
-		}
-		if schema.object == "" {
-			return false, invalidAppManifest("manifest does not match the v1 schema")
-		}
-		return scanAppManifestObject(decoder, schema.object)
+		return scanAppManifestObject(decoder)
 	case '[':
 		forbidden := false
 		for decoder.More() {
-			elementSchema := appManifestJSONFieldSchema{object: schema.arrayObject}
-			nestedForbidden, err := scanAppManifestValue(decoder, elementSchema, unrestricted)
+			nestedForbidden, err := scanAppManifestValue(decoder)
 			if err != nil {
 				return false, err
 			}
@@ -247,6 +232,88 @@ func scanAppManifestValue(
 		return forbidden, nil
 	default:
 		return false, invalidAppManifest("manifest must be valid JSON")
+	}
+}
+
+func validateAppManifestJSONSchema(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil {
+		return invalidAppManifest("manifest must be valid JSON")
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '{' {
+		return invalidAppManifest("manifest must be one JSON object")
+	}
+	if err := validateAppManifestJSONObject(decoder, "root"); err != nil {
+		return err
+	}
+	return requireJSONEOF(decoder)
+}
+
+func validateAppManifestJSONObject(decoder *json.Decoder, schemaName string) error {
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return invalidAppManifest("manifest must be valid JSON")
+		}
+		key, ok := token.(string)
+		if !ok {
+			return invalidAppManifest("manifest must be valid JSON")
+		}
+		fieldSchema, known := appManifestJSONObjectSchemas[schemaName][key]
+		if !known {
+			return invalidAppManifest("manifest does not match the v1 schema")
+		}
+		if err := validateAppManifestJSONValue(decoder, fieldSchema); err != nil {
+			return err
+		}
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return invalidAppManifest("manifest must be valid JSON")
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '}' {
+		return invalidAppManifest("manifest must be valid JSON")
+	}
+	return nil
+}
+
+func validateAppManifestJSONValue(
+	decoder *json.Decoder,
+	schema appManifestJSONFieldSchema,
+) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return invalidAppManifest("manifest must be valid JSON")
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		if schema.object == "" {
+			return invalidAppManifest("manifest does not match the v1 schema")
+		}
+		return validateAppManifestJSONObject(decoder, schema.object)
+	case '[':
+		for decoder.More() {
+			elementSchema := appManifestJSONFieldSchema{object: schema.arrayObject}
+			if err := validateAppManifestJSONValue(decoder, elementSchema); err != nil {
+				return err
+			}
+		}
+		token, err := decoder.Token()
+		if err != nil {
+			return invalidAppManifest("manifest must be valid JSON")
+		}
+		if closing, ok := token.(json.Delim); !ok || closing != ']' {
+			return invalidAppManifest("manifest must be valid JSON")
+		}
+		return nil
+	default:
+		return invalidAppManifest("manifest must be valid JSON")
 	}
 }
 
@@ -269,7 +336,13 @@ func isForbiddenAppManifestField(field string) bool {
 		"networkpolicy",
 		"secretref",
 		"privatekey",
-		"apikey":
+		"privatekeyvalue",
+		"apikey",
+		"apikeyvalue",
+		"clientsecret",
+		"clientsecretvalue",
+		"iframeurl",
+		"tokenvalue":
 		return true
 	}
 
@@ -396,25 +469,77 @@ func allowedAppManifestScope(scope string) bool {
 }
 
 func validAppManifestPath(path string) bool {
-	if len(path) > appManifestMaxPathBytes {
+	if !validAppManifestPathLayer(path) {
 		return false
 	}
-
-	decodedPath := path
-	for range appManifestMaxPathDecodeRounds {
-		if !validAppManifestPathLayer(decodedPath) {
-			return false
-		}
-		next, err := url.PathUnescape(decodedPath)
-		if err != nil {
-			return false
-		}
-		if next == decodedPath {
-			return true
-		}
-		decodedPath = next
+	decodedPath, ok := decodeAppManifestPath(path)
+	if !ok {
+		return false
 	}
-	return false
+	return validAppManifestPathLayer(decodedPath)
+}
+
+func decodeAppManifestPath(path string) (string, bool) {
+	// Each round contracts disjoint %HH nodes; every contraction removes two
+	// active nodes, so decoding to the fixpoint remains linear in input size.
+	values := []byte(path)
+	next := make([]int, len(values))
+	percentNodes := make([]int, 0)
+	for index, value := range values {
+		next[index] = index + 1
+		if value == '%' {
+			percentNodes = append(percentNodes, index)
+		}
+	}
+	next[len(next)-1] = -1
+
+	for len(percentNodes) > 0 {
+		for _, percent := range percentNodes {
+			first := next[percent]
+			if first < 0 {
+				return "", false
+			}
+			second := next[first]
+			if second < 0 || !isAppManifestHex(values[first]) || !isAppManifestHex(values[second]) {
+				return "", false
+			}
+		}
+
+		nextPercentNodes := make([]int, 0, len(percentNodes))
+		for _, percent := range percentNodes {
+			first := next[percent]
+			second := next[first]
+			values[percent] = appManifestHexValue(values[first])<<4 | appManifestHexValue(values[second])
+			next[percent] = next[second]
+			if values[percent] == '%' {
+				nextPercentNodes = append(nextPercentNodes, percent)
+			}
+		}
+		percentNodes = nextPercentNodes
+	}
+
+	decoded := make([]byte, 0, len(values))
+	for index := 0; index >= 0; index = next[index] {
+		decoded = append(decoded, values[index])
+	}
+	return string(decoded), true
+}
+
+func isAppManifestHex(value byte) bool {
+	return value >= '0' && value <= '9' ||
+		value >= 'a' && value <= 'f' ||
+		value >= 'A' && value <= 'F'
+}
+
+func appManifestHexValue(value byte) byte {
+	switch {
+	case value >= '0' && value <= '9':
+		return value - '0'
+	case value >= 'a' && value <= 'f':
+		return value - 'a' + 10
+	default:
+		return value - 'A' + 10
+	}
 }
 
 func validAppManifestPathLayer(path string) bool {
