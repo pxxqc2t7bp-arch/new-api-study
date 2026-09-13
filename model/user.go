@@ -415,6 +415,10 @@ func GetMaxUserId() int {
 }
 
 func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (users []*User, total int64, err error) {
+	return GetAllUsersForViewer(common.RoleRootUser, pageInfo, sortOptions...)
+}
+
+func GetAllUsersForViewer(viewerRole int, pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (users []*User, total int64, err error) {
 	// Start transaction
 	tx := DB.Begin()
 	if tx.Error != nil {
@@ -426,8 +430,10 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
 		}
 	}()
 
+	query := applyUserListingVisibility(tx.Unscoped().Model(&User{}), viewerRole)
+
 	// Get total count within transaction
-	err = tx.Unscoped().Model(&User{}).Count(&total).Error
+	err = query.Count(&total).Error
 	if err != nil {
 		tx.Rollback()
 		return nil, 0, err
@@ -435,7 +441,7 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
 
 	// Get paginated users within same transaction
 	order := resolveUserSortOptions(sortOptions)
-	err = order.Apply(tx.Unscoped()).Limit(pageInfo.GetPageSize()).Offset(pageInfo.GetStartIdx()).Omit("password", "access_token").Find(&users).Error
+	err = order.Apply(query).Limit(pageInfo.GetPageSize()).Offset(pageInfo.GetStartIdx()).Omit("password", "access_token").Find(&users).Error
 	if err != nil {
 		tx.Rollback()
 		return nil, 0, err
@@ -450,6 +456,10 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
 }
 
 func SearchUsers(keyword string, group string, role *int, status *int, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
+	return SearchUsersForViewer(common.RoleRootUser, keyword, group, role, status, startIdx, num, sortOptions...)
+}
+
+func SearchUsersForViewer(viewerRole int, keyword string, group string, role *int, status *int, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
 	var users []*User
 	var total int64
 	var err error
@@ -466,7 +476,7 @@ func SearchUsers(keyword string, group string, role *int, status *int, startIdx 
 	}()
 
 	// 构建基础查询
-	query := tx.Unscoped().Model(&User{})
+	query := applyUserListingVisibility(tx.Unscoped().Model(&User{}), viewerRole)
 
 	// 构建搜索条件
 	likeCondition := "username LIKE ? OR email LIKE ? OR display_name LIKE ?"
@@ -516,6 +526,13 @@ func SearchUsers(keyword string, group string, role *int, status *int, startIdx 
 	}
 
 	return users, total, nil
+}
+
+func applyUserListingVisibility(query *gorm.DB, viewerRole int) *gorm.DB {
+	if viewerRole != common.RoleRootUser {
+		return query.Where("role <> ?", common.RolePluginAdminUser)
+	}
+	return query
 }
 
 func GetUserById(id int, selectAll bool) (*User, error) {

@@ -103,6 +103,31 @@ func performUserManagementRequest(t *testing.T, role int, method, path, body str
 	return recorder
 }
 
+type userListingResponse struct {
+	Success bool `json:"success"`
+	Data    struct {
+		Total int          `json:"total"`
+		Items []model.User `json:"items"`
+	} `json:"data"`
+}
+
+func decodeUserListingResponse(t *testing.T, recorder *httptest.ResponseRecorder) userListingResponse {
+	t.Helper()
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response userListingResponse
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response), recorder.Body.String())
+	require.True(t, response.Success, recorder.Body.String())
+	return response
+}
+
+func listedUserIDs(users []model.User) []int {
+	ids := make([]int, 0, len(users))
+	for _, user := range users {
+		ids = append(ids, user.Id)
+	}
+	return ids
+}
+
 func TestManageUserDisableAdvancesAuthVersionOnceAndRevokesSession(t *testing.T) {
 	db := setupManageUserTestDB(t)
 	now := time.Now().Unix()
@@ -613,6 +638,65 @@ func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 			} else if !tc.failCache {
 				assert.Equal(t, strconv.Itoa(tc.wantCached), server.HGet(quotaKey, "Quota"))
 			}
+		})
+	}
+}
+
+func TestUserListingsRespectViewerRole(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		path       string
+		handler    gin.HandlerFunc
+		adminTotal int
+		adminIDs   []int
+		rootTotal  int
+		rootIDs    []int
+	}{
+		{
+			name:       "list",
+			path:       "/api/user/?p=1&page_size=2&sort_by=id&sort_order=asc",
+			handler:    GetAllUsers,
+			adminTotal: 3,
+			adminIDs:   []int{1, 3},
+			rootTotal:  4,
+			rootIDs:    []int{1, 2},
+		},
+		{
+			name:       "search",
+			path:       "/api/user/search?keyword=listing&p=1&page_size=2&sort_by=id&sort_order=asc",
+			handler:    SearchUsers,
+			adminTotal: 3,
+			adminIDs:   []int{1, 3},
+			rootTotal:  4,
+			rootIDs:    []int{1, 2},
+		},
+		{
+			name:       "search with plugin admin role filter",
+			path:       "/api/user/search?keyword=listing&role=5&p=1&page_size=2&sort_by=id&sort_order=asc",
+			handler:    SearchUsers,
+			adminTotal: 0,
+			adminIDs:   []int{},
+			rootTotal:  1,
+			rootIDs:    []int{2},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupManageUserTestDB(t)
+			users := []model.User{
+				{Id: 1, Username: "listing-common-one", Password: "password", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "listing-common-one"},
+				{Id: 2, Username: "listing-plugin-admin", Password: "password", Role: common.RolePluginAdminUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "listing-plugin-admin"},
+				{Id: 3, Username: "listing-admin", Password: "password", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "listing-admin"},
+				{Id: 4, Username: "listing-common-two", Password: "password", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AffCode: "listing-common-two"},
+			}
+			require.NoError(t, db.Create(&users).Error)
+
+			admin := decodeUserListingResponse(t, performUserManagementRequest(t, common.RoleAdminUser, http.MethodGet, tc.path, "", nil, tc.handler))
+			assert.Equal(t, tc.adminTotal, admin.Data.Total)
+			assert.Equal(t, tc.adminIDs, listedUserIDs(admin.Data.Items))
+
+			root := decodeUserListingResponse(t, performUserManagementRequest(t, common.RoleRootUser, http.MethodGet, tc.path, "", nil, tc.handler))
+			assert.Equal(t, tc.rootTotal, root.Data.Total)
+			assert.Equal(t, tc.rootIDs, listedUserIDs(root.Data.Items))
 		})
 	}
 }
