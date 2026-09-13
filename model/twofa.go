@@ -333,15 +333,28 @@ func (t *TwoFA) ValidateBackupCodeAndUpdateUsage(code string) (bool, error) {
 
 // GetTwoFAStats 获取2FA统计信息（管理员使用）
 func GetTwoFAStats() (map[string]any, error) {
+	return GetTwoFAStatsForViewer(common.RoleRootUser)
+}
+
+func GetTwoFAStatsForViewer(viewerRole int) (map[string]any, error) {
 	var totalUsers, enabledUsers int64
 
-	// 总用户数
-	if err := DB.Model(&User{}).Count(&totalUsers).Error; err != nil {
+	visibleUsers := DB.Model(&User{})
+	if viewerRole != common.RoleRootUser {
+		visibleUsers = visibleUsers.Where("role <> ?", common.RolePluginAdminUser)
+	}
+	if err := visibleUsers.Count(&totalUsers).Error; err != nil {
 		return nil, err
 	}
 
-	// 启用2FA的用户数
-	if err := DB.Model(&TwoFA{}).Where("is_enabled = true").Count(&enabledUsers).Error; err != nil {
+	visibleUserIds := DB.Model(&User{}).Select("id")
+	if viewerRole != common.RoleRootUser {
+		visibleUserIds = visibleUserIds.Where("role <> ?", common.RolePluginAdminUser)
+	}
+	if err := DB.Model(&TwoFA{}).
+		Where("is_enabled = ?", true).
+		Where("user_id IN (?)", visibleUserIds).
+		Count(&enabledUsers).Error; err != nil {
 		return nil, err
 	}
 

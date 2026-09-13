@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -39,6 +40,14 @@ func setupAdminCompleteTopUpFixture(t *testing.T, targetRole int, provider strin
 
 func completeTopUpAs(t *testing.T, actorRole int, tradeNo string) topUpAdminResponse {
 	t.Helper()
+	response := completeTopUpRequestAs(t, actorRole, tradeNo)
+	var body topUpAdminResponse
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body), response.Body.String())
+	return body
+}
+
+func completeTopUpRequestAs(t *testing.T, actorRole int, tradeNo string) *httptest.ResponseRecorder {
+	t.Helper()
 	response := performUserManagementRequest(
 		t,
 		actorRole,
@@ -49,9 +58,7 @@ func completeTopUpAs(t *testing.T, actorRole int, tradeNo string) topUpAdminResp
 		AdminCompleteTopUp,
 	)
 	require.Equal(t, http.StatusOK, response.Code)
-	var body topUpAdminResponse
-	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body), response.Body.String())
-	return body
+	return response
 }
 
 type topUpAdminResponse struct {
@@ -163,6 +170,58 @@ func TestAdminCompleteTopUpAuthorizesBeforeCompletedOrderIdempotency(t *testing.
 	assert.NotContains(t, completedResponse.Message, topUp.TradeNo)
 	assert.NotContains(t, completedResponse.Message, user.Username)
 	assertManualTopUpState(t, db, user.Id, topUp.TradeNo, common.TopUpStatusSuccess, 50)
+}
+
+func TestAdminCompleteTopUpHidesProtectedOrderExistence(t *testing.T) {
+	db, user, pending := setupAdminCompleteTopUpFixture(t, common.RolePluginAdminUser, model.PaymentProviderEpay)
+	completed := model.TopUp{
+		UserId: user.Id, Amount: 2, TradeNo: "MANUAL-PROTECTED-COMPLETED",
+		PaymentMethod: model.PaymentProviderEpay, PaymentProvider: model.PaymentProviderEpay,
+		CreateTime: common.GetTimestamp(), Status: common.TopUpStatusSuccess,
+	}
+	missingOwner := model.TopUp{
+		UserId: user.Id + 1_000_000, Amount: 2, TradeNo: "MANUAL-MISSING-OWNER",
+		PaymentMethod: model.PaymentProviderEpay, PaymentProvider: model.PaymentProviderEpay,
+		CreateTime: common.GetTimestamp(), Status: common.TopUpStatusPending,
+	}
+	require.NoError(t, db.Create(&completed).Error)
+	require.NoError(t, db.Create(&missingOwner).Error)
+
+	missing := completeTopUpRequestAs(t, common.RoleAdminUser, "MANUAL-MISSING-ORDER")
+	for name, tradeNo := range map[string]string{
+		"missing owner":       missingOwner.TradeNo,
+		"protected pending":   pending.TradeNo,
+		"protected completed": completed.TradeNo,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := completeTopUpRequestAs(t, common.RoleAdminUser, tradeNo)
+			assert.Equal(t, missing.Body.String(), response.Body.String())
+		})
+	}
+	assert.JSONEq(t, fmt.Sprintf(
+		`{"success":false,"message":%q}`,
+		i18n.Translate(i18n.DefaultLang, i18n.MsgUserNoPermissionHigherLevel),
+	), missing.Body.String())
+	assertManualTopUpState(t, db, user.Id, pending.TradeNo, common.TopUpStatusPending, 50)
+	assertManualTopUpState(t, db, user.Id, completed.TradeNo, common.TopUpStatusSuccess, 50)
+}
+
+func TestAdminCompleteTopUpPreservesInternalDatabaseErrors(t *testing.T) {
+	db, _, topUp := setupAdminCompleteTopUpFixture(t, common.RoleCommonUser, model.PaymentProviderEpay)
+	forcedErr := errors.New("forced topup database failure")
+	callbackName := "test:fail_manual_topup_query"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "TopUp" {
+			_ = tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Query().Remove(callbackName))
+	})
+
+	response := completeTopUpRequestAs(t, common.RoleAdminUser, topUp.TradeNo)
+
+	assert.JSONEq(t, `{"success":false,"message":"forced topup database failure"}`, response.Body.String())
 }
 
 func TestTopUpListingsRespectViewerRole(t *testing.T) {

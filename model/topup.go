@@ -491,7 +491,13 @@ func ManualCompleteTopUpForRole(tradeNo string, callerIp string, operatorRole in
 		topUp := &TopUp{}
 		// 行级锁，避免并发补单
 		if err := lockForUpdate(tx).Where(refCol+" = ?", tradeNo).First(topUp).Error; err != nil {
-			return errors.New("充值订单不存在")
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				if operatorRole == common.RoleAdminUser {
+					return ErrTopUpTargetNotManageable
+				}
+				return errors.New("充值订单不存在")
+			}
+			return err
 		}
 
 		var user User

@@ -44,6 +44,20 @@ func manageUserQuota(c *gin.Context, req ManageRequest) {
 		markAuditLogged(c)
 	}()
 
+	if req.Id > 0 {
+		if _, result := getManageableTargetUser(c, req.Id, manageableTargetOptions{}); result != manageableTargetFound {
+			switch result {
+			case manageableTargetUnauthorized:
+				params["failure_reason"] = "permission_denied"
+			case manageableTargetInternalError:
+				params["failure_reason"] = "database_error"
+			default:
+				params["failure_reason"] = "target_not_found"
+			}
+			return
+		}
+	}
+
 	adjustment, err := model.AdjustUserQuota(req.Id, c.GetInt("role"), req.Mode, req.Value)
 	if err != nil {
 		switch {
@@ -56,7 +70,7 @@ func manageUserQuota(c *gin.Context, req ManageRequest) {
 			}
 		case errors.Is(err, model.ErrUserQuotaPermission):
 			params["failure_reason"] = "permission_denied"
-			common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
+			common.ApiErrorI18n(c, i18n.MsgUserNotExists)
 		case errors.Is(err, gorm.ErrRecordNotFound):
 			params["failure_reason"] = "target_not_found"
 			common.ApiErrorI18n(c, i18n.MsgUserNotExists)

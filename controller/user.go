@@ -381,20 +381,72 @@ func canManageTargetRole(myRole int, targetRole int) bool {
 	return common.CanManageUserRole(myRole, targetRole)
 }
 
+type manageableTargetOptions struct {
+	includeDeleted       bool
+	requireStrictlyLower bool
+	writeInternalError   func(*gin.Context, error)
+}
+
+type manageableTargetResult uint8
+
+const (
+	manageableTargetFound manageableTargetResult = iota
+	manageableTargetNotFound
+	manageableTargetUnauthorized
+	manageableTargetInternalError
+)
+
+func getManageableTargetUser(c *gin.Context, id int, options manageableTargetOptions) (*model.User, manageableTargetResult) {
+	if id <= 0 {
+		common.ApiErrorI18n(c, i18n.MsgUserNotExists)
+		return nil, manageableTargetNotFound
+	}
+
+	var (
+		user *model.User
+		err  error
+	)
+	if options.includeDeleted {
+		user = &model.User{}
+		err = model.DB.Unscoped().
+			Omit("password", "access_token").
+			Where("id = ?", id).
+			First(user).Error
+	} else {
+		user, err = model.GetUserById(id, false)
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		common.ApiErrorI18n(c, i18n.MsgUserNotExists)
+		return nil, manageableTargetNotFound
+	}
+	if err != nil {
+		if options.writeInternalError != nil {
+			options.writeInternalError(c, err)
+		} else {
+			common.ApiError(c, err)
+		}
+		return nil, manageableTargetInternalError
+	}
+
+	allowed := canManageTargetRole(c.GetInt("role"), user.Role)
+	if options.requireStrictlyLower {
+		allowed = common.CanManageLowerUserRole(c.GetInt("role"), user.Role)
+	}
+	if !allowed {
+		common.ApiErrorI18n(c, i18n.MsgUserNotExists)
+		return nil, manageableTargetUnauthorized
+	}
+	return user, manageableTargetFound
+}
+
 func GetUser(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	user, err := model.GetUserById(id, false)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	myRole := c.GetInt("role")
-	if !canManageTargetRole(myRole, user.Role) {
-		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionSameLevel)
+	user, result := getManageableTargetUser(c, id, manageableTargetOptions{})
+	if result != manageableTargetFound {
 		return
 	}
 	user.AdminPermissions = authz.Capabilities(user.Id, user.Role)
@@ -660,9 +712,8 @@ func UpdateUser(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgUserInputInvalid, map[string]any{"Error": err.Error()})
 		return
 	}
-	originUser, err := model.GetUserById(updatedUser.Id, false)
-	if err != nil {
-		common.ApiError(c, err)
+	originUser, result := getManageableTargetUser(c, updatedUser.Id, manageableTargetOptions{})
+	if result != manageableTargetFound {
 		return
 	}
 	if updatedUser.Role != common.RoleGuestUser && updatedUser.Role != originUser.Role {
@@ -670,11 +721,6 @@ func UpdateUser(c *gin.Context) {
 		return
 	}
 	updatedUser.Role = originUser.Role
-	myRole := c.GetInt("role")
-	if !canManageTargetRole(myRole, originUser.Role) {
-		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
-		return
-	}
 	updatePassword := updatedUser.Password != ""
 	authzTouched := false
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
@@ -728,15 +774,8 @@ func AdminClearUserBinding(c *gin.Context) {
 		return
 	}
 
-	user, err := model.GetUserById(id, false)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-
-	myRole := c.GetInt("role")
-	if !canManageTargetRole(myRole, user.Role) {
-		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionSameLevel)
+	user, result := getManageableTargetUser(c, id, manageableTargetOptions{})
+	if result != manageableTargetFound {
 		return
 	}
 
@@ -913,14 +952,8 @@ func DeleteUser(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	originUser, err := model.GetUserById(id, false)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	myRole := c.GetInt("role")
-	if !common.CanManageLowerUserRole(myRole, originUser.Role) {
-		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
+	originUser, result := getManageableTargetUser(c, id, manageableTargetOptions{requireStrictlyLower: true})
+	if result != manageableTargetFound {
 		return
 	}
 	err = model.HardDeleteUserById(id)
@@ -1060,20 +1093,11 @@ func ManageUser(c *gin.Context) {
 		manageUserQuota(c, req)
 		return
 	}
-	user := model.User{
-		Id: req.Id,
-	}
-	// Fill attributes
-	model.DB.Unscoped().Where(&user).First(&user)
-	if user.Id == 0 {
-		common.ApiErrorI18n(c, i18n.MsgUserNotExists)
+	user, result := getManageableTargetUser(c, req.Id, manageableTargetOptions{includeDeleted: true})
+	if result != manageableTargetFound {
 		return
 	}
 	myRole := c.GetInt("role")
-	if !canManageTargetRole(myRole, user.Role) {
-		common.ApiErrorI18n(c, i18n.MsgUserNoPermissionHigherLevel)
-		return
-	}
 	switch req.Action {
 	case "disable":
 		user.Status = common.UserStatusDisabled

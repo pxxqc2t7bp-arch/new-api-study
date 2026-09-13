@@ -6,13 +6,11 @@ import (
 	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 )
 
 type Verify2FARequest struct {
@@ -174,7 +172,7 @@ func Verify2FALogin(c *gin.Context) {
 
 // Admin2FAStats 管理员获取2FA统计信息
 func Admin2FAStats(c *gin.Context) {
-	stats, err := model.GetTwoFAStats()
+	stats, err := model.GetTwoFAStatsForViewer(c.GetInt("role"))
 	if err != nil {
 		writeSecurityOperationError(c, err)
 		return
@@ -199,23 +197,9 @@ func AdminDisable2FA(c *gin.Context) {
 		return
 	}
 
-	// 检查目标用户权限
-	targetUser, err := model.GetUserById(userId, false)
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		common.ApiErrorI18n(c, i18n.MsgUserNotExists)
-		return
-	}
-	if err != nil {
-		writeSecurityOperationError(c, err)
-		return
-	}
-
-	myRole := c.GetInt("role")
-	if !canManageTargetRole(myRole, targetUser.Role) {
-		c.JSON(http.StatusOK, gin.H{
-			"success": false,
-			"message": "无权操作同级或更高级用户的2FA设置",
-		})
+	if _, result := getManageableTargetUser(c, userId, manageableTargetOptions{
+		writeInternalError: writeSecurityOperationError,
+	}); result != manageableTargetFound {
 		return
 	}
 

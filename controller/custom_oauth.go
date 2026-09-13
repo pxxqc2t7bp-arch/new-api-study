@@ -496,15 +496,7 @@ func GetUserOAuthBindingsByAdmin(c *gin.Context) {
 		return
 	}
 
-	targetUser, err := model.GetUserById(userId, false)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-
-	myRole := c.GetInt("role")
-	if !canManageTargetRole(myRole, targetUser.Role) {
-		common.ApiErrorMsg(c, "no permission")
+	if _, result := getManageableTargetUser(c, userId, manageableTargetOptions{}); result != manageableTargetFound {
 		return
 	}
 
@@ -575,15 +567,7 @@ func UnbindCustomOAuthByAdmin(c *gin.Context) {
 		return
 	}
 
-	targetUser, err := model.GetUserById(userId, false)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-
-	myRole := c.GetInt("role")
-	if !canManageTargetRole(myRole, targetUser.Role) {
-		common.ApiErrorMsg(c, "no permission")
+	if _, result := getManageableTargetUser(c, userId, manageableTargetOptions{}); result != manageableTargetFound {
 		return
 	}
 

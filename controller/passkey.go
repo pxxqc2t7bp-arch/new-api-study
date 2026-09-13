@@ -431,14 +431,10 @@ func AdminResetPasskey(c *gin.Context) {
 		return
 	}
 
-	user := &model.User{Id: id}
-	if err := user.FillUserById(); err != nil {
-		writeSecurityOperationError(c, err)
-		return
-	}
-	myRole := c.GetInt("role")
-	if !canManageTargetRole(myRole, user.Role) {
-		common.ApiErrorMsg(c, "no permission")
+	user, result := getManageableTargetUser(c, id, manageableTargetOptions{
+		writeInternalError: writeSecurityOperationError,
+	})
+	if result != manageableTargetFound {
 		return
 	}
 

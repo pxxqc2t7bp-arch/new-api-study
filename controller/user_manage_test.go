@@ -289,12 +289,38 @@ func assertAdministrativeDeletionAuthDataPurged(t *testing.T, db *gorm.DB, userI
 func TestRootDeleteUserRetainsPluginAdminHistoryAndHardDeletesCommonUser(t *testing.T) {
 	t.Run("plugin admin becomes a durable tombstone", func(t *testing.T) {
 		db := setupAdministrativeDeletionTestDB(t)
+		const (
+			originalUsername = "deleted-plugin-admin"
+			originalPassword = "plugin-admin-password"
+			originalEmail    = "deleted-plugin-admin@example.com"
+			originalToken    = "plugin-admin-access-token"
+		)
+		passwordHash, err := common.HashAccountPassword(originalPassword)
+		require.NoError(t, err)
+		accessToken := originalToken
+		accessTokenCreatedAt := int64(1_700_000_100)
 		user := model.User{
-			Username: "deleted-plugin-admin", Password: "password", Role: common.RolePluginAdminUser,
-			Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "deleted-plugin-admin",
+			Username: originalUsername, Password: passwordHash, DisplayName: "Plugin Admin Name",
+			Role: common.RolePluginAdminUser, Status: common.UserStatusEnabled,
+			Email: "deleted-plugin-admin@example.com", GitHubId: "github-sensitive",
+			DiscordId: "discord-sensitive", OidcId: "oidc-sensitive", WeChatId: "wechat-sensitive",
+			TelegramId: "telegram-sensitive", LinuxDOId: "linuxdo-sensitive",
+			AccessToken: &accessToken, AccessTokenCreatedAt: &accessTokenCreatedAt,
+			Quota: 101, UsedQuota: 202, RequestCount: 303, Group: "sensitive-group",
+			AffCode: "deleted-plugin-admin", AffCount: 4, AffQuota: 505,
+			AffHistoryQuota: 606, InviterId: 707, Setting: `{"notify":"secret"}`,
+			Remark: "sensitive remark", StripeCustomer: "cus_sensitive",
+			CreatedAt: 1_700_000_000, LastLoginAt: 1_700_000_200, AuthVersion: 1,
 		}
 		require.NoError(t, db.Create(&user).Error)
 		seedAdministrativeDeletionAuthData(t, db, user, "deleted-plugin-admin")
+
+		login := model.User{Username: originalUsername, Password: originalPassword}
+		require.NoError(t, login.ValidateAndFill())
+		accessTokenUser, err := model.ValidateAccessToken(originalToken)
+		require.NoError(t, err)
+		require.NotNil(t, accessTokenUser)
+		assert.Equal(t, user.Id, accessTokenUser.Id)
 
 		now := time.Now().Unix()
 		topUp := model.TopUp{
@@ -325,7 +351,7 @@ func TestRootDeleteUserRetainsPluginAdminHistoryAndHardDeletesCommonUser(t *test
 		require.Equal(t, http.StatusOK, response.Code)
 		require.Contains(t, response.Body.String(), `"success":true`)
 
-		_, err := model.GetUserById(user.Id, false)
+		_, err = model.GetUserById(user.Id, false)
 		require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 		require.ErrorIs(t, db.First(&model.User{}, user.Id).Error, gorm.ErrRecordNotFound)
 
@@ -335,8 +361,44 @@ func TestRootDeleteUserRetainsPluginAdminHistoryAndHardDeletesCommonUser(t *test
 		assert.Equal(t, user.Id, tombstone.Id)
 		assert.True(t, tombstone.DeletedAt.Valid)
 		assert.Equal(t, common.RolePluginAdminUser, tombstone.Role)
+		assert.Equal(t, common.UserStatusDisabled, tombstone.Status)
 		assert.EqualValues(t, 2, tombstone.AuthVersion)
+		assert.Equal(t, "tomb-"+strconv.FormatInt(int64(user.Id), 36), tombstone.Username)
+		assert.Equal(t, "tombstone-"+strconv.FormatInt(int64(user.Id), 36), tombstone.AffCode)
+		assert.Empty(t, tombstone.Password)
+		assert.Empty(t, tombstone.DisplayName)
+		assert.Empty(t, tombstone.Email)
+		assert.Empty(t, tombstone.GitHubId)
+		assert.Empty(t, tombstone.DiscordId)
+		assert.Empty(t, tombstone.OidcId)
+		assert.Empty(t, tombstone.WeChatId)
+		assert.Empty(t, tombstone.TelegramId)
+		assert.Empty(t, tombstone.LinuxDOId)
+		assert.Nil(t, tombstone.AccessToken)
+		assert.Nil(t, tombstone.AccessTokenCreatedAt)
+		assert.Zero(t, tombstone.Quota)
+		assert.Zero(t, tombstone.UsedQuota)
+		assert.Zero(t, tombstone.RequestCount)
+		assert.Empty(t, tombstone.Group)
+		assert.Zero(t, tombstone.AffCount)
+		assert.Zero(t, tombstone.AffQuota)
+		assert.Zero(t, tombstone.AffHistoryQuota)
+		assert.Zero(t, tombstone.InviterId)
+		assert.Empty(t, tombstone.Setting)
+		assert.Empty(t, tombstone.Remark)
+		assert.Empty(t, tombstone.StripeCustomer)
+		assert.Zero(t, tombstone.LastLoginAt)
+		assert.EqualValues(t, 1_700_000_000, tombstone.CreatedAt)
 		assertAdministrativeDeletionAuthDataPurged(t, db, user.Id)
+
+		login = model.User{Username: originalUsername, Password: originalPassword}
+		assert.ErrorIs(t, login.ValidateAndFill(), model.ErrInvalidCredentials)
+		accessTokenUser, err = model.ValidateAccessToken(originalToken)
+		require.NoError(t, err)
+		assert.Nil(t, accessTokenUser)
+		exists, err := model.CheckUserExistOrDeleted(originalUsername, originalEmail)
+		require.NoError(t, err)
+		assert.False(t, exists)
 
 		_, adminTopUps := getTopUpListingAs(t, common.RoleAdminUser, "/api/user/topup?p=1&page_size=10")
 		assert.Zero(t, adminTopUps.Data.Total)
@@ -1011,6 +1073,138 @@ func TestUserManagementProtectsPluginAdminAccounts(t *testing.T) {
 				require.NoError(t, db.Unscoped().Model(record).Where("user_id = ?", user.Id).Count(&count).Error)
 				assert.EqualValues(t, 1, count, table)
 			}
+		})
+	}
+}
+
+func TestUserManagementHidesPluginAdminExistence(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		invoke func(int) *httptest.ResponseRecorder
+	}{
+		{
+			name: "read",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodGet, "/api/user/1", "", gin.Params{{Key: "id", Value: strconv.Itoa(id)}}, GetUser)
+			},
+		},
+		{
+			name: "update password",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"username":"compromised","password":"replacement-password","display_name":"changed","role":%d,"status":%d,"group":"default"}`, id, common.RolePluginAdminUser, common.UserStatusEnabled)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPut, "/api/user/", body, nil, UpdateUser)
+			},
+		},
+		{
+			name: "hard delete",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1", "", gin.Params{{Key: "id", Value: strconv.Itoa(id)}}, DeleteUser)
+			},
+		},
+		{
+			name: "disable",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"disable"}`, id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "enable",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"enable"}`, id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "promote",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"promote"}`, id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "demote",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"demote"}`, id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "soft delete",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"delete"}`, id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "adjust quota",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"add_quota","mode":"add","value":1}`, id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "clear built-in OAuth binding",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				params := gin.Params{{Key: "id", Value: strconv.Itoa(id)}, {Key: "binding_type", Value: "github"}}
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1/bindings/github", "", params, AdminClearUserBinding)
+			},
+		},
+		{
+			name: "read custom OAuth bindings",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodGet, "/api/user/1/oauth/bindings", "", gin.Params{{Key: "id", Value: strconv.Itoa(id)}}, GetUserOAuthBindingsByAdmin)
+			},
+		},
+		{
+			name: "clear custom OAuth binding",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				params := gin.Params{{Key: "id", Value: strconv.Itoa(id)}, {Key: "provider_id", Value: "77"}}
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1/oauth/bindings/77", "", params, UnbindCustomOAuthByAdmin)
+			},
+		},
+		{
+			name: "disable 2FA",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1/2fa", "", gin.Params{{Key: "id", Value: strconv.Itoa(id)}}, AdminDisable2FA)
+			},
+		},
+		{
+			name: "reset passkey",
+			invoke: func(id int) *httptest.ResponseRecorder {
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1/reset_passkey", "", gin.Params{{Key: "id", Value: strconv.Itoa(id)}}, AdminResetPasskey)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupManageUserTestDB(t)
+			require.NoError(t, db.AutoMigrate(
+				&model.CustomOAuthProvider{},
+				&model.UserOAuthBinding{},
+				&model.ExternalIdentityClaim{},
+				&model.TwoFA{},
+				&model.TwoFABackupCode{},
+				&model.PasskeyCredential{},
+				&model.AuthFlow{},
+				&model.Token{},
+			))
+			user := model.User{
+				Username: "hidden-plugin-admin-target", Password: "stored-password",
+				Role: common.RolePluginAdminUser, Status: common.UserStatusEnabled,
+				Group: "default", AffCode: "hidden-plugin-admin-aff",
+			}
+			require.NoError(t, db.Create(&user).Error)
+
+			protected := tc.invoke(user.Id)
+			missing := tc.invoke(user.Id + 1_000_000)
+
+			require.Equal(t, http.StatusOK, protected.Code)
+			assert.Equal(t, protected.Code, missing.Code)
+			assert.Equal(t, protected.Body.String(), missing.Body.String())
+			assert.JSONEq(t, fmt.Sprintf(
+				`{"success":false,"message":%q}`,
+				i18n.Translate(i18n.DefaultLang, i18n.MsgUserNotExists),
+			), protected.Body.String())
 		})
 	}
 }

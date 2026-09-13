@@ -1043,6 +1043,37 @@ func (user *User) HardDelete() error {
 			return err
 		}
 		if storedUser.Role == common.RolePluginAdminUser {
+			tombstoneId := strconv.FormatInt(int64(storedUser.Id), 36)
+			if err := tx.Unscoped().Model(&User{}).Where("id = ?", storedUser.Id).Updates(map[string]any{
+				"username":                "tomb-" + tombstoneId,
+				"password":                "",
+				"display_name":            "",
+				"status":                  common.UserStatusDisabled,
+				"email":                   "",
+				"github_id":               "",
+				"discord_id":              "",
+				"oidc_id":                 "",
+				"wechat_id":               "",
+				"telegram_id":             "",
+				"access_token":            nil,
+				"access_token_created_at": nil,
+				"quota":                   0,
+				"used_quota":              0,
+				"request_count":           0,
+				"group":                   "",
+				"aff_code":                "tombstone-" + tombstoneId,
+				"aff_count":               0,
+				"aff_quota":               0,
+				"aff_history":             0,
+				"inviter_id":              0,
+				"linux_do_id":             "",
+				"setting":                 "",
+				"remark":                  "",
+				"stripe_customer":         "",
+				"last_login_at":           0,
+			}).Error; err != nil {
+				return err
+			}
 			return tx.Delete(&storedUser).Error
 		}
 		return tx.Unscoped().Delete(&storedUser).Error
