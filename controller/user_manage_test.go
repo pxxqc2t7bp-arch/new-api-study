@@ -80,16 +80,26 @@ func setupManageUserTestDB(t *testing.T) *gorm.DB {
 
 func performManageUserRequest(t *testing.T, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	return performUserManagementRequest(t, common.RoleRootUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+}
+
+func performUserManagementRequest(t *testing.T, role int, method, path, body string, params gin.Params, handler gin.HandlerFunc) *httptest.ResponseRecorder {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	c.Request = httptest.NewRequest(http.MethodPost, "/api/user/manage", strings.NewReader(body))
+	c.Request = httptest.NewRequest(method, path, strings.NewReader(body))
 	c.Request.Header.Set("Content-Type", "application/json")
 	c.Set("id", 9999)
-	c.Set("role", common.RoleRootUser)
-	c.Set("username", "root-operator")
+	c.Set("role", role)
+	username := "admin-operator"
+	if role == common.RoleRootUser {
+		username = "root-operator"
+	}
+	c.Set("username", username)
 	c.Set(common.RequestIdKey, "quota-test-request")
-	ManageUser(c)
+	c.Params = params
+	handler(c)
 	return recorder
 }
 
@@ -605,4 +615,200 @@ func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUserManagementProtectsPluginAdminAccounts(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		invoke func(*model.User) *httptest.ResponseRecorder
+	}{
+		{
+			name: "read",
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodGet, "/api/user/1", "", gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}}, GetUser)
+			},
+		},
+		{
+			name: "update password",
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"username":"compromised","password":"replacement-password","display_name":"changed","role":%d,"status":%d,"group":"default"}`, user.Id, user.Role, user.Status)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPut, "/api/user/", body, nil, UpdateUser)
+			},
+		},
+		{
+			name: "hard delete",
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1", "", gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}}, DeleteUser)
+			},
+		},
+		{
+			name: "disable",
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"disable"}`, user.Id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "demote",
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"demote"}`, user.Id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "soft delete",
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"delete"}`, user.Id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "adjust quota",
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"add_quota","mode":"add","value":1}`, user.Id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "clear built-in OAuth binding",
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				params := gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}, {Key: "binding_type", Value: "github"}}
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1/bindings/github", "", params, AdminClearUserBinding)
+			},
+		},
+		{
+			name: "read custom OAuth bindings",
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodGet, "/api/user/1/oauth/bindings", "", gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}}, GetUserOAuthBindingsByAdmin)
+			},
+		},
+		{
+			name: "clear custom OAuth binding",
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				params := gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}, {Key: "provider_id", Value: "77"}}
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1/oauth/bindings/77", "", params, UnbindCustomOAuthByAdmin)
+			},
+		},
+		{
+			name: "disable 2FA",
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1/2fa", "", gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}}, AdminDisable2FA)
+			},
+		},
+		{
+			name: "reset passkey",
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1/reset_passkey", "", gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}}, AdminResetPasskey)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupManageUserTestDB(t)
+			require.NoError(t, db.AutoMigrate(
+				&model.CustomOAuthProvider{},
+				&model.UserOAuthBinding{},
+				&model.ExternalIdentityClaim{},
+				&model.TwoFA{},
+				&model.TwoFABackupCode{},
+				&model.PasskeyCredential{},
+				&model.AuthFlow{},
+				&model.Token{},
+			))
+			user := model.User{
+				Username: "plugin-admin-target", Password: "stored-password", DisplayName: "plugin admin",
+				Role: common.RolePluginAdminUser, Status: common.UserStatusEnabled, Group: "default",
+				Quota: 123, AuthVersion: 7, GitHubId: "github-subject", AffCode: "plugin-admin-aff",
+			}
+			require.NoError(t, db.Create(&user).Error)
+			require.NoError(t, db.Create(&model.CustomOAuthProvider{Id: 77, Name: "Plugin OAuth", Slug: "plugin-oauth"}).Error)
+			require.NoError(t, db.Create(&model.UserOAuthBinding{UserId: user.Id, ProviderId: 77, ProviderUserId: "custom-subject"}).Error)
+			require.NoError(t, db.Create(&model.TwoFA{UserId: user.Id, Secret: "secret", IsEnabled: true}).Error)
+			require.NoError(t, db.Create(&model.PasskeyCredential{UserID: user.Id, CredentialID: "credential", PublicKey: "public-key"}).Error)
+
+			response := tc.invoke(&user)
+
+			assert.Equal(t, http.StatusOK, response.Code)
+			require.Contains(t, response.Body.String(), `"success":false`)
+			var stored model.User
+			require.NoError(t, db.Unscoped().First(&stored, user.Id).Error)
+			assert.False(t, stored.DeletedAt.Valid)
+			assert.Equal(t, "plugin-admin-target", stored.Username)
+			assert.Equal(t, "stored-password", stored.Password)
+			assert.Equal(t, common.RolePluginAdminUser, stored.Role)
+			assert.Equal(t, common.UserStatusEnabled, stored.Status)
+			assert.Equal(t, 123, stored.Quota)
+			assert.Equal(t, "github-subject", stored.GitHubId)
+			assert.EqualValues(t, 7, stored.AuthVersion)
+			for table, record := range map[string]any{
+				"custom OAuth binding": &model.UserOAuthBinding{},
+				"2FA":                  &model.TwoFA{},
+				"passkey":              &model.PasskeyCredential{},
+			} {
+				var count int64
+				require.NoError(t, db.Unscoped().Model(record).Where("user_id = ?", user.Id).Count(&count).Error)
+				assert.EqualValues(t, 1, count, table)
+			}
+		})
+	}
+}
+
+func TestUserManagementRolePolicy(t *testing.T) {
+	t.Run("admin cannot create plugin admin", func(t *testing.T) {
+		db := setupManageUserTestDB(t)
+		response := performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/", `{"username":"admin-created-plugin","password":"plugin-password","role":5}`, nil, CreateUser)
+		require.Contains(t, response.Body.String(), `"success":false`)
+		var count int64
+		require.NoError(t, db.Model(&model.User{}).Where("username = ?", "admin-created-plugin").Count(&count).Error)
+		assert.Zero(t, count)
+	})
+
+	t.Run("root creates and manages plugin admin", func(t *testing.T) {
+		db := setupManageUserTestDB(t)
+		previousMaster := common.IsMasterNode
+		common.IsMasterNode = false
+		t.Cleanup(func() { common.IsMasterNode = previousMaster })
+		require.NoError(t, authz.Init(db))
+
+		response := performUserManagementRequest(t, common.RoleRootUser, http.MethodPost, "/api/user/", `{"username":"root-created-plugin","password":"plugin-password","role":5}`, nil, CreateUser)
+		require.Contains(t, response.Body.String(), `"success":true`)
+		var user model.User
+		require.NoError(t, db.First(&user, "username = ?", "root-created-plugin").Error)
+		assert.Equal(t, common.RolePluginAdminUser, user.Role)
+
+		response = performUserManagementRequest(t, common.RoleRootUser, http.MethodGet, "/api/user/1", "", gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}}, GetUser)
+		require.Contains(t, response.Body.String(), `"success":true`)
+		response = performUserManagementRequest(t, common.RoleRootUser, http.MethodPost, "/api/user/manage", fmt.Sprintf(`{"id":%d,"action":"disable"}`, user.Id), nil, ManageUser)
+		require.Contains(t, response.Body.String(), `"success":true`)
+		require.NoError(t, db.First(&user, user.Id).Error)
+		assert.Equal(t, common.UserStatusDisabled, user.Status)
+
+		response = performUserManagementRequest(t, common.RoleRootUser, http.MethodPost, "/api/user/", `{"username":"second-root","password":"root-password","role":100}`, nil, CreateUser)
+		require.Contains(t, response.Body.String(), `"success":false`)
+		var rootCount int64
+		require.NoError(t, db.Model(&model.User{}).Where("username = ?", "second-root").Count(&rootCount).Error)
+		assert.Zero(t, rootCount)
+	})
+
+	t.Run("admin creates and manages common user", func(t *testing.T) {
+		db := setupManageUserTestDB(t)
+		response := performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/", `{"username":"admin-created-common","password":"common-password","role":1}`, nil, CreateUser)
+		require.Contains(t, response.Body.String(), `"success":true`)
+		var user model.User
+		require.NoError(t, db.First(&user, "username = ?", "admin-created-common").Error)
+		assert.Equal(t, common.RoleCommonUser, user.Role)
+
+		response = performUserManagementRequest(t, common.RoleAdminUser, http.MethodGet, "/api/user/1", "", gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}}, GetUser)
+		require.Contains(t, response.Body.String(), `"success":true`)
+		body := fmt.Sprintf(`{"id":%d,"username":"admin-updated-common","password":"updated-password","role":%d,"status":%d,"group":"default"}`, user.Id, user.Role, user.Status)
+		response = performUserManagementRequest(t, common.RoleAdminUser, http.MethodPut, "/api/user/", body, nil, UpdateUser)
+		require.Contains(t, response.Body.String(), `"success":true`)
+		require.NoError(t, db.First(&user, user.Id).Error)
+		assert.Equal(t, "admin-updated-common", user.Username)
+		assert.True(t, common.ValidatePasswordAndHash("updated-password", user.Password))
+
+		response = performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", fmt.Sprintf(`{"id":%d,"action":"disable"}`, user.Id), nil, ManageUser)
+		require.Contains(t, response.Body.String(), `"success":true`)
+		require.NoError(t, db.First(&user, user.Id).Error)
+		assert.Equal(t, common.UserStatusDisabled, user.Status)
+	})
 }
