@@ -108,6 +108,33 @@ func TestUserAuthAllowsOpaqueDottedPAT(t *testing.T) {
 	assert.Equal(t, user.Id, body.ID)
 }
 
+func TestPluginAdminUsesUserAuthWithoutAdminElevation(t *testing.T) {
+	setupDashboardAuthMiddlewareTest(t)
+	user := createMiddlewarePATUser(t, "plugin-admin-user", "plugin-admin-pat")
+	require.NoError(t, model.DB.Model(user).Update("role", common.RolePluginAdminUser).Error)
+
+	router := gin.New()
+	router.GET("/user", UserAuth(), func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+	router.GET("/admin", AdminAuth(), func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+
+	userRequest := httptest.NewRequest(http.MethodGet, "/user", nil)
+	userRequest.Header.Set("Authorization", "Bearer plugin-admin-pat")
+	userResponse := httptest.NewRecorder()
+	router.ServeHTTP(userResponse, userRequest)
+	assert.Equal(t, http.StatusNoContent, userResponse.Code)
+
+	adminRequest := httptest.NewRequest(http.MethodGet, "/admin", nil)
+	adminRequest.Header.Set("Authorization", "Bearer plugin-admin-pat")
+	adminResponse := httptest.NewRecorder()
+	router.ServeHTTP(adminResponse, adminRequest)
+	assert.Equal(t, http.StatusForbidden, adminResponse.Code)
+	assert.Contains(t, adminResponse.Body.String(), "AUTH_INSUFFICIENT_PRIVILEGE")
+}
+
 func TestUserAuthNeverFallsBackForRecognizedInvalidInternalJWT(t *testing.T) {
 	setupDashboardAuthMiddlewareTest(t)
 	identity := service.AuthIdentity{UserID: 42, SessionID: "session-42", UserAuthVersion: 1, SessionVersion: 1}

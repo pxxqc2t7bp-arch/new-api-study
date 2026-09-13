@@ -298,6 +298,13 @@ func TestPluginAdminHasOnlyAppPluginManage(t *testing.T) {
 	db := newAuthzTestDB(t)
 	require.NoError(t, Init(db))
 
+	assert.Equal(t, 5, common.RolePluginAdminUser)
+	assert.True(t, common.IsValidateRole(common.RolePluginAdminUser))
+	assert.True(t, Can(42, common.RolePluginAdminUser, AppPluginManage))
+	assert.False(t, Can(42, common.RolePluginAdminUser, ChannelRead))
+	assert.False(t, Can(42, common.RolePluginAdminUser, AuditRead))
+	assert.False(t, Can(42, common.RolePluginAdminUser, TaskPluginBind))
+
 	assert.Equal(t, []Permission{AppPluginManage}, PermissionsForRole(BuiltInRolePluginAdmin))
 
 	var pluginAdmin *RoleDescriptor
