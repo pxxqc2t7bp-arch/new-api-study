@@ -22,6 +22,9 @@ import (
 func TestAppInstallationNeverReturnsSecretRef(t *testing.T) {
 	db := openAppPluginServiceDB(t)
 	logAppPluginServiceDBVersion(t, db)
+	t.Run("records database runtime metadata", func(t *testing.T) {
+		assertAppPluginServiceRuntimeMetadata(t, db)
+	})
 	require.NoError(t, model.MigrateAppPluginTables(db))
 
 	svc := NewAppPluginInstallationService(db, AppPluginInstallationOptions{
@@ -84,6 +87,9 @@ func TestAppInstallationNeverReturnsSecretRef(t *testing.T) {
 func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 	db := openAppPluginServiceDB(t)
 	logAppPluginServiceDBVersion(t, db)
+	t.Run("records database runtime metadata", func(t *testing.T) {
+		assertAppPluginServiceRuntimeMetadata(t, db)
+	})
 	require.NoError(t, model.MigrateAppPluginTables(db))
 
 	svc := NewAppPluginInstallationService(db, AppPluginInstallationOptions{
@@ -133,6 +139,9 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 func TestAppInstallationOwnsParentOriginsAndEnabledSurfaces(t *testing.T) {
 	db := openAppPluginServiceDB(t)
 	logAppPluginServiceDBVersion(t, db)
+	t.Run("records database runtime metadata", func(t *testing.T) {
+		assertAppPluginServiceRuntimeMetadata(t, db)
+	})
 	require.NoError(t, model.MigrateAppPluginTables(db))
 
 	svc := NewAppPluginInstallationService(db, AppPluginInstallationOptions{
@@ -262,6 +271,35 @@ func logAppPluginServiceDBVersion(t *testing.T, db *gorm.DB) {
 		require.NoError(t, db.Raw("select version()").Scan(&version).Error)
 	}
 	t.Logf("database=%s version=%s", db.Dialector.Name(), version)
+}
+
+func assertAppPluginServiceRuntimeMetadata(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	dialect := db.Dialector.Name()
+	require.Equal(t, dialect, os.Getenv("APP_PLUGIN_TEST_DIALECT"))
+	require.NotEmpty(t, os.Getenv("APP_PLUGIN_TEST_DRIVER"))
+
+	var version string
+	switch dialect {
+	case "sqlite":
+		require.NoError(t, db.Raw("select sqlite_version()").Scan(&version).Error)
+		require.Equal(t, "github.com/glebarez/sqlite@v1.11.0", os.Getenv("APP_PLUGIN_TEST_DRIVER"))
+		require.Empty(t, os.Getenv("APP_PLUGIN_TEST_IMAGE"))
+		require.Empty(t, os.Getenv("APP_PLUGIN_TEST_PLATFORM"))
+	case "mysql":
+		require.NoError(t, db.Raw("select version()").Scan(&version).Error)
+		require.Equal(t, "gorm.io/driver/mysql@v1.5.7", os.Getenv("APP_PLUGIN_TEST_DRIVER"))
+		require.Equal(t, "mysql:5.7.44@sha256:4bc6bc963e6d8443453676cae56536f4b8156d78bae03c0145cbe47c2aad73bb", os.Getenv("APP_PLUGIN_TEST_IMAGE"))
+		require.Equal(t, "linux/amd64", os.Getenv("APP_PLUGIN_TEST_PLATFORM"))
+	case "postgres":
+		require.NoError(t, db.Raw("select version()").Scan(&version).Error)
+		require.Equal(t, "gorm.io/driver/postgres@v1.5.9", os.Getenv("APP_PLUGIN_TEST_DRIVER"))
+		require.Equal(t, "postgres:15.19@sha256:9b1d34adbce1dd07ee6e94b4a2cf698884b89bd44a6c9c12f5da8f3acbfe4957", os.Getenv("APP_PLUGIN_TEST_IMAGE"))
+		require.Equal(t, "linux/arm64", os.Getenv("APP_PLUGIN_TEST_PLATFORM"))
+	default:
+		t.Fatalf("unsupported database dialect %q", dialect)
+	}
+	require.Equal(t, version, os.Getenv("APP_PLUGIN_TEST_DATABASE_VERSION"))
 }
 
 func appPluginInstallCommand(key, version string) AppInstallCommand {

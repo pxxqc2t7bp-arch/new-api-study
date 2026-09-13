@@ -21,6 +21,9 @@ import (
 func TestAppPluginMigrationFreshUpgradeReplay(t *testing.T) {
 	db := openAppPluginModelDB(t)
 	logAppPluginDBVersion(t, db)
+	t.Run("records database runtime metadata", func(t *testing.T) {
+		assertAppPluginModelRuntimeMetadata(t, db)
+	})
 
 	t.Run("fresh migration creates every host-owned app plugin table", func(t *testing.T) {
 		require.NoError(t, MigrateAppPluginTables(db))
@@ -116,6 +119,9 @@ func (legacyAppInstallation) TableName() string {
 func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 	db := openAppPluginModelDB(t)
 	logAppPluginDBVersion(t, db)
+	t.Run("records database runtime metadata", func(t *testing.T) {
+		assertAppPluginModelRuntimeMetadata(t, db)
+	})
 	require.NoError(t, MigrateAppPluginTables(db))
 
 	t.Run("same scope request hash and content digest replays frozen response with stable IDs", func(t *testing.T) {
@@ -136,7 +142,8 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 	t.Run("same app key and version with different canonical manifest digest is a stable conflict", func(t *testing.T) {
 		first := appPluginModelInstallRequest("writer", "1.1.0", "https://apps.example.com/writer-1-1/")
 		second := first
-		second.ManifestSHA256 = appPluginDigest(`{"key":"writer","version":"1.1.0","name":"changed"}`)
+		second.CanonicalManifestJSON = []byte(`{"apiVersion":1,"kind":"app","key":"writer","version":"1.1.0","name":"changed"}`)
+		second.ManifestSHA256 = appPluginDigest(string(second.CanonicalManifestJSON))
 
 		_, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 12, Key: "first"}, first)
 		require.NoError(t, err)
@@ -150,8 +157,7 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 	t.Run("same idempotency scope with a different request hash conflicts", func(t *testing.T) {
 		scope := AppIdempotencyScope{ActorID: 13, Key: "install-writer-2"}
 		first := appPluginModelInstallRequest("reader", "1.0.0", "https://apps.example.com/reader/")
-		second := first
-		second.BaseURL = "https://apps.example.com/reader-v2/"
+		second := appPluginModelInstallRequest("reader", "1.0.0", "https://apps.example.com/reader-v2/")
 
 		_, err := InstallAppVersion(context.Background(), db, scope, first)
 		require.NoError(t, err)
@@ -186,11 +192,104 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 		_, err = InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 15, Key: "casesensitive"}, lower)
 		require.NoError(t, err)
 	})
+
+	t.Run("rejects tampered or malformed canonical manifest without persistence", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			mutate func(*AppInstallRequest)
+		}{
+			{
+				name: "tampered digest",
+				mutate: func(req *AppInstallRequest) {
+					req.ManifestSHA256 = appPluginDigest("tampered")
+				},
+			},
+			{
+				name: "malformed JSON",
+				mutate: func(req *AppInstallRequest) {
+					req.CanonicalManifestJSON = []byte(`{"key":`)
+					req.ManifestSHA256 = appPluginDigest(string(req.CanonicalManifestJSON))
+				},
+			},
+		}
+		for i, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				key := fmt.Sprintf("invalid-manifest-%d", i)
+				req := appPluginModelInstallRequest(key, "1.0.0", fmt.Sprintf("https://apps.example.com/invalid/%d/", i))
+				test.mutate(&req)
+				before := appPluginPersistenceCounts(t, db)
+
+				_, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 16, Key: fmt.Sprintf("%s-%d", test.name, i)}, req)
+
+				require.Error(t, err)
+				assert.ErrorIs(t, err, ErrAppInstallRequestInvalid)
+				assert.Equal(t, before, appPluginPersistenceCounts(t, db))
+			})
+		}
+	})
+
+	t.Run("rejects manifest key or version mismatch without persistence", func(t *testing.T) {
+		for i, field := range []string{"key", "version"} {
+			t.Run(field, func(t *testing.T) {
+				key := fmt.Sprintf("manifest-mismatch-%d", i)
+				req := appPluginModelInstallRequest(key, "1.0.0", fmt.Sprintf("https://apps.example.com/mismatch/%d/", i))
+				if field == "key" {
+					req.AppKey = "different-key"
+				} else {
+					req.ManifestVersion = "2.0.0"
+				}
+				before := appPluginPersistenceCounts(t, db)
+
+				_, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 17, Key: fmt.Sprintf("%s-%d", field, i)}, req)
+
+				require.Error(t, err)
+				assert.ErrorIs(t, err, ErrAppInstallRequestInvalid)
+				assert.Equal(t, before, appPluginPersistenceCounts(t, db))
+			})
+		}
+	})
+
+	t.Run("rejects invalid host-owned input without persistence", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			mutate func(*AppInstallRequest)
+		}{
+			{name: "insecure base URL", mutate: func(req *AppInstallRequest) { req.BaseURL = "http://apps.example.com/plugin/" }},
+			{name: "endpoint outside base URL", mutate: func(req *AppInstallRequest) { req.CallbackURL = "https://evil.example/callback" }},
+			{name: "unknown enabled surface", mutate: func(req *AppInstallRequest) { req.EnabledSurfaces = []string{"admin"} }},
+			{name: "non-origin parent URL", mutate: func(req *AppInstallRequest) { req.AllowedParentOrigins = []string{"https://console.example.com/path"} }},
+			{name: "insecure allowed origin", mutate: func(req *AppInstallRequest) { req.AllowedOrigins = []string{"http://apps.example.com"} }},
+			{name: "invalid user group reference", mutate: func(req *AppInstallRequest) { req.AllowedUserPolicy.Groups = []string{""} }},
+			{name: "invalid network host reference", mutate: func(req *AppInstallRequest) { req.NetworkPolicy.AllowHosts = []string{"https://api.example.com/path"} }},
+			{name: "missing entitlement policy reference", mutate: func(req *AppInstallRequest) { req.EntitlementPolicyID = "" }},
+			{name: "missing credential ID", mutate: func(req *AppInstallRequest) { req.ServiceCredentialID = "" }},
+			{name: "missing credential version", mutate: func(req *AppInstallRequest) { req.ServiceCredentialVersion = "" }},
+			{name: "invalid credential hash", mutate: func(req *AppInstallRequest) { req.ServiceCredentialHash = "not-a-sha256" }},
+			{name: "invalid credential expiry", mutate: func(req *AppInstallRequest) { req.ServiceCredentialExpiry = 0 }},
+		}
+		for i, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				key := fmt.Sprintf("invalid-host-%d", i)
+				req := appPluginModelInstallRequest(key, "1.0.0", fmt.Sprintf("https://apps.example.com/invalid-host/%d/", i))
+				test.mutate(&req)
+				before := appPluginPersistenceCounts(t, db)
+
+				_, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 18, Key: fmt.Sprintf("%s-%d", test.name, i)}, req)
+
+				require.Error(t, err)
+				assert.ErrorIs(t, err, ErrAppInstallRequestInvalid)
+				assert.Equal(t, before, appPluginPersistenceCounts(t, db))
+			})
+		}
+	})
 }
 
 func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 	db := openAppPluginModelDB(t)
 	logAppPluginDBVersion(t, db)
+	t.Run("records database runtime metadata", func(t *testing.T) {
+		assertAppPluginModelRuntimeMetadata(t, db)
+	})
 	require.NoError(t, MigrateAppPluginTables(db))
 
 	first := appPluginModelInstallRequest("routes-one", "1.0.0", "https://apps.example.com/one/")
@@ -203,8 +302,7 @@ func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 		assert.Equal(t, result.InstallationID, claim.InstallationID)
 	}
 
-	colliding := appPluginModelInstallRequest("routes-two", "1.0.0", "https://apps.example.com/two/")
-	colliding.DirectURL = first.DirectURL
+	colliding := appPluginModelInstallRequest("routes-two", "1.0.0", "https://apps.example.com/one/")
 	_, err = InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 22, Key: "routes-two"}, colliding)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrAppRouteClaimConflict)
@@ -219,6 +317,9 @@ func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 	db := openAppPluginModelDB(t)
 	logAppPluginDBVersion(t, db)
+	t.Run("records database runtime metadata", func(t *testing.T) {
+		assertAppPluginModelRuntimeMetadata(t, db)
+	})
 	require.NoError(t, MigrateAppPluginTables(db))
 
 	install := appPluginModelInstallRequest("lifecycle", "1.0.0", "https://apps.example.com/lifecycle/")
@@ -339,26 +440,71 @@ func logAppPluginDBVersion(t *testing.T, db *gorm.DB) {
 	t.Logf("database=%s version=%s", db.Dialector.Name(), version)
 }
 
-func appPluginModelInstallRequest(key, version, baseURL string) AppInstallRequest {
-	return AppInstallRequest{
-		AppKey:                  key,
-		ManifestVersion:         version,
-		ManifestSHA256:          appPluginDigest(key + ":" + version),
-		CanonicalManifestJSON:   []byte(`{"apiVersion":1,"kind":"app","key":"` + key + `","version":"` + version + `"}`),
-		BaseURL:                 baseURL,
-		CallbackURL:             baseURL + "callback",
-		DirectURL:               baseURL + "direct",
-		EmbeddedURL:             baseURL + "embedded",
-		EnabledSurfaces:         []string{"direct", "embedded"},
-		AllowedParentOrigins:    []string{"https://console.example.com"},
-		AllowedOrigins:          []string{"https://apps.example.com"},
-		AllowedUserPolicy:       AppAllowedUserPolicy{Groups: []string{"default"}},
-		NetworkPolicy:           AppNetworkPolicy{AllowHosts: []string{"api.example.com"}},
-		EntitlementPolicyID:     "policy-basic",
-		ServiceCredentialHash:   appPluginDigest("credential:" + key),
-		ServiceCredentialID:     "cred_" + key,
-		ServiceCredentialExpiry: 4102444800,
+func assertAppPluginModelRuntimeMetadata(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	dialect := db.Dialector.Name()
+	require.Equal(t, dialect, os.Getenv("APP_PLUGIN_TEST_DIALECT"))
+	require.NotEmpty(t, os.Getenv("APP_PLUGIN_TEST_DRIVER"))
+
+	var version string
+	switch dialect {
+	case "sqlite":
+		require.NoError(t, db.Raw("select sqlite_version()").Scan(&version).Error)
+		require.Equal(t, "github.com/glebarez/sqlite@v1.11.0", os.Getenv("APP_PLUGIN_TEST_DRIVER"))
+		require.Empty(t, os.Getenv("APP_PLUGIN_TEST_IMAGE"))
+		require.Empty(t, os.Getenv("APP_PLUGIN_TEST_PLATFORM"))
+	case "mysql":
+		require.NoError(t, db.Raw("select version()").Scan(&version).Error)
+		require.Equal(t, "gorm.io/driver/mysql@v1.5.7", os.Getenv("APP_PLUGIN_TEST_DRIVER"))
+		require.Equal(t, "mysql:5.7.44@sha256:4bc6bc963e6d8443453676cae56536f4b8156d78bae03c0145cbe47c2aad73bb", os.Getenv("APP_PLUGIN_TEST_IMAGE"))
+		require.Equal(t, "linux/amd64", os.Getenv("APP_PLUGIN_TEST_PLATFORM"))
+	case "postgres":
+		require.NoError(t, db.Raw("select version()").Scan(&version).Error)
+		require.Equal(t, "gorm.io/driver/postgres@v1.5.9", os.Getenv("APP_PLUGIN_TEST_DRIVER"))
+		require.Equal(t, "postgres:15.19@sha256:9b1d34adbce1dd07ee6e94b4a2cf698884b89bd44a6c9c12f5da8f3acbfe4957", os.Getenv("APP_PLUGIN_TEST_IMAGE"))
+		require.Equal(t, "linux/arm64", os.Getenv("APP_PLUGIN_TEST_PLATFORM"))
+	default:
+		t.Fatalf("unsupported database dialect %q", dialect)
 	}
+	require.Equal(t, version, os.Getenv("APP_PLUGIN_TEST_DATABASE_VERSION"))
+}
+
+func appPluginModelInstallRequest(key, version, baseURL string) AppInstallRequest {
+	manifest := []byte(`{"apiVersion":1,"kind":"app","key":"` + key + `","version":"` + version + `"}`)
+	return AppInstallRequest{
+		AppKey:                   key,
+		ManifestVersion:          version,
+		ManifestSHA256:           appPluginDigest(string(manifest)),
+		CanonicalManifestJSON:    manifest,
+		BaseURL:                  baseURL,
+		CallbackURL:              baseURL + "callback",
+		DirectURL:                baseURL + "direct",
+		EmbeddedURL:              baseURL + "embedded",
+		EnabledSurfaces:          []string{"direct", "embedded"},
+		AllowedParentOrigins:     []string{"https://console.example.com"},
+		AllowedOrigins:           []string{"https://apps.example.com"},
+		AllowedUserPolicy:        AppAllowedUserPolicy{Groups: []string{"default"}},
+		NetworkPolicy:            AppNetworkPolicy{AllowHosts: []string{"api.example.com"}},
+		EntitlementPolicyID:      "policy-basic",
+		ServiceCredentialHash:    appPluginDigest("credential:" + key),
+		ServiceCredentialID:      "cred_" + key,
+		ServiceCredentialVersion: "v1",
+		ServiceCredentialExpiry:  4102444800,
+	}
+}
+
+func appPluginPersistenceCounts(t *testing.T, db *gorm.DB) [4]int64 {
+	t.Helper()
+	var counts [4]int64
+	for i, table := range []any{
+		&AppVersion{},
+		&AppInstallation{},
+		&AppInstallationIdempotency{},
+		&AppRouteClaim{},
+	} {
+		require.NoError(t, db.Model(table).Count(&counts[i]).Error)
+	}
+	return counts
 }
 
 func appPluginDigest(value string) string {

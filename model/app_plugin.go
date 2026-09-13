@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql/driver"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +27,7 @@ var (
 	ErrAppVersionConflict              = errors.New("app_version_conflict")
 	ErrAppIdempotencyConflict          = errors.New("app_idempotency_conflict")
 	ErrAppRouteClaimConflict           = errors.New("app_route_claim_conflict")
+	ErrAppInstallRequestInvalid        = errors.New("app_install_request_invalid")
 	ErrAppInstallationRevisionConflict = errors.New("app_installation_revision_conflict")
 	ErrAppInstallationRevoked          = errors.New("app_installation_revoked")
 	ErrAppInstallationStatusInvalid    = errors.New("app_installation_status_invalid")
@@ -300,7 +303,13 @@ func MigrateAppPluginTables(db *gorm.DB) error {
 	return nil
 }
 
+// InstallAppVersion persists a request already validated and assembled by the host service.
+// These checks are defense in depth for cheap cross-field and storage invariants, not a
+// replacement for service.ValidateAppManifest at the external boundary.
 func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencyScope, req AppInstallRequest) (AppInstallResult, error) {
+	if err := validateAppInstallRequest(req); err != nil {
+		return AppInstallResult{}, err
+	}
 	requestHash, err := appInstallRequestHash(req)
 	if err != nil {
 		return AppInstallResult{}, err
@@ -435,6 +444,120 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 		return nil
 	})
 	return result, err
+}
+
+func validateAppInstallRequest(req AppInstallRequest) error {
+	invalid := func(reason string) error {
+		return fmt.Errorf("%w: %s", ErrAppInstallRequestInvalid, reason)
+	}
+	if req.ManifestSHA256 != appPluginSHA256(req.CanonicalManifestJSON) {
+		return invalid("canonical manifest digest mismatch")
+	}
+	var manifestIdentity struct {
+		Key     string `json:"key"`
+		Version string `json:"version"`
+	}
+	if err := common.Unmarshal(req.CanonicalManifestJSON, &manifestIdentity); err != nil {
+		return invalid("canonical manifest is not valid JSON")
+	}
+	if req.AppKey == "" || manifestIdentity.Key != req.AppKey {
+		return invalid("manifest key mismatch")
+	}
+	if req.ManifestVersion == "" || manifestIdentity.Version != req.ManifestVersion {
+		return invalid("manifest version mismatch")
+	}
+
+	baseURL, err := url.Parse(req.BaseURL)
+	if err != nil || !validAppInstallHTTPSURL(baseURL) || !strings.HasSuffix(baseURL.Path, "/") {
+		return invalid("invalid base URL")
+	}
+	for _, endpoint := range []string{req.CallbackURL, req.DirectURL, req.EmbeddedURL} {
+		endpointURL, parseErr := url.Parse(endpoint)
+		if parseErr != nil ||
+			!validAppInstallHTTPSURL(endpointURL) ||
+			endpointURL.Host != baseURL.Host ||
+			!strings.HasPrefix(endpointURL.EscapedPath(), baseURL.EscapedPath()) {
+			return invalid("invalid app endpoint")
+		}
+	}
+	if !validAppInstallStringSet(req.EnabledSurfaces, func(surface string) bool {
+		return surface == "direct" || surface == "embedded"
+	}) {
+		return invalid("invalid enabled surfaces")
+	}
+	for _, origins := range [][]string{req.AllowedParentOrigins, req.AllowedOrigins} {
+		if !validAppInstallStringSet(origins, validAppInstallOrigin) {
+			return invalid("invalid allowed origins")
+		}
+	}
+	if !validAppInstallStringSet(req.AllowedUserPolicy.Groups, validAppInstallReference) {
+		return invalid("invalid allowed user policy")
+	}
+	if !validAppInstallStringSet(req.NetworkPolicy.AllowHosts, validAppInstallHost) {
+		return invalid("invalid network policy")
+	}
+	if !validAppInstallReference(req.EntitlementPolicyID) {
+		return invalid("invalid entitlement policy reference")
+	}
+	if !validAppInstallReference(req.ServiceCredentialID) ||
+		!validAppInstallReference(req.ServiceCredentialVersion) ||
+		req.ServiceCredentialExpiry <= 0 ||
+		!validAppInstallSHA256(req.ServiceCredentialHash) {
+		return invalid("invalid service credential reference")
+	}
+	return nil
+}
+
+func validAppInstallHTTPSURL(value *url.URL) bool {
+	return value != nil &&
+		value.Scheme == "https" &&
+		value.Host != "" &&
+		value.User == nil &&
+		value.RawQuery == "" &&
+		!value.ForceQuery &&
+		value.Fragment == ""
+}
+
+func validAppInstallOrigin(origin string) bool {
+	parsed, err := url.Parse(origin)
+	return err == nil &&
+		validAppInstallHTTPSURL(parsed) &&
+		parsed.Path == "" &&
+		parsed.RawPath == ""
+}
+
+func validAppInstallHost(host string) bool {
+	if !validAppInstallReference(host) || strings.ContainsAny(host, "/?#@") {
+		return false
+	}
+	parsed, err := url.Parse("https://" + host)
+	return err == nil && parsed.Host == host && parsed.Hostname() != ""
+}
+
+func validAppInstallReference(value string) bool {
+	return value != "" && value == strings.TrimSpace(value)
+}
+
+func validAppInstallStringSet(values []string, valid func(string) bool) bool {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if !valid(value) {
+			return false
+		}
+		if _, exists := seen[value]; exists {
+			return false
+		}
+		seen[value] = struct{}{}
+	}
+	return true
+}
+
+func validAppInstallSHA256(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil && value == strings.ToLower(value)
 }
 
 func CompareAndSwapAppInstallationStatus(ctx context.Context, db *gorm.DB, installationID string, revision int64, status string) (AppInstallation, error) {
