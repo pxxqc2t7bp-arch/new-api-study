@@ -385,7 +385,10 @@ func validAppManifestPath(path string) bool {
 }
 
 func validAppManifestPathLayer(path string) bool {
-	if path == "" || path[0] != '/' || strings.HasPrefix(path, "//") {
+	if path == "" ||
+		path[0] != '/' ||
+		strings.HasPrefix(path, "//") ||
+		strings.ContainsAny(path, "?#") {
 		return false
 	}
 	for _, char := range path {
