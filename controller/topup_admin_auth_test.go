@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -56,6 +57,32 @@ func completeTopUpAs(t *testing.T, actorRole int, tradeNo string) topUpAdminResp
 type topUpAdminResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+}
+
+type topUpListingResponse struct {
+	Success bool `json:"success"`
+	Data    struct {
+		Total int           `json:"total"`
+		Items []model.TopUp `json:"items"`
+	} `json:"data"`
+}
+
+func getTopUpListingAs(t *testing.T, role int, path string) (*httptest.ResponseRecorder, topUpListingResponse) {
+	t.Helper()
+	recorder := performUserManagementRequest(t, role, http.MethodGet, path, "", nil, GetAllTopUps)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response topUpListingResponse
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response), recorder.Body.String())
+	require.True(t, response.Success, recorder.Body.String())
+	return recorder, response
+}
+
+func listedTopUpIDs(topUps []model.TopUp) []int {
+	ids := make([]int, 0, len(topUps))
+	for _, topUp := range topUps {
+		ids = append(ids, topUp.Id)
+	}
+	return ids
 }
 
 func assertManualTopUpState(t *testing.T, db *gorm.DB, userId int, tradeNo, wantStatus string, wantQuota int) {
@@ -114,6 +141,72 @@ func TestAdminCompleteTopUpRespectsTargetRole(t *testing.T) {
 			assertManualTopUpState(t, db, user.Id, topUp.TradeNo, common.TopUpStatusSuccess, 50+tc.credited)
 		})
 	}
+}
+
+func TestTopUpListingsRespectViewerRole(t *testing.T) {
+	db := setupManageUserTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.TopUp{}))
+
+	commonUser := model.User{
+		Username: "topup-listing-common", Password: "password", Role: common.RoleCommonUser,
+		Status: common.UserStatusEnabled, Group: "default", AffCode: "topup-listing-common",
+	}
+	pluginAdmin := model.User{
+		Username: "topup-listing-plugin-admin", Password: "password", Role: common.RolePluginAdminUser,
+		Status: common.UserStatusEnabled, Group: "default", AffCode: "topup-listing-plugin-admin",
+	}
+	require.NoError(t, db.Create(&commonUser).Error)
+	require.NoError(t, db.Create(&pluginAdmin).Error)
+
+	topUps := []model.TopUp{
+		{UserId: commonUser.Id, TradeNo: "TOPUP-COMMON-OLD", CreateTime: 1, Status: common.TopUpStatusSuccess},
+		{UserId: pluginAdmin.Id, TradeNo: "TOPUP-PLUGIN-OLD", CreateTime: 2, Status: common.TopUpStatusSuccess},
+		{UserId: commonUser.Id, TradeNo: "TOPUP-COMMON-MIDDLE", CreateTime: 3, Status: common.TopUpStatusSuccess},
+		{UserId: pluginAdmin.Id, TradeNo: "TOPUP-PLUGIN-PROTECTED-EXACT", CreateTime: 4, Status: common.TopUpStatusSuccess},
+		{UserId: commonUser.Id, TradeNo: "TOPUP-COMMON-NEW", CreateTime: 5, Status: common.TopUpStatusSuccess},
+	}
+	require.NoError(t, db.Create(&topUps).Error)
+
+	_, adminPageOne := getTopUpListingAs(t, common.RoleAdminUser, "/api/user/topup?p=1&page_size=2")
+	assert.Equal(t, 3, adminPageOne.Data.Total)
+	assert.Equal(t, []int{topUps[4].Id, topUps[2].Id}, listedTopUpIDs(adminPageOne.Data.Items))
+
+	_, adminPageTwo := getTopUpListingAs(t, common.RoleAdminUser, "/api/user/topup?p=2&page_size=2")
+	assert.Equal(t, 3, adminPageTwo.Data.Total)
+	assert.Equal(t, []int{topUps[0].Id}, listedTopUpIDs(adminPageTwo.Data.Items))
+
+	_, rootList := getTopUpListingAs(t, common.RoleRootUser, "/api/user/topup?p=1&page_size=5")
+	assert.Equal(t, 5, rootList.Data.Total)
+	assert.Equal(
+		t,
+		[]int{topUps[4].Id, topUps[3].Id, topUps[2].Id, topUps[1].Id, topUps[0].Id},
+		listedTopUpIDs(rootList.Data.Items),
+	)
+
+	adminRecorder, adminProtectedSearch := getTopUpListingAs(
+		t,
+		common.RoleAdminUser,
+		"/api/user/topup?keyword=TOPUP-PLUGIN-PROTECTED-EXACT&p=1&page_size=10",
+	)
+	assert.Zero(t, adminProtectedSearch.Data.Total)
+	assert.Empty(t, adminProtectedSearch.Data.Items)
+	assert.NotContains(t, adminRecorder.Body.String(), topUps[3].TradeNo)
+
+	_, rootProtectedSearch := getTopUpListingAs(
+		t,
+		common.RoleRootUser,
+		"/api/user/topup?keyword=TOPUP-PLUGIN-PROTECTED-EXACT&p=1&page_size=10",
+	)
+	assert.Equal(t, 1, rootProtectedSearch.Data.Total)
+	assert.Equal(t, []int{topUps[3].Id}, listedTopUpIDs(rootProtectedSearch.Data.Items))
+
+	_, adminCommonSearch := getTopUpListingAs(
+		t,
+		common.RoleAdminUser,
+		"/api/user/topup?keyword=TOPUP-COMMON-MIDDLE&p=1&page_size=10",
+	)
+	assert.Equal(t, 1, adminCommonSearch.Data.Total)
+	assert.Equal(t, []int{topUps[2].Id}, listedTopUpIDs(adminCommonSearch.Data.Items))
 }
 
 func TestAdminCompleteTopUpReauthorizesAfterTransactionTimePromotion(t *testing.T) {

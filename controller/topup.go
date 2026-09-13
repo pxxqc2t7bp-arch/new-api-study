@@ -549,9 +549,9 @@ func GetAllTopUps(c *gin.Context) {
 		err    error
 	)
 	if keyword != "" {
-		topups, total, err = model.SearchAllTopUps(keyword, pageInfo)
+		topups, total, err = model.SearchAllTopUpsForViewer(c.GetInt("role"), keyword, pageInfo)
 	} else {
-		topups, total, err = model.GetAllTopUps(pageInfo)
+		topups, total, err = model.GetAllTopUpsForViewer(c.GetInt("role"), pageInfo)
 	}
 	if err != nil {
 		common.ApiError(c, err)
