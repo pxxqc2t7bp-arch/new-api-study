@@ -486,6 +486,7 @@ func ManualCompleteTopUpForRole(tradeNo string, callerIp string, operatorRole in
 	var quotaToAdd int
 	var payMoney float64
 	var paymentMethod string
+	completed := false
 
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		topUp := &TopUp{}
@@ -555,11 +556,15 @@ func ManualCompleteTopUpForRole(tradeNo string, callerIp string, operatorRole in
 		userId = topUp.UserId
 		payMoney = topUp.Money
 		paymentMethod = topUp.PaymentMethod
+		completed = true
 		return nil
 	})
 
 	if err != nil {
 		return err
+	}
+	if !completed {
+		return nil
 	}
 
 	// 事务外记录日志，避免阻塞

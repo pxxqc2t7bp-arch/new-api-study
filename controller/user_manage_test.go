@@ -640,6 +640,206 @@ func TestDeleteUserRechecksPromotedTargetRoleInsideTransaction(t *testing.T) {
 	}
 }
 
+type adminTargetMutationChildren struct {
+	externalIdentities []model.ExternalIdentityClaim
+	backupCodes        []model.TwoFABackupCode
+	twoFA              []model.TwoFA
+	authFlows          []model.AuthFlow
+	passkeys           []model.PasskeyCredential
+	tokens             []model.Token
+	oauthBindings      []model.UserOAuthBinding
+	sessions           []model.UserSession
+	authzRules         []model.CasbinRule
+	logs               []model.Log
+	auditLogs          []model.AuditLog
+}
+
+func loadAdminTargetMutationChildren(t *testing.T, db *gorm.DB, userID int) adminTargetMutationChildren {
+	t.Helper()
+	var snapshot adminTargetMutationChildren
+	for records, order := range map[any]string{
+		&snapshot.externalIdentities: "id",
+		&snapshot.backupCodes:        "id",
+		&snapshot.twoFA:              "id",
+		&snapshot.authFlows:          "id",
+		&snapshot.passkeys:           "id",
+		&snapshot.tokens:             "id",
+		&snapshot.oauthBindings:      "id",
+		&snapshot.sessions:           "sid",
+	} {
+		require.NoError(t, db.Unscoped().Where("user_id = ?", userID).Order(order).Find(records).Error)
+	}
+	require.NoError(t, db.Where("v0 = ?", authz.UserSubject(userID)).Order("id").Find(&snapshot.authzRules).Error)
+	require.NoError(t, db.Order("id").Find(&snapshot.logs).Error)
+	require.NoError(t, db.Order("id").Find(&snapshot.auditLogs).Error)
+	return snapshot
+}
+
+func TestAdminTargetMutationsReauthorizeAfterConcurrentPromotion(t *testing.T) {
+	testCases := []struct {
+		name        string
+		initialRole int
+		status      int
+		invoke      func(*model.User) *httptest.ResponseRecorder
+	}{
+		{
+			name: "update profile", initialRole: common.RoleCommonUser, status: common.UserStatusEnabled,
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(
+					`{"id":%d,"username":"mutated-username","display_name":"Mutated","role":%d,"status":%d,"group":"mutated-group","remark":"mutated"}`,
+					user.Id, user.Role, user.Status,
+				)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPut, "/api/user/", body, nil, UpdateUser)
+			},
+		},
+		{
+			name: "update password", initialRole: common.RoleCommonUser, status: common.UserStatusEnabled,
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(
+					`{"id":%d,"username":%q,"password":"replacement-password","display_name":%q,"role":%d,"status":%d,"group":%q,"remark":%q}`,
+					user.Id, user.Username, user.DisplayName, user.Role, user.Status, user.Group, user.Remark,
+				)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPut, "/api/user/", body, nil, UpdateUser)
+			},
+		},
+		{
+			name: "disable", initialRole: common.RoleCommonUser, status: common.UserStatusEnabled,
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"disable"}`, user.Id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "enable", initialRole: common.RoleCommonUser, status: common.UserStatusDisabled,
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"enable"}`, user.Id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "soft delete", initialRole: common.RoleCommonUser, status: common.UserStatusEnabled,
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"delete"}`, user.Id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "promote", initialRole: common.RoleCommonUser, status: common.UserStatusEnabled,
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"promote"}`, user.Id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "demote", initialRole: common.RoleGuestUser, status: common.UserStatusEnabled,
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				body := fmt.Sprintf(`{"id":%d,"action":"demote"}`, user.Id)
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodPost, "/api/user/manage", body, nil, ManageUser)
+			},
+		},
+		{
+			name: "clear built-in OAuth binding", initialRole: common.RoleCommonUser, status: common.UserStatusEnabled,
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				params := gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}, {Key: "binding_type", Value: "github"}}
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1/bindings/github", "", params, AdminClearUserBinding)
+			},
+		},
+		{
+			name: "clear custom OAuth binding", initialRole: common.RoleCommonUser, status: common.UserStatusEnabled,
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				params := gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}, {Key: "provider_id", Value: "1"}}
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1/oauth/bindings/1", "", params, UnbindCustomOAuthByAdmin)
+			},
+		},
+		{
+			name: "disable 2FA", initialRole: common.RoleCommonUser, status: common.UserStatusEnabled,
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				params := gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}}
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1/2fa", "", params, AdminDisable2FA)
+			},
+		},
+		{
+			name: "reset passkey", initialRole: common.RoleCommonUser, status: common.UserStatusEnabled,
+			invoke: func(user *model.User) *httptest.ResponseRecorder {
+				params := gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}}
+				return performUserManagementRequest(t, common.RoleAdminUser, http.MethodDelete, "/api/user/1/reset_passkey", "", params, AdminResetPasskey)
+			},
+		},
+	}
+
+	for index, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupAdministrativeDeletionTestDB(t)
+			user := model.User{
+				Username: "promotion-target", Password: "stored-password", DisplayName: "Stored Name",
+				Role: tc.initialRole, Status: tc.status, Email: "stored@example.com",
+				GitHubId: "stored-github", DiscordId: "stored-discord", OidcId: "stored-oidc",
+				WeChatId: "stored-wechat", TelegramId: "stored-telegram", LinuxDOId: "stored-linuxdo",
+				Quota: 123, UsedQuota: 45, RequestCount: 6, Group: "stored-group",
+				AffCode: "concurrent-promotion-aff", AffCount: 7, AffQuota: 8, AffHistoryQuota: 9,
+				InviterId: 10, Setting: `{"stored":true}`, Remark: "stored remark",
+				StripeCustomer: "cus_stored", CreatedAt: 1_700_003_000, LastLoginAt: 1_700_003_001,
+				AuthVersion: 7,
+			}
+			require.NoError(t, db.Create(&user).Error)
+			if tc.initialRole == common.RoleGuestUser {
+				require.NoError(t, db.Model(&model.User{}).Where("id = ?", user.Id).Update("role", common.RoleGuestUser).Error)
+				user.Role = common.RoleGuestUser
+			}
+			seedAdministrativeDeletionAuthData(t, db, user, fmt.Sprintf("concurrent-promotion-%d", index))
+			require.NoError(t, db.Create(&model.CasbinRule{
+				Ptype: "p", V0: authz.UserSubject(user.Id), V1: "user", V2: "read", V3: "allow",
+			}).Error)
+
+			missingUser := user
+			missingUser.Id += 1_000_000
+			missing := tc.invoke(&missingUser)
+
+			var beforeUser model.User
+			require.NoError(t, db.Unscoped().First(&beforeUser, user.Id).Error)
+			beforeChildren := loadAdminTargetMutationChildren(t, db, user.Id)
+
+			promoted := false
+			var promotionErr error
+			var promotionRows int64
+			callbackName := fmt.Sprintf("test:promote_before_admin_mutation_%d", index)
+			require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if promoted || tx.Error != nil || tx.Statement == nil || tx.Statement.Table != "users" {
+					return
+				}
+				target, ok := tx.Statement.Dest.(*model.User)
+				if !ok || target.Id != user.Id || target.Role != tc.initialRole {
+					return
+				}
+				promoted = true
+				result := db.Model(&model.User{}).
+					Where("id = ?", user.Id).
+					Update("role", common.RolePluginAdminUser)
+				promotionErr = result.Error
+				promotionRows = result.RowsAffected
+			}))
+			t.Cleanup(func() {
+				_ = db.Callback().Query().Remove(callbackName)
+			})
+
+			denied := tc.invoke(&user)
+
+			require.True(t, promoted)
+			require.NoError(t, promotionErr)
+			require.EqualValues(t, 1, promotionRows)
+			assert.Equal(t, missing.Code, denied.Code)
+			assert.Equal(t, missing.Body.String(), denied.Body.String())
+
+			var stored model.User
+			require.NoError(t, db.Unscoped().First(&stored, user.Id).Error)
+			expectedUser := beforeUser
+			expectedUser.Role = common.RolePluginAdminUser
+			assert.Equal(t, expectedUser, stored)
+			assert.Equal(t, beforeChildren, loadAdminTargetMutationChildren(t, db, user.Id))
+		})
+	}
+}
+
 func createQuotaTestOperator(t *testing.T, db *gorm.DB, role int) model.User {
 	t.Helper()
 	if role == 0 {

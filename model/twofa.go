@@ -232,17 +232,25 @@ func GetUnusedBackupCodeCount(userId int) (int, error) {
 // DisableTwoFAWithAuthVersion atomically removes the factor and invalidates
 // every access token issued against the previous security configuration.
 func DisableTwoFAWithAuthVersion(userId int) error {
-	return disableTwoFAWithAuthVersion(userId, nil)
+	return disableTwoFAWithAuthVersion(userId, nil, nil)
 }
 
 func DisableTwoFAForSession(identity AuthSessionIdentity) error {
-	return disableTwoFAWithAuthVersion(identity.UserID, &identity)
+	return disableTwoFAWithAuthVersion(identity.UserID, &identity, nil)
 }
 
-func disableTwoFAWithAuthVersion(userId int, identity *AuthSessionIdentity) error {
+func DisableTwoFAForRole(userId int, operatorRole int) error {
+	return disableTwoFAWithAuthVersion(userId, nil, &operatorRole)
+}
+
+func disableTwoFAWithAuthVersion(userId int, identity *AuthSessionIdentity, operatorRole *int) error {
 	if err := DB.Transaction(func(tx *gorm.DB) error {
 		if identity != nil {
 			if err := ValidateAuthSessionWithTx(tx, *identity); err != nil {
+				return err
+			}
+		} else if operatorRole != nil {
+			if _, err := lockManageableUserTx(tx, userId, *operatorRole, false); err != nil {
 				return err
 			}
 		} else if err := lockForUpdate(tx).Select("id").First(&User{}, userId).Error; err != nil {

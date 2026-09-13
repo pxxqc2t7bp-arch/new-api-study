@@ -450,7 +450,10 @@ func AdminResetPasskey(c *gin.Context) {
 		return
 	}
 
-	if err := model.DeletePasskeyByUserIDWithAuthVersion(user.Id); err != nil {
+	if err := model.DeletePasskeyByUserIDForRole(user.Id, c.GetInt("role")); err != nil {
+		if writeManageableTargetMutationError(c, err) {
+			return
+		}
 		writeSecurityOperationError(c, err)
 		return
 	}

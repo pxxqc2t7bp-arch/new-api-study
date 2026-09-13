@@ -172,6 +172,27 @@ func TestAdminCompleteTopUpAuthorizesBeforeCompletedOrderIdempotency(t *testing.
 	assertManualTopUpState(t, db, user.Id, topUp.TradeNo, common.TopUpStatusSuccess, 50)
 }
 
+func TestAdminCompleteTopUpIdempotentReplaySkipsPostCommitSideEffects(t *testing.T) {
+	db, user, topUp := setupAdminCompleteTopUpFixture(t, common.RoleCommonUser, model.PaymentProviderEpay)
+
+	first := completeTopUpAs(t, common.RoleAdminUser, topUp.TradeNo)
+	require.True(t, first.Success)
+	assertManualTopUpState(t, db, user.Id, topUp.TradeNo, common.TopUpStatusSuccess, 250)
+
+	var firstLogs []model.Log
+	require.NoError(t, db.Where("type = ?", model.LogTypeTopup).Order("id").Find(&firstLogs).Error)
+	require.Len(t, firstLogs, 1)
+	assert.Equal(t, user.Id, firstLogs[0].UserId)
+
+	replay := completeTopUpAs(t, common.RoleAdminUser, topUp.TradeNo)
+	require.True(t, replay.Success)
+	assertManualTopUpState(t, db, user.Id, topUp.TradeNo, common.TopUpStatusSuccess, 250)
+
+	var replayLogs []model.Log
+	require.NoError(t, db.Where("type = ?", model.LogTypeTopup).Order("id").Find(&replayLogs).Error)
+	assert.Equal(t, firstLogs, replayLogs)
+}
+
 func TestAdminCompleteTopUpHidesProtectedOrderExistence(t *testing.T) {
 	db, user, pending := setupAdminCompleteTopUpFixture(t, common.RolePluginAdminUser, model.PaymentProviderEpay)
 	completed := model.TopUp{

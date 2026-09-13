@@ -439,6 +439,14 @@ func getManageableTargetUser(c *gin.Context, id int, options manageableTargetOpt
 	return user, manageableTargetFound
 }
 
+func writeManageableTargetMutationError(c *gin.Context, err error) bool {
+	if !errors.Is(err, model.ErrUserNotManageable) {
+		return false
+	}
+	common.ApiErrorI18n(c, i18n.MsgUserNotExists)
+	return true
+}
+
 func GetUser(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
@@ -723,14 +731,21 @@ func UpdateUser(c *gin.Context) {
 	updatedUser.Role = originUser.Role
 	updatePassword := updatedUser.Password != ""
 	authzTouched := false
+	authVersionAdvanced := false
+	var previousUser *model.User
 	if err := model.DB.Transaction(func(tx *gorm.DB) error {
-		if err := updatedUser.EditWithTx(tx, updatePassword); err != nil {
+		var err error
+		previousUser, authVersionAdvanced, err = updatedUser.EditForRoleWithTx(tx, c.GetInt("role"), updatePassword)
+		if err != nil {
 			return err
 		}
-		touched, err := updateAdminPermissionsForUserInTx(c, tx, updatedUser.Id, originUser.Role, updatedUser.AdminPermissions)
+		touched, err := updateAdminPermissionsForUserInTx(c, tx, updatedUser.Id, previousUser.Role, updatedUser.AdminPermissions)
 		authzTouched = touched
 		return err
 	}); err != nil {
+		if writeManageableTargetMutationError(c, err) {
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
@@ -740,7 +755,7 @@ func UpdateUser(c *gin.Context) {
 			return
 		}
 	}
-	if updatedUser.AuthVersion > originUser.AuthVersion {
+	if authVersionAdvanced {
 		if _, err := model.RevokeAllUserSessions(updatedUser.Id, "admin_user_update"); err != nil {
 			common.ApiError(c, err)
 			return
@@ -751,7 +766,7 @@ func UpdateUser(c *gin.Context) {
 		return
 	}
 	recordManageAuditFor(c, updatedUser.Id, "user.update", map[string]any{
-		"username": originUser.Username,
+		"username": previousUser.Username,
 		"id":       updatedUser.Id,
 	})
 	c.JSON(http.StatusOK, gin.H{
@@ -779,7 +794,10 @@ func AdminClearUserBinding(c *gin.Context) {
 		return
 	}
 
-	if err := user.ClearBinding(bindingType); err != nil {
+	if err := user.ClearBindingForRole(bindingType, c.GetInt("role")); err != nil {
+		if writeManageableTargetMutationError(c, err) {
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
@@ -1097,34 +1115,27 @@ func ManageUser(c *gin.Context) {
 		manageUserQuota(c, req)
 		return
 	}
-	user, result := getManageableTargetUser(c, req.Id, manageableTargetOptions{includeDeleted: true})
+	_, result := getManageableTargetUser(c, req.Id, manageableTargetOptions{includeDeleted: true})
 	if result != manageableTargetFound {
 		return
 	}
 	myRole := c.GetInt("role")
-	switch req.Action {
-	case "disable":
-		user.Status = common.UserStatusDisabled
-		if user.Role == common.RoleRootUser {
-			common.ApiErrorI18n(c, i18n.MsgUserCannotDisableRootUser)
-			return
-		}
-	case "enable":
-		user.Status = common.UserStatusEnabled
-	case "delete":
-		if user.Role == common.RoleRootUser {
-			common.ApiErrorI18n(c, i18n.MsgUserCannotDeleteRootUser)
-			return
-		}
-		if err := user.Delete(); err != nil {
+	if req.Action == "delete" {
+		user, err := model.SoftDeleteUserForRole(req.Id, myRole)
+		if err != nil {
+			if writeManageableTargetMutationError(c, err) {
+				return
+			}
+			if errors.Is(err, model.ErrCannotDeleteRootUser) {
+				common.ApiErrorI18n(c, i18n.MsgUserCannotDeleteRootUser)
+				return
+			}
 			c.JSON(http.StatusOK, gin.H{
 				"success": false,
 				"message": err.Error(),
 			})
 			return
 		}
-		// 删除用户后，强制清理 Redis 中所有该用户令牌的缓存，
-		// 避免已缓存的令牌在 TTL 过期前仍能通过 TokenAuth 校验。
 		if err := model.InvalidateUserTokensCache(user.Id); err != nil {
 			common.SysLog(fmt.Sprintf("failed to invalidate tokens cache for user %d: %s", user.Id, err.Error()))
 		}
@@ -1138,63 +1149,66 @@ func ManageUser(c *gin.Context) {
 			"message": "",
 		})
 		return
-	case "promote":
-		if myRole != common.RoleRootUser {
+	}
+
+	var (
+		user                *model.User
+		authVersionAdvanced bool
+	)
+	err = model.DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		user, authVersionAdvanced, err = model.ManageUserForRoleWithTx(tx, req.Id, myRole, req.Action)
+		if err != nil {
+			return err
+		}
+		if req.Action == "demote" {
+			return authz.ClearUserAuthorizationInTx(tx, user.Id)
+		}
+		return nil
+	})
+	if err != nil {
+		if writeManageableTargetMutationError(c, err) {
+			return
+		}
+		switch {
+		case errors.Is(err, model.ErrUserCannotDisableRoot):
+			common.ApiErrorI18n(c, i18n.MsgUserCannotDisableRootUser)
+		case errors.Is(err, model.ErrUserAdminCannotPromote):
 			common.ApiErrorI18n(c, i18n.MsgUserAdminCannotPromote)
-			return
-		}
-		if user.Role >= common.RoleAdminUser {
+		case errors.Is(err, model.ErrUserAlreadyAdmin):
 			common.ApiErrorI18n(c, i18n.MsgUserAlreadyAdmin)
-			return
-		}
-		user.Role = common.RoleAdminUser
-	case "demote":
-		if user.Role == common.RoleRootUser {
+		case errors.Is(err, model.ErrUserCannotDemoteRoot):
 			common.ApiErrorI18n(c, i18n.MsgUserCannotDemoteRootUser)
-			return
-		}
-		if user.Role == common.RoleCommonUser {
+		case errors.Is(err, model.ErrUserAlreadyCommon):
 			common.ApiErrorI18n(c, i18n.MsgUserAlreadyCommon)
-			return
+		case errors.Is(err, model.ErrInvalidUserManagementAction):
+			common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		default:
+			common.ApiError(c, err)
 		}
-		user.Role = common.RoleCommonUser
-	default:
-		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
 
 	if req.Action == "demote" {
-		if err := model.DB.Transaction(func(tx *gorm.DB) error {
-			if err := user.UpdateWithTx(tx, false); err != nil {
-				return err
-			}
-			return authz.ClearUserAuthorizationInTx(tx, user.Id)
-		}); err != nil {
-			common.ApiError(c, err)
-			return
-		}
 		if err := authz.ReloadPolicy(); err != nil {
 			common.ApiError(c, err)
 			return
 		}
-		if err := model.PublishUserAuthCache(user.Id); err != nil {
-			common.ApiError(c, err)
-			return
+	}
+	if err := model.PublishUserAuthCache(user.Id); err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if authVersionAdvanced {
+		reason := "user_security_changed"
+		if req.Action == "demote" {
+			reason = "admin_demote"
 		}
-		if _, err := model.RevokeAllUserSessions(user.Id, "admin_demote"); err != nil {
-			common.ApiError(c, err)
-			return
-		}
-	} else {
-		if err := user.Update(false); err != nil {
+		if _, err := model.RevokeAllUserSessions(user.Id, reason); err != nil {
 			common.ApiError(c, err)
 			return
 		}
 	}
-	// Update/UpdateWithTx has already published the new user hash and revoked
-	// browser sessions exactly once. Only PAT/relay token caches still need an
-	// explicit invalidation; deleting the user hash here would discard the
-	// freshly published auth-version floor.
 	if err := model.InvalidateUserTokensCache(user.Id); err != nil {
 		common.SysLog(fmt.Sprintf("failed to invalidate tokens cache for user %d: %s", user.Id, err.Error()))
 	}

@@ -232,14 +232,18 @@ func upsertPasskeyCredentialWithAuthVersion(credential *PasskeyCredential, ident
 }
 
 func DeletePasskeyByUserIDWithAuthVersion(userID int) error {
-	return deletePasskeyWithAuthVersion(userID, nil)
+	return deletePasskeyWithAuthVersion(userID, nil, nil)
 }
 
 func DeletePasskeyForSession(identity AuthSessionIdentity) error {
-	return deletePasskeyWithAuthVersion(identity.UserID, &identity)
+	return deletePasskeyWithAuthVersion(identity.UserID, &identity, nil)
 }
 
-func deletePasskeyWithAuthVersion(userID int, identity *AuthSessionIdentity) error {
+func DeletePasskeyByUserIDForRole(userID int, operatorRole int) error {
+	return deletePasskeyWithAuthVersion(userID, nil, &operatorRole)
+}
+
+func deletePasskeyWithAuthVersion(userID int, identity *AuthSessionIdentity, operatorRole *int) error {
 	if userID == 0 {
 		return fmt.Errorf("删除失败，请重试")
 	}
@@ -248,6 +252,12 @@ func deletePasskeyWithAuthVersion(userID int, identity *AuthSessionIdentity) err
 			if err := ValidateAuthSessionWithTx(tx, *identity); err != nil {
 				return err
 			}
+		} else if operatorRole != nil {
+			if _, err := lockManageableUserTx(tx, userID, *operatorRole, false); err != nil {
+				return err
+			}
+		} else if err := lockForUpdate(tx).Select("id").First(&User{}, userID).Error; err != nil {
+			return err
 		}
 		var credential PasskeyCredential
 		if err := lockForUpdate(tx).Where("user_id = ?", userID).First(&credential).Error; err != nil {

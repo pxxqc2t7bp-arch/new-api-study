@@ -19,7 +19,16 @@ import (
 
 const UserNameMaxLength = 20
 
-var ErrUserHardDeleteUnauthorized = errors.New("user hard deletion is not authorized")
+var (
+	ErrUserHardDeleteUnauthorized  = errors.New("user hard deletion is not authorized")
+	ErrUserNotManageable           = errors.New("user is not manageable")
+	ErrUserCannotDisableRoot       = errors.New("root user cannot be disabled")
+	ErrUserAdminCannotPromote      = errors.New("administrator cannot promote users")
+	ErrUserAlreadyAdmin            = errors.New("user is already an administrator")
+	ErrUserCannotDemoteRoot        = errors.New("root user cannot be demoted")
+	ErrUserAlreadyCommon           = errors.New("user is already common")
+	ErrInvalidUserManagementAction = errors.New("invalid user management action")
+)
 
 var userSortColumns = map[string]string{
 	"id":            "id",
@@ -551,6 +560,27 @@ func GetUserById(id int, selectAll bool) (*User, error) {
 	return &user, err
 }
 
+func lockManageableUserTx(tx *gorm.DB, id int, operatorRole int, includeDeleted bool) (*User, error) {
+	if tx == nil || id <= 0 {
+		return nil, ErrUserNotManageable
+	}
+	query := tx
+	if includeDeleted {
+		query = tx.Unscoped()
+	}
+	var user User
+	if err := lockForUpdate(query).Where("id = ?", id).First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrUserNotManageable
+		}
+		return nil, err
+	}
+	if !common.CanManageUserRole(operatorRole, user.Role) {
+		return nil, ErrUserNotManageable
+	}
+	return &user, nil
+}
+
 // GetSelfUserById reads dashboard profile data and password existence in one
 // query. The password hash and management access token are never selected.
 func GetSelfUserById(id int) (*User, error) {
@@ -909,6 +939,38 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 		}
 	}
 
+	current := User{}
+	if err = tx.First(&current, user.Id).Error; err != nil {
+		return err
+	}
+	_, err = user.editWithCurrentTx(tx, &current, updatePassword)
+	return err
+}
+
+// EditForRoleWithTx applies an administrative profile update only after the
+// current target row has been locked and authorized in the caller's transaction.
+func (user *User) EditForRoleWithTx(tx *gorm.DB, operatorRole int, updatePassword bool) (*User, bool, error) {
+	var err error
+	if updatePassword {
+		user.Password, err = common.HashAccountPassword(user.Password)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+
+	current, err := lockManageableUserTx(tx, user.Id, operatorRole, false)
+	if err != nil {
+		return nil, false, err
+	}
+	previous := *current
+	authChanged, err := user.editWithCurrentTx(tx, current, updatePassword)
+	if err != nil {
+		return nil, false, err
+	}
+	return &previous, authChanged, nil
+}
+
+func (user *User) editWithCurrentTx(tx *gorm.DB, current *User, updatePassword bool) (bool, error) {
 	newUser := *user
 	updates := map[string]any{
 		"username":     newUser.Username,
@@ -920,24 +982,102 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 		updates["password"] = newUser.Password
 	}
 
-	current := User{}
-	if err = tx.First(&current, user.Id).Error; err != nil {
-		return err
-	}
 	authChanged := (updatePassword && current.Password != newUser.Password) || current.Group != newUser.Group
 	if authChanged {
-		newUser.AuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
-		if err != nil {
-			return err
+		if _, err := IncrementUserAuthVersionWithTx(tx, user.Id); err != nil {
+			return false, err
 		}
 	}
-	if err = tx.Model(&current).Updates(updates).Error; err != nil {
-		return err
+	if err := tx.Model(current).Updates(updates).Error; err != nil {
+		return false, err
 	}
-	return tx.First(user, user.Id).Error
+	if err := tx.First(user, user.Id).Error; err != nil {
+		return false, err
+	}
+	return authChanged, nil
+}
+
+// ManageUserForRoleWithTx changes only the requested role or status field from
+// a locked database snapshot. The caller may add related transactional work,
+// such as clearing authorization policy on demotion, before commit.
+func ManageUserForRoleWithTx(tx *gorm.DB, userID int, operatorRole int, action string) (*User, bool, error) {
+	user, err := lockManageableUserTx(tx, userID, operatorRole, true)
+	if err != nil {
+		return nil, false, err
+	}
+	if user.DeletedAt.Valid {
+		return nil, false, gorm.ErrRecordNotFound
+	}
+
+	var (
+		column string
+		value  int
+	)
+	switch action {
+	case "disable":
+		if user.Role == common.RoleRootUser {
+			return nil, false, ErrUserCannotDisableRoot
+		}
+		column, value = "status", common.UserStatusDisabled
+	case "enable":
+		column, value = "status", common.UserStatusEnabled
+	case "promote":
+		if operatorRole != common.RoleRootUser {
+			return nil, false, ErrUserAdminCannotPromote
+		}
+		if user.Role >= common.RoleAdminUser {
+			return nil, false, ErrUserAlreadyAdmin
+		}
+		column, value = "role", common.RoleAdminUser
+	case "demote":
+		if user.Role == common.RoleRootUser {
+			return nil, false, ErrUserCannotDemoteRoot
+		}
+		if user.Role == common.RoleCommonUser {
+			return nil, false, ErrUserAlreadyCommon
+		}
+		column, value = "role", common.RoleCommonUser
+	default:
+		return nil, false, ErrInvalidUserManagementAction
+	}
+
+	currentValue := user.Status
+	if column == "role" {
+		currentValue = user.Role
+	}
+	if currentValue == value {
+		return user, false, nil
+	}
+
+	nextAuthVersion, err := IncrementUserAuthVersionWithTx(tx, userID)
+	if err != nil {
+		return nil, false, err
+	}
+	result := tx.Model(&User{}).Where("id = ?", userID).Update(column, value)
+	if result.Error != nil {
+		return nil, false, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return nil, false, gorm.ErrRecordNotFound
+	}
+	if column == "role" {
+		user.Role = value
+	} else {
+		user.Status = value
+	}
+	user.AuthVersion = nextAuthVersion
+	return user, true, nil
 }
 
 func (user *User) ClearBinding(bindingType string) error {
+	return user.clearBinding(bindingType, nil)
+}
+
+func (user *User) ClearBindingForRole(bindingType string, operatorRole int) error {
+	return user.clearBinding(bindingType, &operatorRole)
+}
+
+func (user *User) clearBinding(bindingType string, operatorRole *int) error {
 	if user.Id == 0 {
 		return errors.New("user id is empty")
 	}
@@ -957,22 +1097,32 @@ func (user *User) ClearBinding(bindingType string) error {
 		return errors.New("invalid binding type")
 	}
 
+	var stored *User
 	if err := DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&User{}).Where("id = ?", user.Id).Update(column, "").Error; err != nil {
+		var err error
+		if operatorRole == nil {
+			stored = &User{}
+			err = lockForUpdate(tx).Where("id = ?", user.Id).First(stored).Error
+		} else {
+			stored, err = lockManageableUserTx(tx, user.Id, *operatorRole, false)
+		}
+		if err != nil {
+			return err
+		}
+		if err := tx.Model(stored).Update(column, "").Error; err != nil {
 			return err
 		}
 		if bindingType == ExternalIdentityProviderTelegram {
-			return ReleaseExternalIdentityWithTx(tx, ExternalIdentityProviderTelegram, user.Id)
+			if err := ReleaseExternalIdentityWithTx(tx, ExternalIdentityProviderTelegram, user.Id); err != nil {
+				return err
+			}
 		}
-		return nil
+		return tx.First(stored, user.Id).Error
 	}); err != nil {
 		return err
 	}
 
-	if err := DB.Where("id = ?", user.Id).First(user).Error; err != nil {
-		return err
-	}
-
+	*user = *stored
 	return updateUserCache(*user)
 }
 
@@ -983,6 +1133,43 @@ func (user *User) Delete() error {
 func DeleteUserForSession(identity AuthSessionIdentity) error {
 	user := User{Id: identity.UserID}
 	return user.delete(&identity)
+}
+
+func SoftDeleteUserForRole(userID int, operatorRole int) (*User, error) {
+	if userID <= 0 {
+		return nil, ErrUserNotManageable
+	}
+	var (
+		user            *User
+		nextAuthVersion int64
+	)
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		user, err = lockManageableUserTx(tx, userID, operatorRole, true)
+		if err != nil {
+			return err
+		}
+		if user.Role == common.RoleRootUser {
+			return ErrCannotDeleteRootUser
+		}
+		nextAuthVersion, err = IncrementUserAuthVersionWithTx(tx, userID)
+		if err != nil {
+			return err
+		}
+		return tx.Delete(user).Error
+	}); err != nil {
+		return nil, err
+	}
+	if err := publishCommittedUserAuthVersion(userID, nextAuthVersion); err != nil {
+		return nil, err
+	}
+	if _, err := RevokeAllUserSessions(userID, "user_deleted"); err != nil {
+		return nil, err
+	}
+	if err := invalidateUserCache(userID); err != nil {
+		return nil, err
+	}
+	return user, nil
 }
 
 func (user *User) delete(identity *AuthSessionIdentity) error {
