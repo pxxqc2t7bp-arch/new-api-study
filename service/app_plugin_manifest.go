@@ -376,6 +376,7 @@ func isForbiddenAppManifestField(field string) bool {
 		"privatekey",
 		"authorization",
 		"bearer",
+		"scripturl",
 		"executable",
 		"iframeurl",
 		"proxy",
