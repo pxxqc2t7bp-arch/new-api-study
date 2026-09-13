@@ -193,6 +193,13 @@ func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing
 		"AUTHCODE",
 		"PASSCODE",
 		"ACCESSCODE",
+		"SERVICECREDENTIAL",
+		"CREDENTIALVALUE",
+		"CLIENTCREDENTIALID",
+		"EXECUTABLECODE",
+		"SCRIPTPAYLOAD",
+		"DBPASSWORD",
+		"PROVIDERTOKEN",
 	} {
 		t.Run("forbidden acronym or composite "+field, func(t *testing.T) {
 			assertAppManifestErrorCode(

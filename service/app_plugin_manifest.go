@@ -25,7 +25,49 @@ var (
 			`(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?` +
 			`(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`,
 	)
-	appManifestJSONObjectSchemas = map[string]map[string]appManifestJSONFieldSchema{
+	appManifestSensitiveFieldBases = []string{
+		"credential", "credentials",
+		"secret", "secrets",
+		"password", "passwords", "passwd",
+		"token", "tokens",
+		"authorization", "authorizations",
+		"bearer", "bearers",
+		"script", "scripts",
+		"javascript", "javascripts",
+		"executable", "executables",
+		"iframe", "iframes",
+		"proxy", "proxies",
+		"jwt", "jwts",
+	}
+	appManifestSensitiveFieldQualifiers = []string{
+		"",
+		"access", "api", "app", "auth", "bearer", "client", "db",
+		"encryption", "host", "oauth", "private", "provider", "public",
+		"runner", "service", "signing", "source", "x",
+	}
+	appManifestSensitiveFieldSuffixes = []string{
+		"",
+		"value", "values",
+		"ref", "refs",
+		"id", "ids",
+		"version", "versions",
+		"hash", "hashes",
+		"set", "sets",
+		"config", "configs",
+		"payload", "payloads",
+		"data",
+		"header", "headers",
+		"url", "urls",
+		"rule", "rules",
+		"policy", "policies",
+		"code", "codes",
+	}
+	appManifestCredentialKeyQualifiers = []string{
+		"access", "api", "client", "encryption", "private",
+		"secret", "service", "signing", "xapi",
+	}
+	appManifestCredentialKeySuffixes = []string{"", "value", "ref", "id"}
+	appManifestJSONObjectSchemas     = map[string]map[string]appManifestJSONFieldSchema{
 		"root": {
 			"apiVersion":      {},
 			"kind":            {},
@@ -326,6 +368,24 @@ func requireJSONEOF(decoder *json.Decoder) error {
 
 func isForbiddenAppManifestField(field string) bool {
 	normalized := normalizeAppManifestASCIIField(field)
+	if isForbiddenAppManifestOwnedField(normalized) {
+		return true
+	}
+	if matchesAppManifestNormalizedFamily(
+		normalized,
+		appManifestSensitiveFieldBases,
+		appManifestSensitiveFieldQualifiers,
+		appManifestSensitiveFieldSuffixes,
+	) {
+		return true
+	}
+	if isForbiddenAppManifestKeyFamily(normalized) {
+		return true
+	}
+	return isForbiddenAppManifestCodeFamily(normalized)
+}
+
+func isForbiddenAppManifestOwnedField(normalized string) bool {
 	switch normalized {
 	case "baseurl",
 		"enabled",
@@ -334,110 +394,57 @@ func isForbiddenAppManifestField(field string) bool {
 		"alloweduserpolicy",
 		"allowedorigins",
 		"networkpolicy",
-		"credential",
-		"credentials",
-		"secret",
-		"secretref",
-		"privatekey",
-		"privatekeyvalue",
-		"apikey",
-		"apikeyvalue",
-		"xapikey",
-		"clientsecret",
-		"clientsecretvalue",
-		"password",
-		"passwd",
-		"token",
-		"code",
-		"codepayload",
-		"codeconfig",
-		"sourcecode",
-		"authcode",
-		"authorizationcode",
-		"passcode",
-		"accesscode",
-		"script",
-		"scripturl",
-		"xscripturl",
-		"javascript",
-		"javascripturl",
-		"executable",
 		"entitlementpolicy",
 		"entitlementpolicyversion",
-		"iframe",
-		"iframeurl",
-		"proxy",
-		"proxyrules",
-		"authorization",
-		"authorizationheader",
-		"bearer",
-		"bearertoken",
-		"authheader",
-		"jwt",
-		"tokenvalue",
-		"accesstoken":
-		return true
-	}
-
-	if isForbiddenAppManifestKeyFamily(normalized) {
-		return true
-	}
-
-	segments := tokenizeAppManifestASCIIField(field)
-	for index, segment := range segments {
-		switch segment {
-		case "credential",
-			"credentials",
-			"secret",
-			"password",
-			"passwd",
-			"token",
-			"jwt",
-			"authorization",
-			"bearer",
-			"code",
-			"script",
-			"javascript",
-			"executable",
-			"iframe",
-			"proxy":
-			return true
-		}
-		if segment == "auth" && index+1 < len(segments) && segments[index+1] == "header" ||
-			segment == "key" && index > 0 && isAppManifestCredentialKeyQualifier(segments[index-1]) {
-			return true
-		}
-	}
-	return false
-}
-
-func isForbiddenAppManifestKeyFamily(normalized string) bool {
-	for _, base := range []string{
-		"accesskey",
-		"apikey",
-		"privatekey",
-		"secretkey",
-		"clientkey",
-		"servicekey",
-		"signingkey",
-		"encryptionkey",
-	} {
-		for _, suffix := range []string{"", "value", "ref", "id"} {
-			if normalized == base+suffix {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isAppManifestCredentialKeyQualifier(segment string) bool {
-	switch segment {
-	case "access", "api", "private", "secret", "client", "service", "signing", "encryption":
+		"authheader":
 		return true
 	default:
 		return false
 	}
+}
+
+func isForbiddenAppManifestKeyFamily(normalized string) bool {
+	return matchesAppManifestNormalizedFamily(
+		normalized,
+		[]string{"key"},
+		appManifestCredentialKeyQualifiers,
+		appManifestCredentialKeySuffixes,
+	)
+}
+
+func isForbiddenAppManifestCodeFamily(normalized string) bool {
+	if matchesAppManifestNormalizedFamily(
+		normalized,
+		[]string{"code"},
+		[]string{""},
+		appManifestSensitiveFieldSuffixes,
+	) {
+		return true
+	}
+	for _, prefix := range []string{"source", "auth", "authorization", "pass", "access"} {
+		if normalized == prefix+"code" {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesAppManifestNormalizedFamily(
+	normalized string,
+	bases []string,
+	qualifiers []string,
+	suffixes []string,
+) bool {
+	for _, qualifier := range qualifiers {
+		for _, base := range bases {
+			for _, suffix := range suffixes {
+				if normalized == qualifier+base+suffix {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func normalizeAppManifestASCIIField(field string) string {
@@ -455,50 +462,6 @@ func normalizeAppManifestASCIIField(field string) string {
 		}
 	}
 	return normalized.String()
-}
-
-func tokenizeAppManifestASCIIField(field string) []string {
-	segments := make([]string, 0, 4)
-	start := -1
-	appendSegment := func(end int) {
-		if start >= 0 {
-			segments = append(segments, strings.ToLower(field[start:end]))
-			start = -1
-		}
-	}
-
-	for index := range len(field) {
-		char := field[index]
-		if char >= utf8.RuneSelf {
-			return nil
-		}
-		if !isAppManifestASCIIAlphaNumeric(char) {
-			appendSegment(index)
-			continue
-		}
-		if start < 0 {
-			start = index
-			continue
-		}
-		if char >= 'A' && char <= 'Z' {
-			previous := field[index-1]
-			nextIsLower := index+1 < len(field) && field[index+1] >= 'a' && field[index+1] <= 'z'
-			if previous >= 'a' && previous <= 'z' ||
-				previous >= '0' && previous <= '9' ||
-				previous >= 'A' && previous <= 'Z' && nextIsLower {
-				appendSegment(index)
-				start = index
-			}
-		}
-	}
-	appendSegment(len(field))
-	return segments
-}
-
-func isAppManifestASCIIAlphaNumeric(char byte) bool {
-	return char >= 'a' && char <= 'z' ||
-		char >= 'A' && char <= 'Z' ||
-		char >= '0' && char <= '9'
 }
 
 func validAppManifest(manifest AppManifest) bool {
