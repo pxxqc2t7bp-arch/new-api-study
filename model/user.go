@@ -19,6 +19,8 @@ import (
 
 const UserNameMaxLength = 20
 
+var ErrUserHardDeleteUnauthorized = errors.New("user hard deletion is not authorized")
+
 var userSortColumns = map[string]string{
 	"id":            "id",
 	"username":      "username",
@@ -589,11 +591,15 @@ func DeleteUserById(id int) (err error) {
 }
 
 func HardDeleteUserById(id int) error {
+	return HardDeleteUserByIdForRole(id, common.RoleRootUser)
+}
+
+func HardDeleteUserByIdForRole(id int, operatorRole int) error {
 	if id == 0 {
 		return errors.New("id 为空！")
 	}
 	user := User{Id: id}
-	return user.HardDelete()
+	return user.hardDelete(operatorRole)
 }
 
 func inviteUser(inviterId int) error {
@@ -1016,6 +1022,10 @@ func (user *User) delete(identity *AuthSessionIdentity) error {
 }
 
 func (user *User) HardDelete() error {
+	return user.hardDelete(common.RoleRootUser)
+}
+
+func (user *User) hardDelete(operatorRole int) error {
 	if user.Id == 0 {
 		return errors.New("id 为空！")
 	}
@@ -1028,6 +1038,9 @@ func (user *User) HardDelete() error {
 			Where("id = ?", user.Id).
 			First(&storedUser).Error; err != nil {
 			return err
+		}
+		if !common.CanManageLowerUserRole(operatorRole, storedUser.Role) {
+			return ErrUserHardDeleteUnauthorized
 		}
 		var err error
 		deletedAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
@@ -1043,9 +1056,8 @@ func (user *User) HardDelete() error {
 			return err
 		}
 		if storedUser.Role == common.RolePluginAdminUser {
-			tombstoneId := strconv.FormatInt(int64(storedUser.Id), 36)
 			if err := tx.Unscoped().Model(&User{}).Where("id = ?", storedUser.Id).Updates(map[string]any{
-				"username":                "tomb-" + tombstoneId,
+				"username":                nil,
 				"password":                "",
 				"display_name":            "",
 				"status":                  common.UserStatusDisabled,
@@ -1061,7 +1073,7 @@ func (user *User) HardDelete() error {
 				"used_quota":              0,
 				"request_count":           0,
 				"group":                   "",
-				"aff_code":                "tombstone-" + tombstoneId,
+				"aff_code":                nil,
 				"aff_count":               0,
 				"aff_quota":               0,
 				"aff_history":             0,

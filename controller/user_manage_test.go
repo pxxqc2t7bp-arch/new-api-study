@@ -286,9 +286,83 @@ func assertAdministrativeDeletionAuthDataPurged(t *testing.T, db *gorm.DB, userI
 	}
 }
 
+func assertPluginAdminTombstoneColumnsNullable(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	columnTypes, err := db.Migrator().ColumnTypes(&model.User{})
+	require.NoError(t, err)
+	nullableColumns := map[string]bool{
+		"username":     false,
+		"aff_code":     false,
+		"access_token": false,
+	}
+	for _, columnType := range columnTypes {
+		columnName := strings.ToLower(columnType.Name())
+		if _, ok := nullableColumns[columnName]; !ok {
+			continue
+		}
+		nullable, known := columnType.Nullable()
+		require.True(t, known, "%s nullability is unknown", columnName)
+		nullableColumns[columnName] = nullable
+	}
+	for columnName, nullable := range nullableColumns {
+		assert.True(t, nullable, "%s must permit SQL NULL", columnName)
+	}
+}
+
+func assertPluginAdminTombstoneScrubbed(t *testing.T, db *gorm.DB, userID int, createdAt int64, authVersion int64) {
+	t.Helper()
+	var tombstone model.User
+	require.NoError(t, db.Unscoped().First(&tombstone, userID).Error)
+	assert.Equal(t, userID, tombstone.Id)
+	assert.True(t, tombstone.DeletedAt.Valid)
+	assert.Equal(t, common.RolePluginAdminUser, tombstone.Role)
+	assert.Equal(t, common.UserStatusDisabled, tombstone.Status)
+	assert.Equal(t, authVersion, tombstone.AuthVersion)
+	assert.Empty(t, tombstone.Username)
+	assert.Empty(t, tombstone.Password)
+	assert.Empty(t, tombstone.DisplayName)
+	assert.Empty(t, tombstone.Email)
+	assert.Empty(t, tombstone.GitHubId)
+	assert.Empty(t, tombstone.DiscordId)
+	assert.Empty(t, tombstone.OidcId)
+	assert.Empty(t, tombstone.WeChatId)
+	assert.Empty(t, tombstone.TelegramId)
+	assert.Empty(t, tombstone.LinuxDOId)
+	assert.Nil(t, tombstone.AccessToken)
+	assert.Nil(t, tombstone.AccessTokenCreatedAt)
+	assert.Zero(t, tombstone.Quota)
+	assert.Zero(t, tombstone.UsedQuota)
+	assert.Zero(t, tombstone.RequestCount)
+	assert.Empty(t, tombstone.Group)
+	assert.Empty(t, tombstone.AffCode)
+	assert.Zero(t, tombstone.AffCount)
+	assert.Zero(t, tombstone.AffQuota)
+	assert.Zero(t, tombstone.AffHistoryQuota)
+	assert.Zero(t, tombstone.InviterId)
+	assert.Empty(t, tombstone.Setting)
+	assert.Empty(t, tombstone.Remark)
+	assert.Empty(t, tombstone.StripeCustomer)
+	assert.Zero(t, tombstone.LastLoginAt)
+	assert.Equal(t, createdAt, tombstone.CreatedAt)
+
+	var identifiers struct {
+		Username    *string `gorm:"column:username"`
+		AffCode     *string `gorm:"column:aff_code"`
+		AccessToken *string `gorm:"column:access_token"`
+	}
+	require.NoError(t, db.Unscoped().Model(&model.User{}).
+		Select("username", "aff_code", "access_token").
+		Where("id = ?", userID).
+		Take(&identifiers).Error)
+	assert.Nil(t, identifiers.Username)
+	assert.Nil(t, identifiers.AffCode)
+	assert.Nil(t, identifiers.AccessToken)
+}
+
 func TestRootDeleteUserRetainsPluginAdminHistoryAndHardDeletesCommonUser(t *testing.T) {
 	t.Run("plugin admin becomes a durable tombstone", func(t *testing.T) {
 		db := setupAdministrativeDeletionTestDB(t)
+		assertPluginAdminTombstoneColumnsNullable(t, db)
 		const (
 			originalUsername = "deleted-plugin-admin"
 			originalPassword = "plugin-admin-password"
@@ -314,6 +388,13 @@ func TestRootDeleteUserRetainsPluginAdminHistoryAndHardDeletesCommonUser(t *test
 		}
 		require.NoError(t, db.Create(&user).Error)
 		seedAdministrativeDeletionAuthData(t, db, user, "deleted-plugin-admin")
+		legacyTombstoneID := strconv.FormatInt(int64(user.Id), 36)
+		legacyCollision := model.User{
+			Username: "tomb-" + legacyTombstoneID, Password: "password",
+			Role: common.RoleCommonUser, Status: common.UserStatusEnabled,
+			Group: "default", AffCode: "tombstone-" + legacyTombstoneID,
+		}
+		require.NoError(t, db.Create(&legacyCollision).Error)
 
 		login := model.User{Username: originalUsername, Password: originalPassword}
 		require.NoError(t, login.ValidateAndFill())
@@ -355,40 +436,7 @@ func TestRootDeleteUserRetainsPluginAdminHistoryAndHardDeletesCommonUser(t *test
 		require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 		require.ErrorIs(t, db.First(&model.User{}, user.Id).Error, gorm.ErrRecordNotFound)
 
-		var tombstone model.User
-		tombstoneErr := db.Unscoped().First(&tombstone, user.Id).Error
-		assert.NoError(t, tombstoneErr)
-		assert.Equal(t, user.Id, tombstone.Id)
-		assert.True(t, tombstone.DeletedAt.Valid)
-		assert.Equal(t, common.RolePluginAdminUser, tombstone.Role)
-		assert.Equal(t, common.UserStatusDisabled, tombstone.Status)
-		assert.EqualValues(t, 2, tombstone.AuthVersion)
-		assert.Equal(t, "tomb-"+strconv.FormatInt(int64(user.Id), 36), tombstone.Username)
-		assert.Equal(t, "tombstone-"+strconv.FormatInt(int64(user.Id), 36), tombstone.AffCode)
-		assert.Empty(t, tombstone.Password)
-		assert.Empty(t, tombstone.DisplayName)
-		assert.Empty(t, tombstone.Email)
-		assert.Empty(t, tombstone.GitHubId)
-		assert.Empty(t, tombstone.DiscordId)
-		assert.Empty(t, tombstone.OidcId)
-		assert.Empty(t, tombstone.WeChatId)
-		assert.Empty(t, tombstone.TelegramId)
-		assert.Empty(t, tombstone.LinuxDOId)
-		assert.Nil(t, tombstone.AccessToken)
-		assert.Nil(t, tombstone.AccessTokenCreatedAt)
-		assert.Zero(t, tombstone.Quota)
-		assert.Zero(t, tombstone.UsedQuota)
-		assert.Zero(t, tombstone.RequestCount)
-		assert.Empty(t, tombstone.Group)
-		assert.Zero(t, tombstone.AffCount)
-		assert.Zero(t, tombstone.AffQuota)
-		assert.Zero(t, tombstone.AffHistoryQuota)
-		assert.Zero(t, tombstone.InviterId)
-		assert.Empty(t, tombstone.Setting)
-		assert.Empty(t, tombstone.Remark)
-		assert.Empty(t, tombstone.StripeCustomer)
-		assert.Zero(t, tombstone.LastLoginAt)
-		assert.EqualValues(t, 1_700_000_000, tombstone.CreatedAt)
+		assertPluginAdminTombstoneScrubbed(t, db, user.Id, 1_700_000_000, 2)
 		assertAdministrativeDeletionAuthDataPurged(t, db, user.Id)
 
 		login = model.User{Username: originalUsername, Password: originalPassword}
@@ -440,6 +488,43 @@ func TestRootDeleteUserRetainsPluginAdminHistoryAndHardDeletesCommonUser(t *test
 		assert.Equal(t, quotaRecord.Quota, rootQuota.Data[0].Quota)
 	})
 
+	t.Run("multiple plugin admins retain independent scrubbed tombstones", func(t *testing.T) {
+		db := setupAdministrativeDeletionTestDB(t)
+		for i := range 2 {
+			createdAt := int64(1_700_001_000 + i)
+			accessToken := fmt.Sprintf("plugin-admin-token-%d", i)
+			accessTokenCreatedAt := createdAt + 1
+			user := model.User{
+				Username: fmt.Sprintf("plugin-admin-multi-%d", i), Password: "sensitive-password",
+				DisplayName: "Sensitive Name", Role: common.RolePluginAdminUser,
+				Status: common.UserStatusEnabled, Email: fmt.Sprintf("plugin-%d@example.com", i),
+				GitHubId: fmt.Sprintf("github-%d", i), DiscordId: fmt.Sprintf("discord-%d", i),
+				OidcId: fmt.Sprintf("oidc-%d", i), WeChatId: fmt.Sprintf("wechat-%d", i),
+				TelegramId: fmt.Sprintf("telegram-%d", i), LinuxDOId: fmt.Sprintf("linuxdo-%d", i),
+				AccessToken: &accessToken, AccessTokenCreatedAt: &accessTokenCreatedAt,
+				Quota: 101, UsedQuota: 202, RequestCount: 303, Group: "sensitive-group",
+				AffCode: fmt.Sprintf("plugin-admin-aff-%d", i), AffCount: 4, AffQuota: 505,
+				AffHistoryQuota: 606, InviterId: 707, Setting: `{"secret":true}`,
+				Remark: "sensitive remark", StripeCustomer: fmt.Sprintf("cus_sensitive_%d", i),
+				CreatedAt: createdAt, LastLoginAt: createdAt + 2, AuthVersion: 1,
+			}
+			require.NoError(t, db.Create(&user).Error)
+
+			response := performUserManagementRequest(
+				t,
+				common.RoleRootUser,
+				http.MethodDelete,
+				"/api/user/"+strconv.Itoa(user.Id),
+				"",
+				gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}},
+				DeleteUser,
+			)
+			require.Equal(t, http.StatusOK, response.Code)
+			require.Contains(t, response.Body.String(), `"success":true`)
+			assertPluginAdminTombstoneScrubbed(t, db, user.Id, createdAt, 2)
+		}
+	})
+
 	t.Run("common user remains physically deleted", func(t *testing.T) {
 		db := setupAdministrativeDeletionTestDB(t)
 		user := model.User{
@@ -451,7 +536,7 @@ func TestRootDeleteUserRetainsPluginAdminHistoryAndHardDeletesCommonUser(t *test
 
 		response := performUserManagementRequest(
 			t,
-			common.RoleRootUser,
+			common.RoleAdminUser,
 			http.MethodDelete,
 			"/api/user/"+strconv.Itoa(user.Id),
 			"",
@@ -466,6 +551,93 @@ func TestRootDeleteUserRetainsPluginAdminHistoryAndHardDeletesCommonUser(t *test
 		assert.Zero(t, count)
 		assertAdministrativeDeletionAuthDataPurged(t, db, user.Id)
 	})
+}
+
+func TestDeleteUserRechecksPromotedTargetRoleInsideTransaction(t *testing.T) {
+	db := setupAdministrativeDeletionTestDB(t)
+	accessToken := "stored-access-token"
+	accessTokenCreatedAt := int64(1_700_001_999)
+	user := model.User{
+		Username: "promoted-delete-target", Password: "stored-password", DisplayName: "Stored Name",
+		Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Email: "stored@example.com",
+		GitHubId: "stored-github", DiscordId: "stored-discord", OidcId: "stored-oidc",
+		WeChatId: "stored-wechat", TelegramId: "stored-telegram", LinuxDOId: "stored-linuxdo",
+		AccessToken: &accessToken, AccessTokenCreatedAt: &accessTokenCreatedAt,
+		Quota: 123, UsedQuota: 45, RequestCount: 6, Group: "stored-group",
+		AffCode: "promoted-delete-aff", AffCount: 7, AffQuota: 8, AffHistoryQuota: 9,
+		InviterId: 10, Setting: `{"stored":true}`, Remark: "stored remark",
+		StripeCustomer: "cus_stored", CreatedAt: 1_700_002_000, LastLoginAt: 1_700_002_001,
+		AuthVersion: 7,
+	}
+	require.NoError(t, db.Create(&user).Error)
+	seedAdministrativeDeletionAuthData(t, db, user, "promoted-delete-target")
+	var beforePromotion model.User
+	require.NoError(t, db.Unscoped().First(&beforePromotion, user.Id).Error)
+
+	missing := performUserManagementRequest(
+		t,
+		common.RoleAdminUser,
+		http.MethodDelete,
+		"/api/user/999999",
+		"",
+		gin.Params{{Key: "id", Value: "999999"}},
+		DeleteUser,
+	)
+
+	promoted := false
+	var promotionErr error
+	const callbackName = "test:promote_before_hard_delete"
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if promoted || tx.Error != nil || tx.Statement == nil || tx.Statement.Table != "users" {
+			return
+		}
+		target, ok := tx.Statement.Dest.(*model.User)
+		if !ok || target.Id != user.Id || target.Role != common.RoleCommonUser {
+			return
+		}
+		promoted = true
+		promotionErr = db.Model(&model.User{}).
+			Where("id = ?", user.Id).
+			Update("role", common.RolePluginAdminUser).Error
+	}))
+	t.Cleanup(func() {
+		_ = db.Callback().Query().Remove(callbackName)
+	})
+
+	denied := performUserManagementRequest(
+		t,
+		common.RoleAdminUser,
+		http.MethodDelete,
+		"/api/user/"+strconv.Itoa(user.Id),
+		"",
+		gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}},
+		DeleteUser,
+	)
+
+	require.True(t, promoted)
+	require.NoError(t, promotionErr)
+	assert.Equal(t, missing.Code, denied.Code)
+	assert.Equal(t, missing.Body.String(), denied.Body.String())
+
+	var stored model.User
+	require.NoError(t, db.Unscoped().First(&stored, user.Id).Error)
+	expected := beforePromotion
+	expected.Role = common.RolePluginAdminUser
+	assert.Equal(t, expected, stored)
+	for name, record := range map[string]any{
+		"external identity":    &model.ExternalIdentityClaim{},
+		"2FA backup code":      &model.TwoFABackupCode{},
+		"2FA":                  &model.TwoFA{},
+		"auth flow":            &model.AuthFlow{},
+		"passkey":              &model.PasskeyCredential{},
+		"token":                &model.Token{},
+		"custom OAuth binding": &model.UserOAuthBinding{},
+		"session":              &model.UserSession{},
+	} {
+		var count int64
+		require.NoError(t, db.Unscoped().Model(record).Where("user_id = ?", user.Id).Count(&count).Error)
+		assert.EqualValues(t, 1, count, name)
+	}
 }
 
 func createQuotaTestOperator(t *testing.T, db *gorm.DB, role int) model.User {

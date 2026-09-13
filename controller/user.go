@@ -956,8 +956,12 @@ func DeleteUser(c *gin.Context) {
 	if result != manageableTargetFound {
 		return
 	}
-	err = model.HardDeleteUserById(id)
+	err = model.HardDeleteUserByIdForRole(id, c.GetInt("role"))
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, model.ErrUserHardDeleteUnauthorized) {
+			common.ApiErrorI18n(c, i18n.MsgUserNotExists)
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
