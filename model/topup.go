@@ -494,15 +494,6 @@ func ManualCompleteTopUpForRole(tradeNo string, callerIp string, operatorRole in
 			return errors.New("充值订单不存在")
 		}
 
-		// 幂等处理：已成功直接返回
-		if topUp.Status == common.TopUpStatusSuccess {
-			return nil
-		}
-
-		if topUp.Status != common.TopUpStatusPending {
-			return errors.New("订单状态不是待支付，无法补单")
-		}
-
 		var user User
 		if err := lockForUpdate(tx).
 			Select("id", "role").
@@ -515,6 +506,15 @@ func ManualCompleteTopUpForRole(tradeNo string, callerIp string, operatorRole in
 		}
 		if !common.CanManageUserRole(operatorRole, user.Role) {
 			return ErrTopUpTargetNotManageable
+		}
+
+		// 幂等处理：已成功直接返回
+		if topUp.Status == common.TopUpStatusSuccess {
+			return nil
+		}
+
+		if topUp.Status != common.TopUpStatusPending {
+			return errors.New("订单状态不是待支付，无法补单")
 		}
 
 		// 计算应充值额度：

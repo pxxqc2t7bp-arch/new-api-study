@@ -143,6 +143,28 @@ func TestAdminCompleteTopUpRespectsTargetRole(t *testing.T) {
 	}
 }
 
+func TestAdminCompleteTopUpAuthorizesBeforeCompletedOrderIdempotency(t *testing.T) {
+	db, user, topUp := setupAdminCompleteTopUpFixture(t, common.RolePluginAdminUser, model.PaymentProviderEpay)
+	wantMessage := i18n.Translate(i18n.DefaultLang, i18n.MsgUserNoPermissionHigherLevel)
+
+	pendingResponse := completeTopUpAs(t, common.RoleAdminUser, topUp.TradeNo)
+	require.False(t, pendingResponse.Success)
+	assert.Equal(t, wantMessage, pendingResponse.Message)
+	assertManualTopUpState(t, db, user.Id, topUp.TradeNo, common.TopUpStatusPending, 50)
+
+	require.NoError(t, db.Model(&model.TopUp{}).
+		Where("id = ?", topUp.Id).
+		Update("status", common.TopUpStatusSuccess).Error)
+
+	completedResponse := completeTopUpAs(t, common.RoleAdminUser, topUp.TradeNo)
+	assert.False(t, completedResponse.Success)
+	assert.Equal(t, pendingResponse.Message, completedResponse.Message)
+	assert.Equal(t, wantMessage, completedResponse.Message)
+	assert.NotContains(t, completedResponse.Message, topUp.TradeNo)
+	assert.NotContains(t, completedResponse.Message, user.Username)
+	assertManualTopUpState(t, db, user.Id, topUp.TradeNo, common.TopUpStatusSuccess, 50)
+}
+
 func TestTopUpListingsRespectViewerRole(t *testing.T) {
 	db := setupManageUserTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.TopUp{}))
