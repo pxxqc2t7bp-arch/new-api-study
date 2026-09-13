@@ -235,7 +235,41 @@ func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing
 		})
 	}
 
-	for _, field := range []string{"postcode", "codec", "monkey", "keyboard"} {
+	for _, field := range []string{
+		"accessKey",
+		"access_key",
+		"access-key",
+		"ACCESSKEY",
+		"accessKeyValue",
+		"ACCESS_KEY_ID",
+		"ACCESS-KEY-REF",
+		"apiKeyRef",
+		"private_key_id",
+		"secret-key-value",
+		"clientKey",
+		"service_key_ref",
+		"SIGNING-KEY-ID",
+		"ENCRYPTION_KEY_VALUE",
+	} {
+		t.Run("credential key field "+field, func(t *testing.T) {
+			assertAppManifestErrorCode(
+				t,
+				[]byte(`{"`+field+`":"x"}`),
+				AppManifestForbiddenFieldErrorCode,
+			)
+		})
+	}
+
+	for _, field := range []string{
+		"key",
+		"keyValue",
+		"key_id",
+		"postcode",
+		"codec",
+		"monkey",
+		"hockey",
+		"keyboard",
+	} {
 		t.Run("unrelated field "+field+" is unknown", func(t *testing.T) {
 			assertAppManifestErrorCode(
 				t,

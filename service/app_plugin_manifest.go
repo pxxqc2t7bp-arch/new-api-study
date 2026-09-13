@@ -351,6 +351,21 @@ func isForbiddenAppManifestField(field string) bool {
 		return true
 	}
 
+	for _, credentialQualifier := range []string{
+		"access",
+		"api",
+		"private",
+		"secret",
+		"client",
+		"service",
+		"signing",
+		"encryption",
+	} {
+		if strings.Contains(normalized, credentialQualifier+"key") {
+			return true
+		}
+	}
+
 	for _, sensitive := range []string{
 		"credential",
 		"secret",
