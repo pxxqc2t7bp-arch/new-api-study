@@ -3,6 +3,7 @@ package authz
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -353,18 +354,20 @@ func TestAppPluginErrorsUseStableEnvelope(t *testing.T) {
 		stableCode string
 		message    string
 		retryable  bool
+		statusCode int
 	}{
-		{name: "feature disabled", code: AppPluginErrorCodeFeatureDisabled, stableCode: "app_plugin_disabled", message: "App plugin API is disabled"},
-		{name: "invalid request", code: AppPluginErrorCodeInvalidRequest, stableCode: "invalid_request", message: "Invalid app plugin request"},
-		{name: "permission denied", code: AppPluginErrorCodePermissionDenied, stableCode: "not_found", message: "App plugin not found"},
-		{name: "not found", code: AppPluginErrorCodeNotFound, stableCode: "not_found", message: "App plugin not found"},
-		{name: "conflict", code: AppPluginErrorCodeConflict, stableCode: "app_version_conflict", message: "App plugin state conflict"},
-		{name: "internal", code: AppPluginErrorCodeInternal, stableCode: "service_unavailable", message: "App plugin request failed", retryable: true},
+		{name: "feature disabled", code: AppPluginErrorCodeFeatureDisabled, stableCode: "app_plugin_disabled", message: "App plugin API is disabled", statusCode: http.StatusForbidden},
+		{name: "invalid request", code: AppPluginErrorCodeInvalidRequest, stableCode: "invalid_request", message: "Invalid app plugin request", statusCode: http.StatusBadRequest},
+		{name: "permission denied", code: AppPluginErrorCodePermissionDenied, stableCode: "not_found", message: "App plugin not found", statusCode: http.StatusNotFound},
+		{name: "not found", code: AppPluginErrorCodeNotFound, stableCode: "not_found", message: "App plugin not found", statusCode: http.StatusNotFound},
+		{name: "conflict", code: AppPluginErrorCodeConflict, stableCode: "app_version_conflict", message: "App plugin state conflict", statusCode: http.StatusConflict},
+		{name: "internal", code: AppPluginErrorCodeInternal, stableCode: "service_unavailable", message: "App plugin request failed", retryable: true, statusCode: http.StatusServiceUnavailable},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			envelope := NewAppPluginError(test.code, requestID, errors.New(privateDetail))
+			assert.Equal(t, test.statusCode, envelope.StatusCode)
 			encoded, err := json.Marshal(envelope)
 			require.NoError(t, err)
 			expected, err := json.Marshal(map[string]any{

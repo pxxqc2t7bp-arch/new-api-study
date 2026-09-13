@@ -1,5 +1,7 @@
 package authz
 
+import "net/http"
+
 const (
 	ResourceAppPlugin = "app_plugin"
 	ActionManage      = "manage"
@@ -32,7 +34,8 @@ const (
 )
 
 type AppPluginErrorEnvelope struct {
-	Error AppPluginError `json:"error"`
+	StatusCode int            `json:"-"`
+	Error      AppPluginError `json:"error"`
 }
 
 type AppPluginFieldError struct {
@@ -53,15 +56,20 @@ type AppPluginError struct {
 func NewAppPluginError(code AppPluginErrorCode, requestID string, _ error) AppPluginErrorEnvelope {
 	message := ""
 	retryable := false
+	statusCode := http.StatusServiceUnavailable
 	switch code {
 	case AppPluginErrorCodeFeatureDisabled:
 		message = "App plugin API is disabled"
+		statusCode = http.StatusForbidden
 	case AppPluginErrorCodeInvalidRequest:
 		message = "Invalid app plugin request"
+		statusCode = http.StatusBadRequest
 	case AppPluginErrorCodeNotFound:
 		message = "App plugin not found"
+		statusCode = http.StatusNotFound
 	case AppPluginErrorCodeConflict:
 		message = "App plugin state conflict"
+		statusCode = http.StatusConflict
 	case AppPluginErrorCodeInternal:
 		message = "App plugin request failed"
 		retryable = true
@@ -70,11 +78,14 @@ func NewAppPluginError(code AppPluginErrorCode, requestID string, _ error) AppPl
 		message = "App plugin request failed"
 		retryable = true
 	}
-	return AppPluginErrorEnvelope{Error: AppPluginError{
-		Code:        code,
-		Message:     message,
-		FieldErrors: []AppPluginFieldError{},
-		Retryable:   retryable,
-		RequestID:   requestID,
-	}}
+	return AppPluginErrorEnvelope{
+		StatusCode: statusCode,
+		Error: AppPluginError{
+			Code:        code,
+			Message:     message,
+			FieldErrors: []AppPluginFieldError{},
+			Retryable:   retryable,
+			RequestID:   requestID,
+		},
+	}
 }
