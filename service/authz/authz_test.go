@@ -1,10 +1,13 @@
 package authz
 
 import (
+	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -34,16 +37,20 @@ func TestInitSeedsBuiltInRolesAndPoliciesOnce(t *testing.T) {
 	require.NoError(t, Init(db))
 
 	// root is a superuser role and is granted everything implicitly, so only the
-	// admin baseline is written as explicit policy rows.
+	// non-superuser baselines are written as explicit policy rows.
 	var count int64
 	require.NoError(t, db.Model(&model.CasbinRule{}).Count(&count).Error)
-	assert.Equal(t, int64(len(PermissionsForRole(BuiltInRoleAdmin))), count)
+	assert.Equal(t, int64(
+		len(PermissionsForRole(BuiltInRoleAdmin))+
+			len(PermissionsForRole(BuiltInRolePluginAdmin)),
+	), count)
 
 	var roles []model.AuthzRole
 	require.NoError(t, db.Order("sort asc").Find(&roles).Error)
-	require.Len(t, roles, 2)
+	require.Len(t, roles, 3)
 	assert.Equal(t, BuiltInRoleRoot, roles[0].Key)
 	assert.Equal(t, BuiltInRoleAdmin, roles[1].Key)
+	assert.Equal(t, BuiltInRolePluginAdmin, roles[2].Key)
 
 	assert.True(t, Can(1, common.RoleRootUser, ChannelSensitiveWrite))
 	assert.True(t, Can(2, common.RoleAdminUser, ChannelRead))
@@ -108,6 +115,9 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 		ResourceTaskPlugin: {
 			ActionBind: false,
 		},
+		ResourceAppPlugin: {
+			ActionManage: false,
+		},
 		ResourceAudit: {ActionRead: false},
 	}, ExplicitUserPermissions(42))
 	assert.Equal(t, PermissionsMap{
@@ -139,6 +149,9 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 		},
 		ResourceTaskPlugin: {
 			ActionBind: false,
+		},
+		ResourceAppPlugin: {
+			ActionManage: false,
 		},
 		ResourceAudit: {ActionRead: false},
 	}, ExplicitUserPermissions(42))
@@ -235,6 +248,7 @@ func TestCapabilitiesUseCatalogShape(t *testing.T) {
 	assert.False(t, capabilities[ResourceChannel][ActionSensitiveWrite])
 	assert.False(t, capabilities[ResourceChannel][ActionSecretView])
 	assert.False(t, capabilities[ResourceTaskPlugin][ActionBind])
+	assert.False(t, capabilities[ResourceAppPlugin][ActionManage])
 }
 
 func TestTaskPluginBindIsRootOnlyUntilGranted(t *testing.T) {
@@ -270,4 +284,106 @@ func TestTaskPluginBindIsRootOnlyUntilGranted(t *testing.T) {
 	_, err = enforcer.RemovePolicy(RoleSubject(BuiltInRoleAdmin), ResourceTaskPlugin, ActionBind, EffectAllow)
 	require.NoError(t, err)
 	assert.False(t, Can(2, common.RoleAdminUser, TaskPluginBind))
+}
+
+func TestAppPluginFlagsDefaultOff(t *testing.T) {
+	assert.False(t, operation_setting.AppPluginV1Enabled)
+	assert.False(t, operation_setting.AppPluginSeedanceEnabled)
+	assert.False(t, operation_setting.AppPluginEmbeddedSurfaceEnabled)
+	assert.False(t, operation_setting.AppExecutionGrantsEnabled)
+}
+
+func TestPluginAdminHasOnlyAppPluginManage(t *testing.T) {
+	db := newAuthzTestDB(t)
+	require.NoError(t, Init(db))
+
+	assert.Equal(t, []Permission{AppPluginManage}, PermissionsForRole(BuiltInRolePluginAdmin))
+
+	var pluginAdmin *RoleDescriptor
+	for _, role := range Roles() {
+		if role.Key == BuiltInRolePluginAdmin {
+			role := role
+			pluginAdmin = &role
+			break
+		}
+	}
+	require.NotNil(t, pluginAdmin)
+	assert.False(t, pluginAdmin.Superuser)
+	assert.Equal(t, PermissionsMap{
+		ResourceChannel: {
+			ActionRead:           false,
+			ActionOperate:        false,
+			ActionWrite:          false,
+			ActionSensitiveWrite: false,
+			ActionSecretView:     false,
+		},
+		ResourceTaskPlugin: {
+			ActionBind: false,
+		},
+		ResourceAudit: {
+			ActionRead: false,
+		},
+		ResourceAppPlugin: {
+			ActionManage: true,
+		},
+	}, pluginAdmin.Grants)
+
+	var policies []model.CasbinRule
+	require.NoError(t, db.Where("v0 = ?", RoleSubject(BuiltInRolePluginAdmin)).Find(&policies).Error)
+	require.Len(t, policies, 1)
+	assert.Equal(t, ResourceAppPlugin, policies[0].V1)
+	assert.Equal(t, ActionManage, policies[0].V2)
+	assert.Equal(t, EffectAllow, policies[0].V3)
+
+	root, ok := roleSpec(BuiltInRoleRoot)
+	require.True(t, ok)
+	assert.True(t, roleGrants(root)[ResourceAppPlugin][ActionManage])
+	assert.NotContains(t, PermissionsForRole(BuiltInRoleAdmin), AppPluginManage)
+	assert.NotContains(t, PermissionsForRole(BuiltInRoleAdmin), AuditRead)
+}
+
+func TestAppPluginErrorsUseStableEnvelope(t *testing.T) {
+	const (
+		privateDetail = "secret-token plugin-object-123"
+		requestID     = "request-app-plugin-123"
+	)
+	tests := []struct {
+		name       string
+		code       AppPluginErrorCode
+		stableCode string
+		message    string
+		retryable  bool
+	}{
+		{name: "feature disabled", code: AppPluginErrorCodeFeatureDisabled, stableCode: "app_plugin_disabled", message: "App plugin API is disabled"},
+		{name: "invalid request", code: AppPluginErrorCodeInvalidRequest, stableCode: "invalid_request", message: "Invalid app plugin request"},
+		{name: "permission denied", code: AppPluginErrorCodePermissionDenied, stableCode: "not_found", message: "App plugin not found"},
+		{name: "not found", code: AppPluginErrorCodeNotFound, stableCode: "not_found", message: "App plugin not found"},
+		{name: "conflict", code: AppPluginErrorCodeConflict, stableCode: "app_version_conflict", message: "App plugin state conflict"},
+		{name: "internal", code: AppPluginErrorCodeInternal, stableCode: "service_unavailable", message: "App plugin request failed", retryable: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			envelope := NewAppPluginError(test.code, requestID, errors.New(privateDetail))
+			encoded, err := json.Marshal(envelope)
+			require.NoError(t, err)
+			expected, err := json.Marshal(map[string]any{
+				"error": map[string]any{
+					"code":         test.stableCode,
+					"message":      test.message,
+					"field_errors": []any{},
+					"retryable":    test.retryable,
+					"request_id":   requestID,
+				},
+			})
+			require.NoError(t, err)
+			assert.JSONEq(t, string(expected), string(encoded))
+			assert.NotContains(t, string(encoded), privateDetail)
+			assert.NotContains(t, string(encoded), "plugin-object-123")
+		})
+	}
+
+	notFound := NewAppPluginError(AppPluginErrorCodeNotFound, requestID, errors.New("object does not exist"))
+	notAllowed := NewAppPluginError(AppPluginErrorCodePermissionDenied, requestID, errors.New("plugin-object-123 exists but is forbidden"))
+	assert.Equal(t, notFound, notAllowed)
 }

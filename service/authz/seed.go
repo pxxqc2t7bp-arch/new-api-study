@@ -52,11 +52,26 @@ func seedDefaultPolicies() error {
 		if spec.Superuser {
 			continue
 		}
-		for _, permission := range PermissionsForRole(spec.Key) {
+		permissions, err := permissionsForBuiltInRole(spec)
+		if err != nil {
+			return err
+		}
+		for _, permission := range permissions {
 			if _, err := e.AddPolicy(RoleSubject(spec.Key), permission.Resource, permission.Action, EffectAllow); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func permissionsForBuiltInRole(spec RoleSpec) ([]Permission, error) {
+	permissions := PermissionsForRole(spec.Key)
+	if spec.Key != BuiltInRolePluginAdmin {
+		return permissions, nil
+	}
+	if len(permissions) != 1 || permissions[0] != AppPluginManage {
+		return nil, fmt.Errorf("%s role must grant only %s.%s", BuiltInRolePluginAdmin, ResourceAppPlugin, ActionManage)
+	}
+	return permissions, nil
 }

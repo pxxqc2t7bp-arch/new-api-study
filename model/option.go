@@ -59,6 +59,10 @@ func InitOptionMap() {
 	jsplugin.DefaultRegistry.SetEnabled(constant.TaskPluginEnabled)
 	common.OptionMap["TaskPluginOverrideEnabled"] = strconv.FormatBool(constant.TaskPluginOverrideEnabled)
 	jsplugin.DefaultRegistry.SetOverrideEnabled(constant.TaskPluginOverrideEnabled)
+	common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] = strconv.FormatBool(operation_setting.AppPluginV1Enabled)
+	common.OptionMap[operation_setting.AppPluginSeedanceEnabledOptionKey] = strconv.FormatBool(operation_setting.AppPluginSeedanceEnabled)
+	common.OptionMap[operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey] = strconv.FormatBool(operation_setting.AppPluginEmbeddedSurfaceEnabled)
+	common.OptionMap[operation_setting.AppExecutionGrantsEnabledOptionKey] = strconv.FormatBool(operation_setting.AppExecutionGrantsEnabled)
 	common.OptionMap[setting.TaskPluginMarketplaceSourcesKey] = setting.TaskPluginMarketplaceSources2JsonString()
 	common.OptionMap[setting.TaskPluginDisabledFactoryKeysKey] = "[]"
 	jsplugin.DefaultRegistry.SetDisabledFactoryKeys(nil)
@@ -317,7 +321,7 @@ func updateOptionMap(key string, value string) (err error) {
 			common.ImageDownloadPermission = intValue
 		}
 	}
-	if strings.HasSuffix(key, "Enabled") || key == "DefaultCollapseSidebar" || key == "DefaultUseAutoGroup" || key == "SMTPForceAuthLogin" || key == "SMTPInsecureSkipVerify" {
+	if strings.HasSuffix(key, "Enabled") || operation_setting.IsAppPluginFeatureFlag(key) || key == "DefaultCollapseSidebar" || key == "DefaultUseAutoGroup" || key == "SMTPForceAuthLogin" || key == "SMTPInsecureSkipVerify" {
 		boolValue := value == "true"
 		switch key {
 		case "PasswordRegisterEnabled":
@@ -370,6 +374,14 @@ func updateOptionMap(key string, value string) (err error) {
 		case "TaskPluginOverrideEnabled":
 			constant.TaskPluginOverrideEnabled = boolValue
 			jsplugin.DefaultRegistry.SetOverrideEnabled(boolValue)
+		case operation_setting.AppPluginV1EnabledOptionKey:
+			operation_setting.AppPluginV1Enabled = boolValue
+		case operation_setting.AppPluginSeedanceEnabledOptionKey:
+			operation_setting.AppPluginSeedanceEnabled = boolValue
+		case operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey:
+			operation_setting.AppPluginEmbeddedSurfaceEnabled = boolValue
+		case operation_setting.AppExecutionGrantsEnabledOptionKey:
+			operation_setting.AppExecutionGrantsEnabled = boolValue
 		case "DataExportEnabled":
 			common.DataExportEnabled = boolValue
 		case "DefaultCollapseSidebar":
