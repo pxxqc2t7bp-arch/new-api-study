@@ -264,11 +264,6 @@ func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing
 		"key",
 		"keyValue",
 		"key_id",
-		"postcode",
-		"codec",
-		"monkey",
-		"hockey",
-		"keyboard",
 	} {
 		t.Run("unrelated field "+field+" is unknown", func(t *testing.T) {
 			assertAppManifestErrorCode(
@@ -276,6 +271,79 @@ func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing
 				[]byte(`{"`+field+`":"x"}`),
 				AppManifestInvalidErrorCode,
 			)
+		})
+	}
+}
+
+func TestValidateAppManifestTreatsDescriptionAsOrdinaryUnknownField(t *testing.T) {
+	assertAppManifestErrorCode(
+		t,
+		[]byte(`{"description":"x"}`),
+		AppManifestInvalidErrorCode,
+	)
+}
+
+func TestValidateAppManifestDoesNotMatchSensitiveSubstringsInOrdinaryUnknownFields(t *testing.T) {
+	for _, field := range []string{
+		"transcription",
+		"subscription",
+		"postcode",
+		"codec",
+		"monkey",
+		"hockey",
+		"keyboard",
+		"author",
+	} {
+		t.Run(field, func(t *testing.T) {
+			assertAppManifestErrorCode(
+				t,
+				[]byte(`{"`+field+`":"x"}`),
+				AppManifestInvalidErrorCode,
+			)
+		})
+	}
+}
+
+func TestValidateAppManifestRejectsAuthorizationCredentialFields(t *testing.T) {
+	const credentialValue = "Bearer secret-value"
+	for _, field := range []string{
+		"Authorization",
+		"authorizationHeader",
+		"authorization_header",
+		"authorization-header",
+		"AUTHORIZATION_HEADER",
+	} {
+		t.Run(field, func(t *testing.T) {
+			err := assertAppManifestErrorCode(
+				t,
+				[]byte(`{"`+field+`":"`+credentialValue+`"}`),
+				AppManifestForbiddenFieldErrorCode,
+			)
+			assert.NotContains(t, err.Error(), credentialValue)
+		})
+	}
+}
+
+func TestValidateAppManifestRejectsBearerAndAuthHeaderCredentialFields(t *testing.T) {
+	const credentialValue = "secret-value"
+	for _, field := range []string{
+		"bearer",
+		"bearerToken",
+		"bearer_token",
+		"bearer-token",
+		"BEARER_TOKEN",
+		"authHeader",
+		"auth_header",
+		"auth-header",
+		"AUTH_HEADER",
+	} {
+		t.Run(field, func(t *testing.T) {
+			err := assertAppManifestErrorCode(
+				t,
+				[]byte(`{"`+field+`":"`+credentialValue+`"}`),
+				AppManifestForbiddenFieldErrorCode,
+			)
+			assert.NotContains(t, err.Error(), credentialValue)
 		})
 	}
 }

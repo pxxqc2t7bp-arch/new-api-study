@@ -374,7 +374,8 @@ func isForbiddenAppManifestField(field string) bool {
 		"token",
 		"apikey",
 		"privatekey",
-		"script",
+		"authorization",
+		"bearer",
 		"executable",
 		"iframeurl",
 		"proxy",
@@ -382,6 +383,17 @@ func isForbiddenAppManifestField(field string) bool {
 		if strings.Contains(normalized, sensitive) {
 			return true
 		}
+	}
+
+	segments := tokenizeAppManifestASCIIField(field)
+	for index, segment := range segments {
+		if segment == "script" ||
+			segment == "auth" && index+1 < len(segments) && segments[index+1] == "header" {
+			return true
+		}
+	}
+	if normalized == "authheader" {
+		return true
 	}
 
 	if strings.HasPrefix(normalized, "code") && normalized != "codec" {
@@ -410,6 +422,50 @@ func normalizeAppManifestASCIIField(field string) string {
 		}
 	}
 	return normalized.String()
+}
+
+func tokenizeAppManifestASCIIField(field string) []string {
+	segments := make([]string, 0, 4)
+	start := -1
+	appendSegment := func(end int) {
+		if start >= 0 {
+			segments = append(segments, strings.ToLower(field[start:end]))
+			start = -1
+		}
+	}
+
+	for index := range len(field) {
+		char := field[index]
+		if char >= utf8.RuneSelf {
+			return nil
+		}
+		if !isAppManifestASCIIAlphaNumeric(char) {
+			appendSegment(index)
+			continue
+		}
+		if start < 0 {
+			start = index
+			continue
+		}
+		if char >= 'A' && char <= 'Z' {
+			previous := field[index-1]
+			nextIsLower := index+1 < len(field) && field[index+1] >= 'a' && field[index+1] <= 'z'
+			if previous >= 'a' && previous <= 'z' ||
+				previous >= '0' && previous <= '9' ||
+				previous >= 'A' && previous <= 'Z' && nextIsLower {
+				appendSegment(index)
+				start = index
+			}
+		}
+	}
+	appendSegment(len(field))
+	return segments
+}
+
+func isAppManifestASCIIAlphaNumeric(char byte) bool {
+	return char >= 'a' && char <= 'z' ||
+		char >= 'A' && char <= 'Z' ||
+		char >= '0' && char <= '9'
 }
 
 func validAppManifest(manifest AppManifest) bool {
