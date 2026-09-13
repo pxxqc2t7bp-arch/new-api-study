@@ -48,6 +48,7 @@ var (
 	ErrTopUpStatusInvalid       = errors.New("topup status invalid")
 	ErrInvalidTopUpQuota        = errors.New("invalid top-up quota")
 	ErrTopUpQuotaLimitExceeded  = errors.New("top-up quota limit exceeded")
+	ErrTopUpTargetNotManageable = errors.New("topup target not manageable")
 	ErrWalletQuotaLimitExceeded = errors.New("wallet quota limit exceeded")
 )
 
@@ -447,6 +448,10 @@ func SearchAllTopUps(keyword string, pageInfo *common.PageInfo) (topups []*TopUp
 
 // ManualCompleteTopUp 管理员手动完成订单并给用户充值
 func ManualCompleteTopUp(tradeNo string, callerIp string) error {
+	return ManualCompleteTopUpForRole(tradeNo, callerIp, common.RoleRootUser)
+}
+
+func ManualCompleteTopUpForRole(tradeNo string, callerIp string, operatorRole int) error {
 	if tradeNo == "" {
 		return errors.New("未提供订单号")
 	}
@@ -475,6 +480,20 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 
 		if topUp.Status != common.TopUpStatusPending {
 			return errors.New("订单状态不是待支付，无法补单")
+		}
+
+		var user User
+		if err := lockForUpdate(tx).
+			Select("id", "role").
+			Where("id = ?", topUp.UserId).
+			First(&user).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrTopUpTargetNotManageable
+			}
+			return err
+		}
+		if !common.CanManageUserRole(operatorRole, user.Role) {
+			return ErrTopUpTargetNotManageable
 		}
 
 		// 计算应充值额度：
