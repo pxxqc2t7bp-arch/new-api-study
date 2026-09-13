@@ -130,6 +130,28 @@ func TestHardDeleteUserPublishesTombstoneAndPurgesAuthenticationData(t *testing.
 	assert.False(t, server.Exists(getUserCacheKey(user.Id)))
 }
 
+func TestHardDeleteUserUsesStoredRoleForPluginAdminTombstone(t *testing.T) {
+	truncateTables(t)
+
+	stored := User{
+		Username: "plugin-admin-delete-tombstone", Password: "password",
+		Role: common.RolePluginAdminUser, AuthVersion: 1,
+	}
+	require.NoError(t, DB.Create(&stored).Error)
+
+	staleCaller := User{Id: stored.Id, Role: common.RoleCommonUser}
+	require.NoError(t, staleCaller.HardDelete())
+
+	_, err := GetUserById(stored.Id, false)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+
+	var tombstone User
+	require.NoError(t, DB.Unscoped().First(&tombstone, stored.Id).Error)
+	assert.True(t, tombstone.DeletedAt.Valid)
+	assert.Equal(t, common.RolePluginAdminUser, tombstone.Role)
+	assert.EqualValues(t, 2, tombstone.AuthVersion)
+}
+
 func TestIncrementFailedAttemptsCountsConcurrentFailures(t *testing.T) {
 	truncateTables(t)
 

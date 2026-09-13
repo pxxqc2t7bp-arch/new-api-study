@@ -1022,6 +1022,13 @@ func (user *User) HardDelete() error {
 	var tokens []Token
 	var deletedAuthVersion int64
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		var storedUser User
+		if err := lockForUpdate(tx.Unscoped()).
+			Select("id", "role").
+			Where("id = ?", user.Id).
+			First(&storedUser).Error; err != nil {
+			return err
+		}
 		var err error
 		deletedAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
 		if err != nil {
@@ -1035,7 +1042,10 @@ func (user *User) HardDelete() error {
 		if err := deleteUserAuthenticationData(tx, user.Id); err != nil {
 			return err
 		}
-		return tx.Unscoped().Delete(user).Error
+		if storedUser.Role == common.RolePluginAdminUser {
+			return tx.Delete(&storedUser).Error
+		}
+		return tx.Unscoped().Delete(&storedUser).Error
 	})
 	if err != nil {
 		return err

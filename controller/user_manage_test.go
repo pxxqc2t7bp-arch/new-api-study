@@ -227,6 +227,185 @@ func TestManageUserDeleteReturnsImmediatelyAndUnknownActionFails(t *testing.T) {
 	assert.Equal(t, common.UserStatusEnabled, unchanged.Status)
 }
 
+func setupAdministrativeDeletionTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db := setupManageUserTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.ExternalIdentityClaim{},
+		&model.TwoFABackupCode{},
+		&model.TwoFA{},
+		&model.AuthFlow{},
+		&model.PasskeyCredential{},
+		&model.Token{},
+		&model.UserOAuthBinding{},
+		&model.TopUp{},
+		&model.QuotaData{},
+	))
+	return db
+}
+
+func seedAdministrativeDeletionAuthData(t *testing.T, db *gorm.DB, user model.User, prefix string) {
+	t.Helper()
+	now := time.Now().Unix()
+	for _, record := range []any{
+		&model.ExternalIdentityClaim{Provider: model.ExternalIdentityProviderTelegram, Subject: prefix + "-subject", UserId: user.Id},
+		&model.TwoFABackupCode{UserId: user.Id, CodeHash: prefix + "-backup"},
+		&model.TwoFA{UserId: user.Id, Secret: prefix + "-secret", IsEnabled: true},
+		&model.AuthFlow{
+			TokenHash: prefix + "-flow", Purpose: model.AuthFlowPurposeTwoFALogin,
+			UserId: user.Id, ExpiresAt: time.Now().Add(time.Minute),
+		},
+		&model.PasskeyCredential{UserID: user.Id, CredentialID: prefix + "-credential", PublicKey: "public-key"},
+		&model.Token{UserId: user.Id, Key: prefix + "-token"},
+		&model.UserOAuthBinding{UserId: user.Id, ProviderId: 1, ProviderUserId: prefix + "-oauth"},
+		&model.UserSession{
+			SID: prefix + "-session", UserID: user.Id, Version: 1, UserAuthVersion: user.AuthVersion,
+			Status: model.UserSessionStatusActive, RefreshHash: prefix + "-refresh", LoginMethod: "password",
+			LastActiveAt: now, ExpiresAt: now + 3600,
+		},
+	} {
+		require.NoError(t, db.Create(record).Error)
+	}
+}
+
+func assertAdministrativeDeletionAuthDataPurged(t *testing.T, db *gorm.DB, userID int) {
+	t.Helper()
+	for name, record := range map[string]any{
+		"external identity":    &model.ExternalIdentityClaim{},
+		"2FA backup code":      &model.TwoFABackupCode{},
+		"2FA":                  &model.TwoFA{},
+		"auth flow":            &model.AuthFlow{},
+		"passkey":              &model.PasskeyCredential{},
+		"token":                &model.Token{},
+		"custom OAuth binding": &model.UserOAuthBinding{},
+		"session":              &model.UserSession{},
+	} {
+		var count int64
+		require.NoError(t, db.Unscoped().Model(record).Where("user_id = ?", userID).Count(&count).Error)
+		assert.Zero(t, count, name)
+	}
+}
+
+func TestRootDeleteUserRetainsPluginAdminHistoryAndHardDeletesCommonUser(t *testing.T) {
+	t.Run("plugin admin becomes a durable tombstone", func(t *testing.T) {
+		db := setupAdministrativeDeletionTestDB(t)
+		user := model.User{
+			Username: "deleted-plugin-admin", Password: "password", Role: common.RolePluginAdminUser,
+			Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "deleted-plugin-admin",
+		}
+		require.NoError(t, db.Create(&user).Error)
+		seedAdministrativeDeletionAuthData(t, db, user, "deleted-plugin-admin")
+
+		now := time.Now().Unix()
+		topUp := model.TopUp{
+			UserId: user.Id, TradeNo: "DELETED-PLUGIN-ADMIN-TOPUP",
+			CreateTime: now, Status: common.TopUpStatusSuccess,
+		}
+		logRecord := model.Log{
+			UserId: user.Id, Username: user.Username, CreatedAt: now,
+			Type: model.LogTypeConsume, Quota: 30,
+		}
+		quotaRecord := model.QuotaData{
+			UserID: user.Id, Username: user.Username, ModelName: "historical-model",
+			CreatedAt: 1500, UseGroup: "default", Count: 1, Quota: 30,
+		}
+		require.NoError(t, db.Create(&topUp).Error)
+		require.NoError(t, model.LOG_DB.Create(&logRecord).Error)
+		require.NoError(t, db.Create(&quotaRecord).Error)
+
+		response := performUserManagementRequest(
+			t,
+			common.RoleRootUser,
+			http.MethodDelete,
+			"/api/user/"+strconv.Itoa(user.Id),
+			"",
+			gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}},
+			DeleteUser,
+		)
+		require.Equal(t, http.StatusOK, response.Code)
+		require.Contains(t, response.Body.String(), `"success":true`)
+
+		_, err := model.GetUserById(user.Id, false)
+		require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+		require.ErrorIs(t, db.First(&model.User{}, user.Id).Error, gorm.ErrRecordNotFound)
+
+		var tombstone model.User
+		tombstoneErr := db.Unscoped().First(&tombstone, user.Id).Error
+		assert.NoError(t, tombstoneErr)
+		assert.Equal(t, user.Id, tombstone.Id)
+		assert.True(t, tombstone.DeletedAt.Valid)
+		assert.Equal(t, common.RolePluginAdminUser, tombstone.Role)
+		assert.EqualValues(t, 2, tombstone.AuthVersion)
+		assertAdministrativeDeletionAuthDataPurged(t, db, user.Id)
+
+		_, adminTopUps := getTopUpListingAs(t, common.RoleAdminUser, "/api/user/topup?p=1&page_size=10")
+		assert.Zero(t, adminTopUps.Data.Total)
+		assert.Empty(t, adminTopUps.Data.Items)
+		_, rootTopUps := getTopUpListingAs(t, common.RoleRootUser, "/api/user/topup?p=1&page_size=10")
+		assert.Equal(t, 1, rootTopUps.Data.Total)
+		assert.Equal(t, []int{topUp.Id}, listedTopUpIDs(rootTopUps.Data.Items))
+
+		logPath := fmt.Sprintf(
+			"/api/log/?start_timestamp=%d&end_timestamp=%d&p=1&page_size=10",
+			now-1,
+			now+1,
+		)
+		adminLogs := decodeUsageResponse[usageLogListingResponse](
+			t,
+			performUserManagementRequest(t, common.RoleAdminUser, http.MethodGet, logPath, "", nil, GetAllLogs),
+		)
+		assert.Zero(t, adminLogs.Data.Total)
+		assert.Empty(t, adminLogs.Data.Items)
+		rootLogs := decodeUsageResponse[usageLogListingResponse](
+			t,
+			performUserManagementRequest(t, common.RoleRootUser, http.MethodGet, logPath, "", nil, GetAllLogs),
+		)
+		assert.Equal(t, 1, rootLogs.Data.Total)
+		require.Len(t, rootLogs.Data.Items, 1)
+		assert.Equal(t, logRecord.Id, rootLogs.Data.Items[0].Id)
+
+		const quotaPath = "/api/data/?start_timestamp=1000&end_timestamp=2000"
+		adminQuota := decodeUsageResponse[usageQuotaResponse](
+			t,
+			performUserManagementRequest(t, common.RoleAdminUser, http.MethodGet, quotaPath, "", nil, GetAllQuotaDates),
+		)
+		assert.Empty(t, adminQuota.Data)
+		rootQuota := decodeUsageResponse[usageQuotaResponse](
+			t,
+			performUserManagementRequest(t, common.RoleRootUser, http.MethodGet, quotaPath, "", nil, GetAllQuotaDates),
+		)
+		require.Len(t, rootQuota.Data, 1)
+		assert.Equal(t, quotaRecord.Quota, rootQuota.Data[0].Quota)
+	})
+
+	t.Run("common user remains physically deleted", func(t *testing.T) {
+		db := setupAdministrativeDeletionTestDB(t)
+		user := model.User{
+			Username: "hard-deleted-common-user", Password: "password", Role: common.RoleCommonUser,
+			Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "hard-deleted-common-user",
+		}
+		require.NoError(t, db.Create(&user).Error)
+		seedAdministrativeDeletionAuthData(t, db, user, "hard-deleted-common-user")
+
+		response := performUserManagementRequest(
+			t,
+			common.RoleRootUser,
+			http.MethodDelete,
+			"/api/user/"+strconv.Itoa(user.Id),
+			"",
+			gin.Params{{Key: "id", Value: strconv.Itoa(user.Id)}},
+			DeleteUser,
+		)
+		require.Equal(t, http.StatusOK, response.Code)
+		require.Contains(t, response.Body.String(), `"success":true`)
+
+		var count int64
+		require.NoError(t, db.Unscoped().Model(&model.User{}).Where("id = ?", user.Id).Count(&count).Error)
+		assert.Zero(t, count)
+		assertAdministrativeDeletionAuthDataPurged(t, db, user.Id)
+	})
+}
+
 func createQuotaTestOperator(t *testing.T, db *gorm.DB, role int) model.User {
 	t.Helper()
 	if role == 0 {
