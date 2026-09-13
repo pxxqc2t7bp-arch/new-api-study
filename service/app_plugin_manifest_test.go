@@ -201,6 +201,40 @@ func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing
 		})
 	}
 
+	for _, field := range []string{
+		"sourceCode",
+		"source_code",
+		"source-code",
+		"SOURCECODE",
+	} {
+		t.Run("source code field "+field, func(t *testing.T) {
+			assertAppManifestErrorCode(
+				t,
+				[]byte(`{"`+field+`":"x"}`),
+				AppManifestForbiddenFieldErrorCode,
+			)
+		})
+	}
+
+	for _, field := range []string{
+		"entitlementPolicy",
+		"entitlement_policy",
+		"entitlement-policy",
+		"ENTITLEMENTPOLICY",
+		"entitlementPolicyVersion",
+		"entitlement_policy_version",
+		"entitlement-policy-version",
+		"ENTITLEMENTPOLICYVERSION",
+	} {
+		t.Run("entitlement policy field "+field, func(t *testing.T) {
+			assertAppManifestErrorCode(
+				t,
+				[]byte(`{"`+field+`":"x"}`),
+				AppManifestForbiddenFieldErrorCode,
+			)
+		})
+	}
+
 	for _, field := range []string{"postcode", "codec", "monkey", "keyboard"} {
 		t.Run("unrelated field "+field+" is unknown", func(t *testing.T) {
 			assertAppManifestErrorCode(

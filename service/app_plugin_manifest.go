@@ -342,6 +342,9 @@ func isForbiddenAppManifestField(field string) bool {
 		"clientsecret",
 		"clientsecretvalue",
 		"code",
+		"sourcecode",
+		"entitlementpolicy",
+		"entitlementpolicyversion",
 		"iframe",
 		"iframeurl",
 		"tokenvalue":
