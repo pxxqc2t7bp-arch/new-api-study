@@ -1,0 +1,23 @@
+{
+  "apiVersion": 1,
+  "kind": "app",
+  "key": "seedance-repro",
+  "name": {"en": "Seedance Repro", "zh": "Seedance 复现台"},
+  "version": "0.3.0",
+  "callbackPath": "/auth/callback",
+  "surfaces": {
+    "direct": {"startPath": "/auth/start"},
+    "embedded": {"startPath": "/auth/embed/start"}
+  },
+  "requestedScopes": [
+    "identity.read",
+    "model.invoke",
+    "task.import",
+    "task.read",
+    "resource.reserve",
+    "resource.meter"
+  ],
+  "requires": {
+    "taskPlugins": [{"key": "doubao", "minimumVersion": "1.2.0"}]
+  }
+}
