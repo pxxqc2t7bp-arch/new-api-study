@@ -334,78 +334,110 @@ func isForbiddenAppManifestField(field string) bool {
 		"alloweduserpolicy",
 		"allowedorigins",
 		"networkpolicy",
+		"credential",
+		"credentials",
+		"secret",
 		"secretref",
 		"privatekey",
 		"privatekeyvalue",
 		"apikey",
 		"apikeyvalue",
+		"xapikey",
 		"clientsecret",
 		"clientsecretvalue",
+		"password",
+		"passwd",
+		"token",
 		"code",
+		"codepayload",
+		"codeconfig",
 		"sourcecode",
+		"authcode",
+		"authorizationcode",
+		"passcode",
+		"accesscode",
+		"script",
+		"scripturl",
+		"xscripturl",
+		"javascript",
+		"javascripturl",
+		"executable",
 		"entitlementpolicy",
 		"entitlementpolicyversion",
 		"iframe",
 		"iframeurl",
-		"tokenvalue":
+		"proxy",
+		"proxyrules",
+		"authorization",
+		"authorizationheader",
+		"bearer",
+		"bearertoken",
+		"authheader",
+		"jwt",
+		"tokenvalue",
+		"accesstoken":
 		return true
 	}
 
-	for _, credentialQualifier := range []string{
-		"access",
-		"api",
-		"private",
-		"secret",
-		"client",
-		"service",
-		"signing",
-		"encryption",
-	} {
-		if strings.Contains(normalized, credentialQualifier+"key") {
-			return true
-		}
-	}
-
-	for _, sensitive := range []string{
-		"credential",
-		"secret",
-		"password",
-		"passwd",
-		"token",
-		"apikey",
-		"privatekey",
-		"authorization",
-		"bearer",
-		"scripturl",
-		"executable",
-		"iframeurl",
-		"proxy",
-	} {
-		if strings.Contains(normalized, sensitive) {
-			return true
-		}
+	if isForbiddenAppManifestKeyFamily(normalized) {
+		return true
 	}
 
 	segments := tokenizeAppManifestASCIIField(field)
 	for index, segment := range segments {
-		if segment == "script" ||
-			segment == "auth" && index+1 < len(segments) && segments[index+1] == "header" {
+		switch segment {
+		case "credential",
+			"credentials",
+			"secret",
+			"password",
+			"passwd",
+			"token",
+			"jwt",
+			"authorization",
+			"bearer",
+			"code",
+			"script",
+			"javascript",
+			"executable",
+			"iframe",
+			"proxy":
 			return true
 		}
-	}
-	if normalized == "authheader" {
-		return true
-	}
-
-	if strings.HasPrefix(normalized, "code") && normalized != "codec" {
-		return true
-	}
-	for _, codeCombination := range []string{"authcode", "authorizationcode", "passcode", "accesscode"} {
-		if strings.Contains(normalized, codeCombination) {
+		if segment == "auth" && index+1 < len(segments) && segments[index+1] == "header" ||
+			segment == "key" && index > 0 && isAppManifestCredentialKeyQualifier(segments[index-1]) {
 			return true
 		}
 	}
 	return false
+}
+
+func isForbiddenAppManifestKeyFamily(normalized string) bool {
+	for _, base := range []string{
+		"accesskey",
+		"apikey",
+		"privatekey",
+		"secretkey",
+		"clientkey",
+		"servicekey",
+		"signingkey",
+		"encryptionkey",
+	} {
+		for _, suffix := range []string{"", "value", "ref", "id"} {
+			if normalized == base+suffix {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isAppManifestCredentialKeyQualifier(segment string) bool {
+	switch segment {
+	case "access", "api", "private", "secret", "client", "service", "signing", "encryption":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeAppManifestASCIIField(field string) string {
@@ -576,6 +608,9 @@ func decodeAppManifestPath(path string) (string, bool) {
 	decoded := make([]byte, 0, len(values))
 	for index := 0; index >= 0; index = next[index] {
 		decoded = append(decoded, values[index])
+	}
+	if !utf8.Valid(decoded) {
+		return "", false
 	}
 	return string(decoded), true
 }

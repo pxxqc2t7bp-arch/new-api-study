@@ -139,7 +139,9 @@ func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing
 		"token",
 		"tokenValue",
 		"script",
+		"javascript",
 		"executable",
+		"jwt",
 		"code",
 		"codePayload",
 		"iframe",
@@ -284,6 +286,8 @@ func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing
 		"hockey",
 		"keyboard",
 		"author",
+		"credentialing",
+		"tokenizer",
 	} {
 		t.Run(field, func(t *testing.T) {
 			assertAppManifestErrorCode(
@@ -373,6 +377,7 @@ func TestValidateAppManifestLimitsPathsScopesAndSemver(t *testing.T) {
 	for name, path := range map[string]string{
 		"path over 8 KiB":            "/" + strings.Repeat("a", 8192),
 		"path over 16 decode rounds": "/%25252525252525252525252525252541",
+		"percent-encoded UTF-8 path": "/%E5%A4%8D%E7%8E%B0",
 	} {
 		t.Run(name+" accepted", func(t *testing.T) {
 			raw := mutateAppManifest(t, func(manifest map[string]any) {
@@ -497,6 +502,28 @@ func TestValidateAppManifestLimitsPathsScopesAndSemver(t *testing.T) {
 		t.Run("callback path "+name, func(t *testing.T) {
 			raw := mutateAppManifest(t, func(manifest map[string]any) {
 				manifest["callbackPath"] = path
+			})
+			assertAppManifestErrorCode(t, raw, AppManifestInvalidErrorCode)
+		})
+	}
+
+	for name, testCase := range map[string]struct {
+		target string
+		path   string
+	}{
+		"callback invalid byte":        {target: "callback", path: "/%ff"},
+		"direct overlong encoding":     {target: "direct", path: "/%c0%af"},
+		"embedded surrogate encoding":  {target: "embedded", path: "/%ed%a0%80"},
+		"callback out of range scalar": {target: "callback", path: "/%f4%90%80%80"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw := mutateAppManifest(t, func(manifest map[string]any) {
+				if testCase.target == "callback" {
+					manifest["callbackPath"] = testCase.path
+					return
+				}
+				surface := manifest["surfaces"].(map[string]any)[testCase.target].(map[string]any)
+				surface["startPath"] = testCase.path
 			})
 			assertAppManifestErrorCode(t, raw, AppManifestInvalidErrorCode)
 		})
