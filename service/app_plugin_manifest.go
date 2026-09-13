@@ -66,8 +66,9 @@ var (
 		"access", "api", "client", "encryption", "private",
 		"secret", "service", "signing", "xapi",
 	}
-	appManifestCredentialKeySuffixes = []string{"", "value", "ref", "id"}
-	appManifestJSONObjectSchemas     = map[string]map[string]appManifestJSONFieldSchema{
+	appManifestCredentialKeySuffixes     = []string{"", "value", "ref", "id"}
+	appManifestForbiddenNormalizedFields = buildAppManifestForbiddenNormalizedFields()
+	appManifestJSONObjectSchemas         = map[string]map[string]appManifestJSONFieldSchema{
 		"root": {
 			"apiVersion":      {},
 			"kind":            {},
@@ -368,26 +369,20 @@ func requireJSONEOF(decoder *json.Decoder) error {
 
 func isForbiddenAppManifestField(field string) bool {
 	normalized := normalizeAppManifestASCIIField(field)
-	if isForbiddenAppManifestOwnedField(normalized) {
-		return true
-	}
-	if matchesAppManifestNormalizedFamily(
-		normalized,
-		appManifestSensitiveFieldBases,
-		appManifestSensitiveFieldQualifiers,
-		appManifestSensitiveFieldSuffixes,
-	) {
-		return true
-	}
-	if isForbiddenAppManifestKeyFamily(normalized) {
-		return true
-	}
-	return isForbiddenAppManifestCodeFamily(normalized)
+	_, forbidden := appManifestForbiddenNormalizedFields[normalized]
+	return forbidden
 }
 
-func isForbiddenAppManifestOwnedField(normalized string) bool {
-	switch normalized {
-	case "baseurl",
+func buildAppManifestForbiddenNormalizedFields() map[string]struct{} {
+	capacity := len(appManifestSensitiveFieldQualifiers) *
+		len(appManifestSensitiveFieldBases) *
+		len(appManifestSensitiveFieldSuffixes)
+	capacity += len(appManifestCredentialKeyQualifiers) * len(appManifestCredentialKeySuffixes)
+	capacity += len(appManifestSensitiveFieldSuffixes)
+	forbidden := make(map[string]struct{}, capacity)
+
+	for _, field := range []string{
+		"baseurl",
 		"enabled",
 		"enabledsurfaces",
 		"allowedparentorigins",
@@ -396,55 +391,47 @@ func isForbiddenAppManifestOwnedField(normalized string) bool {
 		"networkpolicy",
 		"entitlementpolicy",
 		"entitlementpolicyversion",
-		"authheader":
-		return true
-	default:
-		return false
+		"authheader",
+	} {
+		forbidden[field] = struct{}{}
 	}
-}
-
-func isForbiddenAppManifestKeyFamily(normalized string) bool {
-	return matchesAppManifestNormalizedFamily(
-		normalized,
+	addAppManifestNormalizedFamily(
+		forbidden,
+		appManifestSensitiveFieldBases,
+		appManifestSensitiveFieldQualifiers,
+		appManifestSensitiveFieldSuffixes,
+	)
+	addAppManifestNormalizedFamily(
+		forbidden,
 		[]string{"key"},
 		appManifestCredentialKeyQualifiers,
 		appManifestCredentialKeySuffixes,
 	)
-}
-
-func isForbiddenAppManifestCodeFamily(normalized string) bool {
-	if matchesAppManifestNormalizedFamily(
-		normalized,
+	addAppManifestNormalizedFamily(
+		forbidden,
 		[]string{"code"},
 		[]string{""},
 		appManifestSensitiveFieldSuffixes,
-	) {
-		return true
-	}
+	)
 	for _, prefix := range []string{"source", "auth", "authorization", "pass", "access"} {
-		if normalized == prefix+"code" {
-			return true
-		}
+		forbidden[prefix+"code"] = struct{}{}
 	}
-	return false
+	return forbidden
 }
 
-func matchesAppManifestNormalizedFamily(
-	normalized string,
+func addAppManifestNormalizedFamily(
+	fields map[string]struct{},
 	bases []string,
 	qualifiers []string,
 	suffixes []string,
-) bool {
+) {
 	for _, qualifier := range qualifiers {
 		for _, base := range bases {
 			for _, suffix := range suffixes {
-				if normalized == qualifier+base+suffix {
-					return true
-				}
+				fields[qualifier+base+suffix] = struct{}{}
 			}
 		}
 	}
-	return false
 }
 
 func normalizeAppManifestASCIIField(field string) string {

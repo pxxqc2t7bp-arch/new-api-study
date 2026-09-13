@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -42,6 +44,42 @@ func TestValidateAppManifestAcceptsSeedanceV1(t *testing.T) {
 }
 
 func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing.T) {
+	t.Run("many unique unknown fields are bounded", func(t *testing.T) {
+		raw := []byte{'{'}
+		fieldCount := 0
+		for {
+			field := append([]byte(`"fld`), strconv.Itoa(fieldCount)...)
+			field = append(field, []byte(`":"x"`)...)
+			separatorBytes := 0
+			if fieldCount > 0 {
+				separatorBytes = 1
+			}
+			if len(raw)+separatorBytes+len(field)+1 > AppManifestMaxBytes {
+				break
+			}
+			if separatorBytes != 0 {
+				raw = append(raw, ',')
+			}
+			raw = append(raw, field...)
+			fieldCount++
+		}
+		raw = append(raw, '}')
+
+		require.Greater(t, fieldCount, 4_000)
+		require.Greater(t, len(raw), AppManifestMaxBytes-32)
+		require.LessOrEqual(t, len(raw), AppManifestMaxBytes)
+
+		const rounds = 3
+		start := time.Now()
+		for range rounds {
+			assertAppManifestErrorCode(t, raw, AppManifestInvalidErrorCode)
+		}
+		elapsed := time.Since(start)
+		t.Logf("%d-byte payload with %d unique fields over %d rounds: %s",
+			len(raw), fieldCount, rounds, elapsed)
+		require.Less(t, elapsed, 1500*time.Millisecond)
+	})
+
 	t.Run("duplicate top-level key", func(t *testing.T) {
 		assertAppManifestErrorCode(t, []byte(`{"key":"first","key":"second"}`), AppManifestInvalidErrorCode)
 	})
