@@ -325,8 +325,8 @@ func requireJSONEOF(decoder *json.Decoder) error {
 }
 
 func isForbiddenAppManifestField(field string) bool {
-	canonical := canonicalAppManifestField(field)
-	switch canonical {
+	normalized := normalizeAppManifestASCIIField(field)
+	switch normalized {
 	case "baseurl",
 		"enabled",
 		"enabledsurfaces",
@@ -341,77 +341,57 @@ func isForbiddenAppManifestField(field string) bool {
 		"apikeyvalue",
 		"clientsecret",
 		"clientsecretvalue",
+		"code",
+		"iframe",
 		"iframeurl",
 		"tokenvalue":
 		return true
 	}
 
-	segments := appManifestFieldSegments(field)
-	for index, segment := range segments {
-		switch segment {
-		case "credential",
-			"credentials",
-			"secret",
-			"secrets",
-			"password",
-			"passwd",
-			"token",
-			"script",
-			"executable",
-			"code",
-			"iframe",
-			"proxy":
+	for _, sensitive := range []string{
+		"credential",
+		"secret",
+		"password",
+		"passwd",
+		"token",
+		"apikey",
+		"privatekey",
+		"script",
+		"executable",
+		"iframeurl",
+		"proxy",
+	} {
+		if strings.Contains(normalized, sensitive) {
 			return true
 		}
-		if index+1 < len(segments) &&
-			(segment == "private" || segment == "api") &&
-			segments[index+1] == "key" {
+	}
+
+	if strings.HasPrefix(normalized, "code") && normalized != "codec" {
+		return true
+	}
+	for _, codeCombination := range []string{"authcode", "authorizationcode", "passcode", "accesscode"} {
+		if strings.Contains(normalized, codeCombination) {
 			return true
 		}
 	}
 	return false
 }
 
-func canonicalAppManifestField(field string) string {
+func normalizeAppManifestASCIIField(field string) string {
 	var normalized strings.Builder
 	normalized.Grow(len(field))
-	for _, char := range field {
-		if unicode.IsLetter(char) || unicode.IsDigit(char) {
-			normalized.WriteRune(unicode.ToLower(char))
+	for index := range len(field) {
+		char := field[index]
+		switch {
+		case char >= 'a' && char <= 'z' || char >= '0' && char <= '9':
+			normalized.WriteByte(char)
+		case char >= 'A' && char <= 'Z':
+			normalized.WriteByte(char + ('a' - 'A'))
+		case char >= utf8.RuneSelf:
+			return ""
 		}
 	}
 	return normalized.String()
-}
-
-func appManifestFieldSegments(field string) []string {
-	runes := []rune(field)
-	segments := make([]string, 0, 2)
-	current := make([]rune, 0, len(runes))
-	flush := func() {
-		if len(current) == 0 {
-			return
-		}
-		segments = append(segments, strings.ToLower(string(current)))
-		current = current[:0]
-	}
-
-	for index, char := range runes {
-		if !unicode.IsLetter(char) && !unicode.IsDigit(char) {
-			flush()
-			continue
-		}
-		if unicode.IsUpper(char) && len(current) > 0 {
-			previous := runes[index-1]
-			nextIsLower := index+1 < len(runes) && unicode.IsLower(runes[index+1])
-			if unicode.IsLower(previous) || unicode.IsDigit(previous) ||
-				unicode.IsUpper(previous) && nextIsLower {
-				flush()
-			}
-		}
-		current = append(current, char)
-	}
-	flush()
-	return segments
 }
 
 func validAppManifest(manifest AppManifest) bool {

@@ -174,12 +174,42 @@ func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing
 		})
 	}
 
-	t.Run("unrelated field containing code is unknown", func(t *testing.T) {
-		raw := mutateAppManifest(t, func(manifest map[string]any) {
-			manifest["requires"].(map[string]any)["postcode"] = "12345"
+	for _, field := range []string{
+		"XAPIKEY",
+		"X_API_KEY",
+		"X-API-KEY",
+		"ACCESSTOKEN",
+		"ACCESS_TOKEN",
+		"ACCESS-TOKEN",
+		"CODEPAYLOAD",
+		"CODE_PAYLOAD",
+		"CODE-PAYLOAD",
+		"CODECONFIG",
+		"PROXYRULES",
+		"PROXY_RULES",
+		"PROXY-RULES",
+		"AUTHCODE",
+		"PASSCODE",
+		"ACCESSCODE",
+	} {
+		t.Run("forbidden acronym or composite "+field, func(t *testing.T) {
+			assertAppManifestErrorCode(
+				t,
+				[]byte(`{"`+field+`":"x"}`),
+				AppManifestForbiddenFieldErrorCode,
+			)
 		})
-		assertAppManifestErrorCode(t, raw, AppManifestInvalidErrorCode)
-	})
+	}
+
+	for _, field := range []string{"postcode", "codec", "monkey", "keyboard"} {
+		t.Run("unrelated field "+field+" is unknown", func(t *testing.T) {
+			assertAppManifestErrorCode(
+				t,
+				[]byte(`{"`+field+`":"x"}`),
+				AppManifestInvalidErrorCode,
+			)
+		})
+	}
 }
 
 func TestValidateAppManifestLimitsPathsScopesAndSemver(t *testing.T) {
