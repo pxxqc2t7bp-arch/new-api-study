@@ -15,6 +15,8 @@ const (
 	AppManifestMaxBytes                = 64 * 1024
 	AppManifestInvalidErrorCode        = "app_manifest_invalid"
 	AppManifestForbiddenFieldErrorCode = "app_manifest_forbidden_field"
+	appManifestMaxPathBytes            = 8 * 1024
+	appManifestMaxPathDecodeRounds     = 16
 )
 
 var (
@@ -25,6 +27,24 @@ var (
 			`(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?` +
 			`(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`,
 	)
+	appManifestJSONFieldCases = map[string]string{
+		"apiversion":      "apiVersion",
+		"callbackpath":    "callbackPath",
+		"direct":          "direct",
+		"embedded":        "embedded",
+		"en":              "en",
+		"key":             "key",
+		"kind":            "kind",
+		"minimumversion":  "minimumVersion",
+		"name":            "name",
+		"requestedscopes": "requestedScopes",
+		"requires":        "requires",
+		"startpath":       "startPath",
+		"surfaces":        "surfaces",
+		"taskplugins":     "taskPlugins",
+		"version":         "version",
+		"zh":              "zh",
+	}
 )
 
 // AppManifest is the validated, declarative App Plugin v1 manifest.
@@ -142,6 +162,9 @@ func scanAppManifestObject(decoder *json.Decoder) (bool, error) {
 			return false, invalidAppManifest("manifest contains a duplicate field")
 		}
 		seen[key] = struct{}{}
+		if isAppManifestFieldCaseMismatch(key) {
+			return false, invalidAppManifest("manifest does not match the v1 schema")
+		}
 		if isForbiddenAppManifestField(key) {
 			forbidden = true
 		}
@@ -202,6 +225,11 @@ func requireJSONEOF(decoder *json.Decoder) error {
 	return nil
 }
 
+func isAppManifestFieldCaseMismatch(field string) bool {
+	expected, known := appManifestJSONFieldCases[strings.ToLower(field)]
+	return known && field != expected
+}
+
 func isForbiddenAppManifestField(field string) bool {
 	canonical := canonicalAppManifestField(field)
 	switch canonical {
@@ -212,31 +240,30 @@ func isForbiddenAppManifestField(field string) bool {
 		"alloweduserpolicy",
 		"allowedorigins",
 		"networkpolicy",
-		"secretref":
+		"secretref",
+		"privatekey",
+		"apikey":
 		return true
 	}
-	if strings.Contains(canonical, "credential") ||
-		strings.Contains(canonical, "secret") ||
-		strings.Contains(canonical, "privatekey") ||
-		strings.Contains(canonical, "apikey") ||
-		strings.Contains(canonical, "password") ||
-		strings.Contains(canonical, "passwd") ||
-		strings.Contains(canonical, "accesstoken") ||
-		strings.Contains(canonical, "authtoken") ||
-		strings.Contains(canonical, "bearertoken") ||
-		strings.HasSuffix(canonical, "token") {
-		return true
+
+	for _, segment := range appManifestFieldSegments(field) {
+		switch segment {
+		case "credential",
+			"credentials",
+			"secret",
+			"secrets",
+			"password",
+			"passwd",
+			"token",
+			"script",
+			"executable",
+			"code",
+			"iframe",
+			"proxy":
+			return true
+		}
 	}
-	if strings.Contains(canonical, "script") ||
-		strings.Contains(canonical, "executable") ||
-		canonical == "code" ||
-		strings.HasSuffix(canonical, "code") {
-		return true
-	}
-	if strings.HasPrefix(canonical, "iframe") {
-		return true
-	}
-	return strings.Contains(canonical, "proxy")
+	return false
 }
 
 func canonicalAppManifestField(field string) string {
@@ -248,6 +275,37 @@ func canonicalAppManifestField(field string) string {
 		}
 	}
 	return normalized.String()
+}
+
+func appManifestFieldSegments(field string) []string {
+	runes := []rune(field)
+	segments := make([]string, 0, 2)
+	current := make([]rune, 0, len(runes))
+	flush := func() {
+		if len(current) == 0 {
+			return
+		}
+		segments = append(segments, strings.ToLower(string(current)))
+		current = current[:0]
+	}
+
+	for index, char := range runes {
+		if !unicode.IsLetter(char) && !unicode.IsDigit(char) {
+			flush()
+			continue
+		}
+		if unicode.IsUpper(char) && len(current) > 0 {
+			previous := runes[index-1]
+			nextIsLower := index+1 < len(runes) && unicode.IsLower(runes[index+1])
+			if unicode.IsLower(previous) || unicode.IsDigit(previous) ||
+				unicode.IsUpper(previous) && nextIsLower {
+				flush()
+			}
+		}
+		current = append(current, char)
+	}
+	flush()
+	return segments
 }
 
 func validAppManifest(manifest AppManifest) bool {
@@ -305,6 +363,28 @@ func allowedAppManifestScope(scope string) bool {
 }
 
 func validAppManifestPath(path string) bool {
+	if len(path) > appManifestMaxPathBytes {
+		return false
+	}
+
+	decodedPath := path
+	for range appManifestMaxPathDecodeRounds {
+		if !validAppManifestPathLayer(decodedPath) {
+			return false
+		}
+		next, err := url.PathUnescape(decodedPath)
+		if err != nil {
+			return false
+		}
+		if next == decodedPath {
+			return true
+		}
+		decodedPath = next
+	}
+	return false
+}
+
+func validAppManifestPathLayer(path string) bool {
 	if path == "" || path[0] != '/' || strings.HasPrefix(path, "//") {
 		return false
 	}
@@ -313,7 +393,6 @@ func validAppManifestPath(path string) bool {
 			return false
 		}
 	}
-
 	parsed, err := url.Parse(path)
 	if err != nil ||
 		parsed.IsAbs() ||
@@ -324,23 +403,7 @@ func validAppManifestPath(path string) bool {
 		parsed.Fragment != "" {
 		return false
 	}
-	decodedPath := parsed.EscapedPath()
-	for {
-		next, err := url.PathUnescape(decodedPath)
-		if err != nil {
-			return false
-		}
-		if next == decodedPath {
-			break
-		}
-		decodedPath = next
-	}
-	for _, char := range decodedPath {
-		if char == '\\' || unicode.IsControl(char) {
-			return false
-		}
-	}
-	for _, segment := range strings.Split(decodedPath, "/") {
+	for _, segment := range strings.Split(path, "/") {
 		if segment == "." || segment == ".." {
 			return false
 		}
