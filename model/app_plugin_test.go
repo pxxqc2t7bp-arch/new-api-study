@@ -98,6 +98,138 @@ func TestAppPluginMigrationFreshUpgradeReplay(t *testing.T) {
 		require.NoError(t, oldDB.Where("app_key = ? AND kind = ?", "legacy", "app_key").First(&ownership).Error)
 		assert.Equal(t, upgraded.InstallationID, ownership.InstallationID)
 	})
+
+	t.Run("upgrade converges duplicate legacy ownership without deleting history", func(t *testing.T) {
+		oldDB := openAppPluginModelDB(t)
+		require.NoError(t, oldDB.Migrator().DropTable(
+			&AppRouteClaim{},
+			&AppInstallationIdempotency{},
+			&AppServiceCredential{},
+			&AppInstallation{},
+		))
+		require.NoError(t, oldDB.AutoMigrate(
+			&legacyAppInstallation{},
+			&AppInstallationIdempotency{},
+			&AppServiceCredential{},
+		))
+
+		legacyInstallations := []legacyAppInstallation{
+			{
+				ID:                   201,
+				AppKey:               "legacy-duplicate",
+				AppVersionID:         "appver-disabled",
+				ManifestVersion:      "1.0.0",
+				ManifestSHA256:       appPluginDigest("legacy-disabled"),
+				BaseURL:              "https://apps.example.com/legacy-disabled/",
+				EnabledSurfaces:      AppStringList{},
+				AllowedParentOrigins: AppStringList{},
+				AllowedOrigins:       AppStringList{},
+				AllowedUserPolicy:    AppAllowedUserPolicy{},
+				NetworkPolicy:        AppNetworkPolicy{},
+				EntitlementPolicyID:  "policy",
+				Status:               AppInstallationStatusDisabled,
+				Revision:             3,
+			},
+			{
+				ID:                   202,
+				AppKey:               "legacy-duplicate",
+				AppVersionID:         "appver-enabled-owner",
+				ManifestVersion:      "2.0.0",
+				ManifestSHA256:       appPluginDigest("legacy-enabled-owner"),
+				BaseURL:              "https://apps.example.com/legacy-enabled-owner/",
+				EnabledSurfaces:      AppStringList{"direct"},
+				AllowedParentOrigins: AppStringList{},
+				AllowedOrigins:       AppStringList{},
+				AllowedUserPolicy:    AppAllowedUserPolicy{},
+				NetworkPolicy:        AppNetworkPolicy{},
+				EntitlementPolicyID:  "policy",
+				Status:               AppInstallationStatusEnabled,
+				Revision:             7,
+			},
+			{
+				ID:                   203,
+				AppKey:               "legacy-duplicate",
+				AppVersionID:         "appver-enabled-non-owner",
+				ManifestVersion:      "3.0.0",
+				ManifestSHA256:       appPluginDigest("legacy-enabled-non-owner"),
+				BaseURL:              "https://apps.example.com/legacy-enabled-non-owner/",
+				EnabledSurfaces:      AppStringList{"embedded"},
+				AllowedParentOrigins: AppStringList{"https://console.example.com"},
+				AllowedOrigins:       AppStringList{},
+				AllowedUserPolicy:    AppAllowedUserPolicy{},
+				NetworkPolicy:        AppNetworkPolicy{},
+				EntitlementPolicyID:  "policy",
+				Status:               AppInstallationStatusEnabled,
+				Revision:             11,
+			},
+		}
+		require.NoError(t, oldDB.Create(&legacyInstallations).Error)
+
+		for _, installation := range legacyInstallations {
+			installationID := fmt.Sprintf("%d", installation.ID)
+			require.NoError(t, oldDB.Create(&AppServiceCredential{
+				AppKey:            installation.AppKey,
+				InstallationID:    installationID,
+				CredentialID:      "cred-" + installationID,
+				CredentialHash:    appPluginDigest("credential-" + installationID),
+				CredentialVersion: "v" + installationID,
+				Status:            "active",
+				ExpiresAt:         4102444800,
+			}).Error)
+			require.NoError(t, oldDB.Create(&AppInstallationIdempotency{
+				ScopeHash:      appPluginDigest("scope-" + installationID),
+				ActorID:        int64(installation.ID),
+				ScopeKey:       "scope-" + installationID,
+				ClaimToken:     appPluginDigest("claim-" + installationID),
+				RequestHash:    appPluginDigest("request-" + installationID),
+				InstallationID: installationID,
+				AppVersionID:   installation.AppVersionID,
+				ResponseJSON:   `{"installation_id":"` + installationID + `"}`,
+				ResponseDigest: appPluginDigest("response-" + installationID),
+			}).Error)
+		}
+
+		require.NoError(t, MigrateAppPluginTables(oldDB))
+		require.NoError(t, MigrateAppPluginTables(oldDB))
+
+		var upgraded []AppInstallation
+		require.NoError(t, oldDB.Where("app_key = ?", "legacy-duplicate").Order("id").Find(&upgraded).Error)
+		require.Len(t, upgraded, 3)
+		assert.Equal(t, []string{
+			AppInstallationStatusRevoked,
+			AppInstallationStatusEnabled,
+			AppInstallationStatusRevoked,
+		}, []string{upgraded[0].Status, upgraded[1].Status, upgraded[2].Status})
+		assert.Equal(t, []int64{4, 7, 12}, []int64{upgraded[0].Revision, upgraded[1].Revision, upgraded[2].Revision})
+
+		var ownership []AppRouteClaim
+		require.NoError(t, oldDB.Where("app_key = ? AND kind = ?", "legacy-duplicate", "app_key").Find(&ownership).Error)
+		require.Len(t, ownership, 1)
+		assert.Equal(t, "202", ownership[0].InstallationID)
+
+		var credentials []AppServiceCredential
+		require.NoError(t, oldDB.Where("app_key = ?", "legacy-duplicate").Order("installation_id").Find(&credentials).Error)
+		require.Len(t, credentials, 3)
+		assert.Equal(t, []string{"cred-201", "cred-202", "cred-203"}, []string{
+			credentials[0].CredentialID,
+			credentials[1].CredentialID,
+			credentials[2].CredentialID,
+		})
+		assert.Equal(t, []string{AppInstallationStatusRevoked, "active", AppInstallationStatusRevoked}, []string{
+			credentials[0].Status,
+			credentials[1].Status,
+			credentials[2].Status,
+		})
+
+		var frozen []AppInstallationIdempotency
+		require.NoError(t, oldDB.Where("installation_id IN ?", []string{"201", "202", "203"}).Order("installation_id").Find(&frozen).Error)
+		require.Len(t, frozen, 3)
+		assert.Equal(t, []string{
+			`{"installation_id":"201"}`,
+			`{"installation_id":"202"}`,
+			`{"installation_id":"203"}`,
+		}, []string{frozen[0].ResponseJSON, frozen[1].ResponseJSON, frozen[2].ResponseJSON})
+	})
 }
 
 type legacyAppInstallation struct {
@@ -439,6 +571,50 @@ func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 		}
 	})
 
+	t.Run("upgrade without credential input preserves existing credential", func(t *testing.T) {
+		v1 := appPluginModelInstallRequest("credential-preserved", "1.0.0", "https://apps.example.com/credential-preserved-v1/")
+		created, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 25, Key: "credential-preserved-v1"}, v1)
+		require.NoError(t, err)
+		var original AppServiceCredential
+		require.NoError(t, db.Where("installation_id = ?", created.InstallationID).First(&original).Error)
+
+		v2 := appPluginModelInstallRequest("credential-preserved", "2.0.0", "https://apps.example.com/credential-preserved-v2/")
+		v2.ServiceCredentialHash = ""
+		v2.ServiceCredentialID = ""
+		v2.ServiceCredentialVersion = ""
+		v2.ServiceCredentialExpiry = 0
+		upgraded, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 25, Key: "credential-preserved-v2"}, v2)
+		require.NoError(t, err)
+
+		assert.Equal(t, credentialMeta(original), upgraded.ServiceCredentialSet)
+		assert.Equal(t, int64(1), appPluginCountForInstallation(t, db, &AppServiceCredential{}, created.InstallationID))
+		var preserved AppServiceCredential
+		require.NoError(t, db.Where("installation_id = ?", created.InstallationID).First(&preserved).Error)
+		assert.Equal(t, original, preserved)
+	})
+
+	t.Run("upgrade credential metadata cannot replace existing credential", func(t *testing.T) {
+		v1 := appPluginModelInstallRequest("credential-metadata-ignored", "1.0.0", "https://apps.example.com/credential-metadata-ignored-v1/")
+		created, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 26, Key: "credential-metadata-ignored-v1"}, v1)
+		require.NoError(t, err)
+		var original AppServiceCredential
+		require.NoError(t, db.Where("installation_id = ?", created.InstallationID).First(&original).Error)
+
+		v2 := appPluginModelInstallRequest("credential-metadata-ignored", "2.0.0", "https://apps.example.com/credential-metadata-ignored-v2/")
+		v2.ServiceCredentialHash = appPluginDigest("replacement-credential")
+		v2.ServiceCredentialID = "replacement-credential"
+		v2.ServiceCredentialVersion = "replacement-version"
+		v2.ServiceCredentialExpiry = 4102444900
+		upgraded, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 26, Key: "credential-metadata-ignored-v2"}, v2)
+		require.NoError(t, err)
+
+		assert.Equal(t, credentialMeta(original), upgraded.ServiceCredentialSet)
+		assert.Equal(t, int64(1), appPluginCountForInstallation(t, db, &AppServiceCredential{}, created.InstallationID))
+		var preserved AppServiceCredential
+		require.NoError(t, db.Where("installation_id = ?", created.InstallationID).First(&preserved).Error)
+		assert.Equal(t, original, preserved)
+	})
+
 	t.Run("upgrade route collision rolls back version configuration claims and idempotency", func(t *testing.T) {
 		blocker := appPluginModelInstallRequest("upgrade-blocker", "1.0.0", "https://apps.example.com/rollback-upgrade-v2/")
 		_, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 24, Key: "upgrade-blocker"}, blocker)
@@ -449,6 +625,8 @@ func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 		require.NoError(t, err)
 		var before AppInstallation
 		require.NoError(t, db.Where("installation_id = ?", created.InstallationID).First(&before).Error)
+		var credentialBefore AppServiceCredential
+		require.NoError(t, db.Where("installation_id = ?", created.InstallationID).First(&credentialBefore).Error)
 
 		v2 := appPluginModelInstallRequest("rollback-upgrade", "2.0.0", "https://apps.example.com/rollback-upgrade-v2/")
 		_, err = InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 24, Key: "rollback-upgrade-v2"}, v2)
@@ -458,6 +636,9 @@ func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 		var after AppInstallation
 		require.NoError(t, db.Where("installation_id = ?", created.InstallationID).First(&after).Error)
 		assert.Equal(t, before, after)
+		var credentialAfter AppServiceCredential
+		require.NoError(t, db.Where("installation_id = ?", created.InstallationID).First(&credentialAfter).Error)
+		assert.Equal(t, credentialBefore, credentialAfter)
 		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppVersion{}, v1.AppKey))
 		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppInstallation{}, v1.AppKey))
 		assert.Equal(t, int64(4), appPluginCountForKey(t, db, &AppRouteClaim{}, v1.AppKey))

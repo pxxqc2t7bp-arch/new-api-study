@@ -302,6 +302,46 @@ func MigrateAppPluginTables(db *gorm.DB) error {
 		return err
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
+		var installations []AppInstallation
+		if err := tx.Where("status <> ?", AppInstallationStatusRevoked).
+			Order("id").
+			Find(&installations).Error; err != nil {
+			return err
+		}
+
+		// Preserve an enabled legacy installation when possible, then use the
+		// lowest primary key as the stable cross-database tie breaker.
+		owners := make(map[string]AppInstallation)
+		for _, installation := range installations {
+			owner, found := owners[installation.AppKey]
+			if !found || (owner.Status != AppInstallationStatusEnabled && installation.Status == AppInstallationStatusEnabled) {
+				owners[installation.AppKey] = installation
+			}
+		}
+		for _, installation := range installations {
+			if installation.ID == owners[installation.AppKey].ID {
+				continue
+			}
+			update := tx.Model(&AppInstallation{}).
+				Where("id = ? AND status <> ?", installation.ID, AppInstallationStatusRevoked).
+				Updates(map[string]any{
+					"status":   AppInstallationStatusRevoked,
+					"revision": gorm.Expr("revision + ?", 1),
+				})
+			if update.Error != nil {
+				return update.Error
+			}
+			if err := tx.Model(&AppServiceCredential{}).
+				Where("installation_id = ? AND status <> ?", installation.InstallationID, AppInstallationStatusRevoked).
+				Update("status", AppInstallationStatusRevoked).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("installation_id = ?", installation.InstallationID).
+				Delete(&AppRouteClaim{}).Error; err != nil {
+				return err
+			}
+		}
+
 		var routeClaims []AppRouteClaim
 		if err := tx.Where("kind <> ?", "app_key").Find(&routeClaims).Error; err != nil {
 			return err
@@ -318,13 +358,10 @@ func MigrateAppPluginTables(db *gorm.DB) error {
 			}
 		}
 
-		var installations []AppInstallation
-		if err := tx.Where("status <> ?", AppInstallationStatusRevoked).
-			Order("id").
-			Find(&installations).Error; err != nil {
-			return err
-		}
 		for _, installation := range installations {
+			if installation.ID != owners[installation.AppKey].ID {
+				continue
+			}
 			claim := appKeyClaim(installation.AppKey, installation.InstallationID)
 			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "claim_key"}}, DoNothing: true}).
 				Create(&claim).Error; err != nil {
@@ -534,14 +571,10 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 			if err := tx.Where("installation_id = ?", installation.InstallationID).First(&installation).Error; err != nil {
 				return err
 			}
-			if err := tx.Where("installation_id = ?", installation.InstallationID).
-				Delete(&AppServiceCredential{}).Error; err != nil {
-				return err
-			}
 		}
 
 		credentialSet := AppCredentialMeta{}
-		if appInstallHasServiceCredential(req) {
+		if isNewInstallation && appInstallHasServiceCredential(req) {
 			credential := AppServiceCredential{
 				AppKey:            req.AppKey,
 				InstallationID:    installation.InstallationID,
@@ -555,11 +588,142 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 				return err
 			}
 			credentialSet = credentialMeta(credential)
+		} else if !isNewInstallation {
+			var credential AppServiceCredential
+			credentialQuery := tx.Where("installation_id = ?", installation.InstallationID).
+				Order("id DESC").
+				Limit(1).
+				Find(&credential)
+			if credentialQuery.Error != nil {
+				return credentialQuery.Error
+			}
+			if credentialQuery.RowsAffected == 1 {
+				credentialSet = credentialMeta(credential)
+			}
 		}
 		result = resultFromInstallation(version.ID, installation, credentialSet)
 		return freezeAppInstallIdempotency(tx, scopeHash, claimToken, &result)
 	})
 	return result, err
+}
+
+// ReplayAppInstall returns and freezes an existing installation response without
+// consulting mutable installation prerequisites.
+func ReplayAppInstall(ctx context.Context, db *gorm.DB, scope AppIdempotencyScope, req AppInstallRequest) (AppInstallResult, bool, error) {
+	if err := validateAppInstallRequest(req); err != nil {
+		return AppInstallResult{}, false, err
+	}
+	requestHash, err := appInstallRequestHash(req)
+	if err != nil {
+		return AppInstallResult{}, false, err
+	}
+	scopeHash := appPluginSHA256([]byte(strconv.FormatInt(scope.ActorID, 10) + "\x00" + scope.Key))
+
+	var result AppInstallResult
+	found := false
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var replay AppInstallationIdempotency
+		replayQuery := tx.Where("scope_hash = ?", scopeHash).Limit(1).Find(&replay)
+		if replayQuery.Error != nil {
+			return replayQuery.Error
+		}
+		if replayQuery.RowsAffected == 1 {
+			if replay.RequestHash != requestHash ||
+				replay.InstallationID == "" ||
+				replay.ResponseJSON == "" {
+				return ErrAppIdempotencyConflict
+			}
+			if err := common.Unmarshal([]byte(replay.ResponseJSON), &result); err != nil {
+				return err
+			}
+			result.AppVersionID = replay.AppVersionID
+			result.ResponseDigest = replay.ResponseDigest
+			found = true
+			return nil
+		}
+
+		var version AppVersion
+		versionQuery := tx.Where("identity_hash = ?", appPluginSHA256([]byte(req.AppKey+"\x00"+req.ManifestVersion))).
+			Limit(1).
+			Find(&version)
+		if versionQuery.Error != nil {
+			return versionQuery.Error
+		}
+		if versionQuery.RowsAffected == 0 {
+			return nil
+		}
+		if version.ManifestSHA256 != req.ManifestSHA256 {
+			return ErrAppVersionConflict
+		}
+
+		var ownership AppRouteClaim
+		ownershipQuery := tx.Where("claim_key = ?", appKeyClaim(req.AppKey, "").ClaimKey).
+			Limit(1).
+			Find(&ownership)
+		if ownershipQuery.Error != nil {
+			return ownershipQuery.Error
+		}
+		if ownershipQuery.RowsAffected == 0 {
+			return nil
+		}
+		if ownership.AppKey != req.AppKey || ownership.Kind != "app_key" {
+			return ErrAppRouteClaimConflict
+		}
+
+		var installation AppInstallation
+		if err := tx.Where("installation_id = ? AND status <> ?", ownership.InstallationID, AppInstallationStatusRevoked).
+			First(&installation).Error; err != nil {
+			return err
+		}
+		frozen, frozenFound, err := findFrozenAppInstallResponse(tx, installation.InstallationID, version.ID)
+		if err != nil {
+			return err
+		}
+		if !frozenFound {
+			return nil
+		}
+
+		claimToken, err := common.GenerateRandomCharsKey(32)
+		if err != nil {
+			return err
+		}
+		replay = AppInstallationIdempotency{
+			ScopeHash:   scopeHash,
+			ActorID:     scope.ActorID,
+			ScopeKey:    scope.Key,
+			ClaimToken:  claimToken,
+			RequestHash: requestHash,
+		}
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&replay).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("scope_hash = ?", scopeHash).First(&replay).Error; err != nil {
+			return err
+		}
+		if replay.RequestHash != requestHash {
+			return ErrAppIdempotencyConflict
+		}
+		if replay.ClaimToken != claimToken {
+			if replay.InstallationID == "" || replay.ResponseJSON == "" {
+				return ErrAppIdempotencyConflict
+			}
+			if err := common.Unmarshal([]byte(replay.ResponseJSON), &result); err != nil {
+				return err
+			}
+			result.AppVersionID = replay.AppVersionID
+			result.ResponseDigest = replay.ResponseDigest
+			found = true
+			return nil
+		}
+
+		result = frozen
+		if err := freezeAppInstallIdempotency(tx, scopeHash, claimToken, &result); err != nil {
+			return err
+		}
+		found = true
+		return nil
+	})
+	return result, found, err
 }
 
 func validateAppInstallRequest(req AppInstallRequest) error {

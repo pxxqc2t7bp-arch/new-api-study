@@ -107,12 +107,6 @@ func (s *AppPluginInstallationService) Install(ctx context.Context, cmd AppInsta
 		return model.AppInstallResult{}, err
 	}
 	canonicalizeAppManifest(&manifest)
-	requirements := mergeTaskPluginRequirements(manifest.Requires.TaskPlugins, []AppManifestTaskPluginRequirement{{Key: "doubao", MinimumVersion: "1.2.0"}})
-	for _, requirement := range requirements {
-		if err := s.taskPluginChecker.CheckTaskPluginDependency(ctx, requirement.Key, requirement.MinimumVersion); err != nil {
-			return model.AppInstallResult{}, err
-		}
-	}
 	canonicalManifestJSON, err := common.Marshal(manifest)
 	if err != nil {
 		return model.AppInstallResult{}, err
@@ -161,10 +155,25 @@ func (s *AppPluginInstallationService) Install(ctx context.Context, cmd AppInsta
 		ServiceCredentialVersion: cmd.ServiceCredential.Version,
 		ServiceCredentialExpiry:  cmd.ServiceCredential.ExpiresAt,
 	}
-	return model.InstallAppVersion(ctx, s.db, model.AppIdempotencyScope{
+	scope := model.AppIdempotencyScope{
 		ActorID: cmd.ActorID,
 		Key:     cmd.IdempotencyKey,
-	}, req)
+	}
+	replayed, found, err := model.ReplayAppInstall(ctx, s.db, scope, req)
+	if err != nil {
+		return model.AppInstallResult{}, err
+	}
+	if found {
+		return replayed, nil
+	}
+
+	requirements := mergeTaskPluginRequirements(manifest.Requires.TaskPlugins, []AppManifestTaskPluginRequirement{{Key: "doubao", MinimumVersion: "1.2.0"}})
+	for _, requirement := range requirements {
+		if err := s.taskPluginChecker.CheckTaskPluginDependency(ctx, requirement.Key, requirement.MinimumVersion); err != nil {
+			return model.AppInstallResult{}, err
+		}
+	}
+	return model.InstallAppVersion(ctx, s.db, scope, req)
 }
 
 func (s *AppPluginInstallationService) CreateEntitlementPolicy(ctx context.Context, draft AppEntitlementPolicyDraft) (AppEntitlementPolicyResult, error) {

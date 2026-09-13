@@ -223,6 +223,121 @@ func TestAppInstallationOwnsParentOriginsAndEnabledSurfaces(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, canonicalFirst.InstallationID, canonicalSecond.InstallationID)
 
+	t.Run("same scope frozen replay precedes mutable dependency checks", func(t *testing.T) {
+		checker := fixedTaskPluginChecker{"doubao": "1.2.0"}
+		replaySvc := NewAppPluginInstallationService(db, AppPluginInstallationOptions{TaskPluginChecker: checker})
+		cmd := appPluginInstallCommand("same-scope-frozen-replay", "1.0.0")
+
+		first, err := replaySvc.Install(context.Background(), cmd)
+		require.NoError(t, err)
+		delete(checker, "doubao")
+
+		replayed, err := replaySvc.Install(context.Background(), cmd)
+		require.NoError(t, err)
+		assert.Equal(t, first, replayed)
+	})
+
+	t.Run("new scope generation replay precedes mutable dependency checks", func(t *testing.T) {
+		checker := fixedTaskPluginChecker{"doubao": "1.2.0"}
+		replaySvc := NewAppPluginInstallationService(db, AppPluginInstallationOptions{TaskPluginChecker: checker})
+		cmd := appPluginInstallCommand("new-scope-frozen-replay", "1.0.0")
+
+		first, err := replaySvc.Install(context.Background(), cmd)
+		require.NoError(t, err)
+		delete(checker, "doubao")
+		cmd.IdempotencyKey += "-replay"
+
+		replayed, err := replaySvc.Install(context.Background(), cmd)
+		require.NoError(t, err)
+		assert.Equal(t, first, replayed)
+
+		var frozen model.AppInstallationIdempotency
+		require.NoError(t, db.Where("scope_key = ?", cmd.IdempotencyKey).First(&frozen).Error)
+		assert.Equal(t, first.InstallationID, frozen.InstallationID)
+		assert.Equal(t, first.ResponseDigest, frozen.ResponseDigest)
+	})
+
+	t.Run("new version still checks current dependencies", func(t *testing.T) {
+		checker := fixedTaskPluginChecker{"doubao": "1.2.0"}
+		replaySvc := NewAppPluginInstallationService(db, AppPluginInstallationOptions{TaskPluginChecker: checker})
+		first := appPluginInstallCommand("new-version-checks-dependencies", "1.0.0")
+		_, err := replaySvc.Install(context.Background(), first)
+		require.NoError(t, err)
+		delete(checker, "doubao")
+		before := appPluginServicePersistenceCounts(t, db)
+
+		_, err = replaySvc.Install(context.Background(), appPluginInstallCommand("new-version-checks-dependencies", "2.0.0"))
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "task plugin doubao below 1.2.0")
+		assert.Equal(t, before, appPluginServicePersistenceCounts(t, db))
+	})
+
+	t.Run("same scope different payload keeps idempotency conflict", func(t *testing.T) {
+		checker := fixedTaskPluginChecker{"doubao": "1.2.0"}
+		replaySvc := NewAppPluginInstallationService(db, AppPluginInstallationOptions{TaskPluginChecker: checker})
+		cmd := appPluginInstallCommand("same-scope-payload-conflict", "1.0.0")
+		_, err := replaySvc.Install(context.Background(), cmd)
+		require.NoError(t, err)
+		delete(checker, "doubao")
+		cmd.BaseURL = "https://apps.example.com/same-scope-payload-conflict-changed/"
+
+		_, err = replaySvc.Install(context.Background(), cmd)
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, model.ErrAppIdempotencyConflict)
+	})
+
+	t.Run("frozen replay still rejects unsafe input before dependency checks", func(t *testing.T) {
+		checker := fixedTaskPluginChecker{"doubao": "1.2.0"}
+		replaySvc := NewAppPluginInstallationService(db, AppPluginInstallationOptions{TaskPluginChecker: checker})
+		cmd := appPluginInstallCommand("validated-frozen-replay", "1.0.0")
+		_, err := replaySvc.Install(context.Background(), cmd)
+		require.NoError(t, err)
+		delete(checker, "doubao")
+
+		tests := []struct {
+			name   string
+			mutate func(*AppInstallCommand)
+		}{
+			{
+				name: "malformed raw manifest",
+				mutate: func(replay *AppInstallCommand) {
+					replay.ManifestJSON = []byte(`{"apiVersion":`)
+				},
+			},
+			{
+				name: "forbidden manifest field",
+				mutate: func(replay *AppInstallCommand) {
+					replay.ManifestJSON = []byte(`{"apiVersion":1,"kind":"app","key":"validated-frozen-replay","name":{"en":"Replay","zh":"Replay"},"version":"1.0.0","callbackPath":"/callback","surfaces":{"direct":{"startPath":"/direct"},"embedded":{"startPath":"/embedded"}},"requestedScopes":["identity.read"],"requires":{"taskPlugins":[{"key":"doubao","minimumVersion":"1.2.0"}]},"baseUrl":"https://evil.example"}`)
+				},
+			},
+			{
+				name: "invalid manifest schema",
+				mutate: func(replay *AppInstallCommand) {
+					replay.ManifestJSON = []byte(`{"apiVersion":1,"kind":"app","key":"validated-frozen-replay","name":{"en":"Replay","zh":"Replay"},"version":"1.0.0","callbackPath":"/callback/../outside","surfaces":{"direct":{"startPath":"/direct"},"embedded":{"startPath":"/embedded"}},"requestedScopes":["identity.read"],"requires":{"taskPlugins":[{"key":"doubao","minimumVersion":"1.2.0"}]}}`)
+				},
+			},
+			{
+				name: "insecure base URL",
+				mutate: func(replay *AppInstallCommand) {
+					replay.BaseURL = "http://apps.example.com/validated-frozen-replay/"
+				},
+			},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				replay := cmd
+				test.mutate(&replay)
+
+				_, err := replaySvc.Install(context.Background(), replay)
+
+				require.Error(t, err)
+				assert.NotContains(t, err.Error(), "task plugin")
+			})
+		}
+	})
+
 	withDefaultPort := appPluginInstallCommand("default-port-one", "1.0.0")
 	withDefaultPort.BaseURL = "https://apps.example.com:443/shared/"
 	_, err = svc.Install(context.Background(), withDefaultPort)
