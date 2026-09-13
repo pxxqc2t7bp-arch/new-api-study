@@ -90,6 +90,24 @@ func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing
 		assertAppManifestErrorCode(t, raw, AppManifestInvalidErrorCode)
 	})
 
+	t.Run("top-level field with Unicode fold variant", func(t *testing.T) {
+		raw := mutateAppManifest(t, func(manifest map[string]any) {
+			surfaces := manifest["surfaces"]
+			delete(manifest, "surfaces")
+			manifest["\u017furfaces"] = surfaces
+		})
+		assertAppManifestErrorCode(t, raw, AppManifestInvalidErrorCode)
+	})
+
+	t.Run("nested field with Unicode fold variant", func(t *testing.T) {
+		raw := mutateAppManifest(t, func(manifest map[string]any) {
+			direct := manifest["surfaces"].(map[string]any)["direct"].(map[string]any)
+			delete(direct, "startPath")
+			direct["\u017ftartPath"] = "/auth/start"
+		})
+		assertAppManifestErrorCode(t, raw, AppManifestInvalidErrorCode)
+	})
+
 	forbiddenFields := []string{
 		"base_url",
 		"enabled",
@@ -103,6 +121,10 @@ func TestValidateAppManifestRejectsDuplicateUnknownAndForbiddenFields(t *testing
 		"clientSecret",
 		"private_key",
 		"apiKey",
+		"privateKeyValue",
+		"APIKeyValue",
+		"private_key_value",
+		"api-key-value",
 		"token",
 		"tokenValue",
 		"script",

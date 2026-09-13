@@ -27,25 +27,43 @@ var (
 			`(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?` +
 			`(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`,
 	)
-	appManifestJSONFieldCases = map[string]string{
-		"apiversion":      "apiVersion",
-		"callbackpath":    "callbackPath",
-		"direct":          "direct",
-		"embedded":        "embedded",
-		"en":              "en",
-		"key":             "key",
-		"kind":            "kind",
-		"minimumversion":  "minimumVersion",
-		"name":            "name",
-		"requestedscopes": "requestedScopes",
-		"requires":        "requires",
-		"startpath":       "startPath",
-		"surfaces":        "surfaces",
-		"taskplugins":     "taskPlugins",
-		"version":         "version",
-		"zh":              "zh",
+	appManifestJSONObjectSchemas = map[string]map[string]appManifestJSONFieldSchema{
+		"root": {
+			"apiVersion":      {},
+			"kind":            {},
+			"key":             {},
+			"name":            {object: "name"},
+			"version":         {},
+			"callbackPath":    {},
+			"surfaces":        {object: "surfaces"},
+			"requestedScopes": {},
+			"requires":        {object: "requires"},
+		},
+		"name": {
+			"en": {},
+			"zh": {},
+		},
+		"surfaces": {
+			"direct":   {object: "surface"},
+			"embedded": {object: "surface"},
+		},
+		"surface": {
+			"startPath": {},
+		},
+		"requires": {
+			"taskPlugins": {arrayObject: "taskPlugin"},
+		},
+		"taskPlugin": {
+			"key":            {},
+			"minimumVersion": {},
+		},
 	}
 )
+
+type appManifestJSONFieldSchema struct {
+	object      string
+	arrayObject string
+}
 
 // AppManifest is the validated, declarative App Plugin v1 manifest.
 type AppManifest struct {
@@ -133,7 +151,7 @@ func scanAppManifestJSON(raw []byte) error {
 	if !ok || delim != '{' {
 		return invalidAppManifest("manifest must be one JSON object")
 	}
-	forbidden, err := scanAppManifestObject(decoder)
+	forbidden, err := scanAppManifestObject(decoder, "root")
 	if err != nil {
 		return err
 	}
@@ -146,7 +164,7 @@ func scanAppManifestJSON(raw []byte) error {
 	return nil
 }
 
-func scanAppManifestObject(decoder *json.Decoder) (bool, error) {
+func scanAppManifestObject(decoder *json.Decoder, schemaName string) (bool, error) {
 	seen := make(map[string]struct{})
 	forbidden := false
 	for decoder.More() {
@@ -162,13 +180,16 @@ func scanAppManifestObject(decoder *json.Decoder) (bool, error) {
 			return false, invalidAppManifest("manifest contains a duplicate field")
 		}
 		seen[key] = struct{}{}
-		if isAppManifestFieldCaseMismatch(key) {
+		fieldSchema, known := appManifestJSONObjectSchemas[schemaName][key]
+		fieldForbidden := isForbiddenAppManifestField(key)
+		if schemaName != "" && !known && !fieldForbidden {
 			return false, invalidAppManifest("manifest does not match the v1 schema")
 		}
-		if isForbiddenAppManifestField(key) {
+		if fieldForbidden {
 			forbidden = true
+			fieldSchema = appManifestJSONFieldSchema{}
 		}
-		nestedForbidden, err := scanAppManifestValue(decoder)
+		nestedForbidden, err := scanAppManifestValue(decoder, fieldSchema, fieldForbidden || schemaName == "")
 		if err != nil {
 			return false, err
 		}
@@ -184,7 +205,11 @@ func scanAppManifestObject(decoder *json.Decoder) (bool, error) {
 	return forbidden, nil
 }
 
-func scanAppManifestValue(decoder *json.Decoder) (bool, error) {
+func scanAppManifestValue(
+	decoder *json.Decoder,
+	schema appManifestJSONFieldSchema,
+	unrestricted bool,
+) (bool, error) {
 	token, err := decoder.Token()
 	if err != nil {
 		return false, invalidAppManifest("manifest must be valid JSON")
@@ -195,11 +220,18 @@ func scanAppManifestValue(decoder *json.Decoder) (bool, error) {
 	}
 	switch delim {
 	case '{':
-		return scanAppManifestObject(decoder)
+		if unrestricted {
+			return scanAppManifestObject(decoder, "")
+		}
+		if schema.object == "" {
+			return false, invalidAppManifest("manifest does not match the v1 schema")
+		}
+		return scanAppManifestObject(decoder, schema.object)
 	case '[':
 		forbidden := false
 		for decoder.More() {
-			nestedForbidden, err := scanAppManifestValue(decoder)
+			elementSchema := appManifestJSONFieldSchema{object: schema.arrayObject}
+			nestedForbidden, err := scanAppManifestValue(decoder, elementSchema, unrestricted)
 			if err != nil {
 				return false, err
 			}
@@ -225,11 +257,6 @@ func requireJSONEOF(decoder *json.Decoder) error {
 	return nil
 }
 
-func isAppManifestFieldCaseMismatch(field string) bool {
-	expected, known := appManifestJSONFieldCases[strings.ToLower(field)]
-	return known && field != expected
-}
-
 func isForbiddenAppManifestField(field string) bool {
 	canonical := canonicalAppManifestField(field)
 	switch canonical {
@@ -246,7 +273,8 @@ func isForbiddenAppManifestField(field string) bool {
 		return true
 	}
 
-	for _, segment := range appManifestFieldSegments(field) {
+	segments := appManifestFieldSegments(field)
+	for index, segment := range segments {
 		switch segment {
 		case "credential",
 			"credentials",
@@ -260,6 +288,11 @@ func isForbiddenAppManifestField(field string) bool {
 			"code",
 			"iframe",
 			"proxy":
+			return true
+		}
+		if index+1 < len(segments) &&
+			(segment == "private" || segment == "api") &&
+			segments[index+1] == "key" {
 			return true
 		}
 	}
