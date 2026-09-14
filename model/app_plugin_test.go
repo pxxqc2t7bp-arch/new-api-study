@@ -402,6 +402,70 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 		}
 	})
 
+	t.Run("concurrent same scope frozen replay returns the original response", func(t *testing.T) {
+		if db.Dialector.Name() != "mysql" {
+			t.Skip("requires MySQL REPEATABLE READ snapshot semantics")
+		}
+
+		req := appPluginModelInstallRequest("concurrent-frozen-replay", "1.0.0", "https://apps.example.com/concurrent-frozen-replay/")
+		original, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 112, Key: "concurrent-frozen-replay-original"}, req)
+		require.NoError(t, err)
+
+		const callbackName = "test:app_plugin_same_scope_frozen_replay_snapshot"
+		snapshotsReady := make(chan struct{}, 2)
+		releaseSnapshots := make(chan struct{})
+		var coordinated atomic.Int32
+		require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_installation_idempotencies" || coordinated.Add(1) > 2 {
+				return
+			}
+			snapshotsReady <- struct{}{}
+			<-releaseSnapshots
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Query().Remove(callbackName))
+		})
+
+		scope := AppIdempotencyScope{ActorID: 112, Key: "concurrent-frozen-replay"}
+		start := make(chan struct{})
+		results := make(chan AppInstallResult, 2)
+		foundResults := make(chan bool, 2)
+		errs := make(chan error, 2)
+		var wg sync.WaitGroup
+		for range 2 {
+			wg.Go(func() {
+				<-start
+				result, found, replayErr := ReplayAppInstall(context.Background(), db, scope, req)
+				results <- result
+				foundResults <- found
+				errs <- replayErr
+			})
+		}
+		close(start)
+		<-snapshotsReady
+		<-snapshotsReady
+		close(releaseSnapshots)
+		wg.Wait()
+		close(results)
+		close(foundResults)
+		close(errs)
+
+		for replayErr := range errs {
+			require.NoError(t, replayErr)
+		}
+		for found := range foundResults {
+			assert.True(t, found)
+		}
+		for result := range results {
+			assert.Equal(t, original, result)
+		}
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppVersion{}, req.AppKey))
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppInstallation{}, req.AppKey))
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppServiceCredential{}, req.AppKey))
+		assert.Equal(t, int64(4), appPluginCountForKey(t, db, &AppRouteClaim{}, req.AppKey))
+		assert.Equal(t, int64(1), appPluginCountForScope(t, db, scope.Key))
+	})
+
 	t.Run("same app key and version with different canonical manifest digest is a stable conflict", func(t *testing.T) {
 		first := appPluginModelInstallRequest("writer", "1.1.0", "https://apps.example.com/writer-1-1/")
 		second := first

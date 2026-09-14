@@ -637,7 +637,7 @@ func ReplayAppInstall(ctx context.Context, db *gorm.DB, scope AppIdempotencyScop
 
 	var result AppInstallResult
 	found := false
-	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	transaction := func(tx *gorm.DB) error {
 		var replay AppInstallationIdempotency
 		replayQuery := tx.Where("scope_hash = ?", scopeHash).Limit(1).Find(&replay)
 		if replayQuery.Error != nil {
@@ -713,7 +713,7 @@ func ReplayAppInstall(ctx context.Context, db *gorm.DB, scope AppIdempotencyScop
 		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&replay).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("scope_hash = ?", scopeHash).First(&replay).Error; err != nil {
+		if err := lockForUpdate(tx).Where("scope_hash = ?", scopeHash).First(&replay).Error; err != nil {
 			return err
 		}
 		if replay.RequestHash != requestHash {
@@ -738,7 +738,20 @@ func ReplayAppInstall(ctx context.Context, db *gorm.DB, scope AppIdempotencyScop
 		}
 		found = true
 		return nil
-	})
+	}
+	const maxTransactionAttempts = 3
+	for attempt := range maxTransactionAttempts {
+		result = AppInstallResult{}
+		found = false
+		err = db.WithContext(ctx).Transaction(transaction)
+		if err == nil || db.Dialector.Name() != "mysql" {
+			break
+		}
+		var mysqlErr *mysqlDriver.MySQLError
+		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1213 || attempt == maxTransactionAttempts-1 {
+			break
+		}
+	}
 	return result, found, err
 }
 
