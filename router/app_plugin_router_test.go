@@ -22,10 +22,11 @@ import (
 )
 
 type routerAppPluginFixture struct {
-	engine           *gin.Engine
-	rootToken        string
-	pluginAdminToken string
-	userToken        string
+	engine            *gin.Engine
+	rootToken         string
+	pluginAdminToken  string
+	userToken         string
+	disabledUserToken string
 }
 
 type routerAppPluginEnvelope struct {
@@ -52,8 +53,45 @@ func TestAppPluginDashboardRoutesAndRedaction(t *testing.T) {
 		assert.Truef(t, registered[route], "route %s must remain registered", route)
 	}
 
-	unauthenticated := routerAppPluginRequest(fixture.engine, http.MethodGet, "/api/app_plugins", "", nil)
-	assert.Equal(t, http.StatusUnauthorized, unauthenticated.Code)
+	for _, request := range []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "navigation", method: http.MethodGet, path: "/api/app_plugins"},
+		{name: "installation list", method: http.MethodGet, path: "/api/app_plugins/installations"},
+		{name: "installation create", method: http.MethodPost, path: "/api/app_plugins/installations"},
+		{name: "installation update", method: http.MethodPatch, path: "/api/app_plugins/installations"},
+	} {
+		t.Run(request.name+" requires authentication envelope", func(t *testing.T) {
+			response := routerAppPluginRequest(fixture.engine, request.method, request.path, "", nil)
+			assertRouterAppPluginErrorEnvelope(t, response, http.StatusUnauthorized, "unauthenticated", "Authentication required", false)
+		})
+	}
+
+	t.Run("malformed authorization is unauthenticated", func(t *testing.T) {
+		response := routerAppPluginRequestWithHeaders(
+			fixture.engine,
+			http.MethodGet,
+			"/api/app_plugins",
+			"",
+			nil,
+			map[string]string{"Authorization": "Bearer malformed token"},
+		)
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusUnauthorized, "unauthenticated", "Authentication required", false)
+	})
+
+	t.Run("invalid token is unauthenticated without disclosure", func(t *testing.T) {
+		const invalidToken = "invalid-app-plugin-token"
+		response := routerAppPluginRequest(fixture.engine, http.MethodGet, "/api/app_plugins", invalidToken, nil)
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusUnauthorized, "unauthenticated", "Authentication required", false)
+		assert.NotContains(t, response.Body.String(), invalidToken)
+	})
+
+	t.Run("disabled identity is inactive", func(t *testing.T) {
+		response := routerAppPluginRequest(fixture.engine, http.MethodGet, "/api/app_plugins", fixture.disabledUserToken, nil)
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusForbidden, "identity_inactive", "Identity is inactive", false)
+	})
 
 	disabled := routerAppPluginRequest(fixture.engine, http.MethodGet, "/api/app_plugins", fixture.userToken, nil)
 	require.Equal(t, http.StatusForbidden, disabled.Code, disabled.Body.String())
@@ -128,6 +166,16 @@ func TestAppPluginDashboardRoutesAndRedaction(t *testing.T) {
 
 	canvas := routerAppPluginRequest(fixture.engine, http.MethodGet, "/api/infinite-canvas", "", nil)
 	assert.Equal(t, http.StatusNoContent, canvas.Code)
+
+	t.Run("internal authentication error is unavailable without disclosure", func(t *testing.T) {
+		sqlDB, err := model.DB.DB()
+		require.NoError(t, err)
+		require.NoError(t, sqlDB.Close())
+		response := routerAppPluginRequest(fixture.engine, http.MethodGet, "/api/app_plugins", fixture.rootToken, nil)
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusServiceUnavailable, "service_unavailable", "App plugin request failed", true)
+		assert.NotContains(t, response.Body.String(), "database is closed")
+		assert.NotContains(t, response.Body.String(), "AUTH_INTERNAL_ERROR")
+	})
 }
 
 func TestAppPluginPatchRequiresRevisionAndRootForSensitiveChanges(t *testing.T) {
@@ -360,10 +408,12 @@ func setupRouterAppPluginTest(t *testing.T) routerAppPluginFixture {
 	rootToken := "app-plugin-root-token"
 	pluginAdminToken := "app-plugin-admin-token"
 	userToken := "app-plugin-user-token"
+	disabledUserToken := "app-plugin-disabled-user-token"
 	users := []model.User{
 		{Username: "app-plugin-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, Group: "default", AccessToken: &rootToken, AuthVersion: 1, AffCode: "app-plugin-root"},
 		{Username: "app-plugin-admin", Role: common.RolePluginAdminUser, Status: common.UserStatusEnabled, Group: "default", AccessToken: &pluginAdminToken, AuthVersion: 1, AffCode: "app-plugin-admin"},
 		{Username: "app-plugin-user", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AccessToken: &userToken, AuthVersion: 1, AffCode: "app-plugin-user"},
+		{Username: "app-plugin-disabled-user", Role: common.RoleCommonUser, Status: common.UserStatusDisabled, Group: "default", AccessToken: &disabledUserToken, AuthVersion: 1, AffCode: "app-plugin-disabled-user"},
 	}
 	require.NoError(t, db.Create(&users).Error)
 
@@ -382,10 +432,11 @@ func setupRouterAppPluginTest(t *testing.T) routerAppPluginFixture {
 		operation_setting.AppPluginV1Enabled = previousFlag
 	})
 	return routerAppPluginFixture{
-		engine:           engine,
-		rootToken:        rootToken,
-		pluginAdminToken: pluginAdminToken,
-		userToken:        userToken,
+		engine:            engine,
+		rootToken:         rootToken,
+		pluginAdminToken:  pluginAdminToken,
+		userToken:         userToken,
+		disabledUserToken: disabledUserToken,
 	}
 }
 
@@ -466,4 +517,29 @@ func routerAppPluginErrorCode(t *testing.T, response *httptest.ResponseRecorder)
 	var envelope routerAppPluginEnvelope
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &envelope), response.Body.String())
 	return envelope.Error.Code
+}
+
+func assertRouterAppPluginErrorEnvelope(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	status int,
+	code string,
+	message string,
+	retryable bool,
+) {
+	t.Helper()
+	require.Equal(t, status, response.Code, response.Body.String())
+	requestID := response.Header().Get(common.RequestIdKey)
+	require.NotEmpty(t, requestID)
+	var actual map[string]any
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &actual), response.Body.String())
+	assert.Equal(t, map[string]any{
+		"error": map[string]any{
+			"code":         code,
+			"message":      message,
+			"field_errors": []any{},
+			"retryable":    retryable,
+			"request_id":   requestID,
+		},
+	}, actual)
 }
