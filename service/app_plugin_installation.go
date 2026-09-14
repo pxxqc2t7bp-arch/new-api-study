@@ -13,6 +13,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	goversion "github.com/hashicorp/go-version"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -207,7 +208,11 @@ func (s *AppPluginInstallationService) CreateEntitlementPolicy(ctx context.Conte
 				return err
 			}
 			var stored model.AppEntitlementPolicy
-			if err := tx.Where("version_key = ?", versionKey).First(&stored).Error; err != nil {
+			storedQuery := tx
+			if tx.Dialector.Name() != "sqlite" {
+				storedQuery = storedQuery.Clauses(clause.Locking{Strength: "UPDATE"})
+			}
+			if err := storedQuery.Where("version_key = ?", versionKey).First(&stored).Error; err != nil {
 				return err
 			}
 			if stored.CreationToken != creationToken {
@@ -224,7 +229,12 @@ func (s *AppPluginInstallationService) CreateEntitlementPolicy(ctx context.Conte
 		if err == nil {
 			return result, nil
 		}
-		if !errors.Is(err, errEntitlementVersionRace) {
+		retry := errors.Is(err, errEntitlementVersionRace)
+		if !retry && s.db.Dialector.Name() == "mysql" {
+			var mysqlErr *mysqlDriver.MySQLError
+			retry = errors.As(err, &mysqlErr) && mysqlErr.Number == 1213
+		}
+		if !retry {
 			return AppEntitlementPolicyResult{}, err
 		}
 	}

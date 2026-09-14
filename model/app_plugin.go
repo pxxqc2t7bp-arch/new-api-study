@@ -283,6 +283,22 @@ func AppPluginErrorCode(err error) string {
 	}
 }
 
+func runAppPluginTransaction(db *gorm.DB, transaction func(*gorm.DB) error) error {
+	const maxAttempts = 3
+	var err error
+	for attempt := range maxAttempts {
+		err = db.Transaction(transaction)
+		if err == nil || db.Dialector.Name() != "mysql" {
+			return err
+		}
+		var mysqlErr *mysqlDriver.MySQLError
+		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1213 || attempt == maxAttempts-1 {
+			return err
+		}
+	}
+	return err
+}
+
 func MigrateAppPluginTables(db *gorm.DB) error {
 	if db.Migrator().HasTable(&AppInstallation{}) {
 		if !db.Migrator().HasColumn(&AppInstallation{}, "installation_id") {
@@ -311,7 +327,7 @@ func MigrateAppPluginTables(db *gorm.DB) error {
 	); err != nil {
 		return err
 	}
-	return db.Transaction(func(tx *gorm.DB) error {
+	return runAppPluginTransaction(db, func(tx *gorm.DB) error {
 		var installations []AppInstallation
 		if err := tx.Where("status <> ?", AppInstallationStatusRevoked).
 			Order("id").
@@ -378,7 +394,7 @@ func MigrateAppPluginTables(db *gorm.DB) error {
 				return err
 			}
 			var stored AppRouteClaim
-			if err := tx.Where("claim_key = ?", claim.ClaimKey).First(&stored).Error; err != nil {
+			if err := lockForUpdate(tx).Where("claim_key = ?", claim.ClaimKey).First(&stored).Error; err != nil {
 				return err
 			}
 			if stored.InstallationID != installation.InstallationID || stored.Kind != "app_key" {
@@ -411,6 +427,7 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 	}
 	var result AppInstallResult
 	transaction := func(tx *gorm.DB) error {
+		result = AppInstallResult{}
 		claim := AppInstallationIdempotency{
 			ScopeHash:   scopeHash,
 			ActorID:     scope.ActorID,
@@ -540,7 +557,7 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 				return err
 			}
 			var stored AppRouteClaim
-			if err := tx.Where("claim_key = ?", claims[i].ClaimKey).First(&stored).Error; err != nil {
+			if err := lockForUpdate(tx).Where("claim_key = ?", claims[i].ClaimKey).First(&stored).Error; err != nil {
 				return err
 			}
 			if stored.AppKey != claims[i].AppKey || stored.InstallationID != claims[i].InstallationID || stored.Kind != claims[i].Kind {
@@ -608,18 +625,7 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 		result = resultFromInstallation(version.ID, installation, credentialSet)
 		return freezeAppInstallIdempotency(tx, scopeHash, claimToken, &result)
 	}
-	const maxTransactionAttempts = 3
-	for attempt := range maxTransactionAttempts {
-		result = AppInstallResult{}
-		err = db.WithContext(ctx).Transaction(transaction)
-		if err == nil || db.Dialector.Name() != "mysql" {
-			break
-		}
-		var mysqlErr *mysqlDriver.MySQLError
-		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1213 || attempt == maxTransactionAttempts-1 {
-			break
-		}
-	}
+	err = runAppPluginTransaction(db.WithContext(ctx), transaction)
 	return result, err
 }
 
@@ -638,6 +644,8 @@ func ReplayAppInstall(ctx context.Context, db *gorm.DB, scope AppIdempotencyScop
 	var result AppInstallResult
 	found := false
 	transaction := func(tx *gorm.DB) error {
+		result = AppInstallResult{}
+		found = false
 		var replay AppInstallationIdempotency
 		replayQuery := tx.Where("scope_hash = ?", scopeHash).Limit(1).Find(&replay)
 		if replayQuery.Error != nil {
@@ -739,19 +747,7 @@ func ReplayAppInstall(ctx context.Context, db *gorm.DB, scope AppIdempotencyScop
 		found = true
 		return nil
 	}
-	const maxTransactionAttempts = 3
-	for attempt := range maxTransactionAttempts {
-		result = AppInstallResult{}
-		found = false
-		err = db.WithContext(ctx).Transaction(transaction)
-		if err == nil || db.Dialector.Name() != "mysql" {
-			break
-		}
-		var mysqlErr *mysqlDriver.MySQLError
-		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1213 || attempt == maxTransactionAttempts-1 {
-			break
-		}
-	}
+	err = runAppPluginTransaction(db.WithContext(ctx), transaction)
 	return result, found, err
 }
 
@@ -922,7 +918,8 @@ func CompareAndSwapAppInstallationStatus(ctx context.Context, db *gorm.DB, insta
 		allowedCurrent = []string{AppInstallationStatusDisabled, AppInstallationStatusEnabled}
 	}
 	var updated AppInstallation
-	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := runAppPluginTransaction(db.WithContext(ctx), func(tx *gorm.DB) error {
+		updated = AppInstallation{}
 		result := tx.Model(&AppInstallation{}).
 			Where("installation_id = ? AND revision = ? AND status IN ?", installationID, revision, allowedCurrent).
 			Updates(map[string]any{"status": status, "revision": gorm.Expr("revision + ?", 1)})

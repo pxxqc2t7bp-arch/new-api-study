@@ -7,14 +7,17 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/glebarez/sqlite"
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/mysql"
+	gormMySQL "gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -137,6 +140,147 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 	assert.Equal(t, int64(2), policyV2.Version)
 	assert.Equal(t, map[string][]string{"files": {"read", "write"}, "models": {"invoke"}}, policyV1.EffectiveRules)
 	assert.Equal(t, map[string][]string{"files": {"read"}}, policyV2.EffectiveRules)
+
+	t.Run("concurrent creates allocate unique continuous immutable versions", func(t *testing.T) {
+		if db.Dialector.Name() != "mysql" {
+			t.Skip("requires MySQL REPEATABLE READ snapshot semantics")
+		}
+
+		const callbackName = "test:app_entitlement_policy_snapshot"
+		type workerKey struct{}
+		snapshotsReady := make(chan string, 2)
+		releaseSnapshots := map[string]chan struct{}{
+			"first":  make(chan struct{}),
+			"second": make(chan struct{}),
+		}
+		var coordinated sync.Map
+		require.NoError(t, db.Callback().Row().After("gorm:row").Register(callbackName, func(tx *gorm.DB) {
+			worker, _ := tx.Statement.Context.Value(workerKey{}).(string)
+			if tx.Statement.Table != "app_entitlement_policies" || worker == "" {
+				return
+			}
+			if _, loaded := coordinated.LoadOrStore(worker, struct{}{}); loaded {
+				return
+			}
+			snapshotsReady <- worker
+			<-releaseSnapshots[worker]
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Row().Remove(callbackName))
+		})
+
+		drafts := []AppEntitlementPolicyDraft{
+			{Key: "concurrent-policy", Rules: map[string][]string{"files": {"read"}}},
+			{Key: "concurrent-policy", Rules: map[string][]string{"files": {"write"}, "models": {"invoke"}}},
+		}
+		type policyOutcome struct {
+			worker string
+			result AppEntitlementPolicyResult
+			err    error
+		}
+		start := make(chan struct{})
+		outcomes := make(chan policyOutcome, len(drafts))
+		var wg sync.WaitGroup
+		for i := range drafts {
+			draft := drafts[i]
+			worker := []string{"first", "second"}[i]
+			wg.Go(func() {
+				<-start
+				ctx := context.WithValue(context.Background(), workerKey{}, worker)
+				result, createErr := svc.CreateEntitlementPolicy(ctx, draft)
+				outcomes <- policyOutcome{worker: worker, result: result, err: createErr}
+			})
+		}
+		close(start)
+		<-snapshotsReady
+		<-snapshotsReady
+		close(releaseSnapshots["first"])
+		first := <-outcomes
+		require.Equal(t, "first", first.worker)
+		require.NoError(t, first.err)
+		close(releaseSnapshots["second"])
+		wg.Wait()
+		close(outcomes)
+
+		results := []AppEntitlementPolicyResult{first.result}
+		for outcome := range outcomes {
+			require.NoError(t, outcome.err)
+			results = append(results, outcome.result)
+		}
+		require.Len(t, results, 2)
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].Version < results[j].Version
+		})
+		assert.Equal(t, []int64{1, 2}, []int64{results[0].Version, results[1].Version})
+		assert.NotEqual(t, results[0].ID, results[1].ID)
+
+		var stored []model.AppEntitlementPolicy
+		require.NoError(t, db.Where("key_hash = ?", serviceDigestBytes([]byte("concurrent-policy"))).Order("version").Find(&stored).Error)
+		require.Len(t, stored, 2)
+		for i := range stored {
+			assert.Equal(t, results[i].ID, stored[i].ID)
+			assert.Equal(t, results[i].Version, stored[i].Version)
+			assert.Equal(t, results[i].EffectiveRules, map[string][]string(stored[i].EffectiveRules))
+		}
+	})
+
+	t.Run("version allocation retries a transient MySQL deadlock", func(t *testing.T) {
+		if db.Dialector.Name() != "mysql" {
+			t.Skip("requires MySQL deadlock retry semantics")
+		}
+
+		const callbackName = "test:app_entitlement_policy_deadlock"
+		var attempts atomic.Int32
+		require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+			policy, ok := tx.Statement.Dest.(*model.AppEntitlementPolicy)
+			if !ok || policy.Key != "policy-deadlock-retry" {
+				return
+			}
+			if attempts.Add(1) == 1 {
+				tx.AddError(&mysqlDriver.MySQLError{Number: 1213, Message: "injected policy deadlock"})
+			}
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Create().Remove(callbackName))
+		})
+
+		result, err := svc.CreateEntitlementPolicy(context.Background(), AppEntitlementPolicyDraft{
+			Key:   "policy-deadlock-retry",
+			Rules: map[string][]string{"files": {"read"}},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, int32(2), attempts.Load())
+		assert.Equal(t, int64(1), result.Version)
+	})
+
+	t.Run("version allocation does not retry a non-deadlock MySQL error", func(t *testing.T) {
+		if db.Dialector.Name() != "mysql" {
+			t.Skip("requires MySQL error classification")
+		}
+
+		const callbackName = "test:app_entitlement_policy_no_retry"
+		var attempts atomic.Int32
+		require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+			policy, ok := tx.Statement.Dest.(*model.AppEntitlementPolicy)
+			if !ok || policy.Key != "policy-no-retry" {
+				return
+			}
+			attempts.Add(1)
+			tx.AddError(&mysqlDriver.MySQLError{Number: 1205, Message: "injected policy lock wait timeout"})
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Create().Remove(callbackName))
+		})
+
+		_, err := svc.CreateEntitlementPolicy(context.Background(), AppEntitlementPolicyDraft{
+			Key:   "policy-no-retry",
+			Rules: map[string][]string{"files": {"read"}},
+		})
+		require.Error(t, err)
+		assert.Equal(t, uint16(1205), err.(*mysqlDriver.MySQLError).Number)
+		assert.Equal(t, int32(1), attempts.Load())
+	})
+
 	assert.ErrorIs(t, svc.UpdateEntitlementPolicy(context.Background(), policyV1.ID, AppEntitlementPolicyDraft{}), ErrEntitlementPolicyImmutable)
 	assert.ErrorIs(t, svc.DeleteEntitlementPolicy(context.Background(), policyV1.ID), ErrEntitlementPolicyImmutable)
 	cmdWithPolicy := appPluginInstallCommand("host-policy-version", "1.0.0")
@@ -415,7 +559,7 @@ func openAppPluginServiceDB(t *testing.T) *gorm.DB {
 		db, err = gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	case "mysql":
 		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required for mysql")
-		db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
+		db, err = gorm.Open(gormMySQL.Open(dsn), &gorm.Config{})
 	case "postgres", "postgresql":
 		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required for postgres")
 		db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})

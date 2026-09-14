@@ -14,9 +14,10 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/glebarez/sqlite"
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/mysql"
+	gormMySQL "gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -292,6 +293,53 @@ func TestAppPluginMigrationFreshUpgradeReplay(t *testing.T) {
 			`{"installation_id":"202"}`,
 			`{"installation_id":"203"}`,
 		}, []string{frozen[0].ResponseJSON, frozen[1].ResponseJSON, frozen[2].ResponseJSON})
+	})
+
+	t.Run("migration DML retries a deadlock and replays one app key owner", func(t *testing.T) {
+		if db.Dialector.Name() != "mysql" {
+			t.Skip("requires MySQL deadlock retry semantics")
+		}
+
+		installation := AppInstallation{
+			InstallationID:       "migration-retry-installation",
+			AppKey:               "migration-retry",
+			AppVersionID:         "migration-retry-version",
+			ManifestVersion:      "1.0.0",
+			ManifestSHA256:       appPluginDigest("migration-retry"),
+			BaseURL:              "https://apps.example.com/migration-retry/",
+			EnabledSurfaces:      AppStringList{},
+			AllowedParentOrigins: AppStringList{},
+			AllowedOrigins:       AppStringList{},
+			AllowedUserPolicy:    AppAllowedUserPolicy{},
+			NetworkPolicy:        AppNetworkPolicy{},
+			Status:               AppInstallationStatusDisabled,
+			Revision:             1,
+		}
+		require.NoError(t, db.Create(&installation).Error)
+
+		const callbackName = "test:app_plugin_migration_deadlock"
+		var attempts atomic.Int32
+		require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+			claim, ok := tx.Statement.Dest.(*AppRouteClaim)
+			if !ok || claim.AppKey != installation.AppKey || claim.Kind != "app_key" {
+				return
+			}
+			if attempts.Add(1) == 1 {
+				tx.AddError(&mysqlDriver.MySQLError{Number: 1213, Message: "injected migration deadlock"})
+			}
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Create().Remove(callbackName))
+		})
+
+		require.NoError(t, MigrateAppPluginTables(db))
+		assert.Equal(t, int32(2), attempts.Load())
+		require.NoError(t, MigrateAppPluginTables(db))
+
+		var ownership []AppRouteClaim
+		require.NoError(t, db.Where("app_key = ? AND kind = ?", installation.AppKey, "app_key").Find(&ownership).Error)
+		require.Len(t, ownership, 1)
+		assert.Equal(t, installation.InstallationID, ownership[0].InstallationID)
 	})
 }
 
@@ -689,6 +737,98 @@ func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 		assert.Zero(t, rows)
 	}
 
+	t.Run("concurrent different apps leave one route owner and a stable collision", func(t *testing.T) {
+		if db.Dialector.Name() != "mysql" {
+			t.Skip("requires MySQL REPEATABLE READ snapshot semantics")
+		}
+
+		const callbackName = "test:app_plugin_route_claim_snapshot"
+		snapshotsReady := make(chan struct{}, 2)
+		releaseSnapshots := make(chan struct{})
+		var coordinated atomic.Int32
+		require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_entitlement_policies" || coordinated.Add(1) > 2 {
+				return
+			}
+			snapshotsReady <- struct{}{}
+			<-releaseSnapshots
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Query().Remove(callbackName))
+		})
+
+		type installOutcome struct {
+			appKey string
+			result AppInstallResult
+			err    error
+		}
+		start := make(chan struct{})
+		outcomes := make(chan installOutcome, 2)
+		requests := []AppInstallRequest{
+			appPluginModelInstallRequest("concurrent-route-one", "1.0.0", "https://apps.example.com/concurrent-route/"),
+			appPluginModelInstallRequest("concurrent-route-two", "1.0.0", "https://apps.example.com/concurrent-route/"),
+		}
+		var wg sync.WaitGroup
+		for i := range requests {
+			req := requests[i]
+			wg.Go(func() {
+				<-start
+				result, installErr := InstallAppVersion(
+					context.Background(),
+					db,
+					AppIdempotencyScope{ActorID: int64(220 + i), Key: "concurrent-route-" + req.AppKey},
+					req,
+				)
+				outcomes <- installOutcome{appKey: req.AppKey, result: result, err: installErr}
+			})
+		}
+		close(start)
+		<-snapshotsReady
+		<-snapshotsReady
+		close(releaseSnapshots)
+		wg.Wait()
+		close(outcomes)
+
+		var winner installOutcome
+		successes := 0
+		conflicts := 0
+		for outcome := range outcomes {
+			switch {
+			case outcome.err == nil:
+				winner = outcome
+				successes++
+			case errors.Is(outcome.err, ErrAppRouteClaimConflict):
+				assert.Equal(t, "app_route_collision", AppPluginErrorCode(outcome.err))
+				conflicts++
+			default:
+				require.NoError(t, outcome.err)
+			}
+		}
+		require.Equal(t, 1, successes)
+		require.Equal(t, 1, conflicts)
+
+		var claims []AppRouteClaim
+		require.NoError(t, db.Where("absolute_endpoint IN ?", []string{
+			requests[0].CallbackURL,
+			requests[0].DirectURL,
+			requests[0].EmbeddedURL,
+		}).Find(&claims).Error)
+		require.Len(t, claims, 3)
+		for _, claim := range claims {
+			assert.Equal(t, winner.appKey, claim.AppKey)
+			assert.Equal(t, winner.result.InstallationID, claim.InstallationID)
+		}
+		assert.Equal(t, int64(4), appPluginCountForKey(t, db, &AppRouteClaim{}, winner.appKey))
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppInstallation{}, winner.appKey))
+		for _, req := range requests {
+			if req.AppKey == winner.appKey {
+				continue
+			}
+			assert.Zero(t, appPluginCountForKey(t, db, &AppRouteClaim{}, req.AppKey))
+			assert.Zero(t, appPluginCountForKey(t, db, &AppInstallation{}, req.AppKey))
+		}
+	})
+
 	t.Run("new immutable version atomically upgrades the existing installation", func(t *testing.T) {
 		v1 := appPluginModelInstallRequest("atomic-upgrade", "1.0.0", "https://apps.example.com/atomic-upgrade-v1/")
 		created, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 23, Key: "atomic-upgrade-v1"}, v1)
@@ -881,6 +1021,197 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 	assert.Equal(t, 1, successes)
 	assert.Equal(t, 1, conflicts)
 
+	t.Run("CAS transaction retries only MySQL deadlocks and stops after three attempts", func(t *testing.T) {
+		req := appPluginModelInstallRequest("cas-retry-limit-"+db.Dialector.Name(), "1.0.0", "https://apps.example.com/cas-retry-limit-"+db.Dialector.Name()+"/")
+		installation, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 330, Key: req.AppKey}, req)
+		require.NoError(t, err)
+
+		const callbackName = "test:app_plugin_cas_retry_limit"
+		var attempts atomic.Int32
+		require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_installations" {
+				return
+			}
+			attempts.Add(1)
+			tx.AddError(&mysqlDriver.MySQLError{Number: 1213, Message: "injected persistent CAS deadlock"})
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Update().Remove(callbackName))
+		})
+
+		_, err = CompareAndSwapAppInstallationStatus(
+			context.Background(),
+			db,
+			installation.InstallationID,
+			installation.Revision,
+			AppInstallationStatusEnabled,
+		)
+		require.Error(t, err)
+		assert.Equal(t, uint16(1213), err.(*mysqlDriver.MySQLError).Number)
+		if db.Dialector.Name() == "mysql" {
+			assert.Equal(t, int32(3), attempts.Load())
+		} else {
+			assert.Equal(t, int32(1), attempts.Load())
+		}
+	})
+
+	t.Run("CAS transaction retries a transient MySQL deadlock", func(t *testing.T) {
+		if db.Dialector.Name() != "mysql" {
+			t.Skip("requires MySQL deadlock retry semantics")
+		}
+
+		req := appPluginModelInstallRequest("cas-retry-success", "1.0.0", "https://apps.example.com/cas-retry-success/")
+		installation, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 331, Key: req.AppKey}, req)
+		require.NoError(t, err)
+
+		const callbackName = "test:app_plugin_cas_retry_success"
+		var attempts atomic.Int32
+		require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_installations" {
+				return
+			}
+			if attempts.Add(1) == 1 {
+				tx.AddError(&mysqlDriver.MySQLError{Number: 1213, Message: "injected transient CAS deadlock"})
+			}
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Update().Remove(callbackName))
+		})
+
+		updated, err := CompareAndSwapAppInstallationStatus(
+			context.Background(),
+			db,
+			installation.InstallationID,
+			installation.Revision,
+			AppInstallationStatusEnabled,
+		)
+		require.NoError(t, err)
+		assert.Equal(t, int32(2), attempts.Load())
+		assert.Equal(t, AppInstallationStatusEnabled, updated.Status)
+		assert.Equal(t, installation.Revision+1, updated.Revision)
+	})
+
+	t.Run("CAS transaction does not retry a non-deadlock MySQL error", func(t *testing.T) {
+		if db.Dialector.Name() != "mysql" {
+			t.Skip("requires MySQL error classification")
+		}
+
+		req := appPluginModelInstallRequest("cas-no-retry", "1.0.0", "https://apps.example.com/cas-no-retry/")
+		installation, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 332, Key: req.AppKey}, req)
+		require.NoError(t, err)
+
+		const callbackName = "test:app_plugin_cas_no_retry"
+		var attempts atomic.Int32
+		require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_installations" {
+				return
+			}
+			attempts.Add(1)
+			tx.AddError(&mysqlDriver.MySQLError{Number: 1205, Message: "injected lock wait timeout"})
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Update().Remove(callbackName))
+		})
+
+		_, err = CompareAndSwapAppInstallationStatus(
+			context.Background(),
+			db,
+			installation.InstallationID,
+			installation.Revision,
+			AppInstallationStatusEnabled,
+		)
+		require.Error(t, err)
+		assert.Equal(t, uint16(1205), err.(*mysqlDriver.MySQLError).Number)
+		assert.Equal(t, int32(1), attempts.Load())
+	})
+
+	t.Run("concurrent CAS upgrade and revoke preserve one live installation owner", func(t *testing.T) {
+		if db.Dialector.Name() != "mysql" {
+			t.Skip("requires MySQL row-level deadlock detection")
+		}
+
+		v1 := appPluginModelInstallRequest("cas-upgrade-revoke", "1.0.0", "https://apps.example.com/cas-upgrade-revoke-v1/")
+		created, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 333, Key: "cas-upgrade-revoke-v1"}, v1)
+		require.NoError(t, err)
+
+		casInstallationLocked := make(chan struct{}, 1)
+		upgradeClaimLocked := make(chan struct{}, 1)
+		allowCASClaimDelete := make(chan struct{})
+		const updateCallbackName = "test:app_plugin_cas_installation_lock"
+		require.NoError(t, db.Callback().Update().After("gorm:update").Register(updateCallbackName, func(tx *gorm.DB) {
+			status, ok := tx.Statement.Dest.(map[string]any)["status"]
+			if tx.Statement.Table != "app_installations" || !ok || status != AppInstallationStatusRevoked {
+				return
+			}
+			casInstallationLocked <- struct{}{}
+			<-allowCASClaimDelete
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Update().Remove(updateCallbackName))
+		})
+
+		var claimLockCoordinated atomic.Bool
+		const queryCallbackName = "test:app_plugin_upgrade_claim_lock"
+		require.NoError(t, db.Callback().Query().After("gorm:query").Register(queryCallbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_route_claims" ||
+				!strings.Contains(tx.Statement.SQL.String(), "FOR UPDATE") ||
+				!claimLockCoordinated.CompareAndSwap(false, true) {
+				return
+			}
+			upgradeClaimLocked <- struct{}{}
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Query().Remove(queryCallbackName))
+		})
+
+		casResult := make(chan error, 1)
+		go func() {
+			_, casErr := CompareAndSwapAppInstallationStatus(
+				context.Background(),
+				db,
+				created.InstallationID,
+				created.Revision,
+				AppInstallationStatusRevoked,
+			)
+			casResult <- casErr
+		}()
+		<-casInstallationLocked
+
+		v2 := appPluginModelInstallRequest("cas-upgrade-revoke", "2.0.0", "https://apps.example.com/cas-upgrade-revoke-v2/")
+		upgradeResult := make(chan error, 1)
+		go func() {
+			_, upgradeErr := InstallAppVersion(
+				context.Background(),
+				db,
+				AppIdempotencyScope{ActorID: 333, Key: "cas-upgrade-revoke-v2"},
+				v2,
+			)
+			upgradeResult <- upgradeErr
+		}()
+		<-upgradeClaimLocked
+		close(allowCASClaimDelete)
+
+		casErr := <-casResult
+		upgradeErr := <-upgradeResult
+		require.NoError(t, upgradeErr)
+		if casErr != nil {
+			assert.ErrorIs(t, casErr, ErrAppInstallationRevisionConflict)
+			assert.NotEqual(t, "service_unavailable", AppPluginErrorCode(casErr))
+		}
+
+		var liveInstallations []AppInstallation
+		require.NoError(t, db.Where("app_key = ? AND status <> ?", v1.AppKey, AppInstallationStatusRevoked).Find(&liveInstallations).Error)
+		require.Len(t, liveInstallations, 1)
+		assert.Equal(t, "2.0.0", liveInstallations[0].ManifestVersion)
+
+		var ownership []AppRouteClaim
+		require.NoError(t, db.Where("app_key = ? AND kind = ?", v1.AppKey, "app_key").Find(&ownership).Error)
+		require.Len(t, ownership, 1)
+		assert.Equal(t, liveInstallations[0].InstallationID, ownership[0].InstallationID)
+		assert.Equal(t, int64(4), appPluginCountForKey(t, db, &AppRouteClaim{}, v1.AppKey))
+		assert.Equal(t, int64(2), appPluginCountForKey(t, db, &AppVersion{}, v1.AppKey))
+	})
+
 	t.Run("concurrent same generation with different scopes replays one installation", func(t *testing.T) {
 		if db.Dialector.Name() != "mysql" {
 			t.Skip("requires MySQL REPEATABLE READ snapshot semantics")
@@ -1006,7 +1337,7 @@ func openAppPluginModelDB(t *testing.T) *gorm.DB {
 	case "mysql":
 		common.SetMainDatabaseType(common.DatabaseTypeMySQL)
 		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required for mysql")
-		db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
+		db, err = gorm.Open(gormMySQL.Open(dsn), &gorm.Config{})
 	case "postgres", "postgresql":
 		common.SetMainDatabaseType(common.DatabaseTypePostgreSQL)
 		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required for postgres")
