@@ -96,6 +96,95 @@ var auditRouteActions = map[string]string{
 
 	// 日志
 	"POST /api/system-task/log-cleanup": "log.cleanup_start",
+
+	// App Plugin installation lifecycle
+	"POST /api/app_plugins/installations":  "app_plugin.install",
+	"PATCH /api/app_plugins/installations": "app_plugin.update",
+}
+
+const appPluginAuditContextKey = "app_plugin_operation_audit"
+
+type appPluginAuditTarget struct {
+	InstallationID string
+	Revision       int64
+}
+
+// SetAppPluginAuditTarget records only the stable object identity and revision
+// needed by App Plugin operation auditing.
+func SetAppPluginAuditTarget(c *gin.Context, installationID string, revision int64) {
+	c.Set(appPluginAuditContextKey, appPluginAuditTarget{
+		InstallationID: installationID,
+		Revision:       revision,
+	})
+}
+
+// AppPluginOperationAudit records every authorized installation write without
+// retaining request bodies, manifests, policies, origins, or credentials.
+func AppPluginOperationAudit() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		action := auditRouteActions[c.Request.Method+" "+c.FullPath()]
+		if action == "" {
+			c.Next()
+			return
+		}
+
+		writer := &auditResponseWriter{
+			ResponseWriter: c.Writer,
+			body:           bytes.NewBuffer(nil),
+			maxSize:        64 * 1024,
+		}
+		c.Writer = writer
+		c.Next()
+
+		target, _ := c.Get(appPluginAuditContextKey)
+		auditTarget, _ := target.(appPluginAuditTarget)
+		result := "success"
+		if !auditResponseSuccess(writer.Status(), writer.body.Bytes()) {
+			result = "failed"
+			var response struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if common.Unmarshal(writer.body.Bytes(), &response) == nil && response.Error.Code != "" {
+				result = response.Error.Code
+			}
+		}
+		params := map[string]any{
+			"actor": map[string]any{
+				"id":   c.GetInt("id"),
+				"role": c.GetInt("role"),
+			},
+			"object":    "app_installation",
+			"object_id": auditTarget.InstallationID,
+			"revision":  auditTarget.Revision,
+			"result":    result,
+		}
+		auditInfo := &model.AuditRequestInfo{
+			Method:  c.Request.Method,
+			Route:   c.FullPath(),
+			Path:    c.FullPath(),
+			Status:  writer.Status(),
+			Success: result == "success",
+		}
+		adminInfo := &model.AuditAdminInfo{
+			AdminID:       c.GetInt("id"),
+			AdminUsername: c.GetString("username"),
+			AdminRole:     c.GetInt("role"),
+			AuthMethod:    auditAuthMethod(c),
+		}
+		model.RecordOperationAuditLog(
+			c.GetInt("id"),
+			c.GetInt("role"),
+			action,
+			c.ClientIP(),
+			action,
+			params,
+			adminInfo,
+			auditInfo,
+			c,
+		)
+	}
 }
 
 // beginAdminAudit 在管理/root 写操作进入 handler 前包装 ResponseWriter，
