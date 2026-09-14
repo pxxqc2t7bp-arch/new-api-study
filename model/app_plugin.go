@@ -389,13 +389,26 @@ func MigrateAppPluginTables(db *gorm.DB) error {
 				continue
 			}
 			claim := appKeyClaim(installation.AppKey, installation.InstallationID)
-			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "claim_key"}}, DoNothing: true}).
-				Create(&claim).Error; err != nil {
+			var stored AppRouteClaim
+			storedQuery := lockForUpdate(tx).Where("claim_key = ?", claim.ClaimKey).Limit(1).Find(&stored)
+			if storedQuery.Error != nil {
+				return storedQuery.Error
+			}
+			var current AppInstallation
+			if err := lockForUpdate(tx).Where("id = ?", installation.ID).First(&current).Error; err != nil {
 				return err
 			}
-			var stored AppRouteClaim
-			if err := lockForUpdate(tx).Where("claim_key = ?", claim.ClaimKey).First(&stored).Error; err != nil {
-				return err
+			if current.Status == AppInstallationStatusRevoked {
+				continue
+			}
+			if storedQuery.RowsAffected == 0 {
+				if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "claim_key"}}, DoNothing: true}).
+					Create(&claim).Error; err != nil {
+					return err
+				}
+				if err := lockForUpdate(tx).Where("claim_key = ?", claim.ClaimKey).First(&stored).Error; err != nil {
+					return err
+				}
 			}
 			if stored.InstallationID != installation.InstallationID || stored.Kind != "app_key" {
 				return ErrAppRouteClaimConflict
@@ -681,7 +694,7 @@ func ReplayAppInstall(ctx context.Context, db *gorm.DB, scope AppIdempotencyScop
 		}
 
 		var ownership AppRouteClaim
-		ownershipQuery := tx.Where("claim_key = ?", appKeyClaim(req.AppKey, "").ClaimKey).
+		ownershipQuery := lockForUpdate(tx).Where("claim_key = ?", appKeyClaim(req.AppKey, "").ClaimKey).
 			Limit(1).
 			Find(&ownership)
 		if ownershipQuery.Error != nil {
@@ -695,9 +708,14 @@ func ReplayAppInstall(ctx context.Context, db *gorm.DB, scope AppIdempotencyScop
 		}
 
 		var installation AppInstallation
-		if err := tx.Where("installation_id = ? AND status <> ?", ownership.InstallationID, AppInstallationStatusRevoked).
-			First(&installation).Error; err != nil {
-			return err
+		installationQuery := lockForUpdate(tx).Where("installation_id = ?", ownership.InstallationID).
+			Limit(1).
+			Find(&installation)
+		if installationQuery.Error != nil {
+			return installationQuery.Error
+		}
+		if installationQuery.RowsAffected == 0 || installation.Status == AppInstallationStatusRevoked {
+			return nil
 		}
 		frozen, frozenFound, err := findFrozenAppInstallResponse(tx, installation.InstallationID, version.ID)
 		if err != nil {

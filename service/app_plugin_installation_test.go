@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -146,6 +147,8 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 			t.Skip("requires MySQL REPEATABLE READ snapshot semantics")
 		}
 
+		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelBarrier()
 		const callbackName = "test:app_entitlement_policy_snapshot"
 		type workerKey struct{}
 		snapshotsReady := make(chan string, 2)
@@ -153,6 +156,20 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 			"first":  make(chan struct{}),
 			"second": make(chan struct{}),
 		}
+		var releaseFirstOnce sync.Once
+		releaseFirst := func() {
+			releaseFirstOnce.Do(func() {
+				close(releaseSnapshots["first"])
+			})
+		}
+		defer releaseFirst()
+		var releaseSecondOnce sync.Once
+		releaseSecond := func() {
+			releaseSecondOnce.Do(func() {
+				close(releaseSnapshots["second"])
+			})
+		}
+		defer releaseSecond()
 		var coordinated sync.Map
 		require.NoError(t, db.Callback().Row().After("gorm:row").Register(callbackName, func(tx *gorm.DB) {
 			worker, _ := tx.Statement.Context.Value(workerKey{}).(string)
@@ -162,8 +179,17 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 			if _, loaded := coordinated.LoadOrStore(worker, struct{}{}); loaded {
 				return
 			}
-			snapshotsReady <- worker
-			<-releaseSnapshots[worker]
+			select {
+			case snapshotsReady <- worker:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("entitlement policy snapshot barrier: %w", barrierCtx.Err()))
+				return
+			}
+			select {
+			case <-releaseSnapshots[worker]:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("entitlement policy snapshot release: %w", barrierCtx.Err()))
+			}
 		}))
 		t.Cleanup(func() {
 			require.NoError(t, db.Callback().Row().Remove(callbackName))
@@ -186,20 +212,39 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 			worker := []string{"first", "second"}[i]
 			wg.Go(func() {
 				<-start
-				ctx := context.WithValue(context.Background(), workerKey{}, worker)
+				ctx := context.WithValue(barrierCtx, workerKey{}, worker)
 				result, createErr := svc.CreateEntitlementPolicy(ctx, draft)
 				outcomes <- policyOutcome{worker: worker, result: result, err: createErr}
 			})
 		}
 		close(start)
-		<-snapshotsReady
-		<-snapshotsReady
-		close(releaseSnapshots["first"])
-		first := <-outcomes
+		for range 2 {
+			select {
+			case <-snapshotsReady:
+			case <-barrierCtx.Done():
+				t.Fatalf("policy creates did not reach their snapshots: %v", barrierCtx.Err())
+			}
+		}
+		releaseFirst()
+		var first policyOutcome
+		select {
+		case first = <-outcomes:
+		case <-barrierCtx.Done():
+			t.Fatalf("first policy create did not finish: %v", barrierCtx.Err())
+		}
 		require.Equal(t, "first", first.worker)
 		require.NoError(t, first.err)
-		close(releaseSnapshots["second"])
-		wg.Wait()
+		releaseSecond()
+		workersDone := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(workersDone)
+		}()
+		select {
+		case <-workersDone:
+		case <-barrierCtx.Done():
+			t.Fatalf("policy creates did not finish: %v", barrierCtx.Err())
+		}
 		close(outcomes)
 
 		results := []AppEntitlementPolicyResult{first.result}

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/glebarez/sqlite"
@@ -295,6 +296,97 @@ func TestAppPluginMigrationFreshUpgradeReplay(t *testing.T) {
 		}, []string{frozen[0].ResponseJSON, frozen[1].ResponseJSON, frozen[2].ResponseJSON})
 	})
 
+	t.Run("migration does not restore ownership after a concurrent revoke", func(t *testing.T) {
+		if db.Dialector.Name() == "sqlite" {
+			t.Skip("requires row-level transaction concurrency")
+		}
+
+		raceDB := openAppPluginModelDB(t)
+		require.NoError(t, MigrateAppPluginTables(raceDB))
+		seedAppPluginModelPolicy(t, raceDB, "policy-basic")
+		req := appPluginModelInstallRequest("migration-revoke", "1.0.0", "https://apps.example.com/migration-revoke/")
+		installed, err := InstallAppVersion(context.Background(), raceDB, AppIdempotencyScope{ActorID: 10, Key: "migration-revoke"}, req)
+		require.NoError(t, err)
+		enabled, err := CompareAndSwapAppInstallationStatus(
+			context.Background(),
+			raceDB,
+			installed.InstallationID,
+			installed.Revision,
+			AppInstallationStatusEnabled,
+		)
+		require.NoError(t, err)
+
+		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelBarrier()
+		snapshotReady := make(chan struct{}, 1)
+		releaseSnapshot := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() {
+				close(releaseSnapshot)
+			})
+		}
+		defer release()
+
+		const callbackName = "test:app_plugin_migration_revoke_snapshot"
+		var coordinated atomic.Bool
+		require.NoError(t, raceDB.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_installations" || !coordinated.CompareAndSwap(false, true) {
+				return
+			}
+			if _, ok := tx.Statement.Dest.(*[]AppInstallation); !ok {
+				return
+			}
+			select {
+			case snapshotReady <- struct{}{}:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("migration snapshot barrier: %w", barrierCtx.Err()))
+				return
+			}
+			select {
+			case <-releaseSnapshot:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("migration snapshot release: %w", barrierCtx.Err()))
+			}
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, raceDB.Callback().Query().Remove(callbackName))
+		})
+
+		migrationResult := make(chan error, 1)
+		go func() {
+			migrationResult <- MigrateAppPluginTables(raceDB.WithContext(barrierCtx))
+		}()
+
+		select {
+		case <-snapshotReady:
+		case <-barrierCtx.Done():
+			t.Fatalf("migration did not read active installations: %v", barrierCtx.Err())
+		}
+		revoked, err := CompareAndSwapAppInstallationStatus(
+			barrierCtx,
+			raceDB,
+			enabled.InstallationID,
+			enabled.Revision,
+			AppInstallationStatusRevoked,
+		)
+		require.NoError(t, err)
+		require.Equal(t, AppInstallationStatusRevoked, revoked.Status)
+		release()
+
+		select {
+		case err := <-migrationResult:
+			require.NoError(t, err)
+		case <-barrierCtx.Done():
+			t.Fatalf("migration did not finish: %v", barrierCtx.Err())
+		}
+
+		var current AppInstallation
+		require.NoError(t, raceDB.Where("installation_id = ?", installed.InstallationID).First(&current).Error)
+		assert.Equal(t, AppInstallationStatusRevoked, current.Status)
+		assert.Zero(t, appPluginCountForKey(t, raceDB, &AppRouteClaim{}, req.AppKey))
+	})
+
 	t.Run("migration DML retries a deadlock and replays one app key owner", func(t *testing.T) {
 		if db.Dialector.Name() != "mysql" {
 			t.Skip("requires MySQL deadlock retry semantics")
@@ -459,16 +551,34 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 		original, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 112, Key: "concurrent-frozen-replay-original"}, req)
 		require.NoError(t, err)
 
+		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelBarrier()
 		const callbackName = "test:app_plugin_same_scope_frozen_replay_snapshot"
 		snapshotsReady := make(chan struct{}, 2)
 		releaseSnapshots := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() {
+				close(releaseSnapshots)
+			})
+		}
+		defer release()
 		var coordinated atomic.Int32
 		require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
 			if tx.Statement.Table != "app_installation_idempotencies" || coordinated.Add(1) > 2 {
 				return
 			}
-			snapshotsReady <- struct{}{}
-			<-releaseSnapshots
+			select {
+			case snapshotsReady <- struct{}{}:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("same-scope replay snapshot barrier: %w", barrierCtx.Err()))
+				return
+			}
+			select {
+			case <-releaseSnapshots:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("same-scope replay snapshot release: %w", barrierCtx.Err()))
+			}
 		}))
 		t.Cleanup(func() {
 			require.NoError(t, db.Callback().Query().Remove(callbackName))
@@ -483,17 +593,31 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 		for range 2 {
 			wg.Go(func() {
 				<-start
-				result, found, replayErr := ReplayAppInstall(context.Background(), db, scope, req)
+				result, found, replayErr := ReplayAppInstall(barrierCtx, db, scope, req)
 				results <- result
 				foundResults <- found
 				errs <- replayErr
 			})
 		}
 		close(start)
-		<-snapshotsReady
-		<-snapshotsReady
-		close(releaseSnapshots)
-		wg.Wait()
+		for range 2 {
+			select {
+			case <-snapshotsReady:
+			case <-barrierCtx.Done():
+				t.Fatalf("same-scope replays did not reach their snapshots: %v", barrierCtx.Err())
+			}
+		}
+		release()
+		workersDone := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(workersDone)
+		}()
+		select {
+		case <-workersDone:
+		case <-barrierCtx.Done():
+			t.Fatalf("same-scope replays did not finish: %v", barrierCtx.Err())
+		}
 		close(results)
 		close(foundResults)
 		close(errs)
@@ -512,6 +636,98 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppServiceCredential{}, req.AppKey))
 		assert.Equal(t, int64(4), appPluginCountForKey(t, db, &AppRouteClaim{}, req.AppKey))
 		assert.Equal(t, int64(1), appPluginCountForScope(t, db, scope.Key))
+	})
+
+	t.Run("new scope generation replay does not freeze a concurrently revoked installation", func(t *testing.T) {
+		if db.Dialector.Name() != "mysql" {
+			t.Skip("requires MySQL REPEATABLE READ snapshot semantics")
+		}
+
+		req := appPluginModelInstallRequest("replay-revoke", "1.0.0", "https://apps.example.com/replay-revoke/")
+		originalScope := AppIdempotencyScope{ActorID: 113, Key: "replay-revoke-original"}
+		original, err := InstallAppVersion(context.Background(), db, originalScope, req)
+		require.NoError(t, err)
+
+		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelBarrier()
+		versionSnapshotReady := make(chan struct{}, 1)
+		releaseVersionSnapshot := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() {
+				close(releaseVersionSnapshot)
+			})
+		}
+		defer release()
+
+		const callbackName = "test:app_plugin_generation_replay_revoke_snapshot"
+		var coordinated atomic.Bool
+		require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_versions" || !coordinated.CompareAndSwap(false, true) {
+				return
+			}
+			if _, ok := tx.Statement.Dest.(*AppVersion); !ok {
+				return
+			}
+			select {
+			case versionSnapshotReady <- struct{}{}:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("generation replay snapshot barrier: %w", barrierCtx.Err()))
+				return
+			}
+			select {
+			case <-releaseVersionSnapshot:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("generation replay snapshot release: %w", barrierCtx.Err()))
+			}
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Query().Remove(callbackName))
+		})
+
+		type replayOutcome struct {
+			result AppInstallResult
+			found  bool
+			err    error
+		}
+		newScope := AppIdempotencyScope{ActorID: 113, Key: "replay-revoke-new-scope"}
+		replayResult := make(chan replayOutcome, 1)
+		go func() {
+			result, found, replayErr := ReplayAppInstall(barrierCtx, db, newScope, req)
+			replayResult <- replayOutcome{result: result, found: found, err: replayErr}
+		}()
+
+		select {
+		case <-versionSnapshotReady:
+		case <-barrierCtx.Done():
+			t.Fatalf("generation replay did not read the immutable version: %v", barrierCtx.Err())
+		}
+		revoked, err := CompareAndSwapAppInstallationStatus(
+			barrierCtx,
+			db,
+			original.InstallationID,
+			original.Revision,
+			AppInstallationStatusRevoked,
+		)
+		require.NoError(t, err)
+		require.Equal(t, AppInstallationStatusRevoked, revoked.Status)
+		release()
+
+		var outcome replayOutcome
+		select {
+		case outcome = <-replayResult:
+		case <-barrierCtx.Done():
+			t.Fatalf("generation replay did not finish: %v", barrierCtx.Err())
+		}
+		require.NoError(t, outcome.err)
+		assert.False(t, outcome.found)
+		assert.Equal(t, AppInstallResult{}, outcome.result)
+		assert.Zero(t, appPluginCountForScope(t, db, newScope.Key))
+
+		sameScope, found, err := ReplayAppInstall(barrierCtx, db, originalScope, req)
+		require.NoError(t, err)
+		require.True(t, found)
+		assert.Equal(t, original, sameScope)
 	})
 
 	t.Run("same app key and version with different canonical manifest digest is a stable conflict", func(t *testing.T) {
@@ -742,16 +958,34 @@ func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 			t.Skip("requires MySQL REPEATABLE READ snapshot semantics")
 		}
 
+		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelBarrier()
 		const callbackName = "test:app_plugin_route_claim_snapshot"
 		snapshotsReady := make(chan struct{}, 2)
 		releaseSnapshots := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() {
+				close(releaseSnapshots)
+			})
+		}
+		defer release()
 		var coordinated atomic.Int32
 		require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
 			if tx.Statement.Table != "app_entitlement_policies" || coordinated.Add(1) > 2 {
 				return
 			}
-			snapshotsReady <- struct{}{}
-			<-releaseSnapshots
+			select {
+			case snapshotsReady <- struct{}{}:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("route collision snapshot barrier: %w", barrierCtx.Err()))
+				return
+			}
+			select {
+			case <-releaseSnapshots:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("route collision snapshot release: %w", barrierCtx.Err()))
+			}
 		}))
 		t.Cleanup(func() {
 			require.NoError(t, db.Callback().Query().Remove(callbackName))
@@ -774,7 +1008,7 @@ func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 			wg.Go(func() {
 				<-start
 				result, installErr := InstallAppVersion(
-					context.Background(),
+					barrierCtx,
 					db,
 					AppIdempotencyScope{ActorID: int64(220 + i), Key: "concurrent-route-" + req.AppKey},
 					req,
@@ -783,10 +1017,24 @@ func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 			})
 		}
 		close(start)
-		<-snapshotsReady
-		<-snapshotsReady
-		close(releaseSnapshots)
-		wg.Wait()
+		for range 2 {
+			select {
+			case <-snapshotsReady:
+			case <-barrierCtx.Done():
+				t.Fatalf("route collision installs did not reach their snapshots: %v", barrierCtx.Err())
+			}
+		}
+		release()
+		workersDone := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(workersDone)
+		}()
+		select {
+		case <-workersDone:
+		case <-barrierCtx.Done():
+			t.Fatalf("route collision installs did not finish: %v", barrierCtx.Err())
+		}
 		close(outcomes)
 
 		var winner installOutcome
@@ -1134,17 +1382,35 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		created, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 333, Key: "cas-upgrade-revoke-v1"}, v1)
 		require.NoError(t, err)
 
+		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelBarrier()
 		casInstallationLocked := make(chan struct{}, 1)
 		upgradeClaimLocked := make(chan struct{}, 1)
 		allowCASClaimDelete := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() {
+				close(allowCASClaimDelete)
+			})
+		}
+		defer release()
 		const updateCallbackName = "test:app_plugin_cas_installation_lock"
 		require.NoError(t, db.Callback().Update().After("gorm:update").Register(updateCallbackName, func(tx *gorm.DB) {
 			status, ok := tx.Statement.Dest.(map[string]any)["status"]
 			if tx.Statement.Table != "app_installations" || !ok || status != AppInstallationStatusRevoked {
 				return
 			}
-			casInstallationLocked <- struct{}{}
-			<-allowCASClaimDelete
+			select {
+			case casInstallationLocked <- struct{}{}:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("CAS installation lock barrier: %w", barrierCtx.Err()))
+				return
+			}
+			select {
+			case <-allowCASClaimDelete:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("CAS claim deletion release: %w", barrierCtx.Err()))
+			}
 		}))
 		t.Cleanup(func() {
 			require.NoError(t, db.Callback().Update().Remove(updateCallbackName))
@@ -1158,7 +1424,11 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 				!claimLockCoordinated.CompareAndSwap(false, true) {
 				return
 			}
-			upgradeClaimLocked <- struct{}{}
+			select {
+			case upgradeClaimLocked <- struct{}{}:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("upgrade ownership lock barrier: %w", barrierCtx.Err()))
+			}
 		}))
 		t.Cleanup(func() {
 			require.NoError(t, db.Callback().Query().Remove(queryCallbackName))
@@ -1167,7 +1437,7 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		casResult := make(chan error, 1)
 		go func() {
 			_, casErr := CompareAndSwapAppInstallationStatus(
-				context.Background(),
+				barrierCtx,
 				db,
 				created.InstallationID,
 				created.Revision,
@@ -1175,24 +1445,42 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 			)
 			casResult <- casErr
 		}()
-		<-casInstallationLocked
+		select {
+		case <-casInstallationLocked:
+		case <-barrierCtx.Done():
+			t.Fatalf("CAS did not lock the installation: %v", barrierCtx.Err())
+		}
 
 		v2 := appPluginModelInstallRequest("cas-upgrade-revoke", "2.0.0", "https://apps.example.com/cas-upgrade-revoke-v2/")
 		upgradeResult := make(chan error, 1)
 		go func() {
 			_, upgradeErr := InstallAppVersion(
-				context.Background(),
+				barrierCtx,
 				db,
 				AppIdempotencyScope{ActorID: 333, Key: "cas-upgrade-revoke-v2"},
 				v2,
 			)
 			upgradeResult <- upgradeErr
 		}()
-		<-upgradeClaimLocked
-		close(allowCASClaimDelete)
+		select {
+		case <-upgradeClaimLocked:
+		case <-barrierCtx.Done():
+			t.Fatalf("upgrade did not reach the ownership lock: %v", barrierCtx.Err())
+		}
+		release()
 
-		casErr := <-casResult
-		upgradeErr := <-upgradeResult
+		var casErr error
+		select {
+		case casErr = <-casResult:
+		case <-barrierCtx.Done():
+			t.Fatalf("CAS did not finish: %v", barrierCtx.Err())
+		}
+		var upgradeErr error
+		select {
+		case upgradeErr = <-upgradeResult:
+		case <-barrierCtx.Done():
+			t.Fatalf("upgrade did not finish: %v", barrierCtx.Err())
+		}
 		require.NoError(t, upgradeErr)
 		if casErr != nil {
 			assert.ErrorIs(t, casErr, ErrAppInstallationRevisionConflict)
@@ -1217,16 +1505,34 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 			t.Skip("requires MySQL REPEATABLE READ snapshot semantics")
 		}
 
+		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelBarrier()
 		const callbackName = "test:app_plugin_same_generation_snapshot"
 		snapshotsReady := make(chan struct{}, 2)
 		releaseSnapshots := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() {
+				close(releaseSnapshots)
+			})
+		}
+		defer release()
 		var coordinated atomic.Int32
 		require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
 			if tx.Statement.Table != "app_installation_idempotencies" || coordinated.Add(1) > 2 {
 				return
 			}
-			snapshotsReady <- struct{}{}
-			<-releaseSnapshots
+			select {
+			case snapshotsReady <- struct{}{}:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("same-generation snapshot barrier: %w", barrierCtx.Err()))
+				return
+			}
+			select {
+			case <-releaseSnapshots:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("same-generation snapshot release: %w", barrierCtx.Err()))
+			}
 		}))
 		t.Cleanup(func() {
 			require.NoError(t, db.Callback().Query().Remove(callbackName))
@@ -1242,16 +1548,30 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 			go func(key string) {
 				defer wg.Done()
 				<-start
-				result, installErr := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 35, Key: key}, req)
+				result, installErr := InstallAppVersion(barrierCtx, db, AppIdempotencyScope{ActorID: 35, Key: key}, req)
 				results <- result
 				errs <- installErr
 			}(scopeKey)
 		}
 		close(start)
-		<-snapshotsReady
-		<-snapshotsReady
-		close(releaseSnapshots)
-		wg.Wait()
+		for range 2 {
+			select {
+			case <-snapshotsReady:
+			case <-barrierCtx.Done():
+				t.Fatalf("same-generation installs did not reach their snapshots: %v", barrierCtx.Err())
+			}
+		}
+		release()
+		workersDone := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(workersDone)
+		}()
+		select {
+		case <-workersDone:
+		case <-barrierCtx.Done():
+			t.Fatalf("same-generation installs did not finish: %v", barrierCtx.Err())
+		}
 		close(results)
 		close(errs)
 
@@ -1276,6 +1596,56 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		created, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 34, Key: "concurrent-upgrade-v1"}, v1)
 		require.NoError(t, err)
 
+		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelBarrier()
+		type workerKey struct{}
+		criticalSectionReady := make(chan string, 2)
+		releaseCriticalSection := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() {
+				close(releaseCriticalSection)
+			})
+		}
+		defer release()
+
+		const callbackName = "test:app_plugin_different_version_ownership_race"
+		var coordinated sync.Map
+		require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+			worker, _ := tx.Statement.Context.Value(workerKey{}).(string)
+			if worker == "" {
+				return
+			}
+			if db.Dialector.Name() == "sqlite" {
+				idempotency, ok := tx.Statement.Dest.(*AppInstallationIdempotency)
+				if !ok || idempotency.ActorID != 34 {
+					return
+				}
+			} else {
+				claim, ok := tx.Statement.Dest.(*AppRouteClaim)
+				if !ok || claim.AppKey != v1.AppKey || claim.Kind != "app_key" {
+					return
+				}
+			}
+			if _, loaded := coordinated.LoadOrStore(worker, struct{}{}); loaded {
+				return
+			}
+			select {
+			case criticalSectionReady <- worker:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("different-version critical-section barrier: %w", barrierCtx.Err()))
+				return
+			}
+			select {
+			case <-releaseCriticalSection:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("different-version critical-section release: %w", barrierCtx.Err()))
+			}
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Create().Remove(callbackName))
+		})
+
 		start := make(chan struct{})
 		results := make(chan AppInstallResult, 2)
 		errs := make(chan error, 2)
@@ -1286,14 +1656,32 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				<-start
+				ctx := context.WithValue(barrierCtx, workerKey{}, version)
 				req := appPluginModelInstallRequest("concurrent-upgrade", version, "https://apps.example.com/concurrent-upgrade-v"+string(version[0])+"/")
-				result, installErr := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 34, Key: "concurrent-upgrade-v" + string(version[0])}, req)
+				result, installErr := InstallAppVersion(ctx, db, AppIdempotencyScope{ActorID: 34, Key: "concurrent-upgrade-v" + string(version[0])}, req)
 				results <- result
 				errs <- installErr
 			}()
 		}
 		close(start)
-		wg.Wait()
+		for range 2 {
+			select {
+			case <-criticalSectionReady:
+			case <-barrierCtx.Done():
+				t.Fatalf("different-version upgrades did not reach the ownership critical section: %v", barrierCtx.Err())
+			}
+		}
+		release()
+		workersDone := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(workersDone)
+		}()
+		select {
+		case <-workersDone:
+		case <-barrierCtx.Done():
+			t.Fatalf("different-version upgrades did not finish: %v", barrierCtx.Err())
+		}
 		close(results)
 		close(errs)
 
