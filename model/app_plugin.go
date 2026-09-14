@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -267,25 +268,34 @@ func AppPluginErrorCode(err error) string {
 	case errors.Is(err, ErrAppVersionConflict):
 		return "app_version_conflict"
 	case errors.Is(err, ErrAppIdempotencyConflict):
-		return "app_idempotency_conflict"
+		return "idempotency_conflict"
 	case errors.Is(err, ErrAppRouteClaimConflict):
-		return "app_route_claim_conflict"
+		return "app_route_collision"
+	case errors.Is(err, ErrAppInstallationRevisionConflict):
+		return "version_conflict"
+	case errors.Is(err, ErrAppInstallationRevoked),
+		errors.Is(err, ErrAppInstallationStatusInvalid):
+		return "invalid_state_transition"
+	case errors.Is(err, ErrAppInstallRequestInvalid):
+		return "validation_error"
 	default:
-		return "app_plugin_error"
+		return "service_unavailable"
 	}
 }
 
 func MigrateAppPluginTables(db *gorm.DB) error {
-	if db.Migrator().HasTable(&AppInstallation{}) && !db.Migrator().HasColumn(&AppInstallation{}, "installation_id") {
-		columnType := "text"
-		switch db.Dialector.Name() {
-		case "mysql":
-			columnType = "varchar(64)"
-		case "postgres":
-			columnType = "varchar(64)"
-		}
-		if err := db.Exec("ALTER TABLE app_installations ADD COLUMN installation_id " + columnType).Error; err != nil {
-			return err
+	if db.Migrator().HasTable(&AppInstallation{}) {
+		if !db.Migrator().HasColumn(&AppInstallation{}, "installation_id") {
+			columnType := "text"
+			switch db.Dialector.Name() {
+			case "mysql":
+				columnType = "varchar(64)"
+			case "postgres":
+				columnType = "varchar(64)"
+			}
+			if err := db.Exec("ALTER TABLE app_installations ADD COLUMN installation_id " + columnType).Error; err != nil {
+				return err
+			}
 		}
 		if err := db.Exec("UPDATE app_installations SET installation_id = id WHERE installation_id IS NULL OR installation_id = ''").Error; err != nil {
 			return err
@@ -400,7 +410,7 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 		return AppInstallResult{}, err
 	}
 	var result AppInstallResult
-	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	transaction := func(tx *gorm.DB) error {
 		claim := AppInstallationIdempotency{
 			ScopeHash:   scopeHash,
 			ActorID:     scope.ActorID,
@@ -412,7 +422,7 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 			return err
 		}
 		var replay AppInstallationIdempotency
-		if err := tx.Where("scope_hash = ?", scopeHash).First(&replay).Error; err != nil {
+		if err := lockForUpdate(tx).Where("scope_hash = ?", scopeHash).First(&replay).Error; err != nil {
 			return err
 		}
 		if replay.RequestHash != requestHash {
@@ -453,7 +463,7 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&version).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("identity_hash = ?", version.IdentityHash).First(&version).Error; err != nil {
+		if err := lockForUpdate(tx).Where("identity_hash = ?", version.IdentityHash).First(&version).Error; err != nil {
 			return err
 		}
 		if version.ManifestSHA256 != req.ManifestSHA256 {
@@ -466,10 +476,7 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 			Create(&ownership).Error; err != nil {
 			return err
 		}
-		ownershipQuery := tx.Where("claim_key = ?", ownership.ClaimKey)
-		if tx.Dialector.Name() != "sqlite" {
-			ownershipQuery = ownershipQuery.Clauses(clause.Locking{Strength: "UPDATE"})
-		}
+		ownershipQuery := lockForUpdate(tx).Where("claim_key = ?", ownership.ClaimKey)
 		if err := ownershipQuery.First(&ownership).Error; err != nil {
 			return err
 		}
@@ -500,10 +507,7 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 				return err
 			}
 		} else {
-			installationQuery := tx.Where("installation_id = ?", ownership.InstallationID)
-			if tx.Dialector.Name() != "sqlite" {
-				installationQuery = installationQuery.Clauses(clause.Locking{Strength: "UPDATE"})
-			}
+			installationQuery := lockForUpdate(tx).Where("installation_id = ?", ownership.InstallationID)
 			if err := installationQuery.First(&installation).Error; err != nil {
 				return err
 			}
@@ -603,7 +607,19 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 		}
 		result = resultFromInstallation(version.ID, installation, credentialSet)
 		return freezeAppInstallIdempotency(tx, scopeHash, claimToken, &result)
-	})
+	}
+	const maxTransactionAttempts = 3
+	for attempt := range maxTransactionAttempts {
+		result = AppInstallResult{}
+		err = db.WithContext(ctx).Transaction(transaction)
+		if err == nil || db.Dialector.Name() != "mysql" {
+			break
+		}
+		var mysqlErr *mysqlDriver.MySQLError
+		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1213 || attempt == maxTransactionAttempts-1 {
+			break
+		}
+	}
 	return result, err
 }
 
@@ -1011,7 +1027,7 @@ func frozenAppInstallResponse(result AppInstallResult) (string, string, error) {
 
 func findFrozenAppInstallResponse(tx *gorm.DB, installationID, appVersionID string) (AppInstallResult, bool, error) {
 	var frozen AppInstallationIdempotency
-	query := tx.Where("installation_id = ? AND app_version_id = ? AND response_json <> ''", installationID, appVersionID).
+	query := lockForUpdate(tx).Where("installation_id = ? AND app_version_id = ? AND response_json <> ''", installationID, appVersionID).
 		Order("id").
 		Limit(1).
 		Find(&frozen)

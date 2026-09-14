@@ -9,8 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -97,6 +99,67 @@ func TestAppPluginMigrationFreshUpgradeReplay(t *testing.T) {
 		var ownership AppRouteClaim
 		require.NoError(t, oldDB.Where("app_key = ? AND kind = ?", "legacy", "app_key").First(&ownership).Error)
 		assert.Equal(t, upgraded.InstallationID, ownership.InstallationID)
+	})
+
+	t.Run("partial DDL resume backfills null and empty public identifiers before auto migration", func(t *testing.T) {
+		oldDB := openAppPluginModelDB(t)
+		require.NoError(t, oldDB.Migrator().DropTable(&AppRouteClaim{}, &AppInstallation{}))
+		require.NoError(t, oldDB.AutoMigrate(&legacyAppInstallation{}))
+		legacyInstallations := []legacyAppInstallation{
+			{
+				ID:                   301,
+				AppKey:               "partial-ddl-null",
+				AppVersionID:         "appver-null",
+				ManifestVersion:      "1.0.0",
+				ManifestSHA256:       appPluginDigest("partial-ddl-null"),
+				BaseURL:              "https://apps.example.com/partial-ddl-null/",
+				EnabledSurfaces:      AppStringList{},
+				AllowedParentOrigins: AppStringList{},
+				AllowedOrigins:       AppStringList{},
+				AllowedUserPolicy:    AppAllowedUserPolicy{},
+				NetworkPolicy:        AppNetworkPolicy{},
+				EntitlementPolicyID:  "policy",
+				Status:               AppInstallationStatusDisabled,
+				Revision:             1,
+			},
+			{
+				ID:                   302,
+				AppKey:               "partial-ddl-empty",
+				AppVersionID:         "appver-empty",
+				ManifestVersion:      "1.0.0",
+				ManifestSHA256:       appPluginDigest("partial-ddl-empty"),
+				BaseURL:              "https://apps.example.com/partial-ddl-empty/",
+				EnabledSurfaces:      AppStringList{},
+				AllowedParentOrigins: AppStringList{},
+				AllowedOrigins:       AppStringList{},
+				AllowedUserPolicy:    AppAllowedUserPolicy{},
+				NetworkPolicy:        AppNetworkPolicy{},
+				EntitlementPolicyID:  "policy",
+				Status:               AppInstallationStatusDisabled,
+				Revision:             1,
+			},
+		}
+		require.NoError(t, oldDB.Create(&legacyInstallations).Error)
+
+		columnType := "text"
+		if oldDB.Dialector.Name() != "sqlite" {
+			columnType = "varchar(64)"
+		}
+		require.NoError(t, oldDB.Exec("ALTER TABLE app_installations ADD COLUMN installation_id "+columnType).Error)
+		require.NoError(t, oldDB.Exec("UPDATE app_installations SET installation_id = '' WHERE id = ?", 302).Error)
+
+		require.NoError(t, MigrateAppPluginTables(oldDB))
+		require.NoError(t, MigrateAppPluginTables(oldDB))
+
+		var upgraded []AppInstallation
+		require.NoError(t, oldDB.Where("id IN ?", []uint{301, 302}).Order("id").Find(&upgraded).Error)
+		require.Len(t, upgraded, 2)
+		assert.Equal(t, []string{"301", "302"}, []string{upgraded[0].InstallationID, upgraded[1].InstallationID})
+		for _, installation := range upgraded {
+			var ownership AppRouteClaim
+			require.NoError(t, oldDB.Where("app_key = ? AND kind = ?", installation.AppKey, "app_key").First(&ownership).Error)
+			assert.Equal(t, installation.InstallationID, ownership.InstallationID)
+		}
 	})
 
 	t.Run("upgrade converges duplicate legacy ownership without deleting history", func(t *testing.T) {
@@ -261,6 +324,28 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 	})
 	require.NoError(t, MigrateAppPluginTables(db))
 	seedAppPluginModelPolicy(t, db, "policy-basic")
+
+	t.Run("maps model errors to the stable error registry", func(t *testing.T) {
+		tests := []struct {
+			name string
+			err  error
+			code string
+		}{
+			{name: "version conflict", err: ErrAppVersionConflict, code: "app_version_conflict"},
+			{name: "idempotency conflict", err: ErrAppIdempotencyConflict, code: "idempotency_conflict"},
+			{name: "route collision", err: ErrAppRouteClaimConflict, code: "app_route_collision"},
+			{name: "revision conflict", err: ErrAppInstallationRevisionConflict, code: "version_conflict"},
+			{name: "revoked installation", err: ErrAppInstallationRevoked, code: "invalid_state_transition"},
+			{name: "invalid installation status", err: ErrAppInstallationStatusInvalid, code: "invalid_state_transition"},
+			{name: "invalid install request", err: ErrAppInstallRequestInvalid, code: "validation_error"},
+			{name: "unknown internal error", err: errors.New("database unavailable"), code: "service_unavailable"},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				assert.Equal(t, test.code, AppPluginErrorCode(fmt.Errorf("wrapped: %w", test.err)))
+			})
+		}
+	})
 
 	t.Run("same scope request hash and content digest replays frozen response with stable IDs", func(t *testing.T) {
 		req := appPluginModelInstallRequest("writer", "1.0.0", "https://apps.example.com/writer/")
@@ -732,6 +817,65 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 	assert.Equal(t, 1, successes)
 	assert.Equal(t, 1, conflicts)
 
+	t.Run("concurrent same generation with different scopes replays one installation", func(t *testing.T) {
+		if db.Dialector.Name() != "mysql" {
+			t.Skip("requires MySQL REPEATABLE READ snapshot semantics")
+		}
+
+		const callbackName = "test:app_plugin_same_generation_snapshot"
+		snapshotsReady := make(chan struct{}, 2)
+		releaseSnapshots := make(chan struct{})
+		var coordinated atomic.Int32
+		require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_installation_idempotencies" || coordinated.Add(1) > 2 {
+				return
+			}
+			snapshotsReady <- struct{}{}
+			<-releaseSnapshots
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Query().Remove(callbackName))
+		})
+
+		req := appPluginModelInstallRequest("concurrent-generation", "1.0.0", "https://apps.example.com/concurrent-generation/")
+		start := make(chan struct{})
+		results := make(chan AppInstallResult, 2)
+		errs := make(chan error, 2)
+		var wg sync.WaitGroup
+		for _, scopeKey := range []string{"concurrent-generation-a", "concurrent-generation-b"} {
+			wg.Add(1)
+			go func(key string) {
+				defer wg.Done()
+				<-start
+				result, installErr := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 35, Key: key}, req)
+				results <- result
+				errs <- installErr
+			}(scopeKey)
+		}
+		close(start)
+		<-snapshotsReady
+		<-snapshotsReady
+		close(releaseSnapshots)
+		wg.Wait()
+		close(results)
+		close(errs)
+
+		var installed []AppInstallResult
+		for installErr := range errs {
+			require.NoError(t, installErr)
+		}
+		for result := range results {
+			installed = append(installed, result)
+		}
+		require.Len(t, installed, 2)
+		assert.Equal(t, installed[0], installed[1])
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppVersion{}, req.AppKey))
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppInstallation{}, req.AppKey))
+		assert.Equal(t, int64(1), appPluginCountForKey(t, db, &AppServiceCredential{}, req.AppKey))
+		assert.Equal(t, int64(4), appPluginCountForKey(t, db, &AppRouteClaim{}, req.AppKey))
+		assert.Equal(t, int64(2), appPluginCountForScope(t, db, "concurrent-generation-a")+appPluginCountForScope(t, db, "concurrent-generation-b"))
+	})
+
 	t.Run("concurrent different versions serialize onto one installation", func(t *testing.T) {
 		v1 := appPluginModelInstallRequest("concurrent-upgrade", "1.0.0", "https://apps.example.com/concurrent-upgrade-v1/")
 		created, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 34, Key: "concurrent-upgrade-v1"}, v1)
@@ -790,14 +934,17 @@ func openAppPluginModelDB(t *testing.T) *gorm.DB {
 	)
 	switch dialect {
 	case "sqlite":
+		common.SetMainDatabaseType(common.DatabaseTypeSQLite)
 		if dsn == "" {
 			dsn = filepath.Join(t.TempDir(), "app_plugin.sqlite")
 		}
 		db, err = gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	case "mysql":
+		common.SetMainDatabaseType(common.DatabaseTypeMySQL)
 		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required for mysql")
 		db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	case "postgres", "postgresql":
+		common.SetMainDatabaseType(common.DatabaseTypePostgreSQL)
 		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required for postgres")
 		db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	default:
