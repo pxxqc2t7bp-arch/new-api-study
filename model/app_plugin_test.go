@@ -1685,8 +1685,9 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 
 		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancelBarrier()
+		type workerKey struct{}
 		casInstallationLocked := make(chan struct{}, 1)
-		upgradeClaimLocked := make(chan struct{}, 1)
+		upgradeClaimAttempted := make(chan struct{}, 1)
 		allowCASClaimDelete := make(chan struct{})
 		var releaseOnce sync.Once
 		release := func() {
@@ -1717,18 +1718,26 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 			require.NoError(t, db.Callback().Update().Remove(updateCallbackName))
 		})
 
-		var claimLockCoordinated atomic.Bool
-		const queryCallbackName = "test:app_plugin_upgrade_claim_lock"
-		require.NoError(t, db.Callback().Query().After("gorm:query").Register(queryCallbackName, func(tx *gorm.DB) {
-			if tx.Statement.Table != "app_route_claims" ||
-				!strings.Contains(tx.Statement.SQL.String(), "FOR UPDATE") ||
-				!claimLockCoordinated.CompareAndSwap(false, true) {
+		var claimAttemptCoordinated atomic.Bool
+		var upgradeInstallationLockStarted atomic.Bool
+		const queryCallbackName = "test:app_plugin_upgrade_lock_attempts"
+		require.NoError(t, db.Callback().Query().Before("gorm:query").Register(queryCallbackName, func(tx *gorm.DB) {
+			worker, _ := tx.Statement.Context.Value(workerKey{}).(string)
+			if worker != "upgrade" {
 				return
 			}
-			select {
-			case upgradeClaimLocked <- struct{}{}:
-			case <-barrierCtx.Done():
-				tx.AddError(fmt.Errorf("upgrade ownership lock barrier: %w", barrierCtx.Err()))
+			_, locksForUpdate := tx.Statement.Clauses["FOR"]
+			switch {
+			case tx.Statement.Table == "app_route_claims" &&
+				locksForUpdate &&
+				claimAttemptCoordinated.CompareAndSwap(false, true):
+				select {
+				case upgradeClaimAttempted <- struct{}{}:
+				case <-barrierCtx.Done():
+					tx.AddError(fmt.Errorf("upgrade ownership lock attempt barrier: %w", barrierCtx.Err()))
+				}
+			case tx.Statement.Table == "app_installations" && locksForUpdate:
+				upgradeInstallationLockStarted.Store(true)
 			}
 		}))
 		t.Cleanup(func() {
@@ -1755,8 +1764,9 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		v2 := appPluginModelInstallRequest("cas-upgrade-revoke", "2.0.0", "https://apps.example.com/cas-upgrade-revoke-v2/")
 		upgradeResult := make(chan error, 1)
 		go func() {
+			ctx := context.WithValue(barrierCtx, workerKey{}, "upgrade")
 			_, upgradeErr := InstallAppVersion(
-				barrierCtx,
+				ctx,
 				db,
 				AppIdempotencyScope{ActorID: 333, Key: "cas-upgrade-revoke-v2"},
 				v2,
@@ -1764,10 +1774,11 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 			upgradeResult <- upgradeErr
 		}()
 		select {
-		case <-upgradeClaimLocked:
+		case <-upgradeClaimAttempted:
 		case <-barrierCtx.Done():
-			t.Fatalf("upgrade did not reach the ownership lock: %v", barrierCtx.Err())
+			t.Fatalf("upgrade did not attempt the ownership lock: %v", barrierCtx.Err())
 		}
+		assert.False(t, upgradeInstallationLockStarted.Load(), "upgrade must remain blocked before locking the installation")
 		release()
 
 		var casErr error
