@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	goversion "github.com/hashicorp/go-version"
+	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -233,6 +234,10 @@ func (s *AppPluginInstallationService) CreateEntitlementPolicy(ctx context.Conte
 		if !retry && s.db.Dialector.Name() == "mysql" {
 			var mysqlErr *mysqlDriver.MySQLError
 			retry = errors.As(err, &mysqlErr) && mysqlErr.Number == 1213
+		}
+		if !retry && s.db.Dialector.Name() == "postgres" {
+			var pgErr *pgconn.PgError
+			retry = errors.As(err, &pgErr) && pgErr.Code == "40P01"
 		}
 		if !retry {
 			return AppEntitlementPolicyResult{}, err

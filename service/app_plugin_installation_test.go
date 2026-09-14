@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/glebarez/sqlite"
 	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	gormMySQL "gorm.io/driver/mysql"
@@ -269,9 +270,9 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 		}
 	})
 
-	t.Run("version allocation retries a transient MySQL deadlock", func(t *testing.T) {
-		if db.Dialector.Name() != "mysql" {
-			t.Skip("requires MySQL deadlock retry semantics")
+	t.Run("version allocation retries a transient database deadlock", func(t *testing.T) {
+		if db.Dialector.Name() == "sqlite" {
+			t.Skip("requires database deadlock retry semantics")
 		}
 
 		const callbackName = "test:app_entitlement_policy_deadlock"
@@ -282,7 +283,12 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 				return
 			}
 			if attempts.Add(1) == 1 {
-				tx.AddError(&mysqlDriver.MySQLError{Number: 1213, Message: "injected policy deadlock"})
+				switch db.Dialector.Name() {
+				case "mysql":
+					tx.AddError(&mysqlDriver.MySQLError{Number: 1213, Message: "injected policy deadlock"})
+				case "postgres":
+					tx.AddError(&pgconn.PgError{Code: "40P01", Message: "injected policy deadlock"})
+				}
 			}
 		}))
 		t.Cleanup(func() {
@@ -298,9 +304,36 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 		assert.Equal(t, int64(1), result.Version)
 	})
 
-	t.Run("version allocation does not retry a non-deadlock MySQL error", func(t *testing.T) {
-		if db.Dialector.Name() != "mysql" {
-			t.Skip("requires MySQL error classification")
+	t.Run("version allocation stops after persistent PostgreSQL deadlocks", func(t *testing.T) {
+		if db.Dialector.Name() != "postgres" {
+			t.Skip("requires PostgreSQL deadlock retry semantics")
+		}
+
+		const callbackName = "test:app_entitlement_policy_pg_deadlock_limit"
+		var attempts atomic.Int32
+		require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+			policy, ok := tx.Statement.Dest.(*model.AppEntitlementPolicy)
+			if !ok || policy.Key != "policy-pg-deadlock-limit" {
+				return
+			}
+			attempts.Add(1)
+			tx.AddError(&pgconn.PgError{Code: "40P01", Message: "injected persistent policy deadlock"})
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Create().Remove(callbackName))
+		})
+
+		_, err := svc.CreateEntitlementPolicy(context.Background(), AppEntitlementPolicyDraft{
+			Key:   "policy-pg-deadlock-limit",
+			Rules: map[string][]string{"files": {"read"}},
+		})
+		require.EqualError(t, err, "entitlement policy version allocation failed")
+		assert.Equal(t, int32(8), attempts.Load())
+	})
+
+	t.Run("version allocation does not retry a non-deadlock database error", func(t *testing.T) {
+		if db.Dialector.Name() == "sqlite" {
+			t.Skip("requires database error classification")
 		}
 
 		const callbackName = "test:app_entitlement_policy_no_retry"
@@ -311,7 +344,12 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 				return
 			}
 			attempts.Add(1)
-			tx.AddError(&mysqlDriver.MySQLError{Number: 1205, Message: "injected policy lock wait timeout"})
+			switch db.Dialector.Name() {
+			case "mysql":
+				tx.AddError(&mysqlDriver.MySQLError{Number: 1205, Message: "injected policy lock wait timeout"})
+			case "postgres":
+				tx.AddError(&pgconn.PgError{Code: "55P03", Message: "injected policy lock not available"})
+			}
 		}))
 		t.Cleanup(func() {
 			require.NoError(t, db.Callback().Create().Remove(callbackName))
@@ -322,7 +360,16 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 			Rules: map[string][]string{"files": {"read"}},
 		})
 		require.Error(t, err)
-		assert.Equal(t, uint16(1205), err.(*mysqlDriver.MySQLError).Number)
+		switch db.Dialector.Name() {
+		case "mysql":
+			var mysqlErr *mysqlDriver.MySQLError
+			require.ErrorAs(t, err, &mysqlErr)
+			assert.Equal(t, uint16(1205), mysqlErr.Number)
+		case "postgres":
+			var pgErr *pgconn.PgError
+			require.ErrorAs(t, err, &pgErr)
+			assert.Equal(t, "55P03", pgErr.Code)
+		}
 		assert.Equal(t, int32(1), attempts.Load())
 	})
 

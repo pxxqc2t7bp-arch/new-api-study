@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/glebarez/sqlite"
 	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	gormMySQL "gorm.io/driver/mysql"
@@ -1269,6 +1270,34 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 	assert.Equal(t, 1, successes)
 	assert.Equal(t, 1, conflicts)
 
+	t.Run("CAS rejects ownership assigned to another installation", func(t *testing.T) {
+		req := appPluginModelInstallRequest("cas-owner-mismatch", "1.0.0", "https://apps.example.com/cas-owner-mismatch/")
+		installation, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 329, Key: req.AppKey}, req)
+		require.NoError(t, err)
+		require.NoError(t, db.Model(&AppRouteClaim{}).
+			Where("app_key = ? AND kind = ?", req.AppKey, "app_key").
+			Update("installation_id", "inst_other").Error)
+		t.Cleanup(func() {
+			require.NoError(t, db.Model(&AppRouteClaim{}).
+				Where("app_key = ? AND kind = ?", req.AppKey, "app_key").
+				Update("installation_id", installation.InstallationID).Error)
+		})
+
+		_, err = CompareAndSwapAppInstallationStatus(
+			context.Background(),
+			db,
+			installation.InstallationID,
+			installation.Revision,
+			AppInstallationStatusEnabled,
+		)
+		assert.ErrorIs(t, err, ErrAppRouteClaimConflict)
+
+		var current AppInstallation
+		require.NoError(t, db.Where("installation_id = ?", installation.InstallationID).First(&current).Error)
+		assert.Equal(t, AppInstallationStatusDisabled, current.Status)
+		assert.Equal(t, installation.Revision, current.Revision)
+	})
+
 	t.Run("CAS transaction retries only MySQL deadlocks and stops after three attempts", func(t *testing.T) {
 		req := appPluginModelInstallRequest("cas-retry-limit-"+db.Dialector.Name(), "1.0.0", "https://apps.example.com/cas-retry-limit-"+db.Dialector.Name()+"/")
 		installation, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 330, Key: req.AppKey}, req)
@@ -1371,6 +1400,278 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		require.Error(t, err)
 		assert.Equal(t, uint16(1205), err.(*mysqlDriver.MySQLError).Number)
 		assert.Equal(t, int32(1), attempts.Load())
+	})
+
+	t.Run("CAS transaction retries a transient PostgreSQL deadlock", func(t *testing.T) {
+		if db.Dialector.Name() != "postgres" {
+			t.Skip("requires PostgreSQL deadlock retry semantics")
+		}
+
+		req := appPluginModelInstallRequest("cas-pg-retry-success", "1.0.0", "https://apps.example.com/cas-pg-retry-success/")
+		installation, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 333, Key: req.AppKey}, req)
+		require.NoError(t, err)
+
+		const callbackName = "test:app_plugin_cas_pg_retry_success"
+		var attempts atomic.Int32
+		require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_installations" {
+				return
+			}
+			if attempts.Add(1) == 1 {
+				tx.AddError(&pgconn.PgError{Code: "40P01", Message: "injected transient CAS deadlock"})
+			}
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Update().Remove(callbackName))
+		})
+
+		updated, err := CompareAndSwapAppInstallationStatus(
+			context.Background(),
+			db,
+			installation.InstallationID,
+			installation.Revision,
+			AppInstallationStatusEnabled,
+		)
+		require.NoError(t, err)
+		assert.Equal(t, int32(2), attempts.Load())
+		assert.Equal(t, AppInstallationStatusEnabled, updated.Status)
+		assert.Equal(t, installation.Revision+1, updated.Revision)
+	})
+
+	t.Run("CAS transaction stops after three persistent PostgreSQL deadlocks", func(t *testing.T) {
+		if db.Dialector.Name() != "postgres" {
+			t.Skip("requires PostgreSQL deadlock retry semantics")
+		}
+
+		req := appPluginModelInstallRequest("cas-pg-retry-limit", "1.0.0", "https://apps.example.com/cas-pg-retry-limit/")
+		installation, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 334, Key: req.AppKey}, req)
+		require.NoError(t, err)
+
+		const callbackName = "test:app_plugin_cas_pg_retry_limit"
+		var attempts atomic.Int32
+		require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_installations" {
+				return
+			}
+			attempts.Add(1)
+			tx.AddError(&pgconn.PgError{Code: "40P01", Message: "injected persistent CAS deadlock"})
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Update().Remove(callbackName))
+		})
+
+		_, err = CompareAndSwapAppInstallationStatus(
+			context.Background(),
+			db,
+			installation.InstallationID,
+			installation.Revision,
+			AppInstallationStatusEnabled,
+		)
+		var pgErr *pgconn.PgError
+		require.ErrorAs(t, err, &pgErr)
+		assert.Equal(t, "40P01", pgErr.Code)
+		assert.Equal(t, int32(3), attempts.Load())
+	})
+
+	t.Run("CAS transaction does not retry a non-deadlock PostgreSQL error", func(t *testing.T) {
+		if db.Dialector.Name() != "postgres" {
+			t.Skip("requires PostgreSQL error classification")
+		}
+
+		req := appPluginModelInstallRequest("cas-pg-no-retry", "1.0.0", "https://apps.example.com/cas-pg-no-retry/")
+		installation, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 335, Key: req.AppKey}, req)
+		require.NoError(t, err)
+
+		const callbackName = "test:app_plugin_cas_pg_no_retry"
+		var attempts atomic.Int32
+		require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_installations" {
+				return
+			}
+			attempts.Add(1)
+			tx.AddError(&pgconn.PgError{Code: "55P03", Message: "injected lock not available"})
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Update().Remove(callbackName))
+		})
+
+		_, err = CompareAndSwapAppInstallationStatus(
+			context.Background(),
+			db,
+			installation.InstallationID,
+			installation.Revision,
+			AppInstallationStatusEnabled,
+		)
+		var pgErr *pgconn.PgError
+		require.ErrorAs(t, err, &pgErr)
+		assert.Equal(t, "55P03", pgErr.Code)
+		assert.Equal(t, int32(1), attempts.Load())
+	})
+
+	t.Run("concurrent PostgreSQL CAS and upgrade acquire ownership before installation", func(t *testing.T) {
+		if db.Dialector.Name() != "postgres" {
+			t.Skip("requires PostgreSQL row-level deadlock detection")
+		}
+
+		v1 := appPluginModelInstallRequest("pg-cas-upgrade", "1.0.0", "https://apps.example.com/pg-cas-upgrade-v1/")
+		created, err := InstallAppVersion(context.Background(), db, AppIdempotencyScope{ActorID: 336, Key: "pg-cas-upgrade-v1"}, v1)
+		require.NoError(t, err)
+
+		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelBarrier()
+		type workerKey struct{}
+		ownershipLocked := make(chan struct{}, 1)
+		casOwnershipAttempted := make(chan struct{}, 1)
+		casInstallationLocked := make(chan struct{}, 1)
+		upgradeInstallationAttempted := make(chan struct{}, 1)
+		releaseOwnership := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() {
+			releaseOnce.Do(func() {
+				close(releaseOwnership)
+			})
+		}
+		defer release()
+
+		ownershipClaimKey := appKeyClaim(v1.AppKey, "").ClaimKey
+		var holderCoordinated atomic.Bool
+		const afterQueryCallback = "test:app_plugin_pg_upgrade_holds_ownership"
+		require.NoError(t, db.Callback().Query().After("gorm:query").Register(afterQueryCallback, func(tx *gorm.DB) {
+			worker, _ := tx.Statement.Context.Value(workerKey{}).(string)
+			if worker != "upgrade" ||
+				tx.Statement.Table != "app_route_claims" ||
+				!strings.Contains(tx.Statement.SQL.String(), "FOR UPDATE") ||
+				len(tx.Statement.Vars) == 0 ||
+				tx.Statement.Vars[0] != ownershipClaimKey ||
+				!holderCoordinated.CompareAndSwap(false, true) {
+				return
+			}
+			select {
+			case ownershipLocked <- struct{}{}:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("upgrade ownership lock barrier: %w", barrierCtx.Err()))
+				return
+			}
+			select {
+			case <-releaseOwnership:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("upgrade ownership release: %w", barrierCtx.Err()))
+			}
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Query().Remove(afterQueryCallback))
+		})
+
+		var casClaimCoordinated atomic.Bool
+		var upgradeInstallationCoordinated atomic.Bool
+		const beforeQueryCallback = "test:app_plugin_pg_lock_attempts"
+		require.NoError(t, db.Callback().Query().Before("gorm:query").Register(beforeQueryCallback, func(tx *gorm.DB) {
+			worker, _ := tx.Statement.Context.Value(workerKey{}).(string)
+			_, locksForUpdate := tx.Statement.Clauses["FOR"]
+			switch {
+			case worker == "cas" &&
+				tx.Statement.Table == "app_route_claims" &&
+				locksForUpdate &&
+				casClaimCoordinated.CompareAndSwap(false, true):
+				select {
+				case casOwnershipAttempted <- struct{}{}:
+				case <-barrierCtx.Done():
+					tx.AddError(fmt.Errorf("CAS ownership attempt barrier: %w", barrierCtx.Err()))
+				}
+			case worker == "upgrade" &&
+				tx.Statement.Table == "app_installations" &&
+				upgradeInstallationCoordinated.CompareAndSwap(false, true):
+				select {
+				case upgradeInstallationAttempted <- struct{}{}:
+				case <-barrierCtx.Done():
+					tx.AddError(fmt.Errorf("upgrade installation attempt barrier: %w", barrierCtx.Err()))
+				}
+			}
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Query().Remove(beforeQueryCallback))
+		})
+
+		var casUpdateCoordinated atomic.Bool
+		const updateCallback = "test:app_plugin_pg_cas_holds_installation"
+		require.NoError(t, db.Callback().Update().After("gorm:update").Register(updateCallback, func(tx *gorm.DB) {
+			worker, _ := tx.Statement.Context.Value(workerKey{}).(string)
+			updates, ok := tx.Statement.Dest.(map[string]any)
+			if worker != "cas" ||
+				tx.Statement.Table != "app_installations" ||
+				!ok ||
+				updates["status"] != AppInstallationStatusRevoked ||
+				!casUpdateCoordinated.CompareAndSwap(false, true) {
+				return
+			}
+			select {
+			case casInstallationLocked <- struct{}{}:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("CAS installation lock barrier: %w", barrierCtx.Err()))
+				return
+			}
+			select {
+			case <-upgradeInstallationAttempted:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("upgrade installation attempt wait: %w", barrierCtx.Err()))
+			}
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Update().Remove(updateCallback))
+		})
+
+		v2 := appPluginModelInstallRequest("pg-cas-upgrade", "2.0.0", "https://apps.example.com/pg-cas-upgrade-v2/")
+		upgradeResult := make(chan error, 1)
+		go func() {
+			ctx := context.WithValue(barrierCtx, workerKey{}, "upgrade")
+			_, upgradeErr := InstallAppVersion(ctx, db, AppIdempotencyScope{ActorID: 336, Key: "pg-cas-upgrade-v2"}, v2)
+			upgradeResult <- upgradeErr
+		}()
+		select {
+		case <-ownershipLocked:
+		case <-barrierCtx.Done():
+			t.Fatalf("upgrade did not lock ownership: %v", barrierCtx.Err())
+		}
+
+		casResult := make(chan error, 1)
+		go func() {
+			ctx := context.WithValue(barrierCtx, workerKey{}, "cas")
+			_, casErr := CompareAndSwapAppInstallationStatus(
+				ctx,
+				db,
+				created.InstallationID,
+				created.Revision,
+				AppInstallationStatusRevoked,
+			)
+			casResult <- casErr
+		}()
+
+		ordered := false
+		select {
+		case <-casOwnershipAttempted:
+			ordered = true
+			release()
+		case <-casInstallationLocked:
+			release()
+		case <-barrierCtx.Done():
+			t.Fatalf("CAS did not attempt an ownership or installation lock: %v", barrierCtx.Err())
+		}
+
+		var upgradeErr error
+		select {
+		case upgradeErr = <-upgradeResult:
+		case <-barrierCtx.Done():
+			t.Fatalf("upgrade did not finish: %v", barrierCtx.Err())
+		}
+		var casErr error
+		select {
+		case casErr = <-casResult:
+		case <-barrierCtx.Done():
+			t.Fatalf("CAS did not finish: %v", barrierCtx.Err())
+		}
+		require.NoError(t, upgradeErr)
+		assert.ErrorIs(t, casErr, ErrAppInstallationRevisionConflict)
+		assert.True(t, ordered, "CAS must attempt the ownership lock before locking the installation")
 	})
 
 	t.Run("concurrent CAS upgrade and revoke preserve one live installation owner", func(t *testing.T) {
@@ -1599,76 +1900,133 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancelBarrier()
 		type workerKey struct{}
-		criticalSectionReady := make(chan string, 2)
-		releaseCriticalSection := make(chan struct{})
+		holderReady := make(chan struct{}, 1)
+		waiterAttempted := make(chan struct{}, 1)
+		releaseHolder := make(chan struct{})
 		var releaseOnce sync.Once
 		release := func() {
 			releaseOnce.Do(func() {
-				close(releaseCriticalSection)
+				close(releaseHolder)
 			})
 		}
 		defer release()
 
-		const callbackName = "test:app_plugin_different_version_ownership_race"
-		var coordinated sync.Map
-		require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
-			worker, _ := tx.Statement.Context.Value(workerKey{}).(string)
-			if worker == "" {
-				return
-			}
-			if db.Dialector.Name() == "sqlite" {
+		if db.Dialector.Name() == "sqlite" {
+			const callbackName = "test:app_plugin_different_version_sqlite_start"
+			workersReady := make(chan struct{}, 2)
+			var coordinated sync.Map
+			require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+				worker, _ := tx.Statement.Context.Value(workerKey{}).(string)
 				idempotency, ok := tx.Statement.Dest.(*AppInstallationIdempotency)
-				if !ok || idempotency.ActorID != 34 {
+				if worker == "" || !ok || idempotency.ActorID != 34 {
 					return
 				}
-			} else {
-				claim, ok := tx.Statement.Dest.(*AppRouteClaim)
-				if !ok || claim.AppKey != v1.AppKey || claim.Kind != "app_key" {
+				if _, loaded := coordinated.LoadOrStore(worker, struct{}{}); loaded {
 					return
 				}
-			}
-			if _, loaded := coordinated.LoadOrStore(worker, struct{}{}); loaded {
-				return
-			}
-			select {
-			case criticalSectionReady <- worker:
-			case <-barrierCtx.Done():
-				tx.AddError(fmt.Errorf("different-version critical-section barrier: %w", barrierCtx.Err()))
-				return
-			}
-			select {
-			case <-releaseCriticalSection:
-			case <-barrierCtx.Done():
-				tx.AddError(fmt.Errorf("different-version critical-section release: %w", barrierCtx.Err()))
-			}
-		}))
-		t.Cleanup(func() {
-			require.NoError(t, db.Callback().Create().Remove(callbackName))
-		})
+				select {
+				case workersReady <- struct{}{}:
+				case <-barrierCtx.Done():
+					tx.AddError(fmt.Errorf("different-version SQLite start barrier: %w", barrierCtx.Err()))
+					return
+				}
+				select {
+				case <-releaseHolder:
+				case <-barrierCtx.Done():
+					tx.AddError(fmt.Errorf("different-version SQLite start release: %w", barrierCtx.Err()))
+				}
+			}))
+			t.Cleanup(func() {
+				require.NoError(t, db.Callback().Create().Remove(callbackName))
+			})
+			holderReady = workersReady
+		} else {
+			ownershipClaimKey := appKeyClaim(v1.AppKey, "").ClaimKey
+			var holderCoordinated atomic.Bool
+			const holderCallback = "test:app_plugin_different_version_ownership_holder"
+			require.NoError(t, db.Callback().Query().After("gorm:query").Register(holderCallback, func(tx *gorm.DB) {
+				worker, _ := tx.Statement.Context.Value(workerKey{}).(string)
+				if worker != "2.0.0" ||
+					tx.Statement.Table != "app_route_claims" ||
+					!strings.Contains(tx.Statement.SQL.String(), "FOR UPDATE") ||
+					len(tx.Statement.Vars) == 0 ||
+					tx.Statement.Vars[0] != ownershipClaimKey ||
+					!holderCoordinated.CompareAndSwap(false, true) {
+					return
+				}
+				select {
+				case holderReady <- struct{}{}:
+				case <-barrierCtx.Done():
+					tx.AddError(fmt.Errorf("different-version ownership holder barrier: %w", barrierCtx.Err()))
+					return
+				}
+				select {
+				case <-releaseHolder:
+				case <-barrierCtx.Done():
+					tx.AddError(fmt.Errorf("different-version ownership holder release: %w", barrierCtx.Err()))
+				}
+			}))
+			t.Cleanup(func() {
+				require.NoError(t, db.Callback().Query().Remove(holderCallback))
+			})
 
-		start := make(chan struct{})
+			var waiterCoordinated atomic.Bool
+			const waiterCallback = "test:app_plugin_different_version_ownership_waiter"
+			require.NoError(t, db.Callback().Query().Before("gorm:query").Register(waiterCallback, func(tx *gorm.DB) {
+				worker, _ := tx.Statement.Context.Value(workerKey{}).(string)
+				_, locksForUpdate := tx.Statement.Clauses["FOR"]
+				if worker != "3.0.0" ||
+					tx.Statement.Table != "app_route_claims" ||
+					!locksForUpdate ||
+					!waiterCoordinated.CompareAndSwap(false, true) {
+					return
+				}
+				select {
+				case waiterAttempted <- struct{}{}:
+				case <-barrierCtx.Done():
+					tx.AddError(fmt.Errorf("different-version ownership waiter barrier: %w", barrierCtx.Err()))
+				}
+			}))
+			t.Cleanup(func() {
+				require.NoError(t, db.Callback().Query().Remove(waiterCallback))
+			})
+		}
+
 		results := make(chan AppInstallResult, 2)
 		errs := make(chan error, 2)
 		var wg sync.WaitGroup
-		for _, version := range []string{"2.0.0", "3.0.0"} {
-			version := version
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				<-start
+		runUpgrade := func(version string) {
+			wg.Go(func() {
 				ctx := context.WithValue(barrierCtx, workerKey{}, version)
 				req := appPluginModelInstallRequest("concurrent-upgrade", version, "https://apps.example.com/concurrent-upgrade-v"+string(version[0])+"/")
 				result, installErr := InstallAppVersion(ctx, db, AppIdempotencyScope{ActorID: 34, Key: "concurrent-upgrade-v" + string(version[0])}, req)
 				results <- result
 				errs <- installErr
-			}()
+			})
 		}
-		close(start)
-		for range 2 {
+
+		if db.Dialector.Name() == "sqlite" {
+			runUpgrade("2.0.0")
+			runUpgrade("3.0.0")
+			for range 2 {
+				select {
+				case <-holderReady:
+				case <-barrierCtx.Done():
+					t.Fatalf("different-version SQLite workers did not reach the start barrier: %v", barrierCtx.Err())
+				}
+			}
+		} else {
+			runUpgrade("2.0.0")
 			select {
-			case <-criticalSectionReady:
+			case <-holderReady:
 			case <-barrierCtx.Done():
-				t.Fatalf("different-version upgrades did not reach the ownership critical section: %v", barrierCtx.Err())
+				t.Fatalf("different-version holder did not acquire the ownership lock: %v", barrierCtx.Err())
+			}
+			runUpgrade("3.0.0")
+			select {
+			case <-waiterAttempted:
+			case <-barrierCtx.Done():
+				t.Fatalf("different-version waiter did not attempt the ownership lock: %v", barrierCtx.Err())
 			}
 		}
 		release()

@@ -15,6 +15,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -288,11 +289,19 @@ func runAppPluginTransaction(db *gorm.DB, transaction func(*gorm.DB) error) erro
 	var err error
 	for attempt := range maxAttempts {
 		err = db.Transaction(transaction)
-		if err == nil || db.Dialector.Name() != "mysql" {
+		if err == nil || attempt == maxAttempts-1 {
 			return err
 		}
-		var mysqlErr *mysqlDriver.MySQLError
-		if !errors.As(err, &mysqlErr) || mysqlErr.Number != 1213 || attempt == maxAttempts-1 {
+		retry := false
+		switch db.Dialector.Name() {
+		case "mysql":
+			var mysqlErr *mysqlDriver.MySQLError
+			retry = errors.As(err, &mysqlErr) && mysqlErr.Number == 1213
+		case "postgres":
+			var pgErr *pgconn.PgError
+			retry = errors.As(err, &pgErr) && pgErr.Code == "40P01"
+		}
+		if !retry {
 			return err
 		}
 	}
@@ -501,14 +510,28 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 		}
 
 		candidateInstallationID := appPluginStableID("inst", req.AppKey, req.ManifestVersion, req.ManifestSHA256, installationNonce)
-		ownership := appKeyClaim(req.AppKey, candidateInstallationID)
-		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "claim_key"}}, DoNothing: true}).
-			Create(&ownership).Error; err != nil {
-			return err
+		candidateOwnership := appKeyClaim(req.AppKey, candidateInstallationID)
+		var ownership AppRouteClaim
+		ownershipProbe := tx.Where("claim_key = ?", candidateOwnership.ClaimKey).Limit(1).Find(&ownership)
+		if ownershipProbe.Error != nil {
+			return ownershipProbe.Error
 		}
-		ownershipQuery := lockForUpdate(tx).Where("claim_key = ?", ownership.ClaimKey)
-		if err := ownershipQuery.First(&ownership).Error; err != nil {
-			return err
+		if ownershipProbe.RowsAffected == 1 {
+			ownership = AppRouteClaim{}
+			ownershipProbe = lockForUpdate(tx).Where("claim_key = ?", candidateOwnership.ClaimKey).Limit(1).Find(&ownership)
+			if ownershipProbe.Error != nil {
+				return ownershipProbe.Error
+			}
+		}
+		if ownershipProbe.RowsAffected == 0 {
+			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "claim_key"}}, DoNothing: true}).
+				Create(&candidateOwnership).Error; err != nil {
+				return err
+			}
+			ownership = AppRouteClaim{}
+			if err := lockForUpdate(tx).Where("claim_key = ?", candidateOwnership.ClaimKey).First(&ownership).Error; err != nil {
+				return err
+			}
 		}
 		if ownership.AppKey != req.AppKey || ownership.Kind != "app_key" {
 			return ErrAppRouteClaimConflict
@@ -938,6 +961,44 @@ func CompareAndSwapAppInstallationStatus(ctx context.Context, db *gorm.DB, insta
 	var updated AppInstallation
 	err := runAppPluginTransaction(db.WithContext(ctx), func(tx *gorm.DB) error {
 		updated = AppInstallation{}
+		var identity AppInstallation
+		if err := tx.Select("app_key").
+			Where("installation_id = ?", installationID).
+			First(&identity).Error; err != nil {
+			return err
+		}
+
+		var ownership AppRouteClaim
+		ownershipQuery := lockForUpdate(tx).
+			Where("claim_key = ?", appKeyClaim(identity.AppKey, "").ClaimKey).
+			Limit(1).
+			Find(&ownership)
+		if ownershipQuery.Error != nil {
+			return ownershipQuery.Error
+		}
+
+		var current AppInstallation
+		if err := lockForUpdate(tx).
+			Where("installation_id = ?", installationID).
+			First(&current).Error; err != nil {
+			return err
+		}
+		if current.Status == AppInstallationStatusRevoked {
+			return ErrAppInstallationRevoked
+		}
+		if current.Revision != revision {
+			return ErrAppInstallationRevisionConflict
+		}
+		if !validInstallationTransition(current.Status, status) {
+			return ErrAppInstallationStatusInvalid
+		}
+		if ownershipQuery.RowsAffected != 1 ||
+			ownership.AppKey != identity.AppKey ||
+			ownership.InstallationID != installationID ||
+			ownership.Kind != "app_key" {
+			return ErrAppRouteClaimConflict
+		}
+
 		result := tx.Model(&AppInstallation{}).
 			Where("installation_id = ? AND revision = ? AND status IN ?", installationID, revision, allowedCurrent).
 			Updates(map[string]any{"status": status, "revision": gorm.Expr("revision + ?", 1)})
@@ -945,17 +1006,6 @@ func CompareAndSwapAppInstallationStatus(ctx context.Context, db *gorm.DB, insta
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
-			var current AppInstallation
-			if err := tx.Select("status", "revision").
-				Where("installation_id = ?", installationID).First(&current).Error; err != nil {
-				return err
-			}
-			if current.Status == AppInstallationStatusRevoked {
-				return ErrAppInstallationRevoked
-			}
-			if current.Revision == revision {
-				return ErrAppInstallationStatusInvalid
-			}
 			return ErrAppInstallationRevisionConflict
 		}
 		if status == AppInstallationStatusRevoked {
