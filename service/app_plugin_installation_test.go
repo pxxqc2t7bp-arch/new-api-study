@@ -144,8 +144,8 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 	assert.Equal(t, map[string][]string{"files": {"read"}}, policyV2.EffectiveRules)
 
 	t.Run("concurrent creates allocate unique continuous immutable versions", func(t *testing.T) {
-		if db.Dialector.Name() != "mysql" {
-			t.Skip("requires MySQL REPEATABLE READ snapshot semantics")
+		if db.Dialector.Name() == "sqlite" {
+			t.Skip("requires concurrent row writers")
 		}
 
 		barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
@@ -327,7 +327,9 @@ func TestAppEntitlementPolicyIsHostOwnedAndVersioned(t *testing.T) {
 			Key:   "policy-pg-deadlock-limit",
 			Rules: map[string][]string{"files": {"read"}},
 		})
-		require.EqualError(t, err, "entitlement policy version allocation failed")
+		var pgErr *pgconn.PgError
+		require.ErrorAs(t, err, &pgErr)
+		assert.Equal(t, "40P01", pgErr.Code, "preserve the cause for the outer transaction owner")
 		assert.Equal(t, int32(8), attempts.Load())
 	})
 
@@ -633,6 +635,8 @@ func TestAppInstallationOwnsParentOriginsAndEnabledSurfaces(t *testing.T) {
 
 func openAppPluginServiceDB(t *testing.T) *gorm.DB {
 	t.Helper()
+	previousType := common.MainDatabaseType()
+	t.Cleanup(func() { common.SetMainDatabaseType(previousType) })
 	dialect := os.Getenv("APP_PLUGIN_TEST_DIALECT")
 	dsn := os.Getenv("APP_PLUGIN_TEST_DSN")
 	t.Logf("APP_PLUGIN_TEST_IMAGE=%s APP_PLUGIN_TEST_PLATFORM=%s APP_PLUGIN_TEST_DIALECT=%s", os.Getenv("APP_PLUGIN_TEST_IMAGE"), os.Getenv("APP_PLUGIN_TEST_PLATFORM"), dialect)
@@ -645,20 +649,26 @@ func openAppPluginServiceDB(t *testing.T) *gorm.DB {
 	)
 	switch dialect {
 	case "sqlite":
+		common.SetMainDatabaseType(common.DatabaseTypeSQLite)
 		if dsn == "" {
 			dsn = filepath.Join(t.TempDir(), "app_plugin.sqlite")
 		}
 		db, err = gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	case "mysql":
+		common.SetMainDatabaseType(common.DatabaseTypeMySQL)
 		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required for mysql")
 		db, err = gorm.Open(gormMySQL.Open(dsn), &gorm.Config{})
 	case "postgres", "postgresql":
+		common.SetMainDatabaseType(common.DatabaseTypePostgreSQL)
 		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required for postgres")
 		db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	default:
 		t.Fatalf("unsupported APP_PLUGIN_TEST_DIALECT %q", dialect)
 	}
 	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, sqlDB.Close()) })
 	return db
 }
 

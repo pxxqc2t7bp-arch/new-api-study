@@ -466,6 +466,24 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 	require.NoError(t, MigrateAppPluginTables(db))
 	seedAppPluginModelPolicy(t, db, "policy-basic")
 
+	t.Run("legacy request hash and frozen replay remain compatible", func(t *testing.T) {
+		req := appPluginModelInstallRequest("legacy-hash", "1.0.0", "https://apps.example.com/legacy-hash/")
+		// SHA-256 of the pre-draft AppInstallRequest JSON field sequence.
+		const legacyHash = "61a7e12bd1a7dd554f7f6de0f89ef7a045a6cec20510ca5bb308c3b92aa00b73"
+		hash, err := appInstallRequestHash(req)
+		require.NoError(t, err)
+		assert.Equal(t, legacyHash, hash)
+		scope := AppIdempotencyScope{ActorID: 19, Key: "legacy-hash"}
+		first, err := InstallAppVersion(t.Context(), db, scope, req)
+		require.NoError(t, err)
+		require.NoError(t, db.Model(&AppInstallationIdempotency{}).Where("scope_key = ?", scope.Key).
+			Update("request_hash", legacyHash).Error)
+		replayed, found, err := ReplayAppInstall(t.Context(), db, scope, req)
+		require.NoError(t, err)
+		assert.True(t, found)
+		assert.Equal(t, first, replayed)
+	})
+
 	t.Run("maps model errors to the stable error registry", func(t *testing.T) {
 		tests := []struct {
 			name string

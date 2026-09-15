@@ -31,10 +31,12 @@ var (
 	ErrAppIdempotencyConflict          = errors.New("app_idempotency_conflict")
 	ErrAppRouteClaimConflict           = errors.New("app_route_claim_conflict")
 	ErrAppInstallRequestInvalid        = errors.New("app_install_request_invalid")
+	ErrAppEntitlementPolicyNotFound    = fmt.Errorf("%w: entitlement policy not found", ErrAppInstallRequestInvalid)
 	ErrAppInstallationRevisionConflict = errors.New("app_installation_revision_conflict")
 	ErrAppInstallationRevoked          = errors.New("app_installation_revoked")
 	ErrAppInstallationStatusInvalid    = errors.New("app_installation_status_invalid")
 	ErrAppInstallationUpgradeForbidden = errors.New("app_installation_upgrade_forbidden")
+	errAppEntitlementVersionRace       = errors.New("app_entitlement_policy_version_race")
 )
 
 type AppJSONMap map[string][]string
@@ -233,10 +235,20 @@ type AppInstallRequest struct {
 	AllowedUserPolicy        AppAllowedUserPolicy
 	NetworkPolicy            AppNetworkPolicy
 	EntitlementPolicyID      string
+	EntitlementPolicyDraft   *AppEntitlementPolicyInput `json:",omitempty"`
 	ServiceCredentialHash    string
 	ServiceCredentialID      string
 	ServiceCredentialVersion string
 	ServiceCredentialExpiry  int64
+}
+
+// AppEntitlementPolicyInput is assembled by the trusted host service. Rules are
+// the original normalized selection; EffectiveRules are the authorized subset.
+// Only the original selection participates in the immutable request hash.
+type AppEntitlementPolicyInput struct {
+	Key            string
+	Rules          AppJSONMap
+	EffectiveRules AppJSONMap `json:"-"`
 }
 
 type AppInstallResult struct {
@@ -289,28 +301,179 @@ func AppPluginErrorCode(err error) string {
 	}
 }
 
-func runAppPluginTransaction(db *gorm.DB, transaction func(*gorm.DB) error) error {
-	const maxAttempts = 3
+// RunAppPluginTransaction retries only fresh outer transactions. With an existing
+// transaction it executes once, without savepoints; callers must propagate errors
+// to the owner. Callbacks must reset captured results on every invocation.
+func RunAppPluginTransaction(db *gorm.DB, transaction func(*gorm.DB) error) error {
+	return runAppPluginTransaction(db, 3, transaction)
+}
+
+func runAppPluginTransaction(db *gorm.DB, maxAttempts int, transaction func(*gorm.DB) error) error {
+	if committer, ok := db.Statement.ConnPool.(gorm.TxCommitter); ok && committer != nil {
+		return transaction(db)
+	}
 	var err error
 	for attempt := range maxAttempts {
+		if err := db.Statement.Context.Err(); err != nil {
+			return err
+		}
 		err = db.Transaction(transaction)
 		if err == nil || attempt == maxAttempts-1 {
 			return err
 		}
-		retry := false
+		retry := errors.Is(err, errAppEntitlementVersionRace)
 		switch db.Dialector.Name() {
 		case "mysql":
 			var mysqlErr *mysqlDriver.MySQLError
-			retry = errors.As(err, &mysqlErr) && mysqlErr.Number == 1213
+			retry = retry || (errors.As(err, &mysqlErr) && mysqlErr.Number == 1213)
 		case "postgres":
 			var pgErr *pgconn.PgError
-			retry = errors.As(err, &pgErr) && pgErr.Code == "40P01"
+			retry = retry || (errors.As(err, &pgErr) && pgErr.Code == "40P01")
 		}
 		if !retry {
 			return err
 		}
 	}
 	return err
+}
+
+// CreateAppEntitlementPolicy allocates an immutable version. A lost version
+// race must restart the outer transaction: MAX can precede a competing commit,
+// while the subsequent locking read observes the winner (MySQL REPEATABLE READ
+// and PostgreSQL READ COMMITTED).
+func CreateAppEntitlementPolicy(ctx context.Context, db *gorm.DB, key string, effective AppJSONMap) (AppEntitlementPolicy, error) {
+	creationToken, err := common.GenerateRandomCharsKey(32)
+	if err != nil {
+		return AppEntitlementPolicy{}, err
+	}
+	var result AppEntitlementPolicy
+	err = runAppPluginTransaction(db.WithContext(ctx), 8, func(tx *gorm.DB) error {
+		result = AppEntitlementPolicy{}
+		var maxVersion int64
+		if err := tx.Model(&AppEntitlementPolicy{}).
+			Where("key_hash = ?", appPluginSHA256([]byte(key))).
+			Select("COALESCE(MAX(version), 0)").Scan(&maxVersion).Error; err != nil {
+			return err
+		}
+		versionKey := appPluginSHA256([]byte(fmt.Sprintf("%s\x00%d", key, maxVersion+1)))
+		policy := AppEntitlementPolicy{
+			ID: "policy_" + versionKey[:32], KeyHash: appPluginSHA256([]byte(key)),
+			VersionKey: versionKey, CreationToken: creationToken, Key: key,
+			Version: maxVersion + 1, EffectiveRules: effective,
+		}
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&policy).Error; err != nil {
+			return err
+		}
+		if err := lockForUpdate(tx).Where("version_key = ?", versionKey).First(&result).Error; err != nil {
+			return err
+		}
+		if result.CreationToken != creationToken {
+			return errAppEntitlementVersionRace
+		}
+		return nil
+	})
+	if err != nil {
+		return AppEntitlementPolicy{}, err
+	}
+	return result, nil
+}
+
+// MutateAppInstallation serializes PATCH with upgrade and lifecycle mutations.
+// The identity read only locates the immutable app key; all decisions use the
+// current installation read after locking app-key ownership, then installation.
+func MutateAppInstallation(ctx context.Context, db *gorm.DB, installationID string, revision int64, mutation func(*gorm.DB, AppInstallation) error) error {
+	return RunAppPluginTransaction(db.WithContext(ctx), func(tx *gorm.DB) error {
+		var identity AppInstallation
+		if err := tx.Select("app_key").Where("installation_id = ?", installationID).First(&identity).Error; err != nil {
+			return err
+		}
+		var ownership AppRouteClaim
+		query := lockForUpdate(tx).Where("claim_key = ?", appKeyClaim(identity.AppKey, "").ClaimKey).
+			Limit(1).Find(&ownership)
+		if query.Error != nil {
+			return query.Error
+		}
+		var current AppInstallation
+		if err := lockForUpdate(tx).Where("installation_id = ?", installationID).First(&current).Error; err != nil {
+			return err
+		}
+		if current.Status == AppInstallationStatusRevoked {
+			return ErrAppInstallationRevoked
+		}
+		if current.Revision != revision {
+			return ErrAppInstallationRevisionConflict
+		}
+		if query.RowsAffected != 1 || ownership.InstallationID != installationID ||
+			ownership.AppKey != identity.AppKey || ownership.Kind != "app_key" {
+			return ErrAppRouteClaimConflict
+		}
+		return mutation(tx, current)
+	})
+}
+
+type AppRouteEndpoints struct {
+	Callback string
+	Direct   string
+	Embedded string
+}
+
+// GetAppInstallationVersion reads the generation selected by a locked
+// installation, not a potentially older MySQL transaction snapshot.
+func GetAppInstallationVersion(tx *gorm.DB, installation AppInstallation) (AppVersion, error) {
+	var version AppVersion
+	err := lockForUpdate(tx).Where("id = ?", installation.AppVersionID).First(&version).Error
+	return version, err
+}
+
+// UpdateAppRouteClaims requires the caller to hold app-key and installation
+// locks. All writers use callback, direct, embedded order.
+func UpdateAppRouteClaims(tx *gorm.DB, installation AppInstallation, endpoints AppRouteEndpoints) error {
+	claims := []AppRouteClaim{
+		appRouteClaim(installation.AppKey, installation.InstallationID, "callback", endpoints.Callback),
+		appRouteClaim(installation.AppKey, installation.InstallationID, "direct", endpoints.Direct),
+		appRouteClaim(installation.AppKey, installation.InstallationID, "embedded", endpoints.Embedded),
+	}
+	for _, claim := range claims {
+		var stored AppRouteClaim
+		query := lockForUpdate(tx).Where("installation_id = ? AND kind = ?", installation.InstallationID, claim.Kind).
+			Limit(1).Find(&stored)
+		if query.Error != nil {
+			return query.Error
+		}
+		if query.RowsAffected == 1 && stored.ClaimKey == claim.ClaimKey && stored.AbsoluteEndpoint == claim.AbsoluteEndpoint {
+			continue
+		}
+		var count int64
+		if err := tx.Model(&AppRouteClaim{}).
+			Where("claim_key = ? AND installation_id <> ?", claim.ClaimKey, installation.InstallationID).
+			Count(&count).Error; err != nil {
+			return err
+		}
+		if count != 0 {
+			return ErrAppRouteClaimConflict
+		}
+		var err error
+		if query.RowsAffected == 0 {
+			err = tx.Create(&claim).Error
+		} else {
+			err = tx.Model(&AppRouteClaim{}).Where("id = ?", stored.ID).
+				Updates(map[string]any{"absolute_endpoint": claim.AbsoluteEndpoint, "claim_key": claim.ClaimKey}).Error
+		}
+		if err != nil {
+			var mysqlErr *mysqlDriver.MySQLError
+			var pgErr *pgconn.PgError
+			var sqliteErr interface{ Code() int }
+			if (errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 &&
+				strings.Contains(mysqlErr.Message, "'idx_app_route_claims_claim_key'")) ||
+				(errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "idx_app_route_claims_claim_key") ||
+				(errors.As(err, &sqliteErr) && sqliteErr.Code() == 2067 &&
+					strings.Contains(err.Error(), "UNIQUE constraint failed: app_route_claims.claim_key")) {
+				return ErrAppRouteClaimConflict
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func MigrateAppPluginTables(db *gorm.DB) error {
@@ -341,7 +504,7 @@ func MigrateAppPluginTables(db *gorm.DB) error {
 	); err != nil {
 		return err
 	}
-	return runAppPluginTransaction(db, func(tx *gorm.DB) error {
+	return RunAppPluginTransaction(db, func(tx *gorm.DB) error {
 		var installations []AppInstallation
 		if err := tx.Where("status <> ?", AppInstallationStatusRevoked).
 			Order("id").
@@ -484,36 +647,6 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 			return nil
 		}
 
-		if req.EntitlementPolicyID != "" {
-			var policyCount int64
-			if err := tx.Model(&AppEntitlementPolicy{}).
-				Where("id = ?", req.EntitlementPolicyID).
-				Count(&policyCount).Error; err != nil {
-				return err
-			}
-			if policyCount != 1 {
-				return fmt.Errorf("%w: entitlement policy not found", ErrAppInstallRequestInvalid)
-			}
-		}
-
-		version := AppVersion{
-			ID:                    appPluginStableID("appver", req.AppKey, req.ManifestVersion),
-			IdentityHash:          appPluginSHA256([]byte(req.AppKey + "\x00" + req.ManifestVersion)),
-			AppKey:                req.AppKey,
-			ManifestVersion:       req.ManifestVersion,
-			ManifestSHA256:        req.ManifestSHA256,
-			CanonicalManifestJSON: string(req.CanonicalManifestJSON),
-		}
-		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&version).Error; err != nil {
-			return err
-		}
-		if err := lockForUpdate(tx).Where("identity_hash = ?", version.IdentityHash).First(&version).Error; err != nil {
-			return err
-		}
-		if version.ManifestSHA256 != req.ManifestSHA256 {
-			return ErrAppVersionConflict
-		}
-
 		candidateInstallationID := appPluginStableID("inst", req.AppKey, req.ManifestVersion, req.ManifestSHA256, installationNonce)
 		candidateOwnership := appKeyClaim(req.AppKey, candidateInstallationID)
 		var ownership AppRouteClaim
@@ -544,6 +677,62 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 
 		isNewInstallation := ownership.InstallationID == candidateInstallationID
 		var installation AppInstallation
+		if !isNewInstallation {
+			if err := lockForUpdate(tx).Where("installation_id = ?", ownership.InstallationID).First(&installation).Error; err != nil {
+				return err
+			}
+			if installation.Status == AppInstallationStatusRevoked {
+				return ErrAppInstallationRevoked
+			}
+		}
+		version := AppVersion{
+			ID:                    appPluginStableID("appver", req.AppKey, req.ManifestVersion),
+			IdentityHash:          appPluginSHA256([]byte(req.AppKey + "\x00" + req.ManifestVersion)),
+			AppKey:                req.AppKey,
+			ManifestVersion:       req.ManifestVersion,
+			ManifestSHA256:        req.ManifestSHA256,
+			CanonicalManifestJSON: string(req.CanonicalManifestJSON),
+		}
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&version).Error; err != nil {
+			return err
+		}
+		if err := lockForUpdate(tx).Where("identity_hash = ?", version.IdentityHash).First(&version).Error; err != nil {
+			return err
+		}
+		if version.ManifestSHA256 != req.ManifestSHA256 {
+			return ErrAppVersionConflict
+		}
+		if !isNewInstallation {
+			frozen, found, err := findFrozenAppInstallResponse(tx, installation.InstallationID, version.ID)
+			if err != nil {
+				return err
+			}
+			if found {
+				result = frozen
+				return freezeAppInstallIdempotency(tx, scopeHash, claimToken, &result)
+			}
+			if req.DisallowUpgrade {
+				return ErrAppInstallationUpgradeForbidden
+			}
+		}
+
+		entitlementID := req.EntitlementPolicyID
+		if req.EntitlementPolicyDraft != nil {
+			policy, err := CreateAppEntitlementPolicy(ctx, tx, req.EntitlementPolicyDraft.Key, req.EntitlementPolicyDraft.EffectiveRules)
+			if err != nil {
+				return err
+			}
+			entitlementID = policy.ID
+		} else if entitlementID != "" {
+			var policyCount int64
+			if err := tx.Model(&AppEntitlementPolicy{}).Where("id = ?", entitlementID).Count(&policyCount).Error; err != nil {
+				return err
+			}
+			if policyCount != 1 {
+				return ErrAppEntitlementPolicyNotFound
+			}
+		}
+
 		if isNewInstallation {
 			installation = AppInstallation{
 				InstallationID:       candidateInstallationID,
@@ -557,7 +746,7 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 				AllowedOrigins:       append(AppStringList(nil), req.AllowedOrigins...),
 				AllowedUserPolicy:    req.AllowedUserPolicy,
 				NetworkPolicy:        req.NetworkPolicy,
-				EntitlementPolicyID:  req.EntitlementPolicyID,
+				EntitlementPolicyID:  entitlementID,
 				Status:               AppInstallationStatusDisabled,
 				Revision:             1,
 			}
@@ -565,26 +754,6 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 				return err
 			}
 		} else {
-			installationQuery := lockForUpdate(tx).Where("installation_id = ?", ownership.InstallationID)
-			if err := installationQuery.First(&installation).Error; err != nil {
-				return err
-			}
-			if installation.Status == AppInstallationStatusRevoked {
-				return ErrAppInstallationRevoked
-			}
-
-			frozen, found, err := findFrozenAppInstallResponse(tx, installation.InstallationID, version.ID)
-			if err != nil {
-				return err
-			}
-			if found {
-				result = frozen
-				return freezeAppInstallIdempotency(tx, scopeHash, claimToken, &result)
-			}
-			if req.DisallowUpgrade {
-				return ErrAppInstallationUpgradeForbidden
-			}
-
 			if err := tx.Where("installation_id = ? AND kind <> ?", installation.InstallationID, "app_key").
 				Delete(&AppRouteClaim{}).Error; err != nil {
 				return err
@@ -623,7 +792,7 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 					"allowed_origins":        AppStringList(req.AllowedOrigins),
 					"allowed_user_policy":    req.AllowedUserPolicy,
 					"network_policy":         req.NetworkPolicy,
-					"entitlement_policy_id":  req.EntitlementPolicyID,
+					"entitlement_policy_id":  entitlementID,
 					"status":                 AppInstallationStatusDisabled,
 					"revision":               gorm.Expr("revision + ?", 1),
 				})
@@ -669,7 +838,10 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 		result = resultFromInstallation(version.ID, installation, credentialSet)
 		return freezeAppInstallIdempotency(tx, scopeHash, claimToken, &result)
 	}
-	err = runAppPluginTransaction(db.WithContext(ctx), transaction)
+	err = RunAppPluginTransaction(db.WithContext(ctx), transaction)
+	if err != nil {
+		return AppInstallResult{}, err
+	}
 	return result, err
 }
 
@@ -796,7 +968,10 @@ func ReplayAppInstall(ctx context.Context, db *gorm.DB, scope AppIdempotencyScop
 		found = true
 		return nil
 	}
-	err = runAppPluginTransaction(db.WithContext(ctx), transaction)
+	err = RunAppPluginTransaction(db.WithContext(ctx), transaction)
+	if err != nil {
+		return AppInstallResult{}, false, err
+	}
 	return result, found, err
 }
 
@@ -849,6 +1024,10 @@ func validateAppInstallRequest(req AppInstallRequest) error {
 	}
 	if req.EntitlementPolicyID != "" && !validAppInstallReference(req.EntitlementPolicyID) {
 		return invalid("invalid entitlement policy reference")
+	}
+	if draft := req.EntitlementPolicyDraft; draft != nil &&
+		(req.EntitlementPolicyID != "" || !validAppInstallReference(draft.Key) || draft.Rules == nil) {
+		return invalid("invalid entitlement policy draft")
 	}
 	hasCredential := appInstallHasServiceCredential(req)
 	hasAnyCredentialField := req.ServiceCredentialID != "" ||
@@ -967,7 +1146,7 @@ func CompareAndSwapAppInstallationStatus(ctx context.Context, db *gorm.DB, insta
 		allowedCurrent = []string{AppInstallationStatusDisabled, AppInstallationStatusEnabled}
 	}
 	var updated AppInstallation
-	err := runAppPluginTransaction(db.WithContext(ctx), func(tx *gorm.DB) error {
+	err := RunAppPluginTransaction(db.WithContext(ctx), func(tx *gorm.DB) error {
 		updated = AppInstallation{}
 		var identity AppInstallation
 		if err := tx.Select("app_key").

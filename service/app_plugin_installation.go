@@ -13,18 +13,14 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
-	mysqlDriver "github.com/go-sql-driver/mysql"
 	goversion "github.com/hashicorp/go-version"
-	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 var (
 	ErrManifestCannotOwnEntitlementPolicy = errors.New("manifest_cannot_own_entitlement_policy")
 	ErrManifestCannotOwnHostPolicy        = errors.New("manifest_cannot_own_host_policy")
 	ErrEntitlementPolicyImmutable         = errors.New("app_entitlement_policy_immutable")
-	errEntitlementVersionRace             = errors.New("app_entitlement_policy_version_race")
 )
 
 type AppPluginInstallationService struct {
@@ -46,18 +42,19 @@ type AppTaskPluginChecker interface {
 }
 
 type AppInstallCommand struct {
-	DisallowUpgrade      bool
-	ActorID              int64
-	IdempotencyKey       string
-	ManifestJSON         []byte
-	BaseURL              string
-	EnabledSurfaces      []string
-	AllowedParentOrigins []string
-	AllowedOrigins       []string
-	AllowedUserPolicy    model.AppAllowedUserPolicy
-	NetworkPolicy        model.AppNetworkPolicy
-	EntitlementPolicyID  string
-	ServiceCredential    AppServiceCredentialInput
+	DisallowUpgrade        bool
+	ActorID                int64
+	IdempotencyKey         string
+	ManifestJSON           []byte
+	BaseURL                string
+	EnabledSurfaces        []string
+	AllowedParentOrigins   []string
+	AllowedOrigins         []string
+	AllowedUserPolicy      model.AppAllowedUserPolicy
+	NetworkPolicy          model.AppNetworkPolicy
+	EntitlementPolicyID    string
+	EntitlementPolicyDraft *AppEntitlementPolicyDraft
+	ServiceCredential      AppServiceCredentialInput
 }
 
 type AppServiceCredentialInput struct {
@@ -159,6 +156,13 @@ func (s *AppPluginInstallationService) Install(ctx context.Context, cmd AppInsta
 		ServiceCredentialVersion: cmd.ServiceCredential.Version,
 		ServiceCredentialExpiry:  cmd.ServiceCredential.ExpiresAt,
 	}
+	if cmd.EntitlementPolicyDraft != nil {
+		req.EntitlementPolicyDraft = &model.AppEntitlementPolicyInput{
+			Key:            strings.TrimSpace(cmd.EntitlementPolicyDraft.Key),
+			Rules:          model.AppJSONMap(normalizeRules(cmd.EntitlementPolicyDraft.Rules)),
+			EffectiveRules: model.AppJSONMap(intersectRules(cmd.EntitlementPolicyDraft.Rules, s.currentAuthz)),
+		}
+	}
 	scope := model.AppIdempotencyScope{
 		ActorID: cmd.ActorID,
 		Key:     cmd.IdempotencyKey,
@@ -182,70 +186,14 @@ func (s *AppPluginInstallationService) Install(ctx context.Context, cmd AppInsta
 
 func (s *AppPluginInstallationService) CreateEntitlementPolicy(ctx context.Context, draft AppEntitlementPolicyDraft) (AppEntitlementPolicyResult, error) {
 	effective := intersectRules(draft.Rules, s.currentAuthz)
-	keyHash := serviceDigestBytes([]byte(draft.Key))
-	creationToken, err := common.GenerateRandomCharsKey(32)
+	policy, err := model.CreateAppEntitlementPolicy(ctx, s.db, draft.Key, model.AppJSONMap(effective))
 	if err != nil {
 		return AppEntitlementPolicyResult{}, err
 	}
-	for range 8 {
-		var result AppEntitlementPolicyResult
-		err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			var maxVersion int64
-			if err := tx.Model(&model.AppEntitlementPolicy{}).
-				Where("key_hash = ?", keyHash).
-				Select("COALESCE(MAX(version), 0)").
-				Scan(&maxVersion).Error; err != nil {
-				return err
-			}
-			versionKey := serviceDigestBytes([]byte(fmt.Sprintf("%s\x00%d", draft.Key, maxVersion+1)))
-			policy := model.AppEntitlementPolicy{
-				ID:             appPolicyID(versionKey),
-				KeyHash:        keyHash,
-				VersionKey:     versionKey,
-				CreationToken:  creationToken,
-				Key:            draft.Key,
-				Version:        maxVersion + 1,
-				EffectiveRules: model.AppJSONMap(effective),
-			}
-			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&policy).Error; err != nil {
-				return err
-			}
-			var stored model.AppEntitlementPolicy
-			storedQuery := tx
-			if tx.Dialector.Name() != "sqlite" {
-				storedQuery = storedQuery.Clauses(clause.Locking{Strength: "UPDATE"})
-			}
-			if err := storedQuery.Where("version_key = ?", versionKey).First(&stored).Error; err != nil {
-				return err
-			}
-			if stored.CreationToken != creationToken {
-				return errEntitlementVersionRace
-			}
-			result = AppEntitlementPolicyResult{
-				ID:             stored.ID,
-				Key:            stored.Key,
-				Version:        stored.Version,
-				EffectiveRules: map[string][]string(stored.EffectiveRules),
-			}
-			return nil
-		})
-		if err == nil {
-			return result, nil
-		}
-		retry := errors.Is(err, errEntitlementVersionRace)
-		if !retry && s.db.Dialector.Name() == "mysql" {
-			var mysqlErr *mysqlDriver.MySQLError
-			retry = errors.As(err, &mysqlErr) && mysqlErr.Number == 1213
-		}
-		if !retry && s.db.Dialector.Name() == "postgres" {
-			var pgErr *pgconn.PgError
-			retry = errors.As(err, &pgErr) && pgErr.Code == "40P01"
-		}
-		if !retry {
-			return AppEntitlementPolicyResult{}, err
-		}
-	}
-	return AppEntitlementPolicyResult{}, fmt.Errorf("entitlement policy version allocation failed")
+	return AppEntitlementPolicyResult{
+		ID: policy.ID, Key: policy.Key, Version: policy.Version,
+		EffectiveRules: map[string][]string(policy.EffectiveRules),
+	}, nil
 }
 
 func (s *AppPluginInstallationService) UpdateEntitlementPolicy(context.Context, string, AppEntitlementPolicyDraft) error {
@@ -409,10 +357,6 @@ func intersectRules(requested, allowed map[string][]string) map[string][]string 
 		}
 	}
 	return effective
-}
-
-func appPolicyID(versionKey string) string {
-	return "policy_" + versionKey[:32]
 }
 
 func mergeTaskPluginRequirements(lists ...[]AppManifestTaskPluginRequirement) []AppManifestTaskPluginRequirement {

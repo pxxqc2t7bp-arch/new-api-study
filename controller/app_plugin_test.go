@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,16 +10,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -50,6 +55,56 @@ type appPluginNavigationEnvelope struct {
 }
 
 func TestAppPluginDashboardCreatesAndUpdatesDisabledInstallations(t *testing.T) {
+	t.Run("atomic mutations", func(t *testing.T) {
+		t.Run("unchanged normalized base URL", appPluginUnchangedRouteRegression)
+		t.Run("claim uniqueness race rolls back", appPluginRouteCollisionRegression)
+		t.Run("unrelated uniqueness errors stay internal", func(t *testing.T) {
+			setupAppPluginControllerTest(t)
+			if model.DB.Dialector.Name() == "sqlite" {
+				t.Skip("driver-specific uniqueness error classification")
+			}
+			app := createAppPluginForControllerTest(t, "other-unique", "Other Unique", "other-unique")
+			const callback = "test:b14_unrelated_unique"
+			require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Table != "app_route_claims" {
+					return
+				}
+				if tx.Dialector.Name() == "mysql" {
+					tx.AddError(&mysqlDriver.MySQLError{Number: 1062, Message: "Duplicate entry for key 'PRIMARY'"})
+				} else {
+					tx.AddError(&pgconn.PgError{Code: "23505", ConstraintName: "app_route_claims_pkey"})
+				}
+			}))
+			t.Cleanup(func() { require.NoError(t, model.DB.Callback().Update().Remove(callback)) })
+			response := appPluginControllerRequest(t, PatchAppPluginInstallation, http.MethodPatch,
+				"/api/app_plugins/installations", appPluginPatchBody(t, app.InstallationID, app.Revision,
+					map[string]any{"base_url": "https://apps.example.com/other-unique-changed/"}),
+				common.RoleRootUser, "default", nil)
+			assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+			assert.Equal(t, "service_unavailable", appPluginErrorCode(t, response))
+			var current model.AppInstallation
+			require.NoError(t, model.DB.Where("installation_id = ?", app.InstallationID).First(&current).Error)
+			assert.Equal(t, app.Revision, current.Revision)
+			assert.Equal(t, app.BaseURL, current.BaseURL)
+		})
+		t.Run("concurrent draft frozen replay", appPluginConcurrentDraftRegression)
+		t.Run("real deadlock retries outer transaction", func(t *testing.T) {
+			appPluginDeadlockRegression(t, false, false)
+		})
+		t.Run("real entitlement deadlock then failure rolls back", func(t *testing.T) {
+			appPluginDeadlockRegression(t, true, false)
+		})
+		t.Run("existing transaction propagates real deadlock", func(t *testing.T) {
+			appPluginDeadlockRegression(t, true, true)
+		})
+		t.Run("policy selection and reference contracts", appPluginPolicySelectionRegression)
+		t.Run("PATCH serializes with upgrade", func(t *testing.T) {
+			appPluginPatchUpgradeRegression(t, false)
+		})
+		t.Run("PATCH uses current generation after upgrade", func(t *testing.T) {
+			appPluginPatchUpgradeRegression(t, true)
+		})
+	})
 	setupAppPluginControllerTest(t)
 	manifest := appPluginTestManifest("seedance-repro", "Seedance Repro", "1.0.0")
 	body := appPluginInstallBody(t, manifest, "https://apps.example.com/seedance/")
@@ -638,9 +693,11 @@ func appPluginControllerRequest(
 	headers map[string]string,
 ) *httptest.ResponseRecorder {
 	t.Helper()
+	requestCtx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
-	context.Request = httptest.NewRequest(method, path, bytes.NewReader(body))
+	context.Request = httptest.NewRequestWithContext(requestCtx, method, path, bytes.NewReader(body))
 	context.Request.Header.Set("Content-Type", "application/json")
 	for key, value := range headers {
 		context.Request.Header.Set(key, value)
@@ -710,4 +767,518 @@ func appPluginErrorCode(t *testing.T, response *httptest.ResponseRecorder) strin
 	var envelope appPluginTestEnvelope
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &envelope), fmt.Sprintf("body=%s", response.Body.String()))
 	return envelope.Error.Code
+}
+
+func appPluginUnchangedRouteRegression(t *testing.T) {
+	setupAppPluginControllerTest(t)
+	app := createAppPluginForControllerTest(t, "same-base", "Same Base", "same-base")
+	var before []model.AppRouteClaim
+	require.NoError(t, model.DB.Order("id").Find(&before).Error)
+	response := appPluginControllerRequest(t, PatchAppPluginInstallation, http.MethodPatch,
+		"/api/app_plugins/installations", appPluginPatchBody(t, app.InstallationID, app.Revision, map[string]any{
+			"base_url":        "HTTPS://APPS.EXAMPLE.COM:443/same-base",
+			"allowed_origins": []string{"https://changed.example.com"},
+		}), common.RoleRootUser, "default", nil)
+	assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var stored model.AppInstallation
+	var after []model.AppRouteClaim
+	require.NoError(t, model.DB.Where("installation_id = ?", app.InstallationID).First(&stored).Error)
+	require.NoError(t, model.DB.Order("id").Find(&after).Error)
+	assert.Equal(t, app.Revision+1, stored.Revision)
+	assert.Equal(t, model.AppStringList{"https://changed.example.com"}, stored.AllowedOrigins)
+	assert.Equal(t, before, after, "unchanged claims must not be replaced")
+	require.NoError(t, model.DB.Where("installation_id = ? AND kind = ?", app.InstallationID, "embedded").
+		Delete(&model.AppRouteClaim{}).Error)
+	repaired := appPluginControllerRequest(t, PatchAppPluginInstallation, http.MethodPatch,
+		"/api/app_plugins/installations", appPluginPatchBody(t, app.InstallationID, stored.Revision,
+			map[string]any{"base_url": app.BaseURL}), common.RoleRootUser, "default", nil)
+	assert.Equal(t, http.StatusOK, repaired.Code, repaired.Body.String())
+	var repairedResult appPluginTestEnvelope
+	require.NoError(t, common.Unmarshal(repaired.Body.Bytes(), &repairedResult))
+	assert.Equal(t, app.Revision+2, repairedResult.Data.Revision)
+	assert.Equal(t, [6]int64{1, 1, 1, 4, 0, 0}, appPluginControllerPersistenceCounts(t))
+}
+
+func appPluginRouteCollisionRegression(t *testing.T) {
+	setupAppPluginControllerTest(t)
+	if model.DB.Dialector.Name() == "sqlite" {
+		t.Skip("SQLite serializes writers")
+	}
+	left := createAppPluginForControllerTest(t, "route-left", "Route Left", "route-left")
+	right := createAppPluginForControllerTest(t, "route-right", "Route Right", "route-right")
+	var rightRow model.AppInstallation
+	require.NoError(t, model.DB.Where("installation_id = ?", right.InstallationID).First(&rightRow).Error)
+	var before []model.AppRouteClaim
+	require.NoError(t, model.DB.Where("installation_id = ?", left.InstallationID).Order("id").Find(&before).Error)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	const target = "https://apps.example.com/route-target/"
+	var injected atomic.Bool
+	var competitorErr, updateErr error
+	const callback = "test:b14_claim_uniqueness_race"
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table != "app_route_claims" || !injected.CompareAndSwap(false, true) {
+			return
+		}
+		competitorErr = model.DB.WithContext(ctx).Transaction(func(other *gorm.DB) error {
+			if err := updateAppPluginRouteClaims(other, rightRow, target); err != nil {
+				return err
+			}
+			return other.Model(&model.AppInstallation{}).Where("installation_id = ?", right.InstallationID).
+				Updates(map[string]any{"base_url": target, "revision": gorm.Expr("revision + 1")}).Error
+		})
+	}))
+	require.NoError(t, model.DB.Callback().Update().After("gorm:update").Register(callback+":result", func(tx *gorm.DB) {
+		if tx.Statement.Table == "app_route_claims" && tx.Error != nil {
+			updateErr = tx.Error
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Callback().Update().Remove(callback))
+		require.NoError(t, model.DB.Callback().Update().Remove(callback+":result"))
+	})
+	response := appPluginControllerRequest(t, PatchAppPluginInstallation, http.MethodPatch,
+		"/api/app_plugins/installations", appPluginPatchBody(t, left.InstallationID, left.Revision,
+			map[string]any{"base_url": target, "entitlement_policy": map[string]any{
+				"key": "losing-policy", "rules": map[string][]string{"app_plugin": {"manage"}},
+			}}), common.RoleRootUser, "default", nil)
+	require.True(t, injected.Load())
+	require.NoError(t, competitorErr)
+	require.Error(t, updateErr, "exercise the actual database unique constraint")
+	marker := "1062"
+	if model.DB.Dialector.Name() == "postgres" {
+		marker = "23505"
+	}
+	require.Contains(t, updateErr.Error(), marker)
+	t.Logf("actual uniqueness error: %v", updateErr)
+	var stored model.AppInstallation
+	var after []model.AppRouteClaim
+	require.NoError(t, model.DB.Where("installation_id = ?", left.InstallationID).First(&stored).Error)
+	require.NoError(t, model.DB.Where("installation_id = ?", left.InstallationID).Order("id").Find(&after).Error)
+	assert.Equal(t, before, after)
+	assert.Equal(t, left.Revision, stored.Revision)
+	assert.Equal(t, left.BaseURL, stored.BaseURL)
+	assert.Equal(t, [6]int64{2, 2, 2, 8, 0, 0}, appPluginControllerPersistenceCounts(t))
+	assert.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+	assert.Equal(t, "app_route_collision", appPluginErrorCode(t, response))
+}
+
+func appPluginConcurrentDraftRegression(t *testing.T) {
+	setupAppPluginControllerTest(t)
+	if model.DB.Dialector.Name() == "sqlite" {
+		t.Skip("SQLite serializes writers")
+	}
+	const key = "concurrent-draft"
+	body := appPluginJSONBody(t, map[string]any{
+		"manifest": appPluginTestManifest(key, key, "1.0.0"),
+		"base_url": "https://apps.example.com/" + key + "/",
+		"entitlement_policy": map[string]any{
+			"key": key, "rules": map[string][]string{"app_plugin": {"manage"}},
+		},
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	type workerKey struct{}
+	var seen sync.Map
+	var arrived atomic.Int32
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	const callback = "test:b14_concurrent_draft"
+	require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+		worker := tx.Statement.Context.Value(workerKey{})
+		if worker == nil || tx.Statement.Table != "app_installation_idempotencies" || tx.RowsAffected != 0 {
+			return
+		}
+		if _, loaded := seen.LoadOrStore(worker, true); loaded {
+			return
+		}
+		if arrived.Add(1) == 2 {
+			unblock()
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			tx.AddError(ctx.Err())
+		}
+	}))
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		unblock()
+		wg.Wait()
+		require.NoError(t, model.DB.Callback().Query().Remove(callback))
+	})
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	for worker := range 2 {
+		wg.Go(func() {
+			responses <- appPluginControllerRequest(t, func(c *gin.Context) {
+				c.Request = c.Request.WithContext(context.WithValue(ctx, workerKey{}, worker))
+				CreateAppPluginInstallation(c)
+			}, http.MethodPost, "/api/app_plugins/installations", body,
+				common.RoleRootUser, "default", map[string]string{"Idempotency-Key": key})
+		})
+	}
+	var first string
+	for range 2 {
+		select {
+		case response := <-responses:
+			assert.Equal(t, http.StatusCreated, response.Code, response.Body.String())
+			if first == "" {
+				first = response.Body.String()
+			} else {
+				assert.JSONEq(t, first, response.Body.String(), "both requests must return the identical frozen response")
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	require.Equal(t, int32(2), arrived.Load())
+	assert.Equal(t, [6]int64{1, 1, 1, 4, 1, 0}, appPluginControllerPersistenceCounts(t))
+	var frozen model.AppInstallationIdempotency
+	require.NoError(t, model.DB.First(&frozen).Error)
+	assert.NotEmpty(t, frozen.ResponseJSON)
+	assert.NotEmpty(t, frozen.ResponseDigest)
+}
+
+func appPluginDeadlockRegression(t *testing.T, entitlement, existingTransaction bool) {
+	setupAppPluginControllerTest(t)
+	dialect := model.DB.Dialector.Name()
+	if dialect == "sqlite" {
+		t.Skip("row deadlock detection is specific to MySQL/PostgreSQL")
+	}
+	require.NoError(t, model.DB.Exec("CREATE TABLE b14_regression_locks (id integer PRIMARY KEY, value integer NOT NULL)").Error)
+	for id := 0; id <= 80; id++ {
+		require.NoError(t, model.DB.Exec("INSERT INTO b14_regression_locks (id, value) VALUES (?, 0)", id).Error)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	rival := model.DB.WithContext(ctx).Begin()
+	require.NoError(t, rival.Error)
+	defer rival.Rollback()
+	if dialect == "postgres" {
+		require.NoError(t, rival.Exec("SET LOCAL deadlock_timeout = '10s'").Error)
+	}
+	require.NoError(t, rival.Exec("UPDATE b14_regression_locks SET value = value + 1 WHERE id >= 2").Error)
+	var rivalID int
+	idQuery := "SELECT CONNECTION_ID()"
+	if dialect == "postgres" {
+		idQuery = "SELECT pg_backend_pid()"
+	}
+	require.NoError(t, rival.Raw(idQuery).Scan(&rivalID).Error)
+	var injected atomic.Bool
+	var deadlockErr error
+	rivalDone := make(chan error, 1)
+	var wg sync.WaitGroup
+	const callback = "test:b14_real_deadlock"
+	deadlockTable := "app_installations"
+	if entitlement {
+		deadlockTable = "app_entitlement_policies"
+	}
+	require.NoError(t, model.DB.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+		if entitlement {
+			if claim, ok := tx.Statement.Dest.(*model.AppRouteClaim); ok && claim.Kind == "direct" {
+				tx.AddError(errors.New("later route creation failed"))
+				return
+			}
+		}
+		if tx.Statement.Table != deadlockTable || !injected.CompareAndSwap(false, true) {
+			return
+		}
+		db := tx.Session(&gorm.Session{NewDB: true}).WithContext(ctx)
+		if dialect == "postgres" {
+			if err := db.Exec("SET LOCAL deadlock_timeout = '50ms'").Error; err != nil {
+				tx.AddError(err)
+				return
+			}
+		}
+		if err := db.Exec("UPDATE b14_regression_locks SET value = value + 1 WHERE id = 1").Error; err != nil {
+			tx.AddError(err)
+			return
+		}
+		wg.Go(func() {
+			err := rival.Exec("UPDATE b14_regression_locks SET value = value + 1 WHERE id = 1").Error
+			if err == nil {
+				err = rival.Commit().Error
+			} else {
+				rival.Rollback()
+			}
+			rivalDone <- err
+		})
+		if err := appPluginWaitForDBLock(ctx, model.DB, rivalID); err != nil {
+			tx.AddError(err)
+			return
+		}
+		deadlockErr = db.Exec("UPDATE b14_regression_locks SET value = value + 1 WHERE id = 2").Error
+		tx.AddError(deadlockErr)
+	}))
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+		require.NoError(t, model.DB.Callback().Create().Remove(callback))
+	})
+	body := appPluginInstallBody(t, appPluginTestManifest("deadlock-app", "Deadlock App", "1.0.0"), "https://apps.example.com/deadlock/")
+	if entitlement {
+		var request map[string]any
+		require.NoError(t, common.Unmarshal(body, &request))
+		request["entitlement_policy"] = map[string]any{
+			"key": "deadlock-policy", "rules": map[string][]string{"app_plugin": {"manage"}},
+		}
+		body = appPluginJSONBody(t, request)
+	}
+	handler := CreateAppPluginInstallation
+	var nestedResult service.AppEntitlementPolicyResult
+	var nestedErr error
+	if existingTransaction {
+		handler = func(c *gin.Context) {
+			err := model.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				if err := tx.Exec("UPDATE b14_regression_locks SET value = 1 WHERE id = 0").Error; err != nil {
+					return err
+				}
+				nestedResult, nestedErr = service.NewAppPluginInstallationService(tx,
+					service.AppPluginInstallationOptions{CurrentAuthz: appPluginCurrentAuthz()}).
+					CreateEntitlementPolicy(ctx, service.AppEntitlementPolicyDraft{
+						Key: "nested-deadlock", Rules: map[string][]string{"app_plugin": {"manage"}},
+					})
+				if nestedErr != nil {
+					return nestedErr
+				}
+				return errors.New("later outer failure")
+			})
+			writeAppPluginServiceError(c, err)
+		}
+	}
+	response := appPluginControllerRequest(t, handler, http.MethodPost,
+		"/api/app_plugins/installations", body, common.RoleRootUser, "default",
+		map[string]string{"Idempotency-Key": "deadlock-app"})
+	select {
+	case err := <-rivalDone:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	require.Error(t, deadlockErr)
+	marker := "1213"
+	if dialect == "postgres" {
+		marker = "40P01"
+	}
+	require.Contains(t, deadlockErr.Error(), marker)
+	if existingTransaction {
+		require.Error(t, nestedErr, "caller-owned transaction must receive the original deadlock, not a savepoint retry")
+		assert.Contains(t, nestedErr.Error(), marker)
+		assert.Equal(t, service.AppEntitlementPolicyResult{}, nestedResult)
+		var value int
+		require.NoError(t, model.DB.Raw("SELECT value FROM b14_regression_locks WHERE id = 0").Scan(&value).Error)
+		assert.Zero(t, value, "outer writes must roll back too")
+	}
+	counts := appPluginControllerPersistenceCounts(t)
+	t.Logf("actual deadlock=%v status=%d persisted=%v", deadlockErr, response.Code, counts)
+	if entitlement {
+		assert.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+		assert.Equal(t, [6]int64{}, counts, "later failure must roll back every row after a fresh retry")
+	} else {
+		assert.Equal(t, http.StatusCreated, response.Code, response.Body.String())
+		assert.Equal(t, [6]int64{1, 1, 1, 4, 0, 0}, counts)
+	}
+}
+
+func appPluginPolicySelectionRegression(t *testing.T) {
+	setupAppPluginControllerTest(t)
+	const key = "policy-selection"
+	request := map[string]any{
+		"manifest": appPluginTestManifest(key, key, "1.0.0"),
+		"base_url": "https://apps.example.com/" + key + "/",
+		"entitlement_policy": map[string]any{
+			"key": key, "rules": map[string][]string{"app_plugin": {"manage"}, "not_grantable": {"read"}},
+		},
+	}
+	post := func(scope string) *httptest.ResponseRecorder {
+		return appPluginControllerRequest(t, CreateAppPluginInstallation, http.MethodPost,
+			"/api/app_plugins/installations", appPluginJSONBody(t, request), common.RoleRootUser, "default",
+			map[string]string{"Idempotency-Key": scope})
+	}
+	first := post(key)
+	require.Equal(t, http.StatusCreated, first.Code, first.Body.String())
+	var frozen appPluginTestEnvelope
+	require.NoError(t, common.Unmarshal(first.Body.Bytes(), &frozen))
+	request["entitlement_policy"] = map[string]any{
+		"key": key, "rules": map[string][]string{"not_grantable": {"read", "read"}, "app_plugin": {"manage", "manage"}},
+	}
+	canonical := post(key)
+	assert.Equal(t, http.StatusCreated, canonical.Code, canonical.Body.String())
+	assert.JSONEq(t, first.Body.String(), canonical.Body.String())
+	request["entitlement_policy"] = map[string]any{
+		"key": key, "rules": map[string][]string{"app_plugin": {"manage"}, "not_grantable": {"write"}},
+	}
+	conflict := post(key)
+	assert.Equal(t, http.StatusConflict, conflict.Code, conflict.Body.String())
+	assert.Equal(t, "idempotency_conflict", appPluginErrorCode(t, conflict), "hash the original rules, not just the effective subset")
+	replay := post(key + "-generation-replay")
+	assert.Equal(t, http.StatusCreated, replay.Code, replay.Body.String())
+	assert.JSONEq(t, first.Body.String(), replay.Body.String(), "generation replay must not allocate another policy")
+	assert.Equal(t, [6]int64{1, 1, 2, 4, 1, 0}, appPluginControllerPersistenceCounts(t))
+
+	request["manifest"] = appPluginTestManifest(key, key, "2.0.0")
+	request["entitlement_policy"] = map[string]string{"id": frozen.Data.EntitlementPolicyVersion}
+	existing := post(key + "-reference")
+	require.Equal(t, http.StatusCreated, existing.Code, existing.Body.String())
+	var referenced appPluginTestEnvelope
+	require.NoError(t, common.Unmarshal(existing.Body.Bytes(), &referenced))
+	assert.Equal(t, frozen.Data.EntitlementPolicyVersion, referenced.Data.EntitlementPolicyVersion)
+	before := appPluginControllerPersistenceCounts(t)
+	request["manifest"] = appPluginTestManifest(key, key, "3.0.0")
+	request["entitlement_policy"] = "policy_missing"
+	missing := post(key + "-missing")
+	assert.Equal(t, http.StatusNotFound, missing.Code, missing.Body.String())
+	assert.Equal(t, "not_found", appPluginErrorCode(t, missing))
+	assert.Equal(t, before, appPluginControllerPersistenceCounts(t))
+}
+
+func appPluginWaitForDBLock(ctx context.Context, db *gorm.DB, connectionID int) error {
+	query := "SELECT COUNT(*) FROM information_schema.innodb_lock_waits w JOIN information_schema.innodb_trx t ON t.trx_id = w.requesting_trx_id WHERE t.trx_mysql_thread_id = ?"
+	if db.Dialector.Name() == "postgres" {
+		query = "SELECT COUNT(*) FROM pg_stat_activity WHERE pid = ? AND wait_event_type = 'Lock'"
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting int64
+		if err := db.WithContext(ctx).Raw(query, connectionID).Scan(&waiting).Error; err != nil {
+			return err
+		}
+		if waiting > 0 {
+			return nil
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func appPluginPatchUpgradeRegression(t *testing.T, nextRevision bool) {
+	setupAppPluginControllerTest(t)
+	if model.DB.Dialector.Name() == "sqlite" {
+		t.Skip("SQLite serializes writers")
+	}
+	app := createAppPluginForControllerTest(t, "patch-upgrade", "Patch Upgrade", "patch-upgrade")
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	type workerKey struct{}
+	ownershipHeld := make(chan struct{}, 1)
+	patchStarted := make(chan bool, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	var held, started atomic.Bool
+	const callback = "test:b14_patch_upgrade_order"
+	require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Context.Value(workerKey{}) != "upgrade" || tx.Statement.Table != "app_route_claims" ||
+			!strings.Contains(tx.Statement.SQL.String(), "FOR UPDATE") || !held.CompareAndSwap(false, true) {
+			return
+		}
+		ownershipHeld <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			tx.AddError(ctx.Err())
+		}
+	}))
+	require.NoError(t, model.DB.Callback().Query().Before("gorm:query").Register(callback+":patch", func(tx *gorm.DB) {
+		if tx.Statement.Context.Value(workerKey{}) != "patch" || tx.Statement.Table != "app_route_claims" {
+			return
+		}
+		if _, locks := tx.Statement.Clauses["FOR"]; locks && started.CompareAndSwap(false, true) {
+			patchStarted <- true
+		}
+	}))
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callback+":write", func(tx *gorm.DB) {
+		if tx.Statement.Context.Value(workerKey{}) == "patch" && started.CompareAndSwap(false, true) {
+			patchStarted <- false
+			select {
+			case <-release:
+			case <-ctx.Done():
+				tx.AddError(ctx.Err())
+			}
+		}
+	}))
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		unblock()
+		wg.Wait()
+		require.NoError(t, model.DB.Callback().Query().Remove(callback))
+		require.NoError(t, model.DB.Callback().Query().Remove(callback+":patch"))
+		require.NoError(t, model.DB.Callback().Update().Remove(callback+":write"))
+	})
+	upgradeBody := appPluginInstallBody(t, appPluginTestManifest(app.AppKey, "Patch Upgrade", "2.0.0"),
+		"https://apps.example.com/upgraded/")
+	patchRevision := app.Revision
+	if nextRevision {
+		patchRevision++
+	}
+	patchBody := appPluginPatchBody(t, app.InstallationID, patchRevision,
+		map[string]any{"base_url": "https://apps.example.com/patched/"})
+	upgradeDone := make(chan *httptest.ResponseRecorder, 1)
+	patchDone := make(chan *httptest.ResponseRecorder, 1)
+	wg.Go(func() {
+		upgradeDone <- appPluginControllerRequest(t, func(c *gin.Context) {
+			c.Request = c.Request.WithContext(context.WithValue(ctx, workerKey{}, "upgrade"))
+			CreateAppPluginInstallation(c)
+		}, http.MethodPost, "/api/app_plugins/installations", upgradeBody,
+			common.RoleRootUser, "default", map[string]string{"Idempotency-Key": "upgrade-v2"})
+	})
+	select {
+	case <-ownershipHeld:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	wg.Go(func() {
+		patchDone <- appPluginControllerRequest(t, func(c *gin.Context) {
+			c.Request = c.Request.WithContext(context.WithValue(ctx, workerKey{}, "patch"))
+			PatchAppPluginInstallation(c)
+		}, http.MethodPatch, "/api/app_plugins/installations", patchBody, common.RoleRootUser, "default", nil)
+	})
+	select {
+	case ordered := <-patchStarted:
+		assert.True(t, ordered, "PATCH must lock ownership before any mutation")
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	unblock()
+	select {
+	case response := <-upgradeDone:
+		assert.Equal(t, http.StatusCreated, response.Code, response.Body.String())
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case response := <-patchDone:
+		if nextRevision {
+			assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		} else {
+			assert.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+			assert.Equal(t, "version_conflict", appPluginErrorCode(t, response))
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	var current model.AppInstallation
+	require.NoError(t, model.DB.Where("installation_id = ?", app.InstallationID).First(&current).Error)
+	expectedRevision, expectedBase := int64(2), "https://apps.example.com/upgraded/"
+	if nextRevision {
+		expectedRevision, expectedBase = 3, "https://apps.example.com/patched/"
+	}
+	assert.Equal(t, expectedRevision, current.Revision)
+	assert.Equal(t, "2.0.0", current.ManifestVersion)
+	assert.Equal(t, expectedBase, current.BaseURL)
+	var routes []model.AppRouteClaim
+	require.NoError(t, model.DB.Where("installation_id = ? AND kind <> ?", app.InstallationID, "app_key").Find(&routes).Error)
+	require.Len(t, routes, 3)
+	for _, route := range routes {
+		assert.True(t, strings.HasPrefix(route.AbsoluteEndpoint, current.BaseURL), route.AbsoluteEndpoint)
+	}
 }

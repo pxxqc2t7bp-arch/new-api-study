@@ -2,12 +2,9 @@ package controller
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
-	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,7 +22,6 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 const appPluginRequestBodyLimit = service.AppManifestMaxBytes + 64*1024
@@ -265,39 +261,21 @@ func CreateAppPluginInstallation(c *gin.Context) {
 		return
 	}
 
-	var result model.AppInstallResult
-	err = model.DB.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
-		replayEntitlement, resolveErr := appPluginEntitlementForReplay(
-			tx,
-			int64(c.GetInt("id")),
-			idempotencyKey,
-			entitlement,
-		)
-		if resolveErr != nil {
-			return resolveErr
-		}
-		entitlementID, resolveErr := resolveAppPluginEntitlement(c, tx, replayEntitlement)
-		if resolveErr != nil {
-			return resolveErr
-		}
-		command := service.AppInstallCommand{
-			DisallowUpgrade:      role < common.RoleRootUser,
-			ActorID:              int64(c.GetInt("id")),
-			IdempotencyKey:       idempotencyKey,
-			ManifestJSON:         append([]byte(nil), request.Manifest...),
-			BaseURL:              request.BaseURL,
-			EnabledSurfaces:      request.EnabledSurfaces,
-			AllowedParentOrigins: request.AllowedParentOrigins,
-			AllowedOrigins:       request.AllowedOrigins,
-			AllowedUserPolicy:    request.AllowedUserPolicy,
-			NetworkPolicy:        request.NetworkPolicy,
-			EntitlementPolicyID:  entitlementID,
-		}
-		result, resolveErr = service.NewAppPluginInstallationService(
-			tx,
-			service.AppPluginInstallationOptions{},
-		).Install(c.Request.Context(), command)
-		return resolveErr
+	result, err := service.NewAppPluginInstallationService(model.DB, service.AppPluginInstallationOptions{
+		CurrentAuthz: appPluginCurrentAuthz(),
+	}).Install(c.Request.Context(), service.AppInstallCommand{
+		DisallowUpgrade:        role < common.RoleRootUser,
+		ActorID:                int64(c.GetInt("id")),
+		IdempotencyKey:         idempotencyKey,
+		ManifestJSON:           append([]byte(nil), request.Manifest...),
+		BaseURL:                request.BaseURL,
+		EnabledSurfaces:        request.EnabledSurfaces,
+		AllowedParentOrigins:   request.AllowedParentOrigins,
+		AllowedOrigins:         request.AllowedOrigins,
+		AllowedUserPolicy:      request.AllowedUserPolicy,
+		NetworkPolicy:          request.NetworkPolicy,
+		EntitlementPolicyID:    entitlement.reference,
+		EntitlementPolicyDraft: entitlement.draft,
 	})
 	if err != nil {
 		writeAppPluginServiceError(c, err)
@@ -306,50 +284,6 @@ func CreateAppPluginInstallation(c *gin.Context) {
 
 	middleware.SetAppPluginAuditTarget(c, result.InstallationID, result.Revision)
 	c.JSON(http.StatusCreated, gin.H{"success": true, "data": result})
-}
-
-func appPluginEntitlementForReplay(
-	tx *gorm.DB,
-	actorID int64,
-	idempotencyKey string,
-	selection appPluginEntitlementSelection,
-) (appPluginEntitlementSelection, error) {
-	if selection.draft == nil {
-		return selection, nil
-	}
-	var replay model.AppInstallationIdempotency
-	query := tx.Where("actor_id = ? AND scope_key = ?", actorID, idempotencyKey).
-		Limit(1).
-		Find(&replay)
-	if query.Error != nil {
-		return appPluginEntitlementSelection{}, query.Error
-	}
-	if query.RowsAffected == 0 {
-		return selection, nil
-	}
-	if replay.ResponseJSON == "" {
-		return appPluginEntitlementSelection{}, model.ErrAppIdempotencyConflict
-	}
-	var previous model.AppInstallResult
-	if err := common.Unmarshal([]byte(replay.ResponseJSON), &previous); err != nil {
-		return appPluginEntitlementSelection{}, err
-	}
-	if previous.EntitlementPolicyVersion == "" {
-		return appPluginEntitlementSelection{}, model.ErrAppIdempotencyConflict
-	}
-	var policy model.AppEntitlementPolicy
-	if err := tx.Where("id = ?", previous.EntitlementPolicyVersion).First(&policy).Error; err != nil {
-		return appPluginEntitlementSelection{}, err
-	}
-	if policy.Key != selection.draft.Key ||
-		!maps.EqualFunc(
-			map[string][]string(policy.EffectiveRules),
-			appPluginEffectiveEntitlementRules(selection.draft.Rules),
-			slices.Equal,
-		) {
-		return appPluginEntitlementSelection{}, model.ErrAppIdempotencyConflict
-	}
-	return appPluginEntitlementSelection{reference: policy.ID}, nil
 }
 
 // PatchAppPluginInstallation applies one CAS update. B1.4 deliberately rejects
@@ -402,21 +336,8 @@ func PatchAppPluginInstallation(c *gin.Context) {
 	}
 
 	var updated model.AppInstallResult
-	err = model.DB.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
-		var current model.AppInstallation
-		query := tx.Where("installation_id = ?", request.InstallationID).Limit(1).Find(&current)
-		if query.Error != nil {
-			return query.Error
-		}
-		if query.RowsAffected != 1 {
-			return gorm.ErrRecordNotFound
-		}
-		if current.Status == model.AppInstallationStatusRevoked {
-			return &appPluginAPIError{status: http.StatusConflict, code: "invalid_state_transition", path: "/changes/status"}
-		}
-		if current.Revision != request.Revision {
-			return model.ErrAppInstallationRevisionConflict
-		}
+	err = model.MutateAppInstallation(c.Request.Context(), model.DB, request.InstallationID, request.Revision, func(tx *gorm.DB, current model.AppInstallation) error {
+		updated = model.AppInstallResult{}
 		if values.status != nil {
 			switch *values.status {
 			case model.AppInstallationStatusEnabled:
@@ -737,76 +658,30 @@ func appPluginCurrentAuthz() map[string][]string {
 	return rules
 }
 
-func appPluginEffectiveEntitlementRules(requested map[string][]string) map[string][]string {
-	allowed := appPluginCurrentAuthz()
-	effective := make(map[string][]string)
-	for resource, actions := range requested {
-		for _, action := range normalizeAppPluginStrings(actions) {
-			if slices.Contains(allowed[resource], action) {
-				effective[resource] = append(effective[resource], action)
-			}
-		}
-	}
-	return effective
-}
-
 func updateAppPluginRouteClaims(tx *gorm.DB, installation model.AppInstallation, baseURL string) error {
-	var version model.AppVersion
-	if err := tx.Where("id = ?", installation.AppVersionID).First(&version).Error; err != nil {
+	version, err := model.GetAppInstallationVersion(tx, installation)
+	if err != nil {
 		return err
 	}
 	manifest, err := service.ValidateAppManifest([]byte(version.CanonicalManifestJSON))
 	if err != nil {
 		return err
 	}
-	endpoints := map[string]string{}
-	for kind, manifestPath := range map[string]string{
-		"callback": manifest.CallbackPath,
-		"direct":   manifest.Surfaces.Direct.StartPath,
-		"embedded": manifest.Surfaces.Embedded.StartPath,
-	} {
-		endpoint, err := appPluginEndpoint(baseURL, manifestPath)
-		if err != nil {
-			return err
-		}
-		endpoints[kind] = endpoint
+	callback, err := appPluginEndpoint(baseURL, manifest.CallbackPath)
+	if err != nil {
+		return err
 	}
-
-	for kind, endpoint := range endpoints {
-		digest := sha256.Sum256([]byte("route\x00" + endpoint))
-		claimKey := fmt.Sprintf("%x", digest)
-		var collisionCount int64
-		if err := tx.Model(&model.AppRouteClaim{}).
-			Where("claim_key = ? AND installation_id <> ?", claimKey, installation.InstallationID).
-			Count(&collisionCount).Error; err != nil {
-			return err
-		}
-		if collisionCount != 0 {
-			return model.ErrAppRouteClaimConflict
-		}
-		update := tx.Model(&model.AppRouteClaim{}).
-			Where("installation_id = ? AND kind = ?", installation.InstallationID, kind).
-			Updates(map[string]any{"absolute_endpoint": endpoint, "claim_key": claimKey})
-		if update.Error != nil {
-			return update.Error
-		}
-		if update.RowsAffected == 0 {
-			claim := model.AppRouteClaim{
-				AppKey:           installation.AppKey,
-				InstallationID:   installation.InstallationID,
-				ClaimKey:         claimKey,
-				Kind:             kind,
-				AbsoluteEndpoint: endpoint,
-			}
-			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&claim).Error; err != nil {
-				return err
-			}
-			if claim.ID == 0 {
-				return model.ErrAppRouteClaimConflict
-			}
-		}
+	direct, err := appPluginEndpoint(baseURL, manifest.Surfaces.Direct.StartPath)
+	if err != nil {
+		return err
 	}
-	return nil
+	embedded, err := appPluginEndpoint(baseURL, manifest.Surfaces.Embedded.StartPath)
+	if err != nil {
+		return err
+	}
+	return model.UpdateAppRouteClaims(tx, installation, model.AppRouteEndpoints{
+		Callback: callback, Direct: direct, Embedded: embedded,
+	})
 }
 
 func appPluginInstallationResult(db *gorm.DB, installation model.AppInstallation) (model.AppInstallResult, error) {
@@ -1005,6 +880,8 @@ func writeAppPluginServiceError(c *gin.Context, err error) {
 		return
 	}
 	switch {
+	case errors.Is(err, model.ErrAppEntitlementPolicyNotFound):
+		writeAppPluginError(c, http.StatusNotFound, "not_found", "/entitlement_policy")
 	case errors.Is(err, model.ErrAppInstallationUpgradeForbidden):
 		writeAppPluginError(c, http.StatusForbidden, "forbidden", "/manifest")
 	case errors.Is(err, service.ErrManifestCannotOwnEntitlementPolicy),
