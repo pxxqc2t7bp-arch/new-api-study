@@ -176,6 +176,161 @@ func TestAppPluginDashboardRoutesAndRedaction(t *testing.T) {
 	canvas := routerAppPluginRequest(fixture.engine, http.MethodGet, "/api/infinite-canvas", "", nil)
 	assert.Equal(t, http.StatusNoContent, canvas.Code)
 
+	t.Run("rate limits use canonical envelopes", func(t *testing.T) {
+		previousGlobal, previousGlobalNum, previousGlobalDuration := common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration
+		previousCritical, previousCriticalNum, previousCriticalDuration := common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.CriticalRateLimitDuration
+		previousFlag := operation_setting.AppPluginV1Enabled
+		t.Cleanup(func() {
+			common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = previousGlobal, previousGlobalNum, previousGlobalDuration
+			common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.CriticalRateLimitDuration = previousCritical, previousCriticalNum, previousCriticalDuration
+			operation_setting.AppPluginV1Enabled = previousFlag
+		})
+		require.False(t, common.RedisEnabled, "rate-limit regression must use the in-memory limiter")
+		operation_setting.AppPluginV1Enabled = false
+		common.GlobalApiRateLimitEnable = false
+		common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.CriticalRateLimitDuration = true, 1, 60
+
+		for i, test := range []struct {
+			name, path    string
+			authenticated bool
+			userLimit     bool
+		}{
+			{name: "IP authorize before authentication", path: "/api/app_plugins/test/authorize"},
+			{name: "IP credential create after authentication", path: "/api/app_plugins/installations/test/service-credentials", authenticated: true},
+			{name: "IP credential rotate after authentication", path: "/api/app_plugins/installations/test/service-credentials/rotate", authenticated: true},
+			{name: "IP exchange", path: "/internal/apps/v1/launch-codes/exchange"},
+			{name: "IP introspect", path: "/internal/apps/v1/sessions/introspect"},
+			{name: "IP revoke", path: "/internal/apps/v1/sessions/revoke"},
+			{name: "user authorize across IPs", path: "/api/app_plugins/test/authorize", authenticated: true, userLimit: true},
+			{name: "user credential create across IPs", path: "/api/app_plugins/installations/test/service-credentials", authenticated: true, userLimit: true},
+			{name: "user credential rotate across IPs", path: "/api/app_plugins/installations/test/service-credentials/rotate", authenticated: true, userLimit: true},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				token := ""
+				if test.authenticated {
+					token = fmt.Sprintf("b15-rate-limit-token-%d", i)
+					name := fmt.Sprintf("b15-rate-limit-user-%d", i)
+					require.NoError(t, model.DB.Create(&model.User{
+						Id: 15000 + i, Username: name, Role: common.RoleRootUser,
+						Status: common.UserStatusEnabled, Group: "default", AccessToken: &token,
+						AuthVersion: 1, AffCode: name,
+					}).Error)
+				}
+				// Isolate route-local limiters; the real SetApiRouter global chain is tested below.
+				engine := gin.New()
+				require.NoError(t, engine.SetTrustedProxies(nil))
+				if !test.userLimit {
+					engine.Use(middleware.RequestId())
+				}
+				registerAppPluginRoutes(engine.Group("/api"))
+				firstIP := fmt.Sprintf("198.51.100.%d", 2*i+1)
+				secondIP := firstIP
+				if test.userLimit {
+					secondIP = fmt.Sprintf("198.51.100.%d", 2*i+2)
+				}
+				first := routerAppPluginRateLimitRequest(engine, http.MethodPost, test.path, token, firstIP)
+				if i == 0 {
+					assertRouterAppPluginErrorEnvelope(t, first, http.StatusUnauthorized, "unauthenticated", "Authentication required", false)
+				} else if strings.Contains(test.path, "/service-credentials") {
+					assertRouterAppPluginErrorEnvelope(t, first, http.StatusForbidden, "forbidden", "App plugin request is forbidden", false)
+				} else {
+					assertRouterAppPluginErrorEnvelope(t, first, http.StatusForbidden, "app_plugin_disabled", map[bool]string{
+						true: "App plugin API is disabled", false: "App service request denied",
+					}[test.authenticated], false)
+				}
+				limited := routerAppPluginRateLimitRequest(engine, http.MethodPost, test.path, token, secondIP)
+				t.Logf("limiter=%s path=%s first_status=%d second_status=%d body_bytes=%d",
+					test.name, test.path, first.Code, limited.Code, limited.Body.Len())
+				assert.Equal(t, "60", limited.Header().Get("Retry-After"))
+				assert.Equal(t, "no-store", limited.Header().Get("Cache-Control"))
+				assert.Equal(t, "no-referrer", limited.Header().Get("Referrer-Policy"))
+				assert.NotEqual(t, "client-request-id-must-not-be-trusted", limited.Header().Get(common.RequestIdKey))
+				assert.NotEqual(t, first.Header().Get(common.RequestIdKey), limited.Header().Get(common.RequestIdKey))
+				require.NotEmpty(t, limited.Body.String(), "B1.5 429 canonical envelope missing")
+				assertRouterAppPluginErrorEnvelope(t, limited, http.StatusTooManyRequests, "rate_limited", "Too many app plugin requests", true)
+			})
+		}
+
+		t.Run("SetApiRouter global limiter", func(t *testing.T) {
+			common.CriticalRateLimitEnable = false
+			common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = true, 1, 60
+			engine := gin.New()
+			require.NoError(t, engine.SetTrustedProxies(nil))
+			engine.Use(middleware.RequestId())
+			SetApiRouter(engine)
+			for i, test := range []struct {
+				method, path string
+				app          bool
+			}{
+				{http.MethodGet, "/api/app_plugins", true},
+				{http.MethodGet, "/api/app_plugins/installations", true},
+				{http.MethodPost, "/api/app_plugins/installations", true},
+				{http.MethodPatch, "/api/app_plugins/installations", true},
+				{http.MethodPost, "/api/app_plugins/test/authorize", true},
+				{http.MethodPost, "/api/app_plugins/installations/test/service-credentials", true},
+				{http.MethodPost, "/api/app_plugins/installations/test/service-credentials/rotate", true},
+				{http.MethodDelete, "/api/app_plugins/installations/test/service-credentials/test", true},
+				{http.MethodPost, "/internal/apps/v1/launch-codes/exchange", true},
+				{http.MethodPost, "/internal/apps/v1/sessions/introspect", true},
+				{http.MethodPost, "/internal/apps/v1/sessions/revoke", true},
+				{http.MethodGet, "/api/models", false},
+				{http.MethodGet, "/api/user/self", false},
+			} {
+				t.Run(test.method+" "+test.path, func(t *testing.T) {
+					ip := fmt.Sprintf("203.0.113.%d", i+1)
+					first := routerAppPluginRateLimitRequest(engine, http.MethodGet, "/api/app_plugins", "", ip)
+					assertRouterAppPluginErrorEnvelope(t, first, http.StatusUnauthorized, "unauthenticated", "Authentication required", false)
+					limited := routerAppPluginRateLimitRequest(engine, test.method, test.path, "", ip)
+					t.Logf("limiter=GlobalAPI method=%s path=%s first_status=%d second_status=%d body_bytes=%d",
+						test.method, test.path, first.Code, limited.Code, limited.Body.Len())
+					assert.Equal(t, "60", limited.Header().Get("Retry-After"))
+					if !test.app {
+						assert.Equal(t, http.StatusTooManyRequests, limited.Code)
+						assert.Empty(t, limited.Body.String(), "non-App global limiter contract must remain unchanged")
+						assert.Empty(t, limited.Header().Get("Cache-Control"))
+						assert.Empty(t, limited.Header().Get("Referrer-Policy"))
+						return
+					}
+					assert.Equal(t, "no-store", limited.Header().Get("Cache-Control"))
+					assert.Equal(t, "no-referrer", limited.Header().Get("Referrer-Policy"))
+					assert.NotEqual(t, "client-request-id-must-not-be-trusted", limited.Header().Get(common.RequestIdKey))
+					assert.NotEqual(t, first.Header().Get(common.RequestIdKey), limited.Header().Get(common.RequestIdKey))
+					require.NotEmpty(t, limited.Body.String(), "B1.5 429 canonical envelope missing")
+					assertRouterAppPluginErrorEnvelope(t, limited, http.StatusTooManyRequests, "rate_limited", "Too many app plugin requests", true)
+				})
+			}
+		})
+	})
+
+	t.Run("normalization preserves existing responses", func(t *testing.T) {
+		for _, test := range []struct {
+			name, body string
+			status     int
+		}{
+			{"canonical 429", `{"error":{"code":"capacity_exhausted","message":"Capacity exhausted","field_errors":[],"retryable":true,"request_id":"server-existing"}}`, http.StatusTooManyRequests},
+			{"canonical 401", `{"error":{"code":"unauthenticated","message":"Authentication required","field_errors":[],"retryable":false,"request_id":"server-existing"}}`, http.StatusUnauthorized},
+			{"empty 500", "", http.StatusInternalServerError},
+			{"legacy business error", `{"success":false,"code":"BUSINESS_ERROR","message":"Rejected"}`, http.StatusBadRequest},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				engine := gin.New()
+				engine.GET("/api/app_plugins", normalizeAppPluginAuthErrors(), func(c *gin.Context) {
+					c.Header("Retry-After", "17")
+					c.Header("Cache-Control", "no-store")
+					c.Header("Referrer-Policy", "no-referrer")
+					c.Data(test.status, "application/json", []byte(test.body))
+					c.Abort()
+				})
+				response := routerAppPluginRequest(engine, http.MethodGet, "/api/app_plugins", "", nil)
+				assert.Equal(t, test.status, response.Code)
+				assert.Equal(t, test.body, response.Body.String())
+				assert.Equal(t, "17", response.Header().Get("Retry-After"))
+				assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+				assert.Equal(t, "no-referrer", response.Header().Get("Referrer-Policy"))
+			})
+		}
+	})
+
 	t.Run("internal authentication error is unavailable without disclosure", func(t *testing.T) {
 		sqlDB, err := model.DB.DB()
 		require.NoError(t, err)
@@ -627,6 +782,18 @@ func openRouterAppPluginDB(t *testing.T) *gorm.DB {
 
 func routerAppPluginRequest(engine http.Handler, method, path, token string, body []byte) *httptest.ResponseRecorder {
 	return routerAppPluginRequestWithHeaders(engine, method, path, token, body, nil)
+}
+
+func routerAppPluginRateLimitRequest(engine http.Handler, method, path, token, clientIP string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, path, nil)
+	request.RemoteAddr = clientIP + ":12345"
+	request.Header.Set(common.RequestIdKey, "client-request-id-must-not-be-trusted")
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	return response
 }
 
 func routerAppPluginRequestWithHeaders(

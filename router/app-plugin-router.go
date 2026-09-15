@@ -13,13 +13,59 @@ import (
 
 func registerAppPluginRoutes(apiRouter *gin.RouterGroup) {
 	apiRouter.GET("/app_plugins", normalizeAppPluginAuthErrors(), middleware.UserAuth(), controller.ListAppPlugins)
+	apiRouter.POST("/app_plugins/:key/authorize", appPluginNoStore(), normalizeAppPluginAuthErrors(),
+		middleware.CriticalRateLimit(), middleware.UserAuth(), middleware.UserCriticalRateLimit("app-plugin-authorize"), controller.AuthorizeAppPlugin)
 
 	installations := apiRouter.Group("/app_plugins/installations")
-	installations.Use(normalizeAppPluginAuthErrors(), middleware.UserAuth(), requireAppPluginManage())
+	installations.Use(appPluginNoStore(), normalizeAppPluginAuthErrors(), middleware.UserAuth(), requireAppPluginManage())
 	{
 		installations.GET("", controller.ListAppPluginInstallations)
 		installations.POST("", middleware.AppPluginOperationAudit(), controller.CreateAppPluginInstallation)
 		installations.PATCH("", middleware.AppPluginOperationAudit(), controller.PatchAppPluginInstallation)
+		installations.POST("/:id/service-credentials", middleware.CriticalRateLimit(),
+			middleware.UserCriticalRateLimit("app-plugin-credential"), middleware.AppPluginOperationAudit(), controller.CreateAppPluginServiceCredential)
+		installations.POST("/:id/service-credentials/rotate", middleware.CriticalRateLimit(),
+			middleware.UserCriticalRateLimit("app-plugin-credential"), middleware.AppPluginOperationAudit(), controller.RotateAppPluginServiceCredential)
+		installations.DELETE("/:id/service-credentials/:credential_id",
+			middleware.AppPluginOperationAudit(), controller.RevokeAppPluginServiceCredential)
+	}
+	// Gin cleans the sibling path, retaining common API middleware without
+	// placing the service-only endpoints under the dashboard /api namespace.
+	internal := apiRouter.Group("../internal/apps/v1", appPluginNoStore(), normalizeAppPluginAuthErrors(),
+		middleware.CriticalRateLimit(), middleware.AppServiceAuth())
+	internal.POST("/launch-codes/exchange", controller.ExchangeAppPluginLaunchCode)
+	internal.POST("/sessions/introspect", controller.IntrospectAppPluginSession)
+	internal.POST("/sessions/revoke", controller.RevokeAppPluginSession)
+}
+
+func appPluginNoStore() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		c.Header("Referrer-Policy", "no-referrer")
+		c.Next()
+	}
+}
+
+func appPluginAPIErrorBoundary() gin.HandlerFunc {
+	normalize := normalizeAppPluginAuthErrors()
+	return func(c *gin.Context) {
+		// Match registered routes, not prefixes that could include other APIs.
+		switch c.Request.Method + " " + c.FullPath() {
+		case "GET /api/app_plugins",
+			"GET /api/app_plugins/installations",
+			"POST /api/app_plugins/installations",
+			"PATCH /api/app_plugins/installations",
+			"POST /api/app_plugins/:key/authorize",
+			"POST /api/app_plugins/installations/:id/service-credentials",
+			"POST /api/app_plugins/installations/:id/service-credentials/rotate",
+			"DELETE /api/app_plugins/installations/:id/service-credentials/:credential_id",
+			"POST /internal/apps/v1/launch-codes/exchange",
+			"POST /internal/apps/v1/sessions/introspect",
+			"POST /internal/apps/v1/sessions/revoke":
+			normalize(c)
+		default:
+			c.Next()
+		}
 	}
 }
 
@@ -48,7 +94,8 @@ func normalizeAppPluginAuthErrors() gin.HandlerFunc {
 			Code    string `json:"code"`
 		}
 		_, authenticated := c.Get("id")
-		if authenticated || !c.IsAborted() || common.Unmarshal(writer.body.Bytes(), &legacy) != nil || legacy.Success == nil || *legacy.Success {
+		rateLimited := writer.status == http.StatusTooManyRequests && writer.body.Len() == 0
+		if !rateLimited && (authenticated || !c.IsAborted() || common.Unmarshal(writer.body.Bytes(), &legacy) != nil || legacy.Success == nil || *legacy.Success) {
 			writer.commit()
 			return
 		}
@@ -57,20 +104,32 @@ func normalizeAppPluginAuthErrors() gin.HandlerFunc {
 		code := ""
 		message := ""
 		retryable := false
-		switch legacy.Code {
-		case "AUTH_UNAUTHORIZED", "AUTH_TOKEN_EXPIRED", "AUTH_SESSION_REVOKED":
+		switch {
+		case rateLimited:
+			status = http.StatusTooManyRequests
+			code = "rate_limited"
+			message = "Too many app plugin requests"
+			retryable = true
+			header := c.Writer.Header()
+			clear(header)
+			for key, values := range writer.header {
+				header[key] = append([]string(nil), values...)
+			}
+			c.Header("Cache-Control", "no-store")
+			c.Header("Referrer-Policy", "no-referrer")
+		case legacy.Code == "AUTH_UNAUTHORIZED" || legacy.Code == "AUTH_TOKEN_EXPIRED" || legacy.Code == "AUTH_SESSION_REVOKED":
 			status = http.StatusUnauthorized
 			code = "unauthenticated"
 			message = "Authentication required"
-		case "AUTH_USER_DISABLED", "AUTH_USER_INVALID":
+		case legacy.Code == "AUTH_USER_DISABLED" || legacy.Code == "AUTH_USER_INVALID":
 			status = http.StatusForbidden
 			code = "identity_inactive"
 			message = "Identity is inactive"
-		case "AUTH_INSUFFICIENT_PRIVILEGE":
+		case legacy.Code == "AUTH_INSUFFICIENT_PRIVILEGE":
 			status = http.StatusForbidden
 			code = "forbidden"
 			message = "App plugin request is forbidden"
-		case "AUTH_INTERNAL_ERROR":
+		case legacy.Code == "AUTH_INTERNAL_ERROR":
 			status = http.StatusServiceUnavailable
 			code = "service_unavailable"
 			message = "App plugin request failed"

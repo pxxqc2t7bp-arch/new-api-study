@@ -3,10 +3,13 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,9 +19,11 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	mysqlDriver "github.com/go-sql-driver/mysql"
@@ -32,6 +37,348 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func TestAuthorizeReturnsRegisteredOneTimeLaunchURL(t *testing.T) {
+	setupAppPluginControllerTest(t)
+	app, identity := setupAppPluginLaunchController(t)
+	require.NoError(t, model.DB.Model(&model.AppInstallation{}).Where("installation_id = ?", app.InstallationID).
+		Update("status", "enabled").Error)
+	verifier := strings.Repeat("v", 43)
+	challenge := sha256.Sum256([]byte(verifier))
+	request := map[string]any{
+		"surface": "direct", "transaction_id": "controller-transaction",
+		"state":          base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)),
+		"nonce":          base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)),
+		"code_challenge": base64.RawURLEncoding.EncodeToString(challenge[:]), "code_challenge_method": "S256",
+	}
+	call := func(body []byte, key, origin string, session bool) *httptest.ResponseRecorder {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodPost, "https://console.example.com/api/app_plugins/"+app.AppKey+"/authorize", bytes.NewReader(body))
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Request.Header.Set("Origin", origin)
+		c.Request.Header.Set("Idempotency-Key", key)
+		c.Params = gin.Params{{Key: "key", Value: app.AppKey}}
+		c.Set("id", identity.UserID)
+		c.Set("role", common.RoleRootUser)
+		c.Set("group", "default")
+		if session {
+			c.Set("session_id", identity.SessionID)
+			c.Set("auth_version", identity.UserAuthVersion)
+			c.Set("session_version", identity.SessionVersion)
+		}
+		AuthorizeAppPlugin(c)
+		return recorder
+	}
+	first := call(appPluginJSONBody(t, request), "launch-once", "https://console.example.com", true)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	assert.Equal(t, "no-store", first.Header().Get("Cache-Control"))
+	var response struct {
+		Success bool                             `json:"success"`
+		Data    service.AppPluginAuthorizeResult `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(first.Body.Bytes(), &response))
+	require.True(t, response.Success)
+	assert.Equal(t, 60, response.Data.ExpiresIn)
+	assert.Equal(t, "direct", response.Data.Surface)
+	callback, err := url.Parse(response.Data.LaunchURL)
+	require.NoError(t, err)
+	assert.Equal(t, "https", callback.Scheme)
+	assert.Equal(t, "apps.example.com", callback.Host)
+	assert.Equal(t, "/launch-controller/auth/callback", callback.Path)
+	assert.Empty(t, callback.Fragment)
+	assert.Nil(t, callback.User)
+	assert.Equal(t, request["state"], callback.Query().Get("state"))
+	require.NotEmpty(t, callback.Query().Get("code"))
+	assert.Empty(t, callback.Query().Get("code_verifier"))
+	assert.Empty(t, callback.Query().Get("credential"))
+	again := call(appPluginJSONBody(t, request), "launch-once", "https://console.example.com", true)
+	require.Equal(t, http.StatusOK, again.Code)
+	assert.JSONEq(t, first.Body.String(), again.Body.String())
+	t.Run("missing session cannot authorize with a PAT principal", func(t *testing.T) {
+		response := call(appPluginJSONBody(t, request), "pat", "https://console.example.com", false)
+		assert.Equal(t, http.StatusUnauthorized, response.Code)
+		assert.Equal(t, "unauthenticated", appPluginErrorCode(t, response))
+	})
+	t.Run("exact request fields", func(t *testing.T) {
+		for field := range request {
+			changed := make(map[string]any, len(request))
+			for key, value := range request {
+				if key != field {
+					changed[key] = value
+				}
+			}
+			response := call(appPluginJSONBody(t, changed), "missing-"+field, "https://console.example.com", true)
+			assert.Equal(t, http.StatusBadRequest, response.Code, field)
+		}
+		for _, field := range []string{"redirect_uri", "callback", "user_id", "entitlements", "extra"} {
+			changed := make(map[string]any, len(request)+1)
+			for key, value := range request {
+				changed[key] = value
+			}
+			changed[field] = "https://evil.example/callback"
+			response := call(appPluginJSONBody(t, changed), "unknown-"+field, "https://console.example.com", true)
+			assert.Equal(t, http.StatusBadRequest, response.Code, field)
+			assert.NotContains(t, response.Body.String(), "https://evil.example")
+		}
+		body := appPluginJSONBody(t, request)
+		duplicate := append([]byte(`{"surface":"embedded",`), body[1:]...)
+		assert.Equal(t, http.StatusBadRequest, call(duplicate, "duplicate", "https://console.example.com", true).Code)
+	})
+	t.Run("origin and idempotency are mandatory", func(t *testing.T) {
+		assert.Equal(t, http.StatusBadRequest, call(appPluginJSONBody(t, request), "", "https://console.example.com", true).Code)
+		for _, origin := range []string{"", "null", "https://evil.example.com", "http://console.example.com"} {
+			assert.Equal(t, http.StatusForbidden, call(appPluginJSONBody(t, request), "origin", origin, true).Code)
+		}
+	})
+	t.Run("database session wins over authenticated context", func(t *testing.T) {
+		require.NoError(t, model.DB.Model(&model.UserSession{}).Where("sid = ?", identity.SessionID).Update("version", 2).Error)
+		response := call(appPluginJSONBody(t, request), "stale-context", "https://console.example.com", true)
+		assert.Equal(t, http.StatusUnauthorized, response.Code)
+	})
+}
+
+func TestAppEnableRequiresAllPrerequisites(t *testing.T) {
+	t.Run("root credential ceremony and redaction", appPluginCredentialControllerRegression)
+	for _, missing := range []string{"credential", "callback", "surface", "parent", "same-site", "network", "scope", "none"} {
+		t.Run(missing, func(t *testing.T) {
+			setupAppPluginControllerTest(t)
+			app, _ := setupAppPluginLaunchController(t)
+			previousProbe := appPluginEnableNetworkProbe
+			t.Cleanup(func() { appPluginEnableNetworkProbe = previousProbe })
+			appPluginEnableNetworkProbe = func(_ context.Context, installation model.AppInstallation) error {
+				assert.Equal(t, app.InstallationID, installation.InstallationID)
+				assert.Equal(t, app.Revision, installation.Revision)
+				if missing == "network" {
+					return errors.New("network probe denied")
+				}
+				return nil
+			}
+			switch missing {
+			case "credential":
+				require.NoError(t, model.DB.Where("installation_id = ?", app.InstallationID).Delete(&model.AppServiceCredential{}).Error)
+			case "callback":
+				require.NoError(t, model.DB.Where("installation_id = ? AND kind = ?", app.InstallationID, "callback").Delete(&model.AppRouteClaim{}).Error)
+			case "surface":
+				require.NoError(t, model.DB.Model(&model.AppInstallation{}).Where("installation_id = ?", app.InstallationID).
+					Update("enabled_surfaces", model.AppStringList{}).Error)
+			case "parent":
+				require.NoError(t, model.DB.Model(&model.AppInstallation{}).Where("installation_id = ?", app.InstallationID).
+					Update("allowed_parent_origins", model.AppStringList{}).Error)
+			case "same-site":
+				require.NoError(t, model.DB.Model(&model.AppInstallation{}).Where("installation_id = ?", app.InstallationID).
+					Update("allowed_parent_origins", model.AppStringList{"https://console.other.test"}).Error)
+			case "scope":
+				var generation model.AppVersion
+				require.NoError(t, model.DB.Where("app_key = ? AND manifest_version = ?", app.AppKey, app.ManifestVersion).First(&generation).Error)
+				var manifest service.AppManifest
+				require.NoError(t, common.Unmarshal([]byte(generation.CanonicalManifestJSON), &manifest))
+				manifest.RequestedScopes = append(manifest.RequestedScopes, "model.invoke")
+				canonical := appPluginJSONBody(t, manifest)
+				digest := sha256.Sum256(canonical)
+				require.NoError(t, model.DB.Model(&generation).Updates(map[string]any{
+					"canonical_manifest_json": string(canonical), "manifest_sha256": fmt.Sprintf("%x", digest),
+				}).Error)
+				require.NoError(t, model.DB.Model(&model.AppInstallation{}).Where("installation_id = ?", app.InstallationID).
+					Update("manifest_sha256", fmt.Sprintf("%x", digest)).Error)
+			}
+			response := appPluginControllerRequest(t, PatchAppPluginInstallation, http.MethodPatch,
+				"/api/app_plugins/installations", appPluginPatchBody(t, app.InstallationID, app.Revision, map[string]any{"status": "enabled"}),
+				common.RolePluginAdminUser, "default", nil)
+			var current model.AppInstallation
+			require.NoError(t, model.DB.Where("installation_id = ?", app.InstallationID).First(&current).Error)
+			if missing != "none" {
+				assert.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+				assert.Equal(t, "app_enable_prerequisite_missing", appPluginErrorCode(t, response))
+				assert.Equal(t, "disabled", current.Status)
+				assert.Equal(t, app.Revision, current.Revision)
+				return
+			}
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			assert.Equal(t, "enabled", current.Status)
+			assert.Equal(t, app.Revision+1, current.Revision)
+			stale := appPluginControllerRequest(t, PatchAppPluginInstallation, http.MethodPatch,
+				"/api/app_plugins/installations", appPluginPatchBody(t, app.InstallationID, app.Revision, map[string]any{"status": "enabled"}),
+				common.RolePluginAdminUser, "default", nil)
+			assert.Equal(t, http.StatusConflict, stale.Code)
+			assert.Equal(t, "version_conflict", appPluginErrorCode(t, stale))
+			appPluginEnableNetworkProbe = func(context.Context, model.AppInstallation) error {
+				t.Error("disable must not probe the network")
+				return errors.New("unavailable")
+			}
+			disabled := appPluginControllerRequest(t, PatchAppPluginInstallation, http.MethodPatch,
+				"/api/app_plugins/installations", appPluginPatchBody(t, app.InstallationID, current.Revision, map[string]any{"status": "disabled"}),
+				common.RolePluginAdminUser, "default", nil)
+			assert.Equal(t, http.StatusOK, disabled.Code, disabled.Body.String())
+		})
+	}
+	t.Run("credentials are root-only and plaintext is response-only", func(t *testing.T) {
+		setupAppPluginControllerTest(t)
+		app, identity := setupAppPluginLaunchController(t)
+		require.NoError(t, model.DB.Where("installation_id = ?", app.InstallationID).Delete(&model.AppServiceCredential{}).Error)
+		for _, handler := range []gin.HandlerFunc{CreateAppPluginServiceCredential, RotateAppPluginServiceCredential, RevokeAppPluginServiceCredential} {
+			for _, role := range []int{common.RoleCommonUser, common.RolePluginAdminUser, common.RoleAdminUser} {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest(http.MethodPost, "https://console.example.com/api/app_plugins/installations/"+app.InstallationID+"/service-credentials", bytes.NewBufferString(`{}`))
+				c.Request.Header.Set("Origin", "https://console.example.com")
+				c.Request.Header.Set("Content-Type", "application/json")
+				c.Params = gin.Params{{Key: "id", Value: app.InstallationID}, {Key: "credential_id", Value: "unknown"}}
+				c.Set("id", identity.UserID)
+				c.Set("role", role)
+				c.Set("session_id", identity.SessionID)
+				c.Set("auth_version", identity.UserAuthVersion)
+				c.Set("session_version", identity.SessionVersion)
+				handler(c)
+				assert.Equal(t, http.StatusForbidden, recorder.Code, recorder.Body.String())
+			}
+		}
+	})
+}
+
+func appPluginCredentialControllerRegression(t *testing.T) {
+	setupAppPluginControllerTest(t)
+	app, identity := setupAppPluginLaunchController(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.AuthFlow{}, &model.TwoFA{}, &model.PasskeyCredential{}))
+	require.NoError(t, model.DB.Where("installation_id = ?", app.InstallationID).Delete(&model.AppServiceCredential{}).Error)
+	previousEncryption := common.PasswordLoginEncryptionEnabled
+	common.PasswordLoginEncryptionEnabled = false
+	t.Cleanup(func() { common.PasswordLoginEncryptionEnabled = previousEncryption })
+	password, err := common.Password2Hash("b15-test-only-password")
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", identity.UserID).Update("password", password).Error)
+	require.NoError(t, model.PublishUserAuthCache(identity.UserID))
+	conn, err := model.DB.DB()
+	require.NoError(t, err)
+	if model.DB.Dialector.Name() == "sqlite" {
+		conn.SetMaxOpenConns(1)
+	}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("id", identity.UserID)
+		c.Set("role", common.RoleRootUser)
+		c.Set("session_id", identity.SessionID)
+		c.Set("auth_version", identity.UserAuthVersion)
+		c.Set("session_version", identity.SessionVersion)
+		c.Set("group", "default")
+		c.Next()
+	})
+	const base = "/api/app_plugins/installations"
+	router.POST(base+"/:id/service-credentials", middleware.AppPluginOperationAudit(), CreateAppPluginServiceCredential)
+	router.POST(base+"/:id/service-credentials/rotate", middleware.AppPluginOperationAudit(), RotateAppPluginServiceCredential)
+	router.DELETE(base+"/:id/service-credentials/:credential_id", middleware.AppPluginOperationAudit(), RevokeAppPluginServiceCredential)
+	router.GET(base, ListAppPluginInstallations)
+	payload := appPluginJSONBody(t, map[string]any{"scopes": []string{"identity.read", "task.read"}, "expires_at": time.Now().Add(time.Hour).Unix()})
+	call := func(method, path, proof string) *httptest.ResponseRecorder {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		req := httptest.NewRequest(method, "https://console.example.com"+path, bytes.NewReader(payload)).WithContext(ctx)
+		req.Header.Set("Origin", "https://console.example.com")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Security-Proof", proof)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response
+	}
+	operation, err := service.AppPluginCredentialOperation(app.InstallationID, "create")
+	require.NoError(t, err)
+	proof, err := service.VerifySecurityInput(identity, service.VerificationInput{
+		Method: "password", Scope: operation.Scope, Context: operation.Context, Password: "b15-test-only-password",
+	})
+	require.NoError(t, err, "reuse the existing reauthentication ceremony")
+	path := base + "/" + app.InstallationID + "/service-credentials"
+	for _, target := range []string{path + "/rotate", base + "/another-installation/service-credentials"} {
+		response := call(http.MethodPost, target, proof.ProofToken)
+		assert.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+		assert.Equal(t, "approval_required", appPluginErrorCode(t, response))
+		assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+	}
+	for _, unrelated := range []service.VerificationOperation{
+		{Scope: service.VerificationScopeAccessTokenGenerate},
+		{Scope: service.VerificationScopeChannelKeyRead, Context: []byte(`{"channel_id":1}`)},
+	} {
+		unrelatedProof := issueSecurityEnrollmentProof(t, identity, unrelated, "password")
+		response := call(http.MethodPost, path, unrelatedProof)
+		assert.Equal(t, http.StatusForbidden, response.Code)
+	}
+	first := call(http.MethodPost, path, proof.ProofToken)
+	require.Equal(t, http.StatusCreated, first.Code, first.Body.String())
+	assert.Equal(t, "no-store", first.Header().Get("Cache-Control"))
+	assert.Equal(t, "no-referrer", first.Header().Get("Referrer-Policy"))
+	var created struct {
+		Success bool                             `json:"success"`
+		Data    model.AppServiceCredentialIssued `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(first.Body.Bytes(), &created))
+	require.True(t, created.Success)
+	require.Len(t, created.Data.Credential, 43)
+	assert.Equal(t, http.StatusForbidden, call(http.MethodPost, path, proof.ProofToken).Code, "consumed proof is not a retrieval API")
+	rotate, err := service.AppPluginCredentialOperation(app.InstallationID, "rotate")
+	require.NoError(t, err)
+	rotationProof := issueSecurityEnrollmentProof(t, identity, rotate, "password")
+	rotatedResponse := call(http.MethodPost, path+"/rotate", rotationProof)
+	require.Equal(t, http.StatusCreated, rotatedResponse.Code, rotatedResponse.Body.String())
+	var rotated struct {
+		Data model.AppServiceCredentialIssued `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(rotatedResponse.Body.Bytes(), &rotated))
+	assert.NotEqual(t, created.Data.Credential, rotated.Data.Credential)
+	assert.NotEqual(t, created.Data.Version, rotated.Data.Version)
+	assert.WithinDuration(t, time.Now().Add(10*time.Minute), rotated.Data.OverlapUntil, 5*time.Second)
+	listed := call(http.MethodGet, base, "")
+	require.Equal(t, http.StatusOK, listed.Code)
+	var credentials []model.AppServiceCredential
+	require.NoError(t, model.DB.Find(&credentials).Error)
+	require.Len(t, credentials, 2)
+	var audits []model.AuditLog
+	require.NoError(t, model.DB.Find(&audits).Error)
+	require.NotEmpty(t, audits)
+	auditJSON, err := common.Marshal(audits)
+	require.NoError(t, err)
+	for _, secret := range []string{created.Data.Credential, rotated.Data.Credential, proof.ProofToken, rotationProof,
+		credentials[0].CredentialHash, credentials[1].CredentialHash} {
+		assert.NotContains(t, listed.Body.String(), secret)
+		assert.NotContains(t, string(auditJSON), secret)
+	}
+	staleProof := issueSecurityEnrollmentProof(t, identity, rotate, "password")
+	require.NoError(t, model.DB.Model(&model.UserSession{}).Where("sid = ?", identity.SessionID).Update("version", 2).Error)
+	stale := call(http.MethodPost, path+"/rotate", staleProof)
+	assert.Equal(t, http.StatusForbidden, stale.Code, stale.Body.String())
+	require.NoError(t, model.DB.Model(&model.UserSession{}).Where("sid = ?", identity.SessionID).Update("version", 1).Error)
+	operation_setting.AppPluginV1Enabled = false
+	revoked := call(http.MethodDelete, path+"/"+rotated.Data.CredentialID, "")
+	require.Equal(t, http.StatusOK, revoked.Code, revoked.Body.String())
+	_, err = model.AuthenticateAppServiceCredential(t.Context(), model.DB, rotated.Data.Credential, time.Now())
+	require.Error(t, err, "emergency revoke remains available when the feature is disabled")
+}
+
+func setupAppPluginLaunchController(t *testing.T) (model.AppInstallResult, service.AuthIdentity) {
+	t.Helper()
+	t.Setenv("CRYPTO_SECRET", "test-only-persistent-shared-launch-secret")
+	previousSecret, previousAddress := common.CryptoSecret, system_setting.ServerAddress
+	common.CryptoSecret, system_setting.ServerAddress = os.Getenv("CRYPTO_SECRET"), "https://console.example.com"
+	t.Cleanup(func() {
+		common.CryptoSecret, system_setting.ServerAddress = previousSecret, previousAddress
+	})
+	require.NoError(t, model.DB.AutoMigrate(&model.User{}, &model.UserSession{}))
+	require.NoError(t, model.MigrateAppPluginLaunchTables(model.DB))
+	user := model.User{Id: 1001, Username: "launch-controller", Password: "unusable-password",
+		Role: common.RoleRootUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "launch-controller"}
+	require.NoError(t, model.DB.Create(&user).Error)
+	session := model.UserSession{SID: "controller-dashboard-session", UserID: user.Id, Version: 1, UserAuthVersion: 1,
+		Status: model.UserSessionStatusActive, ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		CreatedAt: time.Now().Unix(), LastActiveAt: time.Now().Unix(), RefreshHash: "unusable-refresh-hash"}
+	require.NoError(t, model.DB.Create(&session).Error)
+	app := createAppPluginForControllerTest(t, "launch-controller", "Launch Controller", "launch-controller-install")
+	require.NoError(t, model.DB.Model(&model.AppInstallation{}).Where("installation_id = ?", app.InstallationID).
+		Update("network_policy", model.AppNetworkPolicy{AllowHosts: []string{"apps.example.com"}, DenyPrivateIPRanges: true}).Error)
+	_, err := model.IssueAppServiceCredential(t.Context(), model.DB, app.InstallationID,
+		[]string{"identity.read", "task.read"}, time.Now(), time.Now().Add(time.Hour), false)
+	require.NoError(t, err)
+	return app, service.AuthIdentity{UserID: user.Id, SessionID: session.SID, UserAuthVersion: 1, SessionVersion: 1}
+}
 
 type appPluginTestEnvelope struct {
 	Success bool                   `json:"success"`

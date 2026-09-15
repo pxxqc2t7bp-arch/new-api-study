@@ -34,6 +34,8 @@ const (
 	VerificationScopePasswordSet         = "account.password.set"
 	VerificationScopePasswordChange      = "account.password.change"
 	VerificationScopeAccountDelete       = "account.delete"
+	VerificationScopeAppCredentialCreate = "app_plugin.credential.create"
+	VerificationScopeAppCredentialRotate = "app_plugin.credential.rotate"
 )
 
 var (
@@ -66,6 +68,22 @@ type AccountUnbindingContext struct {
 	ProviderID int `json:"provider_id"`
 }
 
+type AppPluginCredentialContext struct {
+	InstallationID string `json:"installation_id"`
+	Action         string `json:"action"`
+}
+
+func AppPluginCredentialOperation(installationID, action string) (VerificationOperation, error) {
+	scope := VerificationScopeAppCredentialCreate
+	if action == "rotate" {
+		scope = VerificationScopeAppCredentialRotate
+	} else if action != "create" {
+		return VerificationOperation{}, ErrVerificationContextInvalid
+	}
+	context, err := common.Marshal(AppPluginCredentialContext{InstallationID: installationID, Action: action})
+	return VerificationOperation{Scope: scope, Context: context}, err
+}
+
 // VerificationBinding contains no original operation parameters. It can safely
 // travel through a signed proof or a server-owned interactive verification flow.
 type VerificationBinding struct {
@@ -82,6 +100,21 @@ func BindVerificationOperation(operation VerificationOperation) (VerificationBin
 	}
 	var normalized any
 	switch operation.Scope {
+	case VerificationScopeAppCredentialCreate, VerificationScopeAppCredentialRotate:
+		var context AppPluginCredentialContext
+		if len(fields) != 2 || common.Unmarshal(operation.Context, &context) != nil ||
+			!appPluginOpaque(context.InstallationID, 64) ||
+			(operation.Scope == VerificationScopeAppCredentialCreate && context.Action != "create") ||
+			(operation.Scope == VerificationScopeAppCredentialRotate && context.Action != "rotate") {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		if _, ok := fields["installation_id"]; !ok {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		if _, ok := fields["action"]; !ok {
+			return VerificationBinding{}, ErrVerificationContextInvalid
+		}
+		normalized = context
 	case VerificationScopeChannelKeyRead:
 		var context ChannelKeyReadContext
 		if len(fields) != 1 || common.Unmarshal(fields["channel_id"], &context.ChannelID) != nil || context.ChannelID <= 0 {
@@ -186,7 +219,11 @@ func securityVerificationPolicy(scope string, state model.UserVerificationState)
 	case VerificationScopePasskeyRegister, VerificationScopeTwoFASetup,
 		VerificationScopeAccessTokenGenerate, VerificationScopeAccessTokenRevoke,
 		VerificationScopeAccountBind, VerificationScopeAccountUnbind,
-		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete:
+		VerificationScopePasswordSet, VerificationScopePasswordChange, VerificationScopeAccountDelete,
+		VerificationScopeAppCredentialCreate, VerificationScopeAppCredentialRotate:
+		if (scope == VerificationScopeAppCredentialCreate || scope == VerificationScopeAppCredentialRotate) && state.Role != common.RoleRootUser {
+			return nil, ErrVerificationForbidden
+		}
 		if scope == VerificationScopeAccountDelete && state.Role == common.RoleRootUser {
 			return nil, ErrVerificationForbidden
 		}
@@ -231,7 +268,8 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 	if state.Status != common.UserStatusEnabled || state.AuthVersion != identity.UserAuthVersion {
 		return nil, ErrAuthTokenInvalid
 	}
-	if scope == VerificationScopeChannelKeyRead && state.Role != common.RoleRootUser {
+	if (scope == VerificationScopeChannelKeyRead || scope == VerificationScopeAppCredentialCreate ||
+		scope == VerificationScopeAppCredentialRotate) && state.Role != common.RoleRootUser {
 		return nil, ErrVerificationForbidden
 	}
 	methods, err := securityVerificationPolicy(scope, *state)

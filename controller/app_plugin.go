@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
@@ -20,7 +22,9 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 	"gorm.io/gorm"
 )
 
@@ -286,8 +290,8 @@ func CreateAppPluginInstallation(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"success": true, "data": result})
 }
 
-// PatchAppPluginInstallation applies one CAS update. B1.4 deliberately rejects
-// enablement until the B1.5 prerequisite checks exist.
+// PatchAppPluginInstallation applies one CAS update with enable prerequisites
+// checked against the locked revision.
 func PatchAppPluginInstallation(c *gin.Context) {
 	middleware.SetAppPluginAuditTarget(c, "", 0)
 	if !appPluginFeatureEnabled(c) {
@@ -341,7 +345,12 @@ func PatchAppPluginInstallation(c *gin.Context) {
 		if values.status != nil {
 			switch *values.status {
 			case model.AppInstallationStatusEnabled:
-				return &appPluginAPIError{status: http.StatusConflict, code: "app_enable_prerequisite_missing", path: "/changes/status"}
+				if current.Status != model.AppInstallationStatusDisabled || len(request.Changes) != 1 {
+					return &appPluginAPIError{status: http.StatusConflict, code: "invalid_state_transition", path: "/changes/status"}
+				}
+				if err := validateAppPluginEnable(c, tx, current); err != nil {
+					return err
+				}
 			case model.AppInstallationStatusDisabled:
 				if current.Status == model.AppInstallationStatusDisabled && len(request.Changes) == 1 {
 					return &appPluginAPIError{status: http.StatusConflict, code: "invalid_state_transition", path: "/changes/status"}
@@ -869,6 +878,11 @@ func writeAppPluginRequestError(c *gin.Context, err error) {
 }
 
 func writeAppPluginServiceError(c *gin.Context, err error) {
+	var authErr *service.AppPluginAuthError
+	if errors.As(err, &authErr) {
+		writeAppPluginError(c, appPluginAuthStatus(authErr.Code), authErr.Code, "")
+		return
+	}
 	var apiErr *appPluginAPIError
 	if errors.As(err, &apiErr) {
 		writeAppPluginError(c, apiErr.status, apiErr.code, apiErr.path)
@@ -903,7 +917,12 @@ func writeAppPluginServiceError(c *gin.Context, err error) {
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		writeAppPluginError(c, http.StatusNotFound, "not_found", "")
 	default:
-		writeAppPluginError(c, http.StatusServiceUnavailable, "service_unavailable", "")
+		switch err.Error() {
+		case "not_found", "service_identity_invalid", "scope_denied", "invalid_request", "invalid_state_transition":
+			writeAppPluginError(c, appPluginAuthStatus(err.Error()), err.Error(), "")
+		default:
+			writeAppPluginError(c, http.StatusServiceUnavailable, "service_unavailable", "")
+		}
 	}
 }
 
@@ -919,6 +938,17 @@ func writeAppPluginError(c *gin.Context, status int, code, fieldPath string) {
 		fieldErrors = append(fieldErrors, gin.H{"path": fieldPath, "code": "invalid"})
 	}
 	message := map[string]string{
+		"unauthenticated":                 "Authentication required",
+		"identity_inactive":               "Identity is inactive",
+		"identity_not_configured":         "App identity is not configured",
+		"service_identity_invalid":        "App service identity is invalid",
+		"scope_denied":                    "App permission denied",
+		"launch_code_expired":             "Launch code expired",
+		"launch_code_replayed":            "Launch code already consumed",
+		"state_mismatch":                  "Launch state does not match",
+		"nonce_mismatch":                  "Launch nonce does not match",
+		"pkce_verification_failed":        "Launch verification failed",
+		"approval_required":               "Fresh operation verification required",
 		"app_plugin_disabled":             "App plugin API is disabled",
 		"invalid_request":                 "Invalid app plugin request",
 		"forbidden":                       "App plugin request is forbidden",
@@ -948,4 +978,321 @@ func writeAppPluginError(c *gin.Context, status int, code, fieldPath string) {
 		"retryable":    status >= http.StatusInternalServerError,
 		"request_id":   requestID,
 	}})
+}
+
+var appPluginEnableNetworkProbe = service.ProbeAppPluginNetwork
+
+func validateAppPluginEnable(c *gin.Context, tx *gorm.DB, installation model.AppInstallation) error {
+	missing := &appPluginAPIError{status: http.StatusConflict, code: "app_enable_prerequisite_missing", path: "/changes/status"}
+	manifest, _, err := service.ValidateAppPluginRegistration(tx, installation)
+	if err != nil || len(installation.EnabledSurfaces) == 0 {
+		return missing
+	}
+	for _, surface := range installation.EnabledSurfaces {
+		if surface != "direct" && surface != "embedded" {
+			return missing
+		}
+	}
+	if slices.Contains(installation.EnabledSurfaces, "embedded") {
+		if len(installation.AllowedParentOrigins) == 0 {
+			return missing
+		}
+		for _, origin := range installation.AllowedParentOrigins {
+			if !service.AppPluginSameSiteHTTPS(installation.BaseURL, origin) ||
+				!service.AppPluginTrustedOrigin(system_setting.ServerAddress, origin) {
+				return missing
+			}
+		}
+	}
+	scopes, err := model.AppPluginApprovedScopes(tx, installation, time.Now())
+	if err != nil || !slices.Contains(scopes, "identity.read") {
+		return missing
+	}
+	for _, scope := range manifest.RequestedScopes {
+		if !slices.Contains(scopes, scope) {
+			return missing
+		}
+	}
+	if err := appPluginEnableNetworkProbe(c.Request.Context(), installation); err != nil {
+		return missing
+	}
+	return nil
+}
+
+func appPluginAuthStatus(code string) int {
+	switch code {
+	case "invalid_request", "state_mismatch", "nonce_mismatch", "pkce_verification_failed":
+		return http.StatusBadRequest
+	case "unauthenticated", "service_identity_invalid", "launch_code_expired", "launch_code_replayed":
+		return http.StatusUnauthorized
+	case "identity_inactive", "app_plugin_disabled", "scope_denied", "forbidden", "approval_required":
+		return http.StatusForbidden
+	case "not_found":
+		return http.StatusNotFound
+	case "idempotency_conflict", "invalid_state_transition":
+		return http.StatusConflict
+	default:
+		return http.StatusServiceUnavailable
+	}
+}
+
+func appPluginSensitiveResponse(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.Header("Referrer-Policy", "no-referrer")
+	c.Header("X-Content-Type-Options", "nosniff")
+}
+
+func appPluginBrowserOrigin(c *gin.Context) bool {
+	if c.Request.TLS == nil || len(c.Request.Header.Values("Origin")) != 1 ||
+		!service.AppPluginTrustedOrigin(system_setting.ServerAddress, c.GetHeader("Origin")) {
+		writeAppPluginError(c, http.StatusForbidden, "forbidden", "")
+		return false
+	}
+	return true
+}
+
+// Decode with the common codec first. GJSON only visits the validated structure
+// to detect duplicate names (including escaped equivalents) before binding it.
+func decodeAppPluginAuthObject(c *gin.Context, required []string, target any) bool {
+	mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeAppPluginError(c, http.StatusBadRequest, "invalid_request", "")
+		return false
+	}
+	data, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 16*1024))
+	if err != nil {
+		writeAppPluginError(c, http.StatusBadRequest, "invalid_request", "")
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if common.Unmarshal(data, &fields) != nil || fields == nil || len(fields) != len(required) ||
+		!appPluginUniqueJSONFields(gjson.ParseBytes(data)) {
+		writeAppPluginError(c, http.StatusBadRequest, "invalid_request", "")
+		return false
+	}
+	for _, field := range required {
+		value, exists := fields[field]
+		if !exists || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			writeAppPluginError(c, http.StatusBadRequest, "invalid_request", "")
+			return false
+		}
+	}
+	if common.Unmarshal(data, target) != nil {
+		writeAppPluginError(c, http.StatusBadRequest, "invalid_request", "")
+		return false
+	}
+	return true
+}
+
+func appPluginUniqueJSONFields(value gjson.Result) bool {
+	if !value.IsObject() && !value.IsArray() {
+		return true
+	}
+	seen := map[string]bool{}
+	valid := true
+	value.ForEach(func(key, child gjson.Result) bool {
+		if value.IsObject() && seen[key.Str] {
+			valid = false
+			return false
+		}
+		seen[key.Str] = true
+		valid = appPluginUniqueJSONFields(child)
+		return valid
+	})
+	return valid
+}
+
+func AuthorizeAppPlugin(c *gin.Context) {
+	appPluginSensitiveResponse(c)
+	if !appPluginFeatureEnabled(c) || !appPluginBrowserOrigin(c) {
+		return
+	}
+	identity, ok := middleware.GetSessionAuthIdentity(c)
+	if !ok {
+		writeAppPluginError(c, http.StatusUnauthorized, "unauthenticated", "")
+		return
+	}
+	var request service.AppPluginAuthorizeRequest
+	if !decodeAppPluginAuthObject(c, []string{"surface", "transaction_id", "state", "code_challenge", "code_challenge_method", "nonce"}, &request) {
+		return
+	}
+	result, err := service.NewAppPluginAuthService(model.DB, service.ConfiguredAppPluginAuthOptions()).
+		Authorize(c.Request.Context(), identity, c.Param("key"), c.GetHeader("Origin"), c.GetHeader("Idempotency-Key"), request)
+	if err != nil {
+		writeAppPluginServiceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}
+
+func ExchangeAppPluginLaunchCode(c *gin.Context) {
+	appPluginSensitiveResponse(c)
+	identity, ok := middleware.GetAppServiceIdentity(c)
+	if !ok {
+		writeAppPluginError(c, http.StatusUnauthorized, "service_identity_invalid", "")
+		return
+	}
+	var request service.AppPluginExchangeRequest
+	if !decodeAppPluginAuthObject(c, []string{"exchange_request_id", "app_key", "surface", "transaction_id", "code", "code_verifier", "state", "nonce"}, &request) {
+		return
+	}
+	result, err := service.NewAppPluginAuthService(model.DB, service.ConfiguredAppPluginAuthOptions()).Exchange(c.Request.Context(), identity, request)
+	if err != nil {
+		writeAppPluginServiceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}
+
+func IntrospectAppPluginSession(c *gin.Context) {
+	appPluginSensitiveResponse(c)
+	identity, ok := middleware.GetAppServiceIdentity(c)
+	if !ok {
+		writeAppPluginError(c, http.StatusUnauthorized, "service_identity_invalid", "")
+		return
+	}
+	var request service.AppPluginIntrospectRequest
+	if !decodeAppPluginAuthObject(c, []string{"app_key", "app_session_id", "subject", "required_scopes", "required_entitlements"}, &request) {
+		return
+	}
+	result, err := service.NewAppPluginAuthService(model.DB, service.ConfiguredAppPluginAuthOptions()).Introspect(c.Request.Context(), identity, request)
+	if err != nil {
+		writeAppPluginServiceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}
+
+func RevokeAppPluginSession(c *gin.Context) {
+	appPluginSensitiveResponse(c)
+	identity, ok := middleware.GetAppServiceIdentity(c)
+	if !ok {
+		writeAppPluginError(c, http.StatusUnauthorized, "service_identity_invalid", "")
+		return
+	}
+	var request service.AppPluginSessionRevokeRequest
+	if !decodeAppPluginAuthObject(c, []string{"request_id", "app_key", "app_session_id", "subject", "reason"}, &request) {
+		return
+	}
+	result, err := service.NewAppPluginAuthService(model.DB, service.ConfiguredAppPluginAuthOptions()).
+		RevokeSession(c.Request.Context(), identity, c.GetHeader("Idempotency-Key"), request)
+	if err != nil {
+		writeAppPluginServiceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}
+
+func CreateAppPluginServiceCredential(c *gin.Context) { issueAppPluginServiceCredential(c, "create") }
+
+func RotateAppPluginServiceCredential(c *gin.Context) { issueAppPluginServiceCredential(c, "rotate") }
+
+func appPluginCredentialRoot(c *gin.Context) (service.AuthIdentity, bool) {
+	appPluginSensitiveResponse(c)
+	middleware.SetAppPluginAuditTarget(c, c.Param("id"), 0)
+	if c.GetInt("role") != common.RoleRootUser {
+		writeAppPluginError(c, http.StatusForbidden, "forbidden", "")
+		return service.AuthIdentity{}, false
+	}
+	if !appPluginBrowserOrigin(c) {
+		return service.AuthIdentity{}, false
+	}
+	identity, ok := middleware.GetSessionAuthIdentity(c)
+	if !ok {
+		writeAppPluginError(c, http.StatusUnauthorized, "unauthenticated", "")
+	}
+	return identity, ok
+}
+
+func issueAppPluginServiceCredential(c *gin.Context, action string) {
+	defer auditAppPluginCredential(c, action)
+	identity, ok := appPluginCredentialRoot(c)
+	if !ok || !appPluginFeatureEnabled(c) {
+		return
+	}
+	var request struct {
+		Scopes    []string `json:"scopes"`
+		ExpiresAt int64    `json:"expires_at"`
+	}
+	if !decodeAppPluginAuthObject(c, []string{"scopes", "expires_at"}, &request) {
+		return
+	}
+	operation, err := service.AppPluginCredentialOperation(c.Param("id"), action)
+	if err != nil {
+		writeAppPluginError(c, http.StatusBadRequest, "invalid_request", "")
+		return
+	}
+	// Consume before the action, so failed issuance cannot restore the proof.
+	if _, err := service.ConsumeOperationProof(c.GetHeader("X-Security-Proof"), identity, operation); err != nil {
+		writeAppPluginError(c, http.StatusForbidden, "approval_required", "")
+		return
+	}
+	var result model.AppServiceCredentialIssued
+	err = model.RunAppPluginTransaction(model.DB.WithContext(c.Request.Context()), func(tx *gorm.DB) error {
+		result = model.AppServiceCredentialIssued{}
+		if err := lockAppPluginCredentialAuthority(tx, identity, c.Param("id")); err != nil {
+			return err
+		}
+		result, err = model.IssueAppServiceCredential(c.Request.Context(), tx, c.Param("id"),
+			request.Scopes, time.Now(), time.Unix(request.ExpiresAt, 0), action == "rotate")
+		return err
+	})
+	if err != nil {
+		writeAppPluginServiceError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"success": true, "data": result})
+}
+
+func RevokeAppPluginServiceCredential(c *gin.Context) {
+	defer auditAppPluginCredential(c, "revoke")
+	identity, ok := appPluginCredentialRoot(c)
+	if !ok {
+		return
+	}
+	err := model.RunAppPluginTransaction(model.DB.WithContext(c.Request.Context()), func(tx *gorm.DB) error {
+		if err := lockAppPluginCredentialAuthority(tx, identity, c.Param("id")); err != nil {
+			return err
+		}
+		return model.RevokeAppServiceCredential(c.Request.Context(), tx, c.Param("id"), c.Param("credential_id"), time.Now())
+	})
+	if err != nil {
+		writeAppPluginServiceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": gin.H{"credential_id": c.Param("credential_id"), "state": "revoked"}})
+}
+
+func lockAppPluginCredentialAuthority(tx *gorm.DB, identity service.AuthIdentity, installationID string) error {
+	var locator model.AppInstallation
+	if err := tx.Select("app_key").Where("installation_id = ?", installationID).First(&locator).Error; err != nil {
+		return err
+	}
+	// Match launch operations: ownership, installation, then identity children.
+	if _, err := model.LockAppPluginInstallation(tx, locator.AppKey, installationID); err != nil {
+		return err
+	}
+	user, _, err := service.AppPluginDashboardIdentity(tx, identity, time.Now())
+	if err != nil {
+		return err
+	}
+	if user.Role != common.RoleRootUser {
+		return &appPluginAPIError{status: http.StatusForbidden, code: "forbidden"}
+	}
+	return nil
+}
+
+// Credential endpoints are not in the legacy installation audit route map.
+// Record only fixed action/target metadata, never request or response bodies.
+func auditAppPluginCredential(c *gin.Context, action string) {
+	if c.GetInt("id") <= 0 {
+		return
+	}
+	status := c.Writer.Status()
+	success := status >= 200 && status < 300
+	model.RecordOperationAuditLog(c.GetInt("id"), c.GetInt("role"), "app_plugin.credential."+action,
+		c.ClientIP(), "app_plugin.credential."+action, map[string]any{
+			"object": "app_installation", "object_id": c.Param("id"), "credential_id": c.Param("credential_id"),
+		}, &model.AuditAdminInfo{AdminID: c.GetInt("id"), AdminRole: c.GetInt("role"), AuthMethod: "session"},
+		&model.AuditRequestInfo{Method: c.Request.Method, Route: c.FullPath(), Path: c.FullPath(), Status: status, Success: success}, c)
 }

@@ -386,6 +386,9 @@ func migrateDB() error {
 	if err := MigrateAppPluginTables(DB); err != nil {
 		return err
 	}
+	if err := MigrateAppPluginLaunchTables(DB); err != nil {
+		return err
+	}
 	if err := InitializeUserAuthVersions(); err != nil {
 		return err
 	}
