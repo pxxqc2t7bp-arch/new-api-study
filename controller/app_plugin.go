@@ -281,6 +281,7 @@ func CreateAppPluginInstallation(c *gin.Context) {
 			return resolveErr
 		}
 		command := service.AppInstallCommand{
+			DisallowUpgrade:      role < common.RoleRootUser,
 			ActorID:              int64(c.GetInt("id")),
 			IdempotencyKey:       idempotencyKey,
 			ManifestJSON:         append([]byte(nil), request.Manifest...),
@@ -432,7 +433,8 @@ func PatchAppPluginInstallation(c *gin.Context) {
 				return &appPluginAPIError{status: http.StatusConflict, code: "invalid_state_transition", path: "/changes/status"}
 			}
 		}
-		if current.Status == model.AppInstallationStatusEnabled && values.status == nil {
+		hasConfigurationChanges := values.status == nil || len(request.Changes) > 1
+		if current.Status != model.AppInstallationStatusDisabled && hasConfigurationChanges {
 			return &appPluginAPIError{status: http.StatusConflict, code: "invalid_state_transition", path: "/changes/status"}
 		}
 		if role < common.RoleRootUser && values.networkPolicy != nil &&
@@ -1003,6 +1005,8 @@ func writeAppPluginServiceError(c *gin.Context, err error) {
 		return
 	}
 	switch {
+	case errors.Is(err, model.ErrAppInstallationUpgradeForbidden):
+		writeAppPluginError(c, http.StatusForbidden, "forbidden", "/manifest")
 	case errors.Is(err, service.ErrManifestCannotOwnEntitlementPolicy),
 		errors.Is(err, service.ErrManifestCannotOwnHostPolicy):
 		writeAppPluginError(c, http.StatusUnprocessableEntity, service.AppManifestForbiddenFieldErrorCode, "/manifest")

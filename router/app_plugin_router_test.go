@@ -3,10 +3,14 @@ package router
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
@@ -15,8 +19,13 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -367,6 +376,108 @@ func TestAppPluginPatchRequiresRevisionAndRootForSensitiveChanges(t *testing.T) 
 	assert.NotContains(t, string(auditJSON), "must-never-enter-audit")
 	assert.NotContains(t, string(auditJSON), "credential_hash")
 	assert.NotContains(t, string(auditJSON), "secret_ref")
+
+	t.Run("configuration requires currently disabled installation", func(t *testing.T) {
+		for _, actor := range []struct {
+			name, token string
+			root        bool
+		}{
+			{"root", fixture.rootToken, true},
+			{"plugin-admin", fixture.pluginAdminToken, false},
+		} {
+			for _, currentStatus := range []string{"enabled", "disabled"} {
+				for _, nextStatus := range []string{"disabled", "revoked"} {
+					for _, bundled := range []bool{false, true} {
+						name := fmt.Sprintf("%s-%s-%s-config-%t", actor.name, currentStatus, nextStatus, bundled)
+						t.Run(name, func(t *testing.T) {
+							created := routerAppPluginRequestWithHeaders(fixture.engine, http.MethodPost,
+								"/api/app_plugins/installations", fixture.rootToken,
+								routerAppPluginInstallBody(t, name, "1.0.0"), map[string]string{"Idempotency-Key": name})
+							require.Equal(t, http.StatusCreated, created.Code, created.Body.String())
+							var installed routerAppPluginEnvelope
+							require.NoError(t, common.Unmarshal(created.Body.Bytes(), &installed))
+							id := installed.Data.InstallationID
+							if currentStatus == "enabled" {
+								_, err := model.CompareAndSwapAppInstallationStatus(t.Context(), model.DB,
+									id, installed.Data.Revision, model.AppInstallationStatusEnabled)
+								require.NoError(t, err)
+							}
+							require.NoError(t, model.DB.Create(&model.AppServiceCredential{
+								AppKey: name, InstallationID: id, CredentialID: name,
+								CredentialHash: "test-hash", CredentialVersion: "v1", Status: "active",
+							}).Error)
+							var before model.AppInstallation
+							var claimsBefore []model.AppRouteClaim
+							var credentialsBefore []model.AppServiceCredential
+							var policiesBefore []model.AppEntitlementPolicy
+							require.NoError(t, model.DB.Where("installation_id = ?", id).First(&before).Error)
+							require.NoError(t, model.DB.Where("installation_id = ?", id).Order("id").Find(&claimsBefore).Error)
+							require.NoError(t, model.DB.Where("installation_id = ?", id).Order("id").Find(&credentialsBefore).Error)
+							require.NoError(t, model.DB.Order("id").Find(&policiesBefore).Error)
+
+							changes := map[string]any{"status": nextStatus}
+							if bundled {
+								changes["allowed_origins"] = []string{"https://changed.example.com"}
+								changes["base_url"] = "https://apps.example.com/changed-" + name + "/"
+								if actor.root {
+									changes["entitlement_policy"] = map[string]any{
+										"key": name, "rules": map[string][]string{"app_plugin": {"manage"}},
+									}
+								}
+							}
+							wantStatus, wantCode := http.StatusOK, ""
+							switch {
+							case !actor.root && nextStatus == "revoked":
+								wantStatus, wantCode = http.StatusForbidden, "forbidden"
+							case currentStatus == "enabled" && bundled:
+								wantStatus, wantCode = http.StatusConflict, "invalid_state_transition"
+							case currentStatus == "disabled" && nextStatus == "disabled" && !bundled:
+								wantStatus, wantCode = http.StatusConflict, "invalid_state_transition"
+							}
+							response := routerAppPluginRequest(fixture.engine, http.MethodPatch,
+								"/api/app_plugins/installations", actor.token,
+								routerAppPluginPatchBody(t, id, before.Revision, changes))
+							assert.Equal(t, wantStatus, response.Code, response.Body.String())
+							assert.Equal(t, wantCode, routerAppPluginErrorCode(t, response))
+
+							var after model.AppInstallation
+							var claimsAfter []model.AppRouteClaim
+							var credentialsAfter []model.AppServiceCredential
+							var policiesAfter []model.AppEntitlementPolicy
+							require.NoError(t, model.DB.Where("installation_id = ?", id).First(&after).Error)
+							require.NoError(t, model.DB.Where("installation_id = ?", id).Order("id").Find(&claimsAfter).Error)
+							require.NoError(t, model.DB.Where("installation_id = ?", id).Order("id").Find(&credentialsAfter).Error)
+							require.NoError(t, model.DB.Order("id").Find(&policiesAfter).Error)
+							if wantStatus != http.StatusOK {
+								assert.Equal(t, before, after, "rejection must preserve installation and revision")
+								assert.Equal(t, claimsBefore, claimsAfter, "rejection must preserve route claims")
+								assert.Equal(t, credentialsBefore, credentialsAfter, "rejection must preserve credentials")
+								assert.Equal(t, policiesBefore, policiesAfter, "rejection must not create policy versions")
+								return
+							}
+							assert.Equal(t, nextStatus, after.Status)
+							assert.Equal(t, before.Revision+1, after.Revision)
+							if bundled {
+								assert.Equal(t, model.AppStringList{"https://changed.example.com"}, after.AllowedOrigins)
+								assert.Equal(t, changes["base_url"], after.BaseURL)
+							} else {
+								assert.Equal(t, before.AllowedOrigins, after.AllowedOrigins)
+								assert.Equal(t, policiesBefore, policiesAfter)
+							}
+							if nextStatus == "revoked" {
+								assert.Empty(t, claimsAfter)
+								require.Len(t, credentialsAfter, 1)
+								assert.Equal(t, "revoked", credentialsAfter[0].Status)
+							} else {
+								assert.Len(t, claimsAfter, len(claimsBefore))
+								assert.Equal(t, credentialsBefore, credentialsAfter)
+							}
+						})
+					}
+				}
+			}
+		}
+	})
 }
 
 func setupRouterAppPluginTest(t *testing.T) routerAppPluginFixture {
@@ -377,10 +488,18 @@ func setupRouterAppPluginTest(t *testing.T) routerAppPluginFixture {
 	previousMaster := common.IsMasterNode
 	previousFlag := operation_setting.AppPluginV1Enabled
 
-	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "app-plugin-router.db")), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
+	db := openRouterAppPluginDB(t)
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = previousDB, previousLogDB
+		common.SetDatabaseTypes(previousMain, previousLog)
+		common.RedisEnabled = previousRedis
+		common.IsMasterNode = previousMaster
+		operation_setting.AppPluginV1Enabled = previousFlag
 	})
-	require.NoError(t, err)
+	dbType := map[string]common.DatabaseType{
+		"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL,
+	}[db.Dialector.Name()]
+	common.SetDatabaseTypes(dbType, dbType)
 	require.NoError(t, db.AutoMigrate(
 		&model.User{},
 		&model.TaskPlugin{},
@@ -390,7 +509,6 @@ func setupRouterAppPluginTest(t *testing.T) routerAppPluginFixture {
 	))
 	require.NoError(t, model.MigrateAppPluginTables(db))
 	model.DB, model.LOG_DB = db, db
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	common.RedisEnabled = false
 	common.IsMasterNode = true
 	operation_setting.AppPluginV1Enabled = false
@@ -424,13 +542,6 @@ func setupRouterAppPluginTest(t *testing.T) routerAppPluginFixture {
 	api.GET("/infinite-canvas", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 	registerAppPluginRoutes(api)
 
-	t.Cleanup(func() {
-		model.DB, model.LOG_DB = previousDB, previousLogDB
-		common.SetDatabaseTypes(previousMain, previousLog)
-		common.RedisEnabled = previousRedis
-		common.IsMasterNode = previousMaster
-		operation_setting.AppPluginV1Enabled = previousFlag
-	})
 	return routerAppPluginFixture{
 		engine:            engine,
 		rootToken:         rootToken,
@@ -438,6 +549,80 @@ func setupRouterAppPluginTest(t *testing.T) routerAppPluginFixture {
 		userToken:         userToken,
 		disabledUserToken: disabledUserToken,
 	}
+}
+
+func openRouterAppPluginDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	dialect, dsn := os.Getenv("APP_PLUGIN_TEST_DIALECT"), os.Getenv("APP_PLUGIN_TEST_DSN")
+	if dialect == "" {
+		dialect = "sqlite"
+	}
+	config := &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)}
+	name := fmt.Sprintf("app_plugin_router_%d_%d", os.Getpid(), time.Now().UnixNano())
+	var db *gorm.DB
+	var err error
+	switch dialect {
+	case "sqlite":
+		if dsn == "" {
+			dsn = filepath.Join(t.TempDir(), "app-plugin-router.db")
+		} else {
+			// The runner supplies a temporary filename; each fixture owns a sibling.
+			dsn += "." + name
+			sqliteFile := dsn
+			t.Cleanup(func() { assert.NoError(t, os.Remove(sqliteFile)) })
+		}
+		db, err = gorm.Open(sqlite.Open(dsn), config)
+	case "mysql":
+		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required")
+		parsed, parseErr := mysqlDriver.ParseDSN(dsn)
+		require.True(t, parseErr == nil, "invalid mysql test DSN")
+		admin, openErr := gorm.Open(mysql.Open(dsn), config)
+		require.True(t, openErr == nil, "cannot open mysql test database")
+		require.NoError(t, admin.Exec("CREATE DATABASE `"+name+"`").Error)
+		t.Cleanup(func() {
+			assert.NoError(t, admin.Exec("DROP DATABASE `"+name+"`").Error)
+			sqlDB, err := admin.DB()
+			require.NoError(t, err)
+			assert.NoError(t, sqlDB.Close())
+		})
+		parsed.DBName = name
+		db, err = gorm.Open(mysql.Open(parsed.FormatDSN()), config)
+	case "postgres", "postgresql":
+		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required")
+		parsed, parseErr := pgx.ParseConfig(dsn)
+		require.True(t, parseErr == nil, "invalid postgres test DSN")
+		admin, openErr := gorm.Open(postgres.Open(dsn), config)
+		require.True(t, openErr == nil, "cannot open postgres test database")
+		require.NoError(t, admin.Exec(`CREATE SCHEMA "`+name+`"`).Error)
+		t.Cleanup(func() {
+			assert.NoError(t, admin.Exec(`DROP SCHEMA "`+name+`" CASCADE`).Error)
+			sqlDB, err := admin.DB()
+			require.NoError(t, err)
+			assert.NoError(t, sqlDB.Close())
+		})
+		parsed.RuntimeParams["search_path"] = name
+		connection := stdlib.OpenDB(*parsed)
+		db, err = gorm.Open(postgres.New(postgres.Config{Conn: connection}), config)
+	default:
+		t.Fatalf("unsupported APP_PLUGIN_TEST_DIALECT %q", dialect)
+	}
+	require.True(t, err == nil, "cannot open app plugin test database")
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, sqlDB.Close()) })
+	if os.Getenv("APP_PLUGIN_TEST_DIALECT") != "" {
+		require.Equal(t, strings.ReplaceAll(dialect, "postgresql", "postgres"), db.Dialector.Name())
+		var version string
+		query := "SELECT version()"
+		if dialect == "sqlite" {
+			query = "SELECT sqlite_version()"
+		}
+		require.NoError(t, db.Raw(query).Scan(&version).Error)
+		require.Equal(t, os.Getenv("APP_PLUGIN_TEST_DATABASE_VERSION"), version)
+		require.NotEmpty(t, os.Getenv("APP_PLUGIN_TEST_DRIVER"))
+		t.Logf("verified database=%s version=%s driver=%s", db.Dialector.Name(), version, os.Getenv("APP_PLUGIN_TEST_DRIVER"))
+	}
+	return db
 }
 
 func routerAppPluginRequest(engine http.Handler, method, path, token string, body []byte) *httptest.ResponseRecorder {

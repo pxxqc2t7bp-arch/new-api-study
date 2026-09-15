@@ -46,6 +46,7 @@ type AppTaskPluginChecker interface {
 }
 
 type AppInstallCommand struct {
+	DisallowUpgrade      bool
 	ActorID              int64
 	IdempotencyKey       string
 	ManifestJSON         []byte
@@ -138,6 +139,7 @@ func (s *AppPluginInstallationService) Install(ctx context.Context, cmd AppInsta
 		serviceCredentialHash = serviceDigestBytes([]byte(cmd.ServiceCredential.Secret))
 	}
 	req := model.AppInstallRequest{
+		DisallowUpgrade:          cmd.DisallowUpgrade,
 		AppKey:                   manifest.Key,
 		ManifestVersion:          manifest.Version,
 		ManifestSHA256:           serviceDigestBytes(canonicalManifestJSON),

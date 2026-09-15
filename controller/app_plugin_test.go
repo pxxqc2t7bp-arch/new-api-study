@@ -6,16 +6,24 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	mysqlDriver "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -184,7 +192,7 @@ func TestAppPluginDashboardCreatesAndUpdatesDisabledInstallations(t *testing.T) 
 
 		var policyCount int64
 		require.NoError(t, model.DB.Model(&model.AppEntitlementPolicy{}).
-			Where("key = ?", "policy-app-access").
+			Where(&model.AppEntitlementPolicy{Key: "policy-app-access"}).
 			Count(&policyCount).Error)
 		assert.EqualValues(t, 1, policyCount)
 	})
@@ -251,6 +259,109 @@ func TestAppPluginDashboardCreatesAndUpdatesDisabledInstallations(t *testing.T) 
 		assert.Empty(t, clearedResult.Data.EnabledSurfaces)
 		assert.Equal(t, model.AppInstallationStatusDisabled, clearedResult.Data.Status)
 		assert.Contains(t, cleared.Body.String(), `"enabled_surfaces":[]`)
+	})
+
+	t.Run("nonroot upgrades cannot clear root approved policies", func(t *testing.T) {
+		const key = "approved-policy-app"
+		var approvedBody map[string]any
+		require.NoError(t, common.Unmarshal(appPluginInstallBody(t,
+			appPluginTestManifest(key, key, "1.0.0"), "https://apps.example.com/"+key+"/"), &approvedBody))
+		approvedBody["entitlement_policy"] = map[string]any{
+			"key": key, "rules": map[string][]string{"app_plugin": {"manage"}},
+		}
+		created := appPluginControllerRequest(t, CreateAppPluginInstallation, http.MethodPost,
+			"/api/app_plugins/installations", appPluginJSONBody(t, approvedBody),
+			common.RoleRootUser, "default", map[string]string{"Idempotency-Key": key})
+		require.Equal(t, http.StatusCreated, created.Code, created.Body.String())
+		var frozen appPluginTestEnvelope
+		require.NoError(t, common.Unmarshal(created.Body.Bytes(), &frozen))
+
+		var before model.AppInstallation
+		require.NoError(t, model.DB.Where("installation_id = ?", frozen.Data.InstallationID).First(&before).Error)
+		counts := appPluginControllerPersistenceCounts(t)
+		upgrade := appPluginJSONBody(t, map[string]any{
+			"manifest": appPluginTestManifest(key, key, "2.0.0"),
+			"base_url": "https://apps.example.com/upgrade/",
+		})
+		rejected := appPluginControllerRequest(t, CreateAppPluginInstallation, http.MethodPost,
+			"/api/app_plugins/installations", upgrade, common.RolePluginAdminUser, "default",
+			map[string]string{"Idempotency-Key": key + "-v2"})
+		assert.Equal(t, http.StatusForbidden, rejected.Code, rejected.Body.String())
+		assert.Equal(t, "forbidden", appPluginErrorCode(t, rejected))
+		var after model.AppInstallation
+		require.NoError(t, model.DB.Where("installation_id = ?", before.InstallationID).First(&after).Error)
+		assert.Equal(t, before, after, "rejected upgrade must not alter approved policy or revision")
+		assert.Equal(t, counts, appPluginControllerPersistenceCounts(t), "rejected upgrade must roll back all rows")
+	})
+
+	t.Run("nonroot creation and immutable replay preserve request hash semantics", func(t *testing.T) {
+		const key = "nonroot-replay-app"
+		request := map[string]any{
+			"manifest": appPluginTestManifest(key, key, "1.0.0"),
+			"base_url": "https://apps.example.com/" + key + "/",
+		}
+		body := appPluginJSONBody(t, request)
+		created := appPluginControllerRequest(t, CreateAppPluginInstallation, http.MethodPost,
+			"/api/app_plugins/installations", body, common.RolePluginAdminUser, "default",
+			map[string]string{"Idempotency-Key": key})
+		require.Equal(t, http.StatusCreated, created.Code, created.Body.String())
+		var frozen appPluginTestEnvelope
+		require.NoError(t, common.Unmarshal(created.Body.Bytes(), &frozen))
+		assert.Equal(t, model.AppInstallationStatusDisabled, frozen.Data.Status)
+
+		rootUpgrade := appPluginControllerRequest(t, CreateAppPluginInstallation, http.MethodPost,
+			"/api/app_plugins/installations", appPluginInstallBody(t,
+				appPluginTestManifest(key, key, "2.0.0"), "https://apps.example.com/"+key+"/"),
+			common.RoleRootUser, "default", map[string]string{"Idempotency-Key": key + "-root-v2"})
+		require.Equal(t, http.StatusCreated, rootUpgrade.Code, rootUpgrade.Body.String())
+		var rootFrozen appPluginTestEnvelope
+		require.NoError(t, common.Unmarshal(rootUpgrade.Body.Bytes(), &rootFrozen))
+		require.Equal(t, int64(2), rootFrozen.Data.Revision)
+		var before model.AppInstallation
+		require.NoError(t, model.DB.Where("installation_id = ?", frozen.Data.InstallationID).First(&before).Error)
+
+		for _, tc := range []struct {
+			name, scope, version string
+			want                 appPluginTestEnvelope
+		}{
+			{"same scope old generation", key, "1.0.0", frozen},
+			{"different scope old generation", key + "-old-replay", "1.0.0", frozen},
+			{"different scope root generation", key + "-root-replay", "2.0.0", rootFrozen},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				request["manifest"] = appPluginTestManifest(key, key, tc.version)
+				replayed := appPluginControllerRequest(t, CreateAppPluginInstallation, http.MethodPost,
+					"/api/app_plugins/installations", appPluginJSONBody(t, request),
+					common.RolePluginAdminUser, "default", map[string]string{"Idempotency-Key": tc.scope})
+				require.Equal(t, http.StatusCreated, replayed.Code, replayed.Body.String())
+				var actual appPluginTestEnvelope
+				require.NoError(t, common.Unmarshal(replayed.Body.Bytes(), &actual))
+				assert.Equal(t, tc.want, actual)
+			})
+		}
+		for _, tc := range []struct {
+			name, scope, version, baseURL, code string
+		}{
+			{"same scope changed payload", key, "1.0.0", "https://apps.example.com/changed/", "idempotency_conflict"},
+			{"same scope changed generation", key, "3.0.0", request["base_url"].(string), "idempotency_conflict"},
+			{"different scope changed digest", key + "-digest", "1.0.0", request["base_url"].(string), "app_version_conflict"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				manifest := appPluginTestManifest(key, key, tc.version)
+				if tc.code == "app_version_conflict" {
+					manifest["name"] = map[string]string{"en": "Changed", "zh": "Changed"}
+				}
+				conflict := appPluginControllerRequest(t, CreateAppPluginInstallation, http.MethodPost,
+					"/api/app_plugins/installations", appPluginJSONBody(t, map[string]any{
+						"manifest": manifest, "base_url": tc.baseURL,
+					}), common.RolePluginAdminUser, "default", map[string]string{"Idempotency-Key": tc.scope})
+				assert.Equal(t, http.StatusConflict, conflict.Code, conflict.Body.String())
+				assert.Equal(t, tc.code, appPluginErrorCode(t, conflict))
+			})
+		}
+		var after model.AppInstallation
+		require.NoError(t, model.DB.Where("installation_id = ?", before.InstallationID).First(&after).Error)
+		assert.Equal(t, before, after, "replays and conflicts must not mutate current approved state")
 	})
 }
 
@@ -382,14 +493,20 @@ func setupAppPluginControllerTest(t *testing.T) {
 	previousRedis := common.RedisEnabled
 	previousFlag := operation_setting.AppPluginV1Enabled
 
-	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "app-plugin.db")), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
+	db := openAppPluginControllerDB(t)
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = previousDB, previousLogDB
+		common.SetDatabaseTypes(previousMain, previousLog)
+		common.RedisEnabled = previousRedis
+		operation_setting.AppPluginV1Enabled = previousFlag
 	})
-	require.NoError(t, err)
+	dbType := map[string]common.DatabaseType{
+		"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL,
+	}[db.Dialector.Name()]
+	common.SetDatabaseTypes(dbType, dbType)
 	require.NoError(t, db.AutoMigrate(&model.TaskPlugin{}, &model.AuditLog{}))
 	require.NoError(t, model.MigrateAppPluginTables(db))
 	model.DB, model.LOG_DB = db, db
-	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	common.RedisEnabled = false
 	operation_setting.AppPluginV1Enabled = true
 	require.NoError(t, db.Create(&model.TaskPlugin{
@@ -402,13 +519,93 @@ func setupAppPluginControllerTest(t *testing.T) {
 		Active:     true,
 	}).Error)
 
-	t.Cleanup(func() {
-		model.DB, model.LOG_DB = previousDB, previousLogDB
-		common.SetDatabaseTypes(previousMain, previousLog)
-		common.RedisEnabled = previousRedis
-		operation_setting.AppPluginV1Enabled = previousFlag
-	})
 	gin.SetMode(gin.TestMode)
+}
+
+func openAppPluginControllerDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	dialect, dsn := os.Getenv("APP_PLUGIN_TEST_DIALECT"), os.Getenv("APP_PLUGIN_TEST_DSN")
+	if dialect == "" {
+		dialect = "sqlite"
+	}
+	config := &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)}
+	name := fmt.Sprintf("app_plugin_controller_%d_%d", os.Getpid(), time.Now().UnixNano())
+	var db *gorm.DB
+	var err error
+	switch dialect {
+	case "sqlite":
+		if dsn == "" {
+			dsn = filepath.Join(t.TempDir(), "app-plugin.db")
+		} else {
+			// The runner supplies a temporary filename; each fixture owns a sibling.
+			dsn += "." + name
+			sqliteFile := dsn
+			t.Cleanup(func() { assert.NoError(t, os.Remove(sqliteFile)) })
+		}
+		db, err = gorm.Open(sqlite.Open(dsn), config)
+	case "mysql":
+		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required")
+		parsed, parseErr := mysqlDriver.ParseDSN(dsn)
+		require.True(t, parseErr == nil, "invalid mysql test DSN")
+		admin, openErr := gorm.Open(mysql.Open(dsn), config)
+		require.True(t, openErr == nil, "cannot open mysql test database")
+		require.NoError(t, admin.Exec("CREATE DATABASE `"+name+"`").Error)
+		t.Cleanup(func() {
+			assert.NoError(t, admin.Exec("DROP DATABASE `"+name+"`").Error)
+			sqlDB, err := admin.DB()
+			require.NoError(t, err)
+			assert.NoError(t, sqlDB.Close())
+		})
+		parsed.DBName = name
+		db, err = gorm.Open(mysql.Open(parsed.FormatDSN()), config)
+	case "postgres", "postgresql":
+		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required")
+		parsed, parseErr := pgx.ParseConfig(dsn)
+		require.True(t, parseErr == nil, "invalid postgres test DSN")
+		admin, openErr := gorm.Open(postgres.Open(dsn), config)
+		require.True(t, openErr == nil, "cannot open postgres test database")
+		require.NoError(t, admin.Exec(`CREATE SCHEMA "`+name+`"`).Error)
+		t.Cleanup(func() {
+			assert.NoError(t, admin.Exec(`DROP SCHEMA "`+name+`" CASCADE`).Error)
+			sqlDB, err := admin.DB()
+			require.NoError(t, err)
+			assert.NoError(t, sqlDB.Close())
+		})
+		parsed.RuntimeParams["search_path"] = name
+		connection := stdlib.OpenDB(*parsed)
+		db, err = gorm.Open(postgres.New(postgres.Config{Conn: connection}), config)
+	default:
+		t.Fatalf("unsupported APP_PLUGIN_TEST_DIALECT %q", dialect)
+	}
+	require.True(t, err == nil, "cannot open app plugin test database")
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, sqlDB.Close()) })
+	if os.Getenv("APP_PLUGIN_TEST_DIALECT") != "" {
+		require.Equal(t, strings.ReplaceAll(dialect, "postgresql", "postgres"), db.Dialector.Name())
+		var version string
+		query := "SELECT version()"
+		if dialect == "sqlite" {
+			query = "SELECT sqlite_version()"
+		}
+		require.NoError(t, db.Raw(query).Scan(&version).Error)
+		require.Equal(t, os.Getenv("APP_PLUGIN_TEST_DATABASE_VERSION"), version)
+		require.NotEmpty(t, os.Getenv("APP_PLUGIN_TEST_DRIVER"))
+		t.Logf("verified database=%s version=%s driver=%s", db.Dialector.Name(), version, os.Getenv("APP_PLUGIN_TEST_DRIVER"))
+	}
+	return db
+}
+
+func appPluginControllerPersistenceCounts(t *testing.T) [6]int64 {
+	t.Helper()
+	var counts [6]int64
+	for i, table := range []any{
+		&model.AppInstallation{}, &model.AppVersion{}, &model.AppInstallationIdempotency{},
+		&model.AppRouteClaim{}, &model.AppEntitlementPolicy{}, &model.AppServiceCredential{},
+	} {
+		require.NoError(t, model.DB.Model(table).Count(&counts[i]).Error)
+	}
+	return counts
 }
 
 func createAppPluginForControllerTest(t *testing.T, key, name, idempotencyKey string) model.AppInstallResult {

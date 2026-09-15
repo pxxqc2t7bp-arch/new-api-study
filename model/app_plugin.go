@@ -34,6 +34,7 @@ var (
 	ErrAppInstallationRevisionConflict = errors.New("app_installation_revision_conflict")
 	ErrAppInstallationRevoked          = errors.New("app_installation_revoked")
 	ErrAppInstallationStatusInvalid    = errors.New("app_installation_status_invalid")
+	ErrAppInstallationUpgradeForbidden = errors.New("app_installation_upgrade_forbidden")
 )
 
 type AppJSONMap map[string][]string
@@ -216,6 +217,8 @@ type AppIdempotencyScope struct {
 }
 
 type AppInstallRequest struct {
+	// Authorization is not part of the immutable request payload or its hash.
+	DisallowUpgrade          bool `json:"-"`
 	AppKey                   string
 	ManifestVersion          string
 	ManifestSHA256           string
@@ -274,6 +277,8 @@ func AppPluginErrorCode(err error) string {
 		return "app_route_collision"
 	case errors.Is(err, ErrAppInstallationRevisionConflict):
 		return "version_conflict"
+	case errors.Is(err, ErrAppInstallationUpgradeForbidden):
+		return "forbidden"
 	case errors.Is(err, ErrAppInstallationRevoked),
 		errors.Is(err, ErrAppInstallationStatusInvalid):
 		return "invalid_state_transition"
@@ -575,6 +580,9 @@ func InstallAppVersion(ctx context.Context, db *gorm.DB, scope AppIdempotencySco
 			if found {
 				result = frozen
 				return freezeAppInstallIdempotency(tx, scopeHash, claimToken, &result)
+			}
+			if req.DisallowUpgrade {
+				return ErrAppInstallationUpgradeForbidden
 			}
 
 			if err := tx.Where("installation_id = ? AND kind <> ?", installation.InstallationID, "app_key").

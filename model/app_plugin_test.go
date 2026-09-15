@@ -476,6 +476,7 @@ func TestAppInstallIdempotencyAndVersionConflict(t *testing.T) {
 			{name: "idempotency conflict", err: ErrAppIdempotencyConflict, code: "idempotency_conflict"},
 			{name: "route collision", err: ErrAppRouteClaimConflict, code: "app_route_collision"},
 			{name: "revision conflict", err: ErrAppInstallationRevisionConflict, code: "version_conflict"},
+			{name: "unapproved installation upgrade", err: ErrAppInstallationUpgradeForbidden, code: "forbidden"},
 			{name: "revoked installation", err: ErrAppInstallationRevoked, code: "invalid_state_transition"},
 			{name: "invalid installation status", err: ErrAppInstallationStatusInvalid, code: "invalid_state_transition"},
 			{name: "invalid install request", err: ErrAppInstallRequestInvalid, code: "validation_error"},
