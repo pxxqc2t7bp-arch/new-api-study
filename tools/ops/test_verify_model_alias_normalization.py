@@ -46,6 +46,21 @@ class PublicModelVerificationTest(unittest.TestCase):
 
 
 class RegressionCompatibilityTest(unittest.TestCase):
+    def test_full_regression_uses_short_token_prefix(self) -> None:
+        class Profiles:
+            TRANSLATION_MODELS = set()
+            VISUAL_EMBEDDING_MODELS = set()
+            IMAGE_MODEL_SIZES = {}
+            VIDEO_MODELS = set()
+            THREE_D_MODELS = set()
+
+        class E2E:
+            TOKEN_NAME_PREFIX = "e2e-all-enabled-models-20260902"
+            ark_profiles = Profiles
+
+        verify.prepare_e2e_module(E2E)
+        self.assertEqual(E2E.TOKEN_NAME_PREFIX, "alias-all")
+
     def test_capability_profiles_gain_canonical_aliases(self) -> None:
         class Profiles:
             TRANSLATION_MODELS = {"doubao-seed-translation-250915"}

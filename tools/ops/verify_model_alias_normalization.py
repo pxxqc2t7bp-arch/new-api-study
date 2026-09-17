@@ -85,6 +85,11 @@ def validate_round_reports(reports: list[dict[str, Any]]) -> str:
     return next(iter(inventory_hashes), "")
 
 
+def prepare_e2e_module(e2e: Any) -> None:
+    e2e.TOKEN_NAME_PREFIX = "alias-all"
+    extend_capability_profiles(e2e.ark_profiles)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
@@ -309,7 +314,7 @@ def run_regression_rounds(
     if rounds <= 0:
         return []
     e2e = importlib.import_module("e2e_all_enabled_models_20260902")
-    extend_capability_profiles(e2e.ark_profiles)
+    prepare_e2e_module(e2e)
     reports = []
     original_argv = list(sys.argv)
     try:
