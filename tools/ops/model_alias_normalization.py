@@ -336,14 +336,14 @@ def inherit_alias_pricing(
 
 def inherit_managed_upstream_aliases(
     aliases: dict[str, Any],
-    plans: list[dict[str, Any]],
-    managed_channel_ids: set[int],
+    channels: list[dict[str, Any]],
 ) -> dict[str, Any]:
     updated = deepcopy(aliases)
-    for plan in plans:
-        if int(plan["channel_id"]) not in managed_channel_ids:
-            continue
-        for alias, target in sorted(plan["selected"].items()):
+    for channel in channels:
+        mapping = parse_mapping(channel.get("model_mapping"))
+        for model in parse_models(str(channel.get("models") or "")):
+            alias = canonical_alias(model)
+            target = mapping.get(model, model)
             if target != alias:
                 updated[target] = alias
     return updated
@@ -358,9 +358,9 @@ def build_manifest(
     channels: list[dict[str, Any]],
     options: dict[str, dict[str, Any]],
     recent_success_by_channel: dict[int, dict[str, int]],
-    managed_channel_ids: set[int] | None = None,
+    managed_channels: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    managed_channel_ids = managed_channel_ids or set()
+    managed_channels = managed_channels or []
     all_plans: list[dict[str, Any]] = []
     for channel in sorted(channels, key=lambda item: int(item["id"])):
         if not is_public_channel(channel):
@@ -451,8 +451,7 @@ def build_manifest(
     desired_options[UPSTREAM_MODEL_ALIASES_KEY] = (
         inherit_managed_upstream_aliases(
             options.get(UPSTREAM_MODEL_ALIASES_KEY) or {},
-            all_plans,
-            managed_channel_ids,
+            managed_channels,
         )
     )
     return {
@@ -595,16 +594,23 @@ def load_options() -> dict[str, dict[str, Any]]:
     return options
 
 
-def load_managed_channel_ids() -> set[int]:
-    rows = psql(
-        "select channel_id from upstream_managed_routes "
-        "where detached=false order by channel_id"
+def load_managed_channels() -> list[dict[str, Any]]:
+    raw = psql(
+        """
+select coalesce(json_agg(row_to_json(q)),'[]'::json)::text
+from (
+  select c.id,c.models,coalesce(c.model_mapping,'') as model_mapping
+  from channels c
+  join upstream_managed_routes r on r.channel_id=c.id
+  where r.detached=false
+  order by c.id
+) q
+"""
     )
-    return {
-        int(row)
-        for row in rows.splitlines()
-        if row
-    }
+    rows = json.loads(raw or "[]")
+    if not isinstance(rows, list):
+        raise RuntimeError("managed channel inventory is not a list")
+    return rows
 
 
 def load_recent_success() -> dict[int, dict[str, int]]:
@@ -1035,7 +1041,7 @@ def main() -> int:
         channels,
         options,
         successes,
-        managed_channel_ids=load_managed_channel_ids(),
+        managed_channels=load_managed_channels(),
     )
     safe_manifest, manifest_sha256 = report_manifest(
         manifest,

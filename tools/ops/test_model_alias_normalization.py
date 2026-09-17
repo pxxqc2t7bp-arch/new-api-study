@@ -66,6 +66,17 @@ class ChannelPlanTest(unittest.TestCase):
                 "model_mapping": '{"gpt-6":"gpt-6-astra"}',
             },
         ]
+        managed_channels = channels + [
+            {
+                "id": 56,
+                "name": "managed-inactive",
+                "group": "default,cxy",
+                "priority": 0,
+                "status": 3,
+                "models": "gpt-5.6-sol",
+                "model_mapping": "{}",
+            },
+        ]
         options = {key: {} for key in migration.OPTION_KEYS}
         options[migration.UPSTREAM_MODEL_ALIASES_KEY] = {
             "existing-concrete": "existing-alias",
@@ -76,7 +87,7 @@ class ChannelPlanTest(unittest.TestCase):
             channels,
             options,
             {50: {"gpt-6-astra": 100}},
-            managed_channel_ids={50},
+            managed_channels=managed_channels,
         )
 
         self.assertEqual(
@@ -85,6 +96,7 @@ class ChannelPlanTest(unittest.TestCase):
             ],
             {
                 "existing-concrete": "existing-alias",
+                "gpt-5.6-sol": "gpt-5.6",
                 "gpt-6-astra": "gpt-6",
             },
         )
