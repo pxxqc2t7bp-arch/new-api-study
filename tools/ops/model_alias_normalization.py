@@ -908,13 +908,6 @@ def apply_manifest(
         [int(plan["channel_id"]) for plan in plans]
     )
     try:
-        for key in OPTION_KEYS:
-            desired = manifest["desired_options"][key]
-            if desired == original_options[key]:
-                continue
-            update_option(headers, key, desired)
-            applied_options.append(key)
-
         for plan in plans:
             channel_id = int(plan["channel_id"])
             original = api_request(
@@ -934,6 +927,13 @@ def apply_manifest(
                 channel_payload(original, plan),
             )
             applied_channels.append(channel_id)
+
+        for key in OPTION_KEYS:
+            desired = manifest["desired_options"][key]
+            if desired == original_options[key]:
+                continue
+            update_option(headers, key, desired)
+            applied_options.append(key)
 
         readback_errors = []
         for plan in plans:

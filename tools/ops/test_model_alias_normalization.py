@@ -1,6 +1,7 @@
 import gzip
 import json
 import unittest
+from unittest import mock
 
 import model_alias_normalization as migration
 
@@ -364,6 +365,79 @@ class PricingPlanTest(unittest.TestCase):
             migration.decode_response_body(compressed, "gzip"),
             payload,
         )
+
+    def test_channel_aliases_are_applied_before_alias_pricing(self) -> None:
+        original_options = {key: {} for key in migration.OPTION_KEYS}
+        desired_options = {
+            key: dict(value)
+            for key, value in original_options.items()
+        }
+        desired_options["ModelRatio"] = {"gpt-6": 0.1}
+        plan = {
+            "channel_id": 92,
+            "group": "default,cxy",
+            "models": ["gpt-6"],
+            "model_mapping": {"gpt-6": "gpt-6-astra"},
+            "settings_field": "",
+            "desired_settings": {},
+        }
+        manifest = {
+            "channel_changes": [plan],
+            "desired_options": desired_options,
+        }
+        original_channel = {
+            "id": 92,
+            "models": "gpt-6-astra",
+            "model_mapping": "{}",
+        }
+        final_channel = {
+            "id": 92,
+            "models": "gpt-6",
+            "model_mapping": '{"gpt-6":"gpt-6-astra"}',
+        }
+        option_rows = [
+            {"key": key, "value": json.dumps(value)}
+            for key, value in desired_options.items()
+        ]
+        events = []
+        channel_reads = iter([original_channel, final_channel])
+
+        def fake_api_request(headers, method, path, body=None, timeout=120):
+            if method == "GET" and path == "/api/channel/92":
+                return next(channel_reads)
+            if method == "PUT" and path == "/api/channel/":
+                events.append("channel")
+                return None
+            if method == "GET" and path == "/api/option/":
+                return option_rows
+            raise AssertionError((method, path, body, timeout))
+
+        def fake_update_option(headers, key, value):
+            events.append("option:" + key)
+
+        with mock.patch.object(
+            migration,
+            "api_request",
+            side_effect=fake_api_request,
+        ), mock.patch.object(
+            migration,
+            "update_option",
+            side_effect=fake_update_option,
+        ), mock.patch.object(
+            migration,
+            "channel_key_hashes",
+            side_effect=[
+                {92: "same"},
+                {92: "same"},
+            ],
+        ), mock.patch.object(
+            migration,
+            "verify_abilities",
+            return_value=[],
+        ):
+            migration.apply_manifest({}, manifest, original_options)
+
+        self.assertEqual(events[:2], ["channel", "option:ModelRatio"])
 
 
 if __name__ == "__main__":
