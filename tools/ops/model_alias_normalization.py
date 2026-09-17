@@ -242,6 +242,42 @@ def is_public_channel(channel: dict[str, Any]) -> bool:
     return bool(groups & PUBLIC_GROUPS)
 
 
+def public_groups(channel: dict[str, Any]) -> set[str]:
+    return {
+        item.strip()
+        for item in str(channel.get("group") or "").split(",")
+        if item.strip() in PUBLIC_GROUPS
+    }
+
+
+def prune_unverified_alias(plan: dict[str, Any], alias: str) -> None:
+    plan["models"] = [
+        model for model in plan["models"] if model != alias
+    ]
+    plan["model_mapping"].pop(alias, None)
+    plan["selected"].pop(alias, None)
+    plan["selected_candidates"].pop(alias, None)
+    plan["candidates"].pop(alias, None)
+    plan.setdefault("pruned_unverified_aliases", []).append(alias)
+    settings = plan.get("desired_settings")
+    if not isinstance(settings, dict):
+        return
+    advanced = settings.get("advanced_custom")
+    if not isinstance(advanced, dict):
+        return
+    routes = advanced.get("advanced_routes")
+    if not isinstance(routes, list):
+        return
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        models = route.get("models")
+        if isinstance(models, list):
+            route["models"] = [
+                model for model in models if model != alias
+            ]
+
+
 def has_effective_pricing(options: dict[str, dict[str, Any]], model: str) -> bool:
     fixed_price = options["ModelPrice"].get(model)
     if isinstance(fixed_price, (int, float)) and fixed_price > 0:
@@ -286,11 +322,7 @@ def build_manifest(
     options: dict[str, dict[str, Any]],
     recent_success_by_channel: dict[int, dict[str, int]],
 ) -> dict[str, Any]:
-    plans: list[dict[str, Any]] = []
-    coverage = {
-        alias: set()
-        for alias in REQUIRED_ALIASES
-    }
+    all_plans: list[dict[str, Any]] = []
     for channel in sorted(channels, key=lambda item: int(item["id"])):
         if not is_public_channel(channel):
             continue
@@ -302,27 +334,34 @@ def build_manifest(
         plan["name"] = str(channel.get("name") or "")
         plan["group"] = str(channel.get("group") or "")
         plan["priority"] = int(channel.get("priority") or 0)
-        for alias in REQUIRED_ALIASES & set(plan["models"]):
-            coverage[alias].update(
-                group
-                for group in plan["group"].split(",")
-                if group in PUBLIC_GROUPS
-            )
-        if plan["changed"]:
-            plans.append(plan)
+        plan["pruned_unverified_aliases"] = []
+        all_plans.append(plan)
 
     blockers: list[str] = []
+    healthy_coverage: dict[str, set[str]] = defaultdict(set)
+    for plan in all_plans:
+        successes = recent_success_by_channel.get(plan["channel_id"], {})
+        for alias, candidate in plan["selected_candidates"].items():
+            target = plan["selected"][alias]
+            if max(
+                successes.get(candidate, 0),
+                successes.get(target, 0),
+            ) > 0:
+                healthy_coverage[alias].update(public_groups(plan))
+
     for alias in sorted(REQUIRED_ALIASES):
-        missing_groups = sorted(PUBLIC_GROUPS - coverage[alias])
+        missing_groups = sorted(
+            PUBLIC_GROUPS - healthy_coverage.get(alias, set())
+        )
         if missing_groups:
             blockers.append(
                 "%s missing public groups: %s"
                 % (alias, ",".join(missing_groups))
             )
 
-    for plan in plans:
+    for plan in all_plans:
         successes = recent_success_by_channel.get(plan["channel_id"], {})
-        for alias, candidate in plan["selected_candidates"].items():
+        for alias, candidate in list(plan["selected_candidates"].items()):
             if candidate == alias:
                 continue
             target = plan["selected"][alias]
@@ -330,10 +369,16 @@ def build_manifest(
                 successes.get(candidate, 0),
                 successes.get(target, 0),
             ) <= 0:
-                blockers.append(
-                    "channel %d alias %s selected target has no successful log: %s"
-                    % (plan["channel_id"], alias, target)
-                )
+                groups = public_groups(plan)
+                if groups <= healthy_coverage.get(alias, set()):
+                    prune_unverified_alias(plan, alias)
+                else:
+                    blockers.append(
+                        "channel %d alias %s selected target has no successful log: %s"
+                        % (plan["channel_id"], alias, target)
+                    )
+
+    plans = [plan for plan in all_plans if plan["changed"]]
 
     price_sources: dict[str, str] = {}
     for plan in sorted(
