@@ -22,6 +22,9 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(modelUpdateHandler{})
 	service.RegisterSystemTaskHandler(midjourneyPollHandler{})
 	service.RegisterSystemTaskHandler(asyncTaskPollHandler{})
+	service.RegisterSystemTaskHandler(deferredTaskDispatchHandler{})
+	service.RegisterSystemTaskHandler(batchDispatchHandler{})
+	service.RegisterSystemTaskHandler(batchFileCleanupHandler{})
 	service.RegisterSystemTaskHandler(upstreamProbeHandler{})
 	service.RegisterSystemTaskHandler(upstreamReconcileHandler{})
 	service.RegisterSystemTaskHandler(upstreamDailyHandler{})
@@ -152,6 +155,66 @@ func (asyncTaskPollHandler) NewPayload() any { return nil }
 
 func (asyncTaskPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	summary := service.RunTaskPollingOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
+	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
+}
+
+type batchFileCleanupHandler struct{}
+
+type batchFileCleanupSummary struct {
+	Deleted int `json:"deleted"`
+}
+
+func (batchFileCleanupHandler) Type() string {
+	return model.SystemTaskTypeBatchFileCleanup
+}
+
+func (batchFileCleanupHandler) Enabled() bool {
+	return true
+}
+
+func (batchFileCleanupHandler) Interval() time.Duration {
+	return time.Hour
+}
+
+func (batchFileCleanupHandler) NewPayload() any {
+	return nil
+}
+
+func (batchFileCleanupHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	summary := batchFileCleanupSummary{}
+	for {
+		if ctx.Err() != nil {
+			finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, summary, ctx.Err())
+			return
+		}
+		files, err := model.ListExpiredAPIFiles(common.GetTimestamp(), 100)
+		if err != nil {
+			finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, summary, err)
+			return
+		}
+		if len(files) == 0 {
+			break
+		}
+		deletedThisPass := 0
+		for _, file := range files {
+			deleted, deleteErr := model.DeleteExpiredAPIFile(file, common.GetTimestamp())
+			if deleteErr != nil {
+				finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusFailed, summary, deleteErr)
+				return
+			}
+			if !deleted {
+				continue
+			}
+			deletedThisPass++
+			summary.Deleted++
+			if deleteErr = service.DeleteBatchFile(file.StorageKey); deleteErr != nil {
+				common.SysLog(fmt.Sprintf("expired batch file content cleanup failed: %v", deleteErr))
+			}
+		}
+		if deletedThisPass == 0 || len(files) < 100 {
+			break
+		}
+	}
 	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
 }
 

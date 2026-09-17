@@ -24,6 +24,9 @@ func ResolveIncomingBillingExprRequestInput(c *gin.Context, info *relaycommon.Re
 	input := billingexpr.RequestInput{}
 	if info != nil {
 		input.Headers = cloneStringMap(info.RequestHeaders)
+		if !info.StartTime.IsZero() {
+			input.EvaluatedAtUnix = info.StartTime.Unix()
+		}
 	}
 
 	bodyBytes, err := readIncomingBillingExprBody(c)
@@ -36,7 +39,8 @@ func ResolveIncomingBillingExprRequestInput(c *gin.Context, info *relaycommon.Re
 
 func BuildBillingExprRequestInputFromRequest(request dto.Request, headers map[string]string) (billingexpr.RequestInput, error) {
 	input := billingexpr.RequestInput{
-		Headers: cloneStringMap(headers),
+		Headers:         cloneStringMap(headers),
+		EvaluatedAtUnix: common.GetTimestamp(),
 	}
 	if request == nil {
 		return input, nil
@@ -63,10 +67,17 @@ func readIncomingBillingExprBody(c *gin.Context) ([]byte, error) {
 
 func cloneRequestInput(src billingexpr.RequestInput) billingexpr.RequestInput {
 	input := billingexpr.RequestInput{
-		Headers: cloneStringMap(src.Headers),
+		Headers:         cloneStringMap(src.Headers),
+		EvaluatedAtUnix: src.EvaluatedAtUnix,
 	}
 	if len(src.Body) > 0 {
 		input.Body = append([]byte(nil), src.Body...)
+	}
+	if len(src.Usage) > 0 {
+		input.Usage = make(map[string]any, len(src.Usage))
+		for key, value := range src.Usage {
+			input.Usage[key] = value
+		}
 	}
 	return input
 }

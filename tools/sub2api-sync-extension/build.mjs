@@ -8,7 +8,13 @@ const dist = resolve(root, 'dist')
 await rm(dist, { force: true, recursive: true })
 await mkdir(resolve(dist, 'site-adapters'), { recursive: true })
 
-for (const file of ['background', 'content', 'contracts', 'options']) {
+for (const file of [
+  'auth-session',
+  'background',
+  'content',
+  'contracts',
+  'options',
+]) {
   const source = await readFile(resolve(root, 'src', `${file}.ts`), 'utf8')
   await writeFile(resolve(dist, `${file}.js`), source)
 }

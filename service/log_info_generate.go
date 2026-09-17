@@ -112,6 +112,27 @@ func AppendChannelFailoverAdminInfo(ctx *gin.Context, adminInfo map[string]inter
 	}
 }
 
+func AppendStreamRecoveryAdminInfo(ctx *gin.Context, adminInfo map[string]interface{}) {
+	if ctx == nil || adminInfo == nil {
+		return
+	}
+	streamID := common.GetContextKeyString(ctx, constant.ContextKeyStreamRecoveryID)
+	if streamID == "" {
+		return
+	}
+	recovery := map[string]interface{}{
+		"stream_id": streamID,
+		"worker":    common.GetContextKeyBool(ctx, constant.ContextKeyStreamRecoveryWorker),
+	}
+	if value, exists := common.GetContextKey(ctx, constant.ContextKeyStreamRecoveryBroker); exists {
+		if writer, ok := value.(*StreamRecoveryWriter); ok {
+			recovery["attempt"] = writer.Attempt()
+			recovery["sequence"] = writer.Sequence()
+		}
+	}
+	adminInfo["stream_recovery"] = recovery
+}
+
 func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, modelRatio, groupRatio, completionRatio float64,
 	cacheTokens int, cacheRatio float64, modelPrice float64, userGroupRatio float64) map[string]interface{} {
 	other := make(map[string]interface{})
@@ -151,6 +172,7 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 
 	AppendChannelAffinityAdminInfo(ctx, adminInfo)
 	AppendChannelFailoverAdminInfo(ctx, adminInfo)
+	AppendStreamRecoveryAdminInfo(ctx, adminInfo)
 
 	other["admin_info"] = adminInfo
 	appendRequestPath(ctx, relayInfo, other)

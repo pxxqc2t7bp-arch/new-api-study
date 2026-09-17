@@ -282,6 +282,51 @@ func parseOpenAIModelIDs(body []byte) ([]string, error) {
 	return ids, nil
 }
 
+func parseVolcengineModelIDs(body []byte) ([]string, error) {
+	var result struct {
+		Data *[]struct {
+			ID     string  `json:"id"`
+			Status *string `json:"status"`
+		} `json:"data"`
+	}
+	if err := common.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("invalid Volcengine Models response: %w", err)
+	}
+	if result.Data == nil {
+		return nil, fmt.Errorf("invalid Volcengine Models response: data is required")
+	}
+
+	ids := make([]string, 0, len(*result.Data))
+	seen := make(map[string]struct{}, len(*result.Data))
+	for index, item := range *result.Data {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			return nil, fmt.Errorf("invalid Volcengine Models response: data[%d].id is required", index)
+		}
+		if _, exists := seen[id]; exists {
+			return nil, fmt.Errorf("invalid Volcengine Models response: duplicate model id %q", id)
+		}
+		seen[id] = struct{}{}
+
+		status := ""
+		if item.Status != nil {
+			status = strings.TrimSpace(*item.Status)
+		}
+		switch strings.ToLower(status) {
+		case "", "active":
+			ids = append(ids, id)
+		case "shutdown", "retiring":
+			continue
+		default:
+			return nil, fmt.Errorf("invalid Volcengine Models response: model %q has unknown status %q", id, status)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("Volcengine Models response contains no active model IDs")
+	}
+	return ids, nil
+}
+
 func sanitizeFetchModelsError(err error, key string) error {
 	if err == nil {
 		return nil
@@ -407,6 +452,7 @@ func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
 	}
 
 	var url string
+	parseVolcengineCatalog := false
 	switch channel.Type {
 	case constant.ChannelTypeAli:
 		url = fmt.Sprintf("%s/compatible-mode/v1/models", baseURL)
@@ -420,7 +466,8 @@ func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
 		if plan, ok := constant.ChannelSpecialBases[baseURL]; ok && plan.OpenAIBaseURL != "" {
 			url = fmt.Sprintf("%s/v1/models", plan.OpenAIBaseURL)
 		} else {
-			url = fmt.Sprintf("%s/v1/models", baseURL)
+			url = fmt.Sprintf("%s/api/v3/models", strings.TrimRight(baseURL, "/"))
+			parseVolcengineCatalog = true
 		}
 	case constant.ChannelTypeMoonshot:
 		if plan, ok := constant.ChannelSpecialBases[baseURL]; ok && plan.OpenAIBaseURL != "" {
@@ -448,6 +495,9 @@ func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
 		return nil, sanitizeAdvancedCustomRequestError(err, key, url)
 	}
 
+	if parseVolcengineCatalog {
+		return parseVolcengineModelIDs(body)
+	}
 	var result OpenAIModelsResponse
 	if err := common.Unmarshal(body, &result); err != nil {
 		return nil, err

@@ -201,6 +201,12 @@ const (
 	ContextKeyPinnedEndpoint  = "task_plugin_pinned_endpoint"
 	ContextKeyRouteRequest    = "task_plugin_route_request"
 	ContextKeyProtocolRequest = "task_plugin_protocol_request"
+	ContextKeyExecutionMode   = "task_plugin_execution_mode"
+)
+
+const (
+	ExecutionModeUpstreamTask = "upstream_task"
+	ExecutionModeDeferred     = "deferred"
 )
 
 type PinnedPlugin struct {

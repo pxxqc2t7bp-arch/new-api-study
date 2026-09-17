@@ -30,6 +30,7 @@ type UpstreamOrchestrationSetting struct {
 	StaticEgressIPs           map[string][]string `json:"static_egress_ips"`
 	ModelAliases              map[string]string   `json:"model_aliases"`
 	ModelExclusions           map[string][]string `json:"model_exclusions"`
+	ProtocolModelExclusions   map[string][]string `json:"protocol_model_exclusions"`
 }
 
 var upstreamOrchestrationSetting = UpstreamOrchestrationSetting{
@@ -55,6 +56,7 @@ var upstreamOrchestrationSetting = UpstreamOrchestrationSetting{
 	StaticEgressIPs:           map[string][]string{},
 	ModelAliases:              map[string]string{},
 	ModelExclusions:           map[string][]string{},
+	ProtocolModelExclusions:   map[string][]string{},
 }
 
 func init() {
@@ -127,5 +129,8 @@ func normalizeUpstreamOrchestrationSetting(setting *UpstreamOrchestrationSetting
 	}
 	if setting.ModelExclusions == nil {
 		setting.ModelExclusions = map[string][]string{}
+	}
+	if setting.ProtocolModelExclusions == nil {
+		setting.ProtocolModelExclusions = map[string][]string{}
 	}
 }

@@ -5,6 +5,14 @@ import "github.com/QuantumNous/new-api/constant"
 // GetEndpointTypesByChannelType 获取渠道最优先端点类型（所有的渠道都支持 OpenAI 端点）
 func GetEndpointTypesByChannelType(channelType int, modelName string) []constant.EndpointType {
 	var endpointTypes []constant.EndpointType
+	if channelType == constant.ChannelTypeVolcEngine {
+		if IsImageGenerationModel(modelName) {
+			return []constant.EndpointType{constant.EndpointTypeImageGeneration}
+		}
+		if IsVideoGenerationModel(modelName) {
+			return []constant.EndpointType{constant.EndpointTypeOpenAIVideo}
+		}
+	}
 	switch channelType {
 	case constant.ChannelTypeJina:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeJinaRerank}
@@ -29,6 +37,8 @@ func GetEndpointTypesByChannelType(channelType int, modelName string) []constant
 	case constant.ChannelTypeXai:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAI, constant.EndpointTypeOpenAIResponse}
 	case constant.ChannelTypeSora:
+		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAIVideo}
+	case constant.ChannelTypeDoubaoVideo:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeOpenAIVideo}
 	case constant.ChannelTypeVolcEngine3D:
 		endpointTypes = []constant.EndpointType{constant.EndpointTypeThreeDGeneration}

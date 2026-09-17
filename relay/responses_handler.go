@@ -143,6 +143,9 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
 	}
+	if terminalError := streamRecoveryTerminalError(c, info); terminalError != nil {
+		return terminalError
+	}
 
 	usageDto := usage.(*dto.Usage)
 	helper.ApplySmartRouterActualModelPricing(c, info, info.GetEstimatePromptTokens(), request.GetTokenCountMeta())

@@ -1,26 +1,37 @@
+const SEEDANCE_MODELS = [
+  "doubao-seedance-1-0-pro-250528",
+  "doubao-seedance-1-0-pro-fast-251015",
+  "doubao-seedance-1-0-lite-t2v",
+  "doubao-seedance-1-0-lite-i2v",
+  "doubao-seedance-1-5-pro-251215",
+  "doubao-seedance-2-0-260128",
+  "doubao-seedance-2-0-fast-260128",
+  "doubao-seedance-2-0-mini-260615",
+  "doubao-seedance-2-5-260628",
+  "doubao-seedance-2-5-draft-preview-260828",
+];
+
+const SEEDREAM_MODELS = [
+  "doubao-seedream-4-0-20260415",
+  "doubao-seedream-4-0-250828",
+  "doubao-seedream-4-5-251128",
+  "doubao-seedream-5-0-260128",
+  "doubao-seedream-5-0-pro-260628",
+];
+
 export const meta = {
   apiVersion: 1,
   key: "doubao",
-  name: "Doubao Video",
+  name: "Doubao Media",
   icon: "Doubao.Color",
   description: {
-    en: "Volcengine Doubao Seedance video generation (text-to-video, image-to-video, and video-to-video)",
-    zh: "火山引擎豆包 Seedance 视频生成（文生视频、图生视频、视频生视频）",
+    en: "Volcengine Doubao Seedream image and Seedance video generation",
+    zh: "火山引擎豆包 Seedream 图片与 Seedance 视频生成",
   },
-  version: "1.0.0",
+  version: "1.2.0",
   author: { name: "QuantumNous" },
   channelTypes: [54, 45], // VolcEngine-type channels serve Ark video models with the same wire format
-  models: [
-    "doubao-seedance-1-0-pro-250528",
-    "doubao-seedance-1-0-pro-fast-251015",
-    "doubao-seedance-1-0-lite-t2v",
-    "doubao-seedance-1-0-lite-i2v",
-    "doubao-seedance-1-5-pro-251215",
-    "doubao-seedance-2-0-260128",
-    "doubao-seedance-2-0-fast-260128",
-    "doubao-seedance-2-0-mini-260615",
-    "doubao-seedance-2-5-260628",
-  ],
+  models: SEEDANCE_MODELS.concat(SEEDREAM_MODELS),
   fetchMode: "per_task",
   usageSchema: {
     tokens: {
@@ -32,7 +43,7 @@ export const meta = {
       },
     },
     resolution: {
-      enum: ["480p", "720p", "1080p", "4k"],
+      enum: ["480p", "720p", "1080p", "4k", "1K", "2K", "3K", "4K"],
       description: {
         en: "Output video resolution; Seedance token unit price varies by resolution tier.",
         zh: "输出视频分辨率；Seedance token 单价随分辨率档位变化。",
@@ -45,22 +56,66 @@ export const meta = {
         zh: "请求是否包含参考视频输入；Seedance 对视频生视频 token 按更低单价计费。",
       },
     },
+    image_count: {
+      type: "number",
+      unit: "count",
+      description: {
+        en: "Number of images requested from Seedream.",
+        zh: "Seedream 请求生成的图片数量。",
+      },
+    },
+    reference_image_count: {
+      type: "number",
+      unit: "count",
+      description: {
+        en: "Number of reference images supplied to Seedream.",
+        zh: "Seedream 请求包含的参考图片数量。",
+      },
+    },
   },
   // Official Ark formula tokens = (input + output seconds) × W × H × 24 / 1024,
   // 16:9 max-pixel sizes, cross-checked against Volcengine price examples.
   usageExamples: [
-    { label: "480p · 5s", facts: { tokens: 48038, resolution: "480p", video_input: "none" } },
-    { label: "720p · 5s", facts: { tokens: 108000, resolution: "720p", video_input: "none" } },
-    { label: "1080p · 5s", facts: { tokens: 243000, resolution: "1080p", video_input: "none" } },
-    { label: "4k · 5s", facts: { tokens: 972000, resolution: "4k", video_input: "none" } },
-    { label: "720p · 10s", facts: { tokens: 216000, resolution: "720p", video_input: "none" } },
-    { label: "720p · 5s (+4s 输入视频)", facts: { tokens: 194400, resolution: "720p", video_input: "video" } },
+    {
+      label: "480p · 5s",
+      facts: { tokens: 48038, resolution: "480p", video_input: "none", image_count: 1, reference_image_count: 0 },
+    },
+    {
+      label: "720p · 5s",
+      facts: { tokens: 108000, resolution: "720p", video_input: "none", image_count: 1, reference_image_count: 0 },
+    },
+    {
+      label: "1080p · 5s",
+      facts: { tokens: 243000, resolution: "1080p", video_input: "none", image_count: 1, reference_image_count: 0 },
+    },
+    {
+      label: "4k · 5s",
+      facts: { tokens: 972000, resolution: "4k", video_input: "none", image_count: 1, reference_image_count: 0 },
+    },
+    {
+      label: "720p · 10s",
+      facts: { tokens: 216000, resolution: "720p", video_input: "none", image_count: 1, reference_image_count: 0 },
+    },
+    {
+      label: "720p · 5s (+4s 输入视频)",
+      facts: { tokens: 194400, resolution: "720p", video_input: "video", image_count: 1, reference_image_count: 0 },
+    },
   ],
   routes: [
-    { method: "POST", path: "/doubao/api/v3/contents/generations/tasks", type: "submit", decode: "createTask", render: "taskCreated" },
+    {
+      method: "POST",
+      path: "/doubao/api/v3/contents/generations/tasks",
+      type: "submit",
+      decode: "createTask",
+      render: "taskCreated",
+      models: SEEDANCE_MODELS,
+    },
     { method: "GET", path: "/doubao/api/v3/contents/generations/tasks/:task_id", type: "query", render: "taskStatus" },
   ],
-  protocols: [{ name: "openai_responses", supports: ["stream", "sync", "background"] }, "openai_video"],
+  protocols: [
+    { name: "openai_responses", supports: ["stream", "sync", "background"] },
+    { name: "openai_video", models: SEEDANCE_MODELS },
+  ],
 };
 
 function trimmed(value) {
@@ -118,6 +173,59 @@ function hasVideo(content) {
   return Array.isArray(content) && content.some((item) => item && (item.type === "video_url" || Object.prototype.hasOwnProperty.call(item, "video_url")));
 }
 
+function isSeedreamModel(model) {
+  return SEEDREAM_MODELS.includes(trimmed(model));
+}
+
+function normalizeImageResolution(value) {
+  const raw = trimmed(value).toUpperCase().replace("×", "X").replace("*", "X");
+  if (["1K", "2K", "3K", "4K"].includes(raw)) return raw;
+  const parts = raw.split("X");
+  if (parts.length === 2) {
+    const width = Number(parts[0]);
+    const height = Number(parts[1]);
+    const edge = Math.max(width, height);
+    if (Number.isFinite(edge) && edge > 0) {
+      if (edge <= 1536) return "1K";
+      if (edge <= 2560) return "2K";
+      if (edge <= 3584) return "3K";
+      return "4K";
+    }
+  }
+  return "2K";
+}
+
+function seedreamImageCount(req) {
+  const direct = Number(req && req.n);
+  if (req && req.n !== undefined) {
+    if (!Number.isInteger(direct) || direct < 1 || direct > 128) throw new Error("n must be an integer between 1 and 128");
+    return direct;
+  }
+  const options = (req && req.sequential_image_generation_options) || {};
+  const sequential = Number(options.max_images);
+  if (options.max_images !== undefined) {
+    if (!Number.isInteger(sequential) || sequential < 1 || sequential > 128) throw new Error("max_images must be an integer between 1 and 128");
+    return sequential;
+  }
+  return 1;
+}
+
+function seedreamReferenceImages(req, model) {
+  const values = [];
+  const append = function (value) {
+    if (Array.isArray(value)) {
+      for (const item of value) append(item);
+      return;
+    }
+    if (trimmed(value)) values.push(trimmed(value));
+  };
+  append(req && req.image);
+  append(req && req.images);
+  const limit = model === "doubao-seedream-5-0-pro-260628" ? 10 : 14;
+  if (values.length > limit) throw new Error("too many reference images");
+  return values;
+}
+
 // Max-pixel 16:9 dimensions per resolution tier. Used when ratio is absent or
 // adaptive so the submit-time estimate overestimates rather than underestimates.
 // Official Ark formula: tokens = seconds × width × height × 24 / 1024.
@@ -137,7 +245,7 @@ function estimateTokens(seconds, resolution) {
 function videoInputRatio(model, resolution, content) {
   const video = hasVideo(content);
   const res = trimmed(resolution).toLowerCase();
-  if (model === "doubao-seedance-2-5-260628") {
+  if (model === "doubao-seedance-2-5-260628" || model === "doubao-seedance-2-5-draft-preview-260828") {
     if (res === "1080p") return video ? 7.0 / 10.7 : 11.7 / 10.7;
     return video ? 42 / 70 : 1;
   }
@@ -197,6 +305,26 @@ function responsesVideoText(ctx) {
   return '<video controls src="' + escaped + '"></video>';
 }
 
+function responsesMediaText(ctx) {
+  const artifacts = (ctx && ctx.artifacts) || {};
+  const imageKeys = Object.keys(artifacts)
+    .filter(function (key) {
+      return key.indexOf("image_") === 0;
+    })
+    .sort();
+  if (imageKeys.length) {
+    return imageKeys
+      .map(function (key, index) {
+        const artifact = artifacts[key] || {};
+        const url = trimmed(artifact.url);
+        if (!url) throw new Error("image artifact is unavailable");
+        return "![generated image " + String(index + 1) + "](" + url + ")";
+      })
+      .join("\n");
+  }
+  return responsesVideoText(ctx);
+}
+
 export const native = {
   createTask: function (ctx) {
     if (!ctx.body || ctx.body.kind !== "json") throw new Error("JSON body required");
@@ -248,6 +376,42 @@ export const native = {
 
 export function buildSubmitRequest(ctx) {
   const req = ctx.requestBody;
+  const model = ctx.upstreamModel || ctx.model || req.model || "";
+  if (isSeedreamModel(model)) {
+    const metadata = req.metadata || {};
+    const body = Object.assign({}, metadata, {
+      model: model,
+      prompt: req.prompt || metadata.prompt || "",
+      response_format: "url",
+    });
+    for (const field of [
+      "n",
+      "size",
+      "quality",
+      "watermark",
+      "output_format",
+      "background",
+      "sequential_image_generation",
+      "sequential_image_generation_options",
+      "optimize_prompt_options",
+    ]) {
+      if (Object.prototype.hasOwnProperty.call(req, field)) body[field] = req[field];
+    }
+    const references = seedreamReferenceImages(req, model);
+    if (references.length === 1) body.image = references[0];
+    else if (references.length > 1) body.image = references;
+    if (req.size || metadata.size) body.size = req.size || metadata.size;
+    body.n = seedreamImageCount(req);
+    delete body.content;
+    return {
+      url: ctx.baseUrl + "/api/v3/images/generations",
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json", Authorization: "Bearer " + ctx.apiKey },
+      body: body,
+      action: references.length ? "image_edit" : "image_generation",
+      rewriteModel: model,
+    };
+  }
   const metadata = req.metadata || {};
   const body = Object.assign({ model: req.model || "", content: [] }, metadata);
   const imageContent = [];
@@ -272,12 +436,30 @@ export function buildSubmitRequest(ctx) {
 }
 
 export function parseSubmitResponse(ctx, resp) {
+  if (isSeedreamModel(ctx.upstreamModel || ctx.model)) {
+    const result = resp.body || {};
+    if (!Array.isArray(result.data) || result.data.length === 0) throw new Error("image data is empty");
+    const first = result.data[0] || {};
+    if (!trimmed(first.url) && !trimmed(first.b64_json)) throw new Error("image artifact is empty");
+    return {
+      taskId: ctx.publicTaskId,
+      taskData: { media_type: "image", response: result },
+      immediate: { taskId: ctx.publicTaskId, status: "SUCCESS", progress: "100%", url: trimmed(first.url) },
+    };
+  }
   if (!resp.body || !resp.body.id) throw new Error("task_id is empty");
   return { taskId: resp.body.id, taskData: resp.body };
 }
 
 export function extractUsage(ctx) {
   const req = ctx.requestBody || {};
+  if (isSeedreamModel(ctx.upstreamModel || ctx.model || req.model)) {
+    return {
+      image_count: seedreamImageCount(req),
+      resolution: normalizeImageResolution(req.size || (req.metadata || {}).size),
+      reference_image_count: seedreamReferenceImages(req, ctx.upstreamModel || ctx.model || req.model).length,
+    };
+  }
   const metadata = req.metadata || {};
   if (ctx.usagePurpose === "billing_ratios") {
     const ratio = videoInputRatio(ctx.upstreamModel || ctx.model, metadata.resolution, metadata.content);
@@ -330,12 +512,22 @@ export function parseTaskResult(ctx, body) {
 
 function artifactData(ctx) {
   const data = (ctx && ctx.data) || {};
+  if (data.media_type === "image" && data.response && typeof data.response === "object") return data.response;
   if (data.data && typeof data.data === "object" && data.data.task_id && Object.prototype.hasOwnProperty.call(data.data, "data")) return data.data.data || {};
   return data;
 }
 
 export function listArtifacts(task) {
   if (task.status !== "SUCCESS") return [];
+  const imageData = artifactData(task);
+  if (Array.isArray(imageData.data)) {
+    const images = [];
+    for (let index = 0; index < imageData.data.length; index++) {
+      const item = imageData.data[index] || {};
+      if (trimmed(item.url)) images.push({ key: "image_" + String(index), type: "image", mimeType: "image/png" });
+    }
+    if (images.length) return images;
+  }
   const content = artifactData(task).content || {};
   const artifacts = [];
   if (trimmed(content.video_url)) artifacts.push({ key: "video", type: "video" });
@@ -344,7 +536,15 @@ export function listArtifacts(task) {
 }
 
 export function buildContentRequest(ctx) {
-  const content = artifactData(ctx).content || {};
+  const data = artifactData(ctx);
+  if (ctx.artifactKey.indexOf("image_") === 0 && Array.isArray(data.data)) {
+    const index = Number(ctx.artifactKey.slice("image_".length));
+    const item = Number.isInteger(index) && index >= 0 ? data.data[index] || {} : {};
+    const imageURL = trimmed(item.url);
+    if (!imageURL) throw new Error("artifact_not_found");
+    return { url: imageURL, method: ctx.clientRequest.method, credentialless: true };
+  }
+  const content = data.content || {};
   const urls = { video: content.video_url, last_frame: content.last_frame_url };
   const url = trimmed(urls[ctx.artifactKey]);
   if (!url) throw new Error("artifact_not_found");
@@ -388,10 +588,23 @@ export const protocols = {
       else if (req.size && !metadata.resolution) metadata.resolution = normalizeResolution(req.size);
       const requestBody = { model: model, prompt: prompt, metadata: metadata };
       if (images.length) requestBody.images = images;
+      if (Object.prototype.hasOwnProperty.call(req, "n")) requestBody.n = req.n;
+      if (Object.prototype.hasOwnProperty.call(req, "sequential_image_generation_options"))
+        requestBody.sequential_image_generation_options = req.sequential_image_generation_options;
+      for (const field of ["sequential_image_generation", "watermark", "output_format", "background", "optimize_prompt_options"]) {
+        if (Object.prototype.hasOwnProperty.call(req, field)) requestBody[field] = req[field];
+      }
       if (Object.prototype.hasOwnProperty.call(req, "seconds")) requestBody.seconds = req.seconds;
       else if (Object.prototype.hasOwnProperty.call(req, "duration")) requestBody.seconds = req.duration;
       if (Object.prototype.hasOwnProperty.call(req, "size")) requestBody.size = req.size;
-      const intent = { kind: "submit", model: model, action: images.length ? "image_to_video" : "text_to_video", requestBody: requestBody };
+      const imageModel = isSeedreamModel(model);
+      const intent = {
+        kind: "submit",
+        model: model,
+        action: imageModel ? (images.length ? "image_edit" : "image_generation") : images.length ? "image_to_video" : "text_to_video",
+        requestBody: requestBody,
+      };
+      if (imageModel) intent.execution = "deferred";
       const originTaskIds = draftTaskIds(metadata.content);
       if (originTaskIds.length) intent.originTaskIds = originTaskIds;
       return intent;
@@ -402,7 +615,7 @@ export const protocols = {
       const progress = Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
       const state = { status: status, progress: progress };
       if (status === "SUCCESS") {
-        const text = responsesVideoText(ctx);
+        const text = responsesMediaText(ctx);
         const events = previousState && previousState.status === status ? [] : [{ type: "output", data: text }];
         return { events: events, state: state, done: true };
       }
@@ -420,7 +633,7 @@ export const protocols = {
             type: "message",
             status: "completed",
             role: "assistant",
-            content: [{ type: "output_text", text: responsesVideoText(ctx), annotations: [], logprobs: [] }],
+            content: [{ type: "output_text", text: responsesMediaText(ctx), annotations: [], logprobs: [] }],
           },
         ],
         metadata: { vendor: "doubao" },

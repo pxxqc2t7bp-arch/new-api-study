@@ -603,7 +603,21 @@ func rankManagedRoutes(
 		if !ok || !managedCandidateSelectionEvaluable(source, group, now, setting) {
 			continue
 		}
-		models, selected := selectedModels[identity]
+		models, groupSelected := selectedModels[identity]
+		routeModels := make([]string, 0, len(models))
+		for _, modelName := range models {
+			if managedProtocolModelExcluded(
+				source.Key,
+				route.ExternalGroupID,
+				route.Protocol,
+				modelName,
+				setting.ProtocolModelExclusions,
+			) {
+				continue
+			}
+			routeModels = append(routeModels, modelName)
+		}
+		selected := groupSelected && len(routeModels) > 0
 		rank := 0
 		priority := int64(0)
 		status := common.ChannelStatusAutoDisabled
@@ -629,8 +643,8 @@ func rankManagedRoutes(
 			channel.Priority = &priority
 			channel.BaseURL = &selectedEndpoint
 			channel.Status = status
-			if selected {
-				channel.Models = strings.Join(models, ",")
+			if groupSelected {
+				channel.Models = strings.Join(routeModels, ",")
 			}
 			if err := tx.Model(&model.Channel{}).Where("id = ?", route.ChannelID).Updates(map[string]any{
 				"priority": priority,
@@ -790,6 +804,31 @@ func managedModelExcluded(
 		excluded = strings.TrimSpace(excluded)
 		if excluded == upstreamModel || excluded == canonicalModel {
 			return true
+		}
+	}
+	return false
+}
+
+func managedProtocolModelExcluded(
+	sourceKey string,
+	externalGroupID string,
+	protocol string,
+	modelName string,
+	exclusions map[string][]string,
+) bool {
+	sourceKey = strings.ToLower(strings.TrimSpace(sourceKey))
+	externalGroupID = strings.TrimSpace(externalGroupID)
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	keys := []string{
+		protocol,
+		sourceKey + ":" + protocol,
+		sourceKey + ":" + externalGroupID + ":" + protocol,
+	}
+	for _, key := range keys {
+		for _, excluded := range exclusions[key] {
+			if strings.TrimSpace(excluded) == modelName {
+				return true
+			}
 		}
 	}
 	return false

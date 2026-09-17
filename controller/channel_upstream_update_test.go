@@ -70,6 +70,71 @@ func TestParseOpenAIModelIDsStrictResponseContract(t *testing.T) {
 	}
 }
 
+func TestParseVolcengineModelIDsStrictResponseContract(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		want      []string
+		wantError string
+	}{
+		{name: "malformed JSON", body: `{"data":`, wantError: "invalid Volcengine Models response"},
+		{name: "missing data", body: `{"object":"list"}`, wantError: "data is required"},
+		{name: "null data", body: `{"data":null}`, wantError: "data is required"},
+		{name: "empty data", body: `{"data":[]}`, wantError: "no active model IDs"},
+		{name: "missing id", body: `{"data":[{"status":null}]}`, wantError: "id is required"},
+		{name: "duplicate id", body: `{"data":[{"id":"m1"},{"id":"m1"}]}`, wantError: "duplicate model id"},
+		{name: "unknown status", body: `{"data":[{"id":"m1","status":"Paused"}]}`, wantError: "unknown status"},
+		{
+			name: "keeps active and null while excluding retired models",
+			body: `{"data":[
+				{"id":" active-null ","status":null},
+				{"id":"active-explicit","status":"Active"},
+				{"id":"old-shutdown","status":"Shutdown"},
+				{"id":"old-retiring","status":"Retiring"}
+			]}`,
+			want: []string{"active-null", "active-explicit"},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			models, err := parseVolcengineModelIDs([]byte(testCase.body))
+			if testCase.wantError != "" {
+				require.ErrorContains(t, err, testCase.wantError)
+				require.Nil(t, models)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, testCase.want, models)
+		})
+	}
+}
+
+func TestFetchVolcengineModelsUsesArkCatalogAndFiltersLifecycle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v3/models", r.URL.Path)
+		assert.Equal(t, "Bearer ark-key", r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"data":[
+			{"id":"active-model","status":null},
+			{"id":"retiring-model","status":"Retiring"},
+			{"id":"shutdown-model","status":"Shutdown"}
+		]}`))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	baseURL := server.URL + "/"
+	channel := &model.Channel{
+		Type:    constant.ChannelTypeVolcEngine,
+		Key:     "ark-key",
+		BaseURL: &baseURL,
+	}
+	models, err := fetchChannelUpstreamModelIDs(channel)
+	require.NoError(t, err)
+	require.Equal(t, []string{"active-model"}, models)
+}
+
 func TestFetchAdvancedCustomModelsAppliesHeaderOverrideAfterRouteAuth(t *testing.T) {
 	type receivedRequest struct {
 		Headers http.Header

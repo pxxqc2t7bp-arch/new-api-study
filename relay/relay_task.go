@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -26,12 +28,13 @@ import (
 )
 
 type TaskSubmitResult struct {
-	UpstreamTaskID string
-	TaskData       []byte
-	ClientResponse any
-	Platform       constant.TaskPlatform
-	Quota          int
-	Immediate      *relaycommon.TaskInfo
+	UpstreamTaskID  string
+	TaskData        []byte
+	ClientResponse  any
+	Platform        constant.TaskPlatform
+	Quota           int
+	Immediate       *relaycommon.TaskInfo
+	DeferredRequest *model.TaskDeferredRequest
 	//PerCallPrice   types.PriceData
 }
 
@@ -275,7 +278,14 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		} else {
 			facts = provider.ExtractUsageFacts(c, info)
 		}
-		cost, trace, runErr := billingexpr.RunExprWithRequest(exprStr, billingexpr.TokenParams{}, billingexpr.RequestInput{Usage: facts})
+		pricingTimeUnix := common.GetTimestamp()
+		if !info.StartTime.IsZero() {
+			pricingTimeUnix = info.StartTime.Unix()
+		}
+		cost, trace, runErr := billingexpr.RunExprWithRequest(exprStr, billingexpr.TokenParams{}, billingexpr.RequestInput{
+			Usage:           facts,
+			EvaluatedAtUnix: pricingTimeUnix,
+		})
 		if runErr != nil || cost < 0 {
 			if runErr == nil {
 				runErr = fmt.Errorf("negative task expression result")
@@ -286,7 +296,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		quota, clamp := common.QuotaRoundChecked(cost * common.QuotaPerUnit * groupRatioInfo.GroupRatio)
 		noteTaskQuotaClamp(info, clamp)
 		priceData = types.PriceData{Quota: quota, QuotaToPreConsume: quota, GroupRatioInfo: groupRatioInfo}
-		info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: modelName, ExprString: exprStr, ExprHash: billingexpr.ExprHashString(exprStr), GroupRatio: groupRatioInfo.GroupRatio, EstimatedQuotaBeforeGroup: cost * common.QuotaPerUnit, EstimatedQuotaAfterGroup: quota, EstimatedTier: trace.MatchedTier, QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(exprStr), TaskUsageBilling: true, UsageFacts: facts}
+		info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{BillingMode: billing_setting.BillingModeTieredExpr, ModelName: modelName, ExprString: exprStr, ExprHash: billingexpr.ExprHashString(exprStr), GroupRatio: groupRatioInfo.GroupRatio, EstimatedQuotaBeforeGroup: cost * common.QuotaPerUnit, EstimatedQuotaAfterGroup: quota, EstimatedTier: trace.MatchedTier, QuotaPerUnit: common.QuotaPerUnit, ExprVersion: billingexpr.ExprVersion(exprStr), BillingBasis: billingexpr.BillingBasisTask, PricingTimeUnix: pricingTimeUnix, TaskUsageBilling: true, UsageFacts: facts}
 	} else {
 		priceData, err = helper.ModelPriceHelperPerCall(c, info)
 		if err != nil {
@@ -336,8 +346,55 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	if err != nil {
 		return nil, service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
 	}
+	if c.GetString(pluginruntime.ContextKeyExecutionMode) == pluginruntime.ExecutionModeDeferred {
+		deferredRequest, captureErr := captureDeferredTaskRequest(c, info)
+		if captureErr != nil {
+			return nil, service.TaskErrorWrapperLocal(captureErr, "deferred_request_invalid", http.StatusBadRequest)
+		}
+		return &TaskSubmitResult{
+			Platform:        platform,
+			Quota:           info.PriceData.Quota,
+			DeferredRequest: deferredRequest,
+		}, nil
+	}
 
-	// 9. 发送请求
+	return submitTaskUpstream(c, info, adaptor, platform, requestBody, info.PriceData.Quota)
+}
+
+// RelayDeferredTaskSubmit rebuilds a previously validated plugin request with
+// current channel credentials. Billing and persistence are intentionally
+// excluded: the foreground request already crossed both durable barriers.
+func RelayDeferredTaskSubmit(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	platform constant.TaskPlatform,
+	quota int,
+) (*TaskSubmitResult, *dto.TaskError) {
+	info.InitChannelMeta(c)
+	resolvedPlatform, adaptor := getTaskAdaptorForRequest(c, platform)
+	if adaptor == nil {
+		code, message := TaskPlatformUnavailableError(platform)
+		return nil, service.TaskErrorWrapperLocal(errors.New(message), code, http.StatusBadRequest)
+	}
+	adaptor.Init(info)
+	if taskErr := adaptor.ValidateRequestAndSetAction(c, info); taskErr != nil {
+		return nil, taskErr
+	}
+	requestBody, err := adaptor.BuildRequestBody(c, info)
+	if err != nil {
+		return nil, service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
+	}
+	return submitTaskUpstream(c, info, adaptor, resolvedPlatform, requestBody, quota)
+}
+
+func submitTaskUpstream(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	adaptor channel.TaskAdaptor,
+	platform constant.TaskPlatform,
+	requestBody io.Reader,
+	quota int,
+) (*TaskSubmitResult, *dto.TaskError) {
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
 		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
@@ -362,7 +419,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	}
 
 	// 11. 提交后计费调整：让适配器根据上游实际返回调整 OtherRatios
-	finalQuota := info.PriceData.Quota
+	finalQuota := quota
 	if info.TieredBillingSnapshot == nil {
 		if adjustedRatios := adaptor.AdjustBillingOnSubmit(info, parsed.TaskData); len(adjustedRatios) > 0 {
 			if adjustedQuota, ok := recalcQuotaFromRatios(info, adjustedRatios); ok {
@@ -381,6 +438,73 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		Platform:       platform,
 		Quota:          finalQuota,
 		Immediate:      parsed.Immediate,
+	}, nil
+}
+
+func captureDeferredTaskRequest(c *gin.Context, info *relaycommon.RelayInfo) (*model.TaskDeferredRequest, error) {
+	if c == nil || c.Request == nil {
+		return nil, errors.New("deferred execution requires an HTTP request")
+	}
+	if strings.Contains(strings.ToLower(c.GetHeader("Content-Type")), "multipart/form-data") {
+		return nil, errors.New("deferred execution does not support multipart request bodies")
+	}
+	requestValue, exists := c.Get("task_request")
+	if !exists {
+		return nil, errors.New("deferred execution requires a normalized task request")
+	}
+	requestBody, err := common.Marshal(requestValue)
+	if err != nil {
+		return nil, fmt.Errorf("encode deferred task request: %w", err)
+	}
+
+	route := pluginruntime.RouteRequestContext{
+		Path:   c.Request.URL.Path,
+		Method: c.Request.Method,
+		Params: map[string]string{},
+		Query:  c.Request.URL.Query(),
+	}
+	if value, found := c.Get(pluginruntime.ContextKeyRouteRequest); found {
+		if prepared, ok := value.(pluginruntime.RouteRequestContext); ok {
+			route = prepared
+		}
+	}
+	if len(route.Files) > 0 {
+		return nil, errors.New("deferred execution does not support uploaded files")
+	}
+	var routeBody json.RawMessage
+	if route.Body != nil {
+		encoded, marshalErr := common.Marshal(route.Body)
+		if marshalErr != nil {
+			return nil, fmt.Errorf("encode deferred route request: %w", marshalErr)
+		}
+		routeBody = json.RawMessage(encoded)
+	}
+
+	headers := map[string]string{}
+	for _, name := range []string{"Content-Type", "Accept"} {
+		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
+			headers[name] = value
+		}
+	}
+	params := make(map[string]string, len(route.Params))
+	for key, value := range route.Params {
+		params[key] = value
+	}
+	query := make(map[string][]string, len(route.Query))
+	for key, values := range route.Query {
+		query[key] = append([]string(nil), values...)
+	}
+	originTasks := append([]relaycommon.OriginTaskRef(nil), info.OriginTasks...)
+	return &model.TaskDeferredRequest{
+		Path:         route.Path,
+		Method:       route.Method,
+		Params:       params,
+		Query:        query,
+		Headers:      headers,
+		RouteBody:    routeBody,
+		RequestBody:  json.RawMessage(requestBody),
+		OriginTaskID: info.OriginTaskID,
+		OriginTasks:  originTasks,
 	}, nil
 }
 

@@ -15,3 +15,7 @@ The extension reads Sub2API login tokens only inside the matching site origin.
 Tokens and cookies are never sent to New API. Existing API keys are represented
 by SHA-256 fingerprints. A newly created managed key is sent once through the
 enrollment result endpoint and is never included in later snapshots.
+
+Expiring access tokens are refreshed through the matching Sub2API origin. The
+refresh token remains in browser memory and site-local storage and is never
+sent to New API.

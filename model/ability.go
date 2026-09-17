@@ -126,6 +126,30 @@ func GetChannelAtPriority(group string, modelName string, priority int64, filter
 	return &channel, err
 }
 
+func ListChannelIDsAtPriority(group string, modelName string, priority int64, filters []dto.ChannelFilter) ([]int, error) {
+	abilities, err := getEligibleAbilities(group, modelName, filters)
+	if err != nil {
+		return nil, err
+	}
+	channelIDs := make([]int, 0, len(abilities))
+	seen := make(map[int]struct{}, len(abilities))
+	for _, ability := range abilities {
+		abilityPriority := int64(0)
+		if ability.Priority != nil {
+			abilityPriority = *ability.Priority
+		}
+		if abilityPriority != priority {
+			continue
+		}
+		if _, exists := seen[ability.ChannelId]; exists {
+			continue
+		}
+		seen[ability.ChannelId] = struct{}{}
+		channelIDs = append(channelIDs, ability.ChannelId)
+	}
+	return channelIDs, nil
+}
+
 func ListChannelPriorities(group string, modelName string, filters []dto.ChannelFilter) ([]int64, error) {
 	abilities, err := getEligibleAbilities(group, modelName, filters)
 	if err != nil {

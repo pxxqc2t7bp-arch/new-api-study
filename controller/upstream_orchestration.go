@@ -212,6 +212,13 @@ func UpdateUpstreamSource(c *gin.Context) {
 			return
 		}
 	}
+	if request.ProtocolModelExclusions != nil {
+		encoded, _ := common.Marshal(request.ProtocolModelExclusions)
+		if err := model.UpdateOption("upstream_orchestration.protocol_model_exclusions", string(encoded)); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
 	if err := model.DB.Model(&source).Updates(updates).Error; err != nil {
 		common.ApiError(c, err)
 		return

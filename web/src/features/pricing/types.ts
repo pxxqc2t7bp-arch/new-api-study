@@ -74,6 +74,10 @@ export type PricingModel = {
   billing_usage_schema?: BillingUsageSchema
   /** Display-only labeled usage vectors for pricing examples. */
   billing_usage_examples?: BillingUsageExample[]
+  pricing_status?: 'verified' | 'inherited' | 'estimated' | 'blocked'
+  pricing_source_url?: string
+  pricing_evidence_hash?: string
+  pricing_valid_until?: number
   /** Pricing version returned by backend, useful for cache busting */
   pricing_version?: string
   /**

@@ -44,3 +44,11 @@ func TestResolvedPinPriorityAndMerge(t *testing.T) {
 		assert.Nil(t, overridden)
 	})
 }
+
+func TestChannelConstraintsHasFilter(t *testing.T) {
+	constraints := &ChannelConstraints{}
+	assert.False(t, constraints.HasFilter(FilterRoutingAccount))
+	constraints.AddFilter(ChannelFilter{Kind: FilterRoutingAccount, RoutingAccount: "cxy"})
+	assert.True(t, constraints.HasFilter(FilterRoutingAccount))
+	assert.False(t, (*ChannelConstraints)(nil).HasFilter(FilterRoutingAccount))
+}

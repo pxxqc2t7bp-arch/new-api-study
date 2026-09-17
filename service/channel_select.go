@@ -38,13 +38,15 @@ func AppendTaskPluginIdentityFilter(c *gin.Context, pluginKey string) {
 }
 
 type RetryParam struct {
-	Ctx          *gin.Context
-	TokenGroup   string
-	ModelName    string
-	RequestPath  string
-	Retry        *int
-	PriorityPath []int64
-	resetNextTry bool
+	Ctx                 *gin.Context
+	TokenGroup          string
+	ModelName           string
+	RequestPath         string
+	Retry               *int
+	PriorityPath        []int64
+	AttemptedChannelIDs []int
+	AttemptedSourceIDs  []int64
+	resetNextTry        bool
 }
 
 func (p *RetryParam) GetRetry() int {
@@ -73,8 +75,8 @@ func (p *RetryParam) ResetRetryNextTry() {
 	p.resetNextTry = true
 }
 
-// AdaptiveRetryTimes returns the number of retries needed to visit each
-// eligible priority level once, capped to keep request latency bounded.
+// AdaptiveRetryTimes visits every priority and, for managed routes, gives
+// distinct upstream sources at the same priority one attempt each.
 func AdaptiveRetryTimes(param *RetryParam) int {
 	if param == nil {
 		return 0
@@ -88,7 +90,7 @@ func AdaptiveRetryTimes(param *RetryParam) int {
 		param.ModelName,
 		filters,
 	)
-	if err != nil || len(priorities) <= 1 {
+	if err != nil || len(priorities) == 0 {
 		return 0
 	}
 	if param.Ctx != nil {
@@ -102,8 +104,40 @@ func AdaptiveRetryTimes(param *RetryParam) int {
 			}
 		}
 	}
-	param.PriorityPath = priorities
-	return min(len(priorities)-1, MaxAdaptiveChannelAttempts-1)
+	param.PriorityPath = expandManagedPriorityPath(param, priorities, filters)
+	return min(len(param.PriorityPath)-1, MaxAdaptiveChannelAttempts-1)
+}
+
+func expandManagedPriorityPath(param *RetryParam, priorities []int64, filters []dto.ChannelFilter) []int64 {
+	path := make([]int64, 0, MaxAdaptiveChannelAttempts)
+	for _, priority := range priorities {
+		attempts := 1
+		channelIDs, err := model.ListSatisfiedChannelIDsAtPriority(
+			param.TokenGroup,
+			param.ModelName,
+			priority,
+			filters,
+		)
+		if err == nil {
+			sources := make(map[int64]struct{})
+			for _, channelID := range channelIDs {
+				route, managed := managedRouteForChannel(channelID)
+				if managed {
+					sources[route.SourceID] = struct{}{}
+				}
+			}
+			if len(sources) > attempts {
+				attempts = len(sources)
+			}
+		}
+		for range attempts {
+			path = append(path, priority)
+			if len(path) == MaxAdaptiveChannelAttempts {
+				return path
+			}
+		}
+	}
+	return path
 }
 
 // CacheGetRandomSatisfiedChannel tries to get a random channel that satisfies the requirements.
@@ -231,9 +265,9 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 		if param.GetRetry() >= len(param.PriorityPath) {
 			return nil, param.TokenGroup, nil
 		}
-		channel, err = model.GetRandomSatisfiedChannelAtPriority(
+		channel, err = selectDiverseChannelAtPriority(
+			param,
 			param.TokenGroup,
-			param.ModelName,
 			param.PriorityPath[param.GetRetry()],
 			filters,
 		)
@@ -241,7 +275,101 @@ func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, 
 			return nil, param.TokenGroup, err
 		}
 	}
+	rememberRetryChannel(param, channel)
 	return channel, selectGroup, nil
+}
+
+func selectDiverseChannelAtPriority(
+	param *RetryParam,
+	group string,
+	priority int64,
+	filters []dto.ChannelFilter,
+) (*model.Channel, error) {
+	preferredExcluded := retryExcludedChannelIDs(param, true)
+	channel, err := model.GetRandomSatisfiedChannelAtPriority(
+		group,
+		param.ModelName,
+		priority,
+		withExcludedChannelIDs(filters, preferredExcluded),
+	)
+	if err != nil || channel != nil || len(param.AttemptedSourceIDs) == 0 {
+		return channel, err
+	}
+	return model.GetRandomSatisfiedChannelAtPriority(
+		group,
+		param.ModelName,
+		priority,
+		withExcludedChannelIDs(filters, param.AttemptedChannelIDs),
+	)
+}
+
+func retryExcludedChannelIDs(param *RetryParam, includeSources bool) []int {
+	if param == nil {
+		return nil
+	}
+	excluded := append([]int(nil), param.AttemptedChannelIDs...)
+	if !includeSources || len(param.AttemptedSourceIDs) == 0 {
+		return excluded
+	}
+	var routes []model.UpstreamManagedRoute
+	if err := model.DB.Where("source_id IN ? AND detached = ?", param.AttemptedSourceIDs, false).
+		Find(&routes).Error; err != nil {
+		return excluded
+	}
+	seen := make(map[int]struct{}, len(excluded)+len(routes))
+	for _, channelID := range excluded {
+		seen[channelID] = struct{}{}
+	}
+	for _, route := range routes {
+		if _, exists := seen[route.ChannelID]; exists {
+			continue
+		}
+		seen[route.ChannelID] = struct{}{}
+		excluded = append(excluded, route.ChannelID)
+	}
+	return excluded
+}
+
+func withExcludedChannelIDs(filters []dto.ChannelFilter, channelIDs []int) []dto.ChannelFilter {
+	if len(channelIDs) == 0 {
+		return filters
+	}
+	result := append([]dto.ChannelFilter(nil), filters...)
+	result = append(result, dto.ChannelFilter{
+		Kind:               dto.FilterExcludeChannelIDs,
+		ExcludedChannelIDs: append([]int(nil), channelIDs...),
+	})
+	return result
+}
+
+func rememberRetryChannel(param *RetryParam, channel *model.Channel) {
+	if param == nil || channel == nil {
+		return
+	}
+	param.AttemptedChannelIDs = append(param.AttemptedChannelIDs, channel.Id)
+	route, managed := managedRouteForChannel(channel.Id)
+	if !managed {
+		return
+	}
+	for _, sourceID := range param.AttemptedSourceIDs {
+		if sourceID == route.SourceID {
+			return
+		}
+	}
+	param.AttemptedSourceIDs = append(param.AttemptedSourceIDs, route.SourceID)
+}
+
+func managedRouteForChannel(channelID int) (*model.UpstreamManagedRoute, bool) {
+	if model.DB == nil || !model.DB.Migrator().HasTable(&model.UpstreamManagedRoute{}) {
+		return nil, false
+	}
+	var routes []model.UpstreamManagedRoute
+	if err := model.DB.Where("channel_id = ? AND detached = ?", channelID, false).
+		Limit(1).
+		Find(&routes).Error; err != nil || len(routes) == 0 {
+		return nil, false
+	}
+	return &routes[0], true
 }
 
 func pinnedTaskPluginChannelTypes(c *gin.Context, expected string) []int {

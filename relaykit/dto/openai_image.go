@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"reflect"
+	"strconv"
 	"strings"
 
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
@@ -158,6 +159,8 @@ func (i *ImageRequest) GetTokenCountMeta() *types.TokenCountMeta {
 	if i.N != nil && *i.N > 0 {
 		imageN = *i.N
 	}
+	resolution := normalizeImageBillingResolution(i.Model, i.Size)
+	referenceImageCount := imageReferenceCount(i.Image) + imageReferenceCount(i.Images)
 
 	// Keep n separate from ImagePriceRatio so size/quality and count remain
 	// independent billing dimensions. Fixed-price pre-consume stores this on
@@ -167,7 +170,62 @@ func (i *ImageRequest) GetTokenCountMeta() *types.TokenCountMeta {
 		MaxTokens:       1584,
 		ImagePriceRatio: sizeRatio * qualityRatio,
 		BillingRatios:   map[string]float64{"n": float64(imageN)},
+		BillingUsage: map[string]any{
+			"image_count":           float64(imageN),
+			"resolution":            resolution,
+			"reference_image_count": float64(referenceImageCount),
+		},
 	}
+}
+
+func normalizeImageBillingResolution(model, size string) string {
+	value := strings.ToUpper(strings.TrimSpace(size))
+	switch value {
+	case "1K", "2K", "3K", "4K":
+		return value
+	}
+	value = strings.ReplaceAll(value, "×", "X")
+	parts := strings.Split(value, "X")
+	if len(parts) == 2 {
+		width, widthErr := strconv.Atoi(parts[0])
+		height, heightErr := strconv.Atoi(parts[1])
+		if widthErr == nil && heightErr == nil && width > 0 && height > 0 {
+			longEdge := max(width, height)
+			switch {
+			case longEdge <= 1536:
+				return "1K"
+			case longEdge <= 2560:
+				return "2K"
+			case longEdge <= 3584:
+				return "3K"
+			default:
+				return "4K"
+			}
+		}
+	}
+	if strings.Contains(strings.ToLower(model), "seedream") {
+		return "2K"
+	}
+	return "1K"
+}
+
+func imageReferenceCount(raw json.RawMessage) int {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0
+	}
+	var value any
+	if err := kitutil.Unmarshal(raw, &value); err != nil {
+		return 0
+	}
+	switch typed := value.(type) {
+	case string:
+		if strings.TrimSpace(typed) != "" {
+			return 1
+		}
+	case []any:
+		return len(typed)
+	}
+	return 0
 }
 
 func (i *ImageRequest) IsStream(c *http.Request) bool {

@@ -241,6 +241,10 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 			c.Set("task_plugin_key", pinned.Plugin.Meta.Key)
 			c.Set("platform", pinned.Plugin.Meta.Key)
 			service.AppendTaskPluginIdentityFilter(c, pinned.Plugin.Meta.Key)
+			if executionErr := applyTaskExecutionMode(c, resolved); executionErr != nil {
+				abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, executionErr.Error())
+				return
+			}
 			if action != "" {
 				c.Set("task_action", action)
 			}
@@ -729,6 +733,10 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 		c.Set("task_plugin_key", pinned.Plugin.Meta.Key)
 		c.Set("platform", pinned.Plugin.Meta.Key)
 		service.AppendTaskPluginIdentityFilter(c, pinned.Plugin.Meta.Key)
+		if executionErr := applyTaskExecutionMode(c, resolved); executionErr != nil {
+			abortWithOpenAiMessage(c, http.StatusBadRequest, executionErr.Error())
+			return
+		}
 		c.Set("relay_mode", relayconstant.RelayModeVideoSubmit)
 		if strings.TrimSpace(action) != "" {
 			c.Set("task_action", action)
@@ -758,6 +766,24 @@ func PrepareTaskPluginEndpoint() gin.HandlerFunc {
 			time.Since(hookStarted).Milliseconds(),
 		)
 		c.Next()
+	}
+}
+
+func applyTaskExecutionMode(c *gin.Context, intent map[string]any) error {
+	mode := pluginruntime.ExecutionModeUpstreamTask
+	if raw, exists := intent["execution"]; exists {
+		value, ok := raw.(string)
+		if !ok {
+			return errors.New("decoded request execution must be a string")
+		}
+		mode = strings.TrimSpace(value)
+	}
+	switch mode {
+	case pluginruntime.ExecutionModeUpstreamTask, pluginruntime.ExecutionModeDeferred:
+		c.Set(pluginruntime.ContextKeyExecutionMode, mode)
+		return nil
+	default:
+		return fmt.Errorf("decoded request execution %q is not supported", mode)
 	}
 }
 
@@ -1471,6 +1497,9 @@ func PrepareTaskPluginSubmit() gin.HandlerFunc {
 		c.Set("task_request", requestBody)
 		c.Set("resolved_task_model", modelName)
 		c.Set("expected_task_plugin_key", pluginKey)
+		if common.IsImageGenerationModel(modelName) {
+			c.Set(pluginruntime.ContextKeyExecutionMode, pluginruntime.ExecutionModeDeferred)
+		}
 		service.AppendTaskPluginIdentityFilter(c, pluginKey)
 		c.Set("relay_mode", relayconstant.RelayModeVideoSubmit)
 		logger.LogDebug(

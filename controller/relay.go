@@ -71,7 +71,13 @@ func geminiRelayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewA
 }
 
 func Relay(c *gin.Context, relayFormat types.RelayFormat) {
+	if handleStreamRecoveryRelay(c, relayFormat, relayDirect) {
+		return
+	}
+	relayDirect(c, relayFormat)
+}
 
+func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 	requestId := c.GetString(common.RequestIdKey)
 	//group := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 	//originalModel := common.GetContextKeyString(c, constant.ContextKeyOriginalModel)
@@ -126,6 +132,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeGenRelayInfoFailed)
 		return
+	}
+	if recoveryWriter := getStreamRecoveryWriter(c); recoveryWriter != nil &&
+		recoveryWriter.Attempt() > 1 {
+		relayInfo.InitChannelMeta(c)
 	}
 
 	needSensitiveCheck := setting.ShouldCheckPromptSensitive()
@@ -209,6 +219,37 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = channelErr
 			break
 		}
+		if recoveryWriter := getStreamRecoveryWriter(c); recoveryWriter != nil {
+			attempt := retryParam.GetRetry() + 1
+			if attempt != recoveryWriter.Attempt() {
+				errorMessage := ""
+				if relayInfo.LastError != nil {
+					errorMessage = relayInfo.LastError.ErrorWithStatusCode()
+				}
+				if stateErr := recoveryWriter.MarkAttemptState("failed", errorMessage); stateErr != nil {
+					newAPIError = types.NewError(stateErr, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+					break
+				}
+				if rotateErr := recoveryWriter.RotateAttempt(attempt); rotateErr != nil {
+					newAPIError = types.NewError(rotateErr, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+					break
+				}
+			}
+			if attemptErr := model.StartStreamExecutionAttempt(
+				recoveryWriter.StreamID(),
+				common.GetContextKeyString(c, constant.ContextKeyStreamRecoveryRunner),
+				attempt,
+				channel.Id,
+				c.GetString("channel_fallback_reason"),
+			); attemptErr != nil {
+				newAPIError = types.NewError(attemptErr, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+				break
+			}
+			if stateErr := recoveryWriter.MarkAttemptState("running", ""); stateErr != nil {
+				newAPIError = types.NewError(stateErr, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+				break
+			}
+		}
 		addUsedChannel(c, channel)
 		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
 			newAPIError = billingErr
@@ -237,6 +278,20 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = geminiRelayHandler(c, relayInfo)
 		default:
 			newAPIError = relayHandler(c, relayInfo)
+		}
+		if newAPIError == nil {
+			if recoveryWriter := getStreamRecoveryWriter(c); recoveryWriter != nil &&
+				!recoveryWriter.Terminal() {
+				streamSummary := "stream ended without a protocol terminal event"
+				if relayInfo.StreamStatus != nil {
+					streamSummary = relayInfo.StreamStatus.Summary()
+				}
+				newAPIError = types.NewErrorWithStatusCode(
+					errors.New(streamSummary),
+					types.ErrorCodeBadResponse,
+					http.StatusBadGateway,
+				)
+			}
 		}
 
 		if newAPIError == nil {
@@ -359,7 +414,10 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 		return false
 	}
 	if c != nil && c.Writer != nil && c.Writer.Written() {
-		return false
+		recoveryWriter := getStreamRecoveryWriter(c)
+		if recoveryWriter == nil || recoveryWriter.Terminal() {
+			return false
+		}
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		return false
@@ -397,7 +455,28 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
 	if service.IsManagedChannel(channelError.ChannelId) {
-		if channelError.AutoBan && service.ShouldRecordManagedRouteFailure(err) {
+		if channelError.AutoBan && service.IsManagedModelUnsupported(err) {
+			modelName := c.GetString("original_model")
+			isolated, isolateErr := service.IsolateManagedRouteModel(
+				channelError.ChannelId,
+				modelName,
+				err.ErrorWithStatusCode(),
+			)
+			if isolateErr != nil {
+				common.SysError(fmt.Sprintf(
+					"failed to isolate unsupported managed model: channel_id=%d model=%s error=%v",
+					channelError.ChannelId,
+					modelName,
+					isolateErr,
+				))
+			} else if isolated {
+				logger.LogWarn(c, fmt.Sprintf(
+					"isolated unsupported managed model: channel_id=%d model=%s",
+					channelError.ChannelId,
+					modelName,
+				))
+			}
+		} else if channelError.AutoBan && service.ShouldRecordManagedRouteFailure(err) {
 			reason := err.ErrorWithStatusCode()
 			gopool.Go(func() {
 				if _, _, recordErr := service.RecordManagedChannelFailure(channelError, reason); recordErr != nil {
@@ -442,6 +521,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		}
 		service.AppendChannelAffinityAdminInfo(c, adminInfo)
 		service.AppendChannelFailoverAdminInfo(c, adminInfo)
+		service.AppendStreamRecoveryAdminInfo(c, adminInfo)
 		other["admin_info"] = adminInfo
 		service.AppendTaskPluginContextAuditInfo(c, other)
 		startTime := common.GetContextKeyTime(c, constant.ContextKeyRequestStartTime)
@@ -774,6 +854,11 @@ func executeTaskSubmissionWith(
 	task.PrivateData.SubscriptionId = relayInfo.SubscriptionId
 	task.PrivateData.TokenId = relayInfo.TokenId
 	task.PrivateData.NodeName = common.NodeName
+	if result.DeferredRequest != nil {
+		task.ExecutionMode = model.TaskExecutionModeDeferred
+		task.DispatchStatus = model.TaskDispatchStatusPending
+		task.PrivateData.DeferredRequest = result.DeferredRequest
+	}
 	task.PrivateData.BillingContext = &model.TaskBillingContext{
 		ModelPrice:      relayInfo.PriceData.ModelPrice,
 		GroupRatio:      relayInfo.PriceData.GroupRatioInfo.GroupRatio,
@@ -820,6 +905,11 @@ func executeTaskSubmissionWith(
 		return nil, taskErr
 	}
 	service.LogTaskConsumption(c, relayInfo, task)
+	if task.ExecutionMode == model.TaskExecutionModeDeferred {
+		if _, _, enqueueErr := service.EnqueueSystemTask(model.SystemTaskTypeDeferredDispatch, nil); enqueueErr != nil {
+			logger.LogWarn(c, "enqueue deferred task dispatcher failed: "+enqueueErr.Error())
+		}
+	}
 	diagnostics.complete(task, result.Quota)
 
 	return &taskSubmissionOutcome{Result: result, Task: task, RelayInfo: relayInfo}, nil

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "New API Sub2API Sync",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "description": "Synchronizes sanitized Sub2API routing, health and usage snapshots with New API.",
   "permissions": [
     "alarms",
