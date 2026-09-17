@@ -11,7 +11,9 @@ import importlib
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from model_alias_normalization import canonical_alias, file_sha256, psql, write_json
@@ -94,6 +96,7 @@ def image_size_for_model(model: str) -> str:
 def prepare_e2e_module(e2e: Any) -> None:
     e2e.TOKEN_NAME_PREFIX = "alias-all"
     extend_capability_profiles(e2e.ark_profiles)
+    original_run_three_d_models = getattr(e2e, "run_three_d_models", None)
 
     def run_image_model(
         model: str,
@@ -152,6 +155,46 @@ def prepare_e2e_module(e2e: Any) -> None:
         )
 
     e2e.run_image_model = run_image_model
+
+    def run_three_d_models(
+        models: list[str],
+        headers: dict[str, str],
+        results: list[dict[str, Any]],
+        output: Path,
+    ) -> None:
+        if not models:
+            return
+
+        def run_one(
+            index: int,
+            model: str,
+            directory: Path,
+        ) -> list[dict[str, Any]]:
+            worker_results: list[dict[str, Any]] = []
+            original_run_three_d_models(
+                [model],
+                headers,
+                worker_results,
+                directory / ("%d.json" % index),
+            )
+            return worker_results
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(
+            prefix=".three-d-workers-",
+            dir=str(output.parent),
+        ) as directory_name:
+            directory = Path(directory_name)
+            with ThreadPoolExecutor(max_workers=len(models)) as executor:
+                futures = [
+                    executor.submit(run_one, index, model, directory)
+                    for index, model in enumerate(models)
+                ]
+                for future in futures:
+                    results.extend(future.result())
+
+    if callable(original_run_three_d_models):
+        e2e.run_three_d_models = run_three_d_models
 
 
 def parse_args() -> argparse.Namespace:

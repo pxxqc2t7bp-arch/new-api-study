@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import verify_model_alias_normalization as verify
 
@@ -46,6 +48,36 @@ class PublicModelVerificationTest(unittest.TestCase):
 
 
 class RegressionCompatibilityTest(unittest.TestCase):
+    def test_three_d_regressions_run_one_model_per_worker(self) -> None:
+        class Profiles:
+            TRANSLATION_MODELS = set()
+            VISUAL_EMBEDDING_MODELS = set()
+            IMAGE_MODEL_SIZES = {}
+            VIDEO_MODELS = set()
+            THREE_D_MODELS = set()
+
+        class E2E:
+            TOKEN_NAME_PREFIX = "long"
+            ark_profiles = Profiles
+
+            @staticmethod
+            def run_three_d_models(models, headers, results, output):
+                results.append({"model": models[0], "passed": True})
+
+        verify.prepare_e2e_module(E2E)
+        results = []
+        with TemporaryDirectory() as directory:
+            E2E.run_three_d_models(
+                ["first", "second", "third"],
+                {},
+                results,
+                Path(directory) / "round.json",
+            )
+        self.assertEqual(
+            [item["model"] for item in results],
+            ["first", "second", "third"],
+        )
+
     def test_alias_image_size_preserves_large_seedream_contract(self) -> None:
         self.assertEqual(
             verify.image_size_for_model("doubao-seedream-4-5"),
