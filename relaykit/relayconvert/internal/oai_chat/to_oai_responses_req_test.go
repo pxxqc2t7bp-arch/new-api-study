@@ -36,7 +36,74 @@ func TestChatCompletionsRequestToResponsesRequestInstructionsAndTools(t *testing
 	assert.Equal(t, "input_image", gjson.GetBytes(got.Input, "0.content.1.type").String())
 	assert.Equal(t, "function_call", gjson.GetBytes(got.Input, "2.type").String())
 	assert.Equal(t, "call_1", gjson.GetBytes(got.Input, "2.call_id").String())
+	assert.Equal(t, "completed", gjson.GetBytes(got.Input, "2.status").String())
 	assert.Equal(t, "function_call_output", gjson.GetBytes(got.Input, "3.type").String())
+	assert.Equal(t, "completed", gjson.GetBytes(got.Input, "3.status").String())
+}
+
+func TestChatCompletionsRequestToResponsesRequestMarksHistoricalToolItemsCompleted(t *testing.T) {
+	tests := []struct {
+		name    string
+		content any
+	}{
+		{name: "nil content", content: nil},
+		{name: "string content", content: "working"},
+		{name: "structured content", content: []any{
+			map[string]any{"type": "text", "text": "working"},
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assistant := dto.Message{Role: "assistant", Content: tt.content}
+			assistant.SetToolCalls([]dto.ToolCallRequest{{
+				ID:   "call_1",
+				Type: "function",
+				Function: dto.FunctionRequest{
+					Name:      "lookup",
+					Arguments: `{"q":"x"}`,
+				},
+			}})
+			req := &dto.GeneralOpenAIRequest{
+				Model: "gpt-test",
+				Messages: []dto.Message{
+					{Role: "user", Content: "look up x"},
+					assistant,
+					{
+						Role:       "tool",
+						ToolCallId: "call_1",
+						Content:    "tool result",
+					},
+					{Role: "user", Content: "summarize"},
+				},
+			}
+
+			got, err := ChatCompletionsRequestToResponsesRequest(req)
+			require.NoError(t, err)
+
+			var inputItems []map[string]any
+			require.NoError(t, kitutil.Unmarshal(got.Input, &inputItems))
+
+			var functionCalls, functionCallOutputs int
+			for _, item := range inputItems {
+				switch item["type"] {
+				case "function_call":
+					functionCalls++
+					assert.Equal(t, "completed", item["status"])
+					assert.Equal(t, "call_1", item["call_id"])
+				case "function_call_output":
+					functionCallOutputs++
+					assert.Equal(t, "completed", item["status"])
+					assert.Equal(t, "call_1", item["call_id"])
+				default:
+					_, hasStatus := item["status"]
+					assert.False(t, hasStatus)
+				}
+			}
+			assert.Equal(t, 1, functionCalls)
+			assert.Equal(t, 1, functionCallOutputs)
+		})
+	}
 }
 
 func TestChatCompletionsRequestToResponsesRequestPreservesPromptCacheKey(t *testing.T) {
