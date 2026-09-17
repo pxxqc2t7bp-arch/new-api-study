@@ -148,11 +148,15 @@ def root_headers() -> dict[str, str]:
     }
 
 
+def verification_token_name(group: str, nonce: int) -> str:
+    return "alias-e2e-%s-%010d" % (group, nonce % 10_000_000_000)
+
+
 def create_token(
     admin_headers: dict[str, str],
     group: str,
 ) -> tuple[int, str]:
-    name = "model-alias-verification-%s-%d" % (group, int(time.time_ns()))
+    name = verification_token_name(group, time.time_ns())
     api_request(
         admin_headers,
         "POST",

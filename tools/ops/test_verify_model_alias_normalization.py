@@ -4,6 +4,11 @@ import verify_model_alias_normalization as verify
 
 
 class PublicModelVerificationTest(unittest.TestCase):
+    def test_verification_token_name_fits_api_limit(self) -> None:
+        name = verify.verification_token_name("default", 1234567890123456789)
+        self.assertLessEqual(len(name), 32)
+        self.assertTrue(name.startswith("alias-e2e-default-"))
+
     def test_required_aliases_present_and_concrete_ids_hidden(self) -> None:
         verify.verify_public_models(
             {"gpt-5.6", "gpt-6", "deepseekv4.1flash", "claude-opus-5"},
