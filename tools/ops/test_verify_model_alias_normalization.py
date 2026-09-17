@@ -46,6 +46,20 @@ class PublicModelVerificationTest(unittest.TestCase):
 
 
 class RegressionCompatibilityTest(unittest.TestCase):
+    def test_alias_image_size_preserves_large_seedream_contract(self) -> None:
+        self.assertEqual(
+            verify.image_size_for_model("doubao-seedream-4-5"),
+            "2048x2048",
+        )
+        self.assertEqual(
+            verify.image_size_for_model("doubao-seedream-5-0"),
+            "2048x2048",
+        )
+        self.assertEqual(
+            verify.image_size_for_model("doubao-seedream-4-0"),
+            "1024x1024",
+        )
+
     def test_full_regression_uses_short_token_prefix(self) -> None:
         class Profiles:
             TRANSLATION_MODELS = set()

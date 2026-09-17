@@ -85,9 +85,73 @@ def validate_round_reports(reports: list[dict[str, Any]]) -> str:
     return next(iter(inventory_hashes), "")
 
 
+def image_size_for_model(model: str) -> str:
+    if model.startswith(("doubao-seedream-4-5", "doubao-seedream-5-")):
+        return "2048x2048"
+    return "1024x1024"
+
+
 def prepare_e2e_module(e2e: Any) -> None:
     e2e.TOKEN_NAME_PREFIX = "alias-all"
     extend_capability_profiles(e2e.ark_profiles)
+
+    def run_image_model(
+        model: str,
+        headers: dict[str, str],
+        results: list[dict[str, Any]],
+        output: Path,
+    ) -> None:
+        started = time.monotonic()
+        payload = {
+            "model": model,
+            "prompt": e2e.IMAGE_PROMPT,
+            "size": image_size_for_model(model),
+            "response_format": "b64_json",
+        }
+        if model.startswith("doubao-seedream-5-"):
+            payload["output_format"] = "png"
+        status, response_headers, raw = e2e.request(
+            "POST",
+            "/v1/images/generations",
+            headers,
+            payload,
+            300,
+        )
+        request_id = e2e.header_value(
+            response_headers,
+            "X-Oneapi-Request-Id",
+        )
+        channel_id, other = e2e.successful_log(request_id)
+        artifact = b""
+        error = ""
+        if status == 200:
+            try:
+                artifact = e2e.decode_image(e2e.json_body(raw))
+            except Exception as exc:
+                error = "%s: %s" % (type(exc).__name__, exc)
+        else:
+            error = e2e.error_message(status, raw)
+        e2e.record_result(
+            results,
+            output,
+            model,
+            "image",
+            started,
+            status == 200 and len(artifact) > 0 and channel_id > 0,
+            status=status,
+            request_id=request_id,
+            channel_id=channel_id,
+            attempted_channels=(other.get("admin_info") or {}).get(
+                "attempted_channels"
+            ),
+            output_bytes=len(artifact),
+            output_sha256=(
+                hashlib.sha256(artifact).hexdigest() if artifact else ""
+            ),
+            error=error,
+        )
+
+    e2e.run_image_model = run_image_model
 
 
 def parse_args() -> argparse.Namespace:
