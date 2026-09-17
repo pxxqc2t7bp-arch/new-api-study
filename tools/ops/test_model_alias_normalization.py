@@ -55,6 +55,40 @@ class CanonicalAliasTest(unittest.TestCase):
 
 
 class ChannelPlanTest(unittest.TestCase):
+    def test_managed_route_target_is_persisted_as_upstream_alias(self) -> None:
+        channels = [
+            {
+                "id": 50,
+                "name": "managed",
+                "group": "default,cxy",
+                "priority": 999,
+                "models": "gpt-6-astra",
+                "model_mapping": '{"gpt-6":"gpt-6-astra"}',
+            },
+        ]
+        options = {key: {} for key in migration.OPTION_KEYS}
+        options[migration.UPSTREAM_MODEL_ALIASES_KEY] = {
+            "existing-concrete": "existing-alias",
+        }
+        options["ModelRatio"]["gpt-6-astra"] = 0.1
+
+        manifest = migration.build_manifest(
+            channels,
+            options,
+            {50: {"gpt-6-astra": 100}},
+            managed_channel_ids={50},
+        )
+
+        self.assertEqual(
+            manifest["desired_options"][
+                migration.UPSTREAM_MODEL_ALIASES_KEY
+            ],
+            {
+                "existing-concrete": "existing-alias",
+                "gpt-6-astra": "gpt-6",
+            },
+        )
+
     def test_recent_success_wins_gpt_codename_collision(self) -> None:
         selected = migration.select_concrete(
             "gpt-5.6",

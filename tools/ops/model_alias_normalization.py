@@ -42,6 +42,8 @@ OPTION_KEYS = (
     "billing_setting.billing_mode",
     "billing_setting.billing_expr",
 )
+UPSTREAM_MODEL_ALIASES_KEY = "upstream_orchestration.model_aliases"
+MANAGED_OPTION_KEYS = OPTION_KEYS + (UPSTREAM_MODEL_ALIASES_KEY,)
 PUBLIC_GROUPS = {"default", "cxy"}
 REQUIRED_ALIASES = {"gpt-5.6", "gpt-6", "deepseekv4.1flash"}
 API_HOST = "127.0.0.1"
@@ -318,7 +320,7 @@ def inherit_alias_pricing(
 ) -> dict[str, dict[str, Any]]:
     updated = {
         key: deepcopy(options.get(key) or {})
-        for key in OPTION_KEYS
+        for key in MANAGED_OPTION_KEYS
     }
     for alias, concrete in sorted(selected.items()):
         if not has_effective_pricing(updated, concrete):
@@ -332,6 +334,21 @@ def inherit_alias_pricing(
     return updated
 
 
+def inherit_managed_upstream_aliases(
+    aliases: dict[str, Any],
+    plans: list[dict[str, Any]],
+    managed_channel_ids: set[int],
+) -> dict[str, Any]:
+    updated = deepcopy(aliases)
+    for plan in plans:
+        if int(plan["channel_id"]) not in managed_channel_ids:
+            continue
+        for alias, target in sorted(plan["selected"].items()):
+            if target != alias:
+                updated[target] = alias
+    return updated
+
+
 def validate_apply_hash(expected: str, actual: str) -> None:
     if not expected or expected != actual:
         raise RuntimeError("manifest SHA-256 does not match current dry-run")
@@ -341,7 +358,9 @@ def build_manifest(
     channels: list[dict[str, Any]],
     options: dict[str, dict[str, Any]],
     recent_success_by_channel: dict[int, dict[str, int]],
+    managed_channel_ids: set[int] | None = None,
 ) -> dict[str, Any]:
+    managed_channel_ids = managed_channel_ids or set()
     all_plans: list[dict[str, Any]] = []
     for channel in sorted(channels, key=lambda item: int(item["id"])):
         if not is_public_channel(channel):
@@ -429,6 +448,13 @@ def build_manifest(
                 )
 
     desired_options = inherit_alias_pricing(options, price_sources)
+    desired_options[UPSTREAM_MODEL_ALIASES_KEY] = (
+        inherit_managed_upstream_aliases(
+            options.get(UPSTREAM_MODEL_ALIASES_KEY) or {},
+            all_plans,
+            managed_channel_ids,
+        )
+    )
     return {
         "channel_changes": plans,
         "required_aliases": sorted(REQUIRED_ALIASES),
@@ -552,12 +578,12 @@ from (
 def load_options() -> dict[str, dict[str, Any]]:
     quoted = ",".join(
         "'" + key.replace("'", "''") + "'"
-        for key in OPTION_KEYS
+        for key in MANAGED_OPTION_KEYS
     )
     rows = psql(
         "select key,value from options where key in (%s) order by key" % quoted
     )
-    options = {key: {} for key in OPTION_KEYS}
+    options = {key: {} for key in MANAGED_OPTION_KEYS}
     for row in rows.splitlines():
         if not row:
             continue
@@ -567,6 +593,18 @@ def load_options() -> dict[str, dict[str, Any]]:
             raise RuntimeError("option %s is not an object" % key)
         options[key] = parsed
     return options
+
+
+def load_managed_channel_ids() -> set[int]:
+    rows = psql(
+        "select channel_id from upstream_managed_routes "
+        "where detached=false order by channel_id"
+    )
+    return {
+        int(row)
+        for row in rows.splitlines()
+        if row
+    }
 
 
 def load_recent_success() -> dict[int, dict[str, int]]:
@@ -662,7 +700,7 @@ def report_manifest(
             for alias, value in desired_options[key].items()
             if options[key].get(alias) != value
         )
-        for key in OPTION_KEYS
+        for key in MANAGED_OPTION_KEYS
     }
     manifest_sha256 = digest(safe)
     safe["manifest_sha256"] = manifest_sha256
@@ -782,7 +820,7 @@ def option_rows_from_api(data: Any) -> dict[str, dict[str, Any]]:
     items = data.get("items", data) if isinstance(data, dict) else data
     if not isinstance(items, list):
         raise RuntimeError("option API payload is not a list")
-    values = {key: {} for key in OPTION_KEYS}
+    values = {key: {} for key in MANAGED_OPTION_KEYS}
     for item in items:
         key = str(item.get("key") or "")
         if key not in values:
@@ -908,6 +946,14 @@ def apply_manifest(
         [int(plan["channel_id"]) for plan in plans]
     )
     try:
+        for key in (UPSTREAM_MODEL_ALIASES_KEY,):
+            desired = manifest["desired_options"].get(key) or {}
+            original = original_options.get(key) or {}
+            if desired == original:
+                continue
+            update_option(headers, key, desired)
+            applied_options.append(key)
+
         for plan in plans:
             channel_id = int(plan["channel_id"])
             original = api_request(
@@ -929,8 +975,8 @@ def apply_manifest(
             applied_channels.append(channel_id)
 
         for key in OPTION_KEYS:
-            desired = manifest["desired_options"][key]
-            if desired == original_options[key]:
+            desired = manifest["desired_options"].get(key) or {}
+            if desired == (original_options.get(key) or {}):
                 continue
             update_option(headers, key, desired)
             applied_options.append(key)
@@ -950,8 +996,12 @@ def apply_manifest(
         api_options = option_rows_from_api(
             api_request(headers, "GET", "/api/option/")
         )
-        if api_options != manifest["desired_options"]:
-            readback_errors.append("pricing option readback mismatch")
+        desired_options = {
+            key: manifest["desired_options"].get(key) or {}
+            for key in MANAGED_OPTION_KEYS
+        }
+        if api_options != desired_options:
+            readback_errors.append("managed option readback mismatch")
         readback_errors.extend(verify_abilities(plans))
         if channel_key_hashes(list(before_key_hashes)) != before_key_hashes:
             readback_errors.append("channel key fingerprint changed")
@@ -971,7 +1021,7 @@ def apply_manifest(
                 restore_channel_payload(originals[channel_id]),
             )
         for key in reversed(applied_options):
-            update_option(headers, key, original_options[key])
+            update_option(headers, key, original_options.get(key) or {})
         raise
 
 
@@ -981,7 +1031,12 @@ def main() -> int:
     channels = load_channels()
     options = load_options()
     successes = load_recent_success()
-    manifest = build_manifest(channels, options, successes)
+    manifest = build_manifest(
+        channels,
+        options,
+        successes,
+        managed_channel_ids=load_managed_channel_ids(),
+    )
     safe_manifest, manifest_sha256 = report_manifest(
         manifest,
         channels,

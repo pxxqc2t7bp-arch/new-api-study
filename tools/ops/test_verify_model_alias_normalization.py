@@ -46,6 +46,21 @@ class PublicModelVerificationTest(unittest.TestCase):
                 {"hidden_concrete_models": ["gpt-5.6-sol"]},
             )
 
+    def test_unlisted_release_suffix_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "noncanonical model identifiers exposed",
+        ):
+            verify.verify_public_models(
+                {
+                    "gpt-5.6",
+                    "gpt-6",
+                    "deepseekv4.1flash",
+                    "qwen3-32b-20250429",
+                },
+                {"hidden_concrete_models": []},
+            )
+
 
 class RegressionCompatibilityTest(unittest.TestCase):
     def test_three_d_regressions_run_one_model_per_worker(self) -> None:

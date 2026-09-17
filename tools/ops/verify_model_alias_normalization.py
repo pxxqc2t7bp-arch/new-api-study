@@ -42,6 +42,16 @@ def verify_public_models(
             "concrete release identifiers still exposed: "
             + ",".join(sorted(hidden))
         )
+    noncanonical = {
+        model
+        for model in public_models
+        if canonical_alias(model) != model
+    }
+    if noncanonical:
+        raise RuntimeError(
+            "noncanonical model identifiers exposed: "
+            + ",".join(sorted(noncanonical))
+        )
 
 
 def extend_capability_profiles(profiles: Any) -> None:
