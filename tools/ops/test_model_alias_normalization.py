@@ -1,3 +1,5 @@
+import gzip
+import json
 import unittest
 
 import model_alias_normalization as migration
@@ -354,6 +356,14 @@ class PricingPlanTest(unittest.TestCase):
     def test_apply_requires_exact_manifest_hash(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "manifest SHA-256"):
             migration.validate_apply_hash("expected", "actual")
+
+    def test_gzip_management_response_is_decoded(self) -> None:
+        payload = {"success": True, "data": {"id": 92}}
+        compressed = gzip.compress(json.dumps(payload).encode())
+        self.assertEqual(
+            migration.decode_response_body(compressed, "gzip"),
+            payload,
+        )
 
 
 if __name__ == "__main__":

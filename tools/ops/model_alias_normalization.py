@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import http.client
 import json
@@ -495,15 +496,25 @@ def api_request(
         connection.request(method, path, body=payload, headers=headers)
         response = connection.getresponse()
         raw = response.read()
+        content_encoding = response.getheader("Content-Encoding") or ""
     finally:
         connection.close()
-    parsed = json.loads(raw or b"{}")
+    parsed = decode_response_body(raw, content_encoding)
     if response.status >= 400 or not parsed.get("success", False):
         raise RuntimeError(
             "%s %s failed: HTTP %d %s"
             % (method, path, response.status, parsed)
         )
     return parsed.get("data")
+
+
+def decode_response_body(raw: bytes, content_encoding: str) -> dict[str, Any]:
+    if content_encoding.lower() == "gzip" or raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    parsed = json.loads(raw or b"{}")
+    if not isinstance(parsed, dict):
+        raise RuntimeError("management API response is not an object")
+    return parsed
 
 
 def root_headers() -> dict[str, str]:
