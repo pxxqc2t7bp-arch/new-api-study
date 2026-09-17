@@ -61,6 +61,36 @@ class ChannelPlanTest(unittest.TestCase):
         )
         self.assertEqual(selected, "gpt-5.6-sol")
 
+    def test_stable_release_beats_more_recent_preview_log(self) -> None:
+        selected = migration.select_concrete(
+            "doubao-seed-2.1-pro",
+            [
+                "doubao-seed-2-1-pro-260628",
+                "doubao-seed-2-1-pro-preview",
+            ],
+            {},
+            {
+                "doubao-seed-2-1-pro-260628": 100,
+                "doubao-seed-2-1-pro-preview": 200,
+            },
+        )
+        self.assertEqual(selected, "doubao-seed-2-1-pro-260628")
+
+    def test_exact_stable_alias_beats_latest_version_label(self) -> None:
+        selected = migration.select_concrete(
+            "doubao-seed-evolving",
+            [
+                "doubao-seed-evolving",
+                "doubao-seed-evolving-latest-version",
+            ],
+            {},
+            {
+                "doubao-seed-evolving": 100,
+                "doubao-seed-evolving-latest-version": 200,
+            },
+        )
+        self.assertEqual(selected, "doubao-seed-evolving")
+
     def test_existing_explicit_mapping_wins(self) -> None:
         selected = migration.select_concrete(
             "deepseekv4.1flash",

@@ -135,6 +135,31 @@ def release_number(model: str) -> int:
     return 0
 
 
+def candidate_rank(
+    alias: str,
+    model: str,
+    recent_success: dict[str, int],
+) -> tuple[int, int, int, int, str]:
+    if model == alias:
+        stability = 4
+    elif re.search(r"(?:^|-)(?:draft-)?preview(?:-|$)", model):
+        stability = 0
+    elif model.endswith("-latest-version"):
+        stability = 1
+    elif release_number(model) > 0:
+        stability = 2
+    else:
+        stability = 3
+    last_success = recent_success.get(model, 0)
+    return (
+        int(last_success > 0),
+        stability,
+        release_number(model),
+        last_success,
+        model,
+    )
+
+
 def select_concrete(
     alias: str,
     candidates: list[str],
@@ -148,11 +173,7 @@ def select_concrete(
             return target
     candidate = max(
         candidates,
-        key=lambda item: (
-            recent_success.get(item, 0),
-            release_number(item),
-            item,
-        ),
+        key=lambda item: candidate_rank(alias, item, recent_success),
     )
     return existing_mapping.get(candidate, candidate)
 
@@ -193,9 +214,7 @@ def build_channel_plan(
             by_alias[alias],
             key=lambda item: (
                 int(item in existing_mapping),
-                recent_success.get(item, 0),
-                release_number(item),
-                item,
+                *candidate_rank(alias, item, recent_success),
             ),
         )
         target = select_concrete(
