@@ -325,10 +325,14 @@ def build_manifest(
         for alias, candidate in plan["selected_candidates"].items():
             if candidate == alias:
                 continue
-            if successes.get(candidate, 0) <= 0:
+            target = plan["selected"][alias]
+            if max(
+                successes.get(candidate, 0),
+                successes.get(target, 0),
+            ) <= 0:
                 blockers.append(
                     "channel %d alias %s selected target has no successful log: %s"
-                    % (plan["channel_id"], alias, candidate)
+                    % (plan["channel_id"], alias, target)
                 )
 
     price_sources: dict[str, str] = {}

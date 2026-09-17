@@ -160,6 +160,52 @@ class ChannelPlanTest(unittest.TestCase):
         )
         self.assertEqual(manifest["blockers"], [])
 
+    def test_mapped_target_success_satisfies_channel_gate(self) -> None:
+        channels = [
+            {
+                "id": 124,
+                "name": "fallback",
+                "group": "default,cxy",
+                "priority": 20,
+                "models": (
+                    "deepseek-v4-flash,"
+                    "deepseek-v4-flash-260425,"
+                    "deepseek-v4-flash-ga-260731"
+                ),
+                "model_mapping": (
+                    '{"deepseek-v4-flash":"deepseek-v4-flash-260425"}'
+                ),
+            },
+            {
+                "id": 92,
+                "name": "rvcompute",
+                "group": "default,cxy",
+                "priority": 1000,
+                "models": "gpt-5.6-sol,gpt-6-astra",
+                "model_mapping": "{}",
+            },
+        ]
+        options = {key: {} for key in migration.OPTION_KEYS}
+        options["ModelRatio"] = {
+            "deepseek-v4-flash": 0.2,
+            "gpt-5.6-sol": 0.1,
+            "gpt-6-astra": 0.1,
+        }
+        manifest = migration.build_manifest(
+            channels,
+            options,
+            {
+                124: {"deepseek-v4-flash-260425": 300},
+                92: {"gpt-5.6-sol": 200, "gpt-6-astra": 150},
+            },
+        )
+        self.assertFalse(
+            any(
+                "channel 124 alias deepseekv4.1flash" in blocker
+                for blocker in manifest["blockers"]
+            )
+        )
+
     def test_advanced_route_filters_use_public_aliases(self) -> None:
         settings = {
             "routing_account": "support",
