@@ -22,11 +22,13 @@
       "arguments": "{\"city\":\"Paris\"}",
       "call_id": "call_1",
       "name": "get_weather",
+      "status": "completed",
       "type": "function_call"
     },
     {
       "call_id": "call_0",
       "output": "{\"result\":\"15 degrees\"}",
+      "status": "completed",
       "type": "function_call_output"
     }
   ],

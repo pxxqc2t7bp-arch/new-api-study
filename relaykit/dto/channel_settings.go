@@ -11,6 +11,7 @@ import (
 )
 
 type ChannelSettings struct {
+	TaskPluginKey          string `json:"task_plugin_key,omitempty"`
 	ForceFormat            bool   `json:"force_format,omitempty"`
 	ThinkingToContent      bool   `json:"thinking_to_content,omitempty"`
 	Proxy                  string `json:"proxy"`
@@ -143,6 +144,7 @@ const (
 	advancedCustomEndpointPathJinaRerank             = "/v1/rerank"
 	advancedCustomEndpointPathImageGeneration        = "/v1/images/generations"
 	advancedCustomEndpointPathEmbeddings             = "/v1/embeddings"
+	advancedCustomEndpointPathMultimodalEmbeddings   = "/v1/embeddings/multimodal"
 )
 
 const (
@@ -262,7 +264,7 @@ func advancedCustomEndpointTypeFromIncomingPath(incomingPath string) (types.Endp
 		return types.EndpointTypeJinaRerank, true
 	case advancedCustomEndpointPathImageGeneration:
 		return types.EndpointTypeImageGeneration, true
-	case advancedCustomEndpointPathEmbeddings:
+	case advancedCustomEndpointPathEmbeddings, advancedCustomEndpointPathMultimodalEmbeddings:
 		return types.EndpointTypeEmbeddings, true
 	default:
 		if isAdvancedCustomGeminiIncomingPath(incomingPath) {

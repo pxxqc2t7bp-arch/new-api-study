@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>New API Sub2API Sync</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; background: Canvas; color: CanvasText; }
+      main { width: min(560px, calc(100% - 32px)); margin: 48px auto; }
+      h1 { font-size: 22px; margin: 0 0 24px; }
+      label { display: grid; gap: 7px; margin: 16px 0; font-size: 13px; }
+      input { height: 38px; border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius: 6px; padding: 0 10px; background: Canvas; color: CanvasText; }
+      button { height: 38px; border: 0; border-radius: 6px; padding: 0 16px; color: white; background: #1769aa; cursor: pointer; }
+      button:disabled { opacity: .55; cursor: default; }
+      .actions { display: flex; gap: 8px; align-items: center; margin-top: 20px; }
+      #status { min-height: 20px; font-size: 13px; }
+      code { overflow-wrap: anywhere; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>New API Sub2API Sync</h1>
+      <label>
+        New API URL
+        <input id="server-url" type="url" placeholder="https://study.chenxy.online">
+      </label>
+      <label>
+        配对码
+        <input id="pairing-code" autocomplete="off">
+      </label>
+      <div class="actions">
+        <button id="pair">配对</button>
+        <button id="sync" type="button">立即同步</button>
+        <span id="status" role="status"></span>
+      </div>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

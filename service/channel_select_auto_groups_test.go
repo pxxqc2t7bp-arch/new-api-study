@@ -89,6 +89,73 @@ func createChannelSelectAutoGroupsChannel(t *testing.T, db *gorm.DB, id int, gro
 	}).Error)
 }
 
+func createChannelSelectPriorityChannel(t *testing.T, db *gorm.DB, id int, group, modelName string, priority int64) {
+	t.Helper()
+	weight := uint(100)
+	require.NoError(t, db.Create(&model.Channel{
+		Id:       id,
+		Type:     constant.ChannelTypeOpenAI,
+		Key:      fmt.Sprintf("key-%d", id),
+		Status:   common.ChannelStatusEnabled,
+		Name:     fmt.Sprintf("channel-%d", id),
+		Weight:   &weight,
+		Models:   modelName,
+		Group:    group,
+		Priority: &priority,
+	}).Error)
+	require.NoError(t, db.Create(&model.Ability{
+		Group:     group,
+		Model:     modelName,
+		ChannelId: id,
+		Enabled:   true,
+		Priority:  &priority,
+		Weight:    weight,
+	}).Error)
+}
+
+func TestAdaptiveRetryTimesUsesAvailablePriorityLevels(t *testing.T) {
+	db := setupChannelSelectAutoGroupsTest(t)
+	const modelName = "priority-level-model"
+	createChannelSelectPriorityChannel(t, db, 2201, "default", modelName, 30)
+	createChannelSelectPriorityChannel(t, db, 2202, "default", modelName, 30)
+	createChannelSelectPriorityChannel(t, db, 2203, "default", modelName, 20)
+	createChannelSelectPriorityChannel(t, db, 2204, "default", modelName, 10)
+	createChannelSelectPriorityChannel(t, db, 2205, "default", modelName, 0)
+	model.InitChannelCache()
+
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	param := &RetryParam{
+		Ctx:         ctx,
+		TokenGroup:  "default",
+		ModelName:   modelName,
+		RequestPath: "/v1/chat/completions",
+	}
+
+	assert.Equal(t, 3, AdaptiveRetryTimes(param))
+	first, _, err := CacheGetRandomSatisfiedChannel(param)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	assert.Equal(t, int64(30), first.GetPriority())
+
+	model.CacheUpdateChannelStatus(first.Id, common.ChannelStatusAutoDisabled)
+	param.IncreaseRetry()
+	second, _, err := CacheGetRandomSatisfiedChannel(param)
+	require.NoError(t, err)
+	require.NotNil(t, second)
+	assert.Equal(t, int64(20), second.GetPriority())
+
+	ctx.Set("channel_priority", int64(20))
+	affinityParam := &RetryParam{
+		Ctx:         ctx,
+		TokenGroup:  "default",
+		ModelName:   modelName,
+		RequestPath: "/v1/chat/completions",
+	}
+	assert.Equal(t, 2, AdaptiveRetryTimes(affinityParam))
+	assert.Equal(t, []int64{20, 10, 0}, affinityParam.PriorityPath)
+}
+
 func TestCacheGetRandomSatisfiedChannelUsesTokenAutoGroupsWhenGlobalAutoIsEmpty(t *testing.T) {
 	db := setupChannelSelectAutoGroupsTest(t)
 	const modelName = "auto-groups-runtime-model"

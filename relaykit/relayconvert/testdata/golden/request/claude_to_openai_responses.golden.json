@@ -22,11 +22,13 @@
       "arguments": "{\"city\":\"Paris\"}",
       "call_id": "toolu_abc",
       "name": "get_weather",
+      "status": "completed",
       "type": "function_call"
     },
     {
       "call_id": "toolu_abc",
       "output": "15 degrees",
+      "status": "completed",
       "type": "function_call_output"
     }
   ],

@@ -448,8 +448,8 @@ func ListActiveUserSessions(userID int, currentSID string, now int64) ([]UserSes
 // no-op, has the same single-winner behavior as MySQL and PostgreSQL. Only a
 // recognized previous digest outside its grace window is treated as reuse;
 // an unknown secret never revokes the victim session.
-func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, now int64, grace time.Duration) (*UserSession, error) {
-	if userID <= 0 || sid == "" || presentedHash == "" || nextHash == "" || hmac.Equal([]byte(presentedHash), []byte(nextHash)) {
+func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, now, expiresAt int64, grace time.Duration) (*UserSession, error) {
+	if userID <= 0 || sid == "" || presentedHash == "" || nextHash == "" || expiresAt <= now || hmac.Equal([]byte(presentedHash), []byte(nextHash)) {
 		return nil, ErrUserSessionInvalid
 	}
 	if now <= 0 {
@@ -478,6 +478,7 @@ func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, n
 					"previous_valid_until":  now + graceSeconds,
 					"refresh_hash":          nextHash,
 					"last_active_at":        now,
+					"expires_at":            expiresAt,
 				})
 			if result.Error != nil {
 				return nil, result.Error
@@ -489,6 +490,7 @@ func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, n
 			session.PreviousValidUntil = now + graceSeconds
 			session.RefreshHash = nextHash
 			session.LastActiveAt = now
+			session.ExpiresAt = expiresAt
 			if err := writeUserSessionCache(session.cacheEntry(), cacheDeadline); err != nil {
 				if errors.Is(err, errUserSessionCacheObservationStale) {
 					if confirmErr := confirmUserSessionActiveSnapshot(&session); confirmErr != nil {
@@ -539,6 +541,38 @@ func RotateUserSessionRefresh(userID int, sid, presentedHash, nextHash string, n
 		return nil, ErrUserSessionRefreshReuse
 	}
 	return nil, ErrUserSessionRefreshInvalid
+}
+
+func TouchUserSessionPresence(sid, presentedHash string, now, expiresAt int64) error {
+	if sid == "" || presentedHash == "" || now <= 0 || expiresAt <= now {
+		return ErrUserSessionInvalid
+	}
+	cacheDeadline := userSessionCacheDeadline()
+	var session UserSession
+	if err := DB.Where("sid = ?", sid).First(&session).Error; err != nil {
+		return err
+	}
+	if session.Status != UserSessionStatusActive || session.RevokedAt != 0 || session.ExpiresAt <= now {
+		return ErrUserSessionInactive
+	}
+	validCurrent := hmac.Equal([]byte(session.RefreshHash), []byte(presentedHash))
+	validPrevious := session.PreviousRefreshHash != "" && now <= session.PreviousValidUntil &&
+		hmac.Equal([]byte(session.PreviousRefreshHash), []byte(presentedHash))
+	if !validCurrent && !validPrevious {
+		return ErrUserSessionRefreshInvalid
+	}
+	result := DB.Model(&UserSession{}).
+		Where("sid = ? AND status = ? AND revoked_at = ? AND expires_at > ?", sid, UserSessionStatusActive, 0, now).
+		Updates(map[string]interface{}{"last_active_at": now, "expires_at": expiresAt})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrUserSessionInactive
+	}
+	session.LastActiveAt = now
+	session.ExpiresAt = expiresAt
+	return writeUserSessionCache(session.cacheEntry(), cacheDeadline)
 }
 
 func RevokeUserSession(userID int, sid, reason string) (bool, error) {

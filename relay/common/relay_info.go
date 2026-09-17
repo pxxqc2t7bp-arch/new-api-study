@@ -92,31 +92,33 @@ type RelayInfo struct {
 	FirstResponseTime time.Time
 	isFirstResponse   bool
 	//SendLastReasoningResponse bool
-	IsStream               bool
-	IsGeminiBatchEmbedding bool
-	IsPlayground           bool
-	UsePrice               bool
-	RelayMode              int
-	OriginModelName        string
-	RequestURLPath         string
-	RequestHeaders         map[string]string
-	ShouldIncludeUsage     bool
-	DisablePing            bool // 是否禁止向下游发送自定义 Ping
-	ClientWs               *websocket.Conn
-	TargetWs               *websocket.Conn
-	InputAudioFormat       string
-	OutputAudioFormat      string
-	RealtimeTools          []dto.RealTimeTool
-	IsFirstRequest         bool
-	AudioUsage             bool
-	ReasoningEffort        string
-	UserSetting            dto.UserSetting
-	UserEmail              string
-	UserQuota              int
-	RelayFormat            types.RelayFormat
-	SendResponseCount      int
-	ReceivedResponseCount  int
-	FinalPreConsumedQuota  int // 最终预消耗的配额
+	IsStream                bool
+	IsGeminiBatchEmbedding  bool
+	IsPlayground            bool
+	UsePrice                bool
+	RelayMode               int
+	OriginModelName         string
+	ActualUpstreamModelName string
+	ActualModelConflict     bool
+	RequestURLPath          string
+	RequestHeaders          map[string]string
+	ShouldIncludeUsage      bool
+	DisablePing             bool // 是否禁止向下游发送自定义 Ping
+	ClientWs                *websocket.Conn
+	TargetWs                *websocket.Conn
+	InputAudioFormat        string
+	OutputAudioFormat       string
+	RealtimeTools           []dto.RealTimeTool
+	IsFirstRequest          bool
+	AudioUsage              bool
+	ReasoningEffort         string
+	UserSetting             dto.UserSetting
+	UserEmail               string
+	UserQuota               int
+	RelayFormat             types.RelayFormat
+	SendResponseCount       int
+	ReceivedResponseCount   int
+	FinalPreConsumedQuota   int // 最终预消耗的配额
 	// ForcePreConsume 为 true 时禁用 BillingSession 的信任额度旁路，
 	// 强制预扣全额。用于异步任务（视频/音乐生成等），因为请求返回后任务仍在运行，
 	// 必须在提交前锁定全额。
@@ -183,6 +185,23 @@ type RelayInfo struct {
 	*ResponsesUsageInfo
 	*ChannelMeta
 	*TaskRelayInfo
+}
+
+func (info *RelayInfo) CaptureActualUpstreamModelName(modelName string) {
+	if info == nil || info.OriginModelName != "doubao-smart-router-250928" {
+		return
+	}
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" || modelName == info.OriginModelName {
+		return
+	}
+	if info.ActualUpstreamModelName == "" {
+		info.ActualUpstreamModelName = modelName
+		return
+	}
+	if info.ActualUpstreamModelName != modelName {
+		info.ActualModelConflict = true
+	}
 }
 
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
@@ -850,6 +869,14 @@ func (info *RelayInfo) HasSendResponse() bool {
 	return info.FirstResponseTime.After(info.StartTime)
 }
 
+type OriginTaskRef struct {
+	TaskID         string
+	UpstreamTaskID string
+	Action         string
+	Status         string
+	Data           []byte
+}
+
 type TaskRelayInfo struct {
 	Action       string
 	OriginTaskID string
@@ -858,6 +885,10 @@ type TaskRelayInfo struct {
 	PublicTaskID string
 
 	ConsumeQuota bool
+
+	// OriginTasks are plugin-declared public-task dependencies resolved by the
+	// host. Driver hooks receive these as ctx.originTasks; presenters do not.
+	OriginTasks []OriginTaskRef
 
 	// LockedChannel holds the full channel object when the request is bound to
 	// a specific channel (e.g., remix on origin task's channel). Stored as any
@@ -876,6 +907,10 @@ type TaskSubmitReq struct {
 	Seconds        string                 `json:"seconds,omitempty"`
 	InputReference string                 `json:"input_reference,omitempty"`
 	Metadata       map[string]interface{} `json:"metadata,omitempty"`
+	Content        []map[string]any       `json:"content,omitempty"`
+	Parameters     map[string]any         `json:"parameters,omitempty"`
+	Seed           *int                   `json:"seed,omitempty"`
+	CallbackURL    string                 `json:"callback_url,omitempty"`
 }
 
 func (t *TaskSubmitReq) GetPrompt() string {
@@ -883,7 +918,15 @@ func (t *TaskSubmitReq) GetPrompt() string {
 }
 
 func (t *TaskSubmitReq) HasImage() bool {
-	return len(t.Images) > 0
+	if len(t.Images) > 0 || strings.TrimSpace(t.Image) != "" {
+		return true
+	}
+	for _, item := range t.Content {
+		if item["type"] == "image_url" {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *TaskSubmitReq) UnmarshalJSON(data []byte) error {
@@ -948,15 +991,16 @@ func (t *TaskSubmitReq) UnmarshalMetadata(v any) error {
 }
 
 type TaskInfo struct {
-	Code             int    `json:"code"`
-	TaskID           string `json:"task_id"`
-	Status           string `json:"status"`
-	Reason           string `json:"reason,omitempty"`
-	Url              string `json:"url,omitempty"`
-	RemoteUrl        string `json:"remote_url,omitempty"`
-	Progress         string `json:"progress,omitempty"`
-	CompletionTokens int    `json:"completion_tokens,omitempty"` // 用于按倍率计费
-	TotalTokens      int    `json:"total_tokens,omitempty"`      // 用于按倍率计费
+	Code             int            `json:"code"`
+	TaskID           string         `json:"task_id"`
+	Status           string         `json:"status"`
+	Reason           string         `json:"reason,omitempty"`
+	Url              string         `json:"url,omitempty"`
+	RemoteUrl        string         `json:"remote_url,omitempty"`
+	Progress         string         `json:"progress,omitempty"`
+	CompletionTokens int            `json:"completion_tokens,omitempty"` // 用于按倍率计费
+	TotalTokens      int            `json:"total_tokens,omitempty"`      // 用于按倍率计费
+	UsageFacts       map[string]any `json:"usage_facts,omitempty"`
 }
 
 func FailTaskInfo(reason string) *TaskInfo {

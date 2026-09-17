@@ -196,6 +196,7 @@ export const TASK_STATUS = {
   IN_PROGRESS: 'IN_PROGRESS', // 执行中
   SUCCESS: 'SUCCESS', // 成功
   FAILURE: 'FAILURE', // 失败
+  CANCELLED: 'CANCELLED', // 已取消
   QUEUED: 'QUEUED', // 排队中
   UNKNOWN: 'UNKNOWN', // 未知
 } as const
@@ -205,6 +206,7 @@ export const TASK_STATUS = {
  */
 export const TASK_PLATFORMS = {
   SUNO: 'suno',
+  SUNOAPI: 'sunoapi',
   KLING: 'kling',
   RUNWAY: 'runway',
   LUMA: 'luma',
@@ -311,6 +313,7 @@ export const TASK_STATUS_MAPPINGS: Record<string, StatusMapping> = {
   [TASK_STATUS.SUBMITTED]: { label: 'Queued', variant: 'yellow' },
   [TASK_STATUS.IN_PROGRESS]: { label: 'In Progress', variant: 'blue' },
   [TASK_STATUS.FAILURE]: { label: 'Failed', variant: 'red' },
+  [TASK_STATUS.CANCELLED]: { label: 'Cancelled', variant: 'neutral' },
   [TASK_STATUS.QUEUED]: { label: 'Queued', variant: 'orange' },
   [TASK_STATUS.UNKNOWN]: { label: 'Unknown', variant: 'neutral' },
 }
@@ -320,6 +323,7 @@ export const TASK_STATUS_MAPPINGS: Record<string, StatusMapping> = {
  */
 export const TASK_PLATFORM_MAPPINGS: Record<string, StatusMapping> = {
   [TASK_PLATFORMS.SUNO]: { label: 'suno', variant: 'green' },
+  [TASK_PLATFORMS.SUNOAPI]: { label: 'sunoapi', variant: 'green' },
   [TASK_PLATFORMS.KLING]: { label: 'kling', variant: 'blue' },
   [TASK_PLATFORMS.RUNWAY]: { label: 'runway', variant: 'violet' },
   [TASK_PLATFORMS.LUMA]: { label: 'luma', variant: 'orange' },

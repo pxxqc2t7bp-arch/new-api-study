@@ -543,6 +543,21 @@ func TestAdvancedCustomSupportedEndpointTypesForModel(t *testing.T) {
 	}, config.SupportedEndpointTypesForModel("other-model"))
 }
 
+func TestAdvancedCustomMultimodalEmbeddingEndpointType(t *testing.T) {
+	config := &AdvancedCustomConfig{Routes: []AdvancedCustomRoute{
+		{
+			IncomingPath: "/v1/embeddings/multimodal",
+			UpstreamPath: "/api/v3/embeddings/multimodal",
+			Models:       []string{"doubao-embedding-vision-251215"},
+		},
+	}}
+
+	assert.Equal(t,
+		[]types.EndpointType{types.EndpointTypeEmbeddings},
+		config.SupportedEndpointTypesForModel("doubao-embedding-vision-251215"),
+	)
+}
+
 func TestAdvancedCustomValidateAlphaSearchConverterPath(t *testing.T) {
 	valid := &AdvancedCustomConfig{
 		Routes: []AdvancedCustomRoute{

@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { type TFunction } from 'i18next'
+import type { TFunction } from 'i18next'
 
 import type { TokenUnit } from './types'
 
@@ -49,6 +49,7 @@ export const QUOTA_TYPES = {
   ALL: 'all',
   TOKEN: 'token',
   REQUEST: 'request',
+  TASK: 'task',
 } as const
 
 export type QuotaTypeOption = (typeof QUOTA_TYPES)[keyof typeof QUOTA_TYPES]
@@ -61,6 +62,7 @@ export function getQuotaTypeLabels(
     [QUOTA_TYPES.ALL]: t('All Models'),
     [QUOTA_TYPES.TOKEN]: t('Token-based'),
     [QUOTA_TYPES.REQUEST]: t('Per Request'),
+    [QUOTA_TYPES.TASK]: t('Task billing'),
   }
 }
 
@@ -75,6 +77,7 @@ export const ENDPOINT_TYPES = {
   IMAGE_GENERATION: 'image-generation',
   EMBEDDINGS: 'embeddings',
   OPENAI_VIDEO: 'openai-video',
+  THREE_D_GENERATION: 'three-d-generation',
 } as const
 
 export type EndpointTypeOption =
@@ -94,6 +97,7 @@ export function getEndpointTypeLabels(
     [ENDPOINT_TYPES.IMAGE_GENERATION]: t('Image'),
     [ENDPOINT_TYPES.EMBEDDINGS]: t('Embeddings'),
     [ENDPOINT_TYPES.OPENAI_VIDEO]: t('Video'),
+    [ENDPOINT_TYPES.THREE_D_GENERATION]: '3D',
   }
 }
 

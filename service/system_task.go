@@ -46,6 +46,15 @@ type ScheduledSystemTaskHandler interface {
 	NewPayload() any
 }
 
+// CalendarSystemTaskHandler schedules work against wall-clock boundaries such
+// as a daily local-time reconciliation. It coexists with interval handlers.
+type CalendarSystemTaskHandler interface {
+	SystemTaskHandler
+	Enabled() bool
+	Due(now time.Time, latest *model.SystemTask) bool
+	NewPayload() any
+}
+
 var (
 	systemTaskHandlersMu sync.RWMutex
 	systemTaskHandlers   = map[string]SystemTaskHandler{}
@@ -261,17 +270,23 @@ func runSystemTaskClaimPass(runnerID string) {
 // row. The task active_key unique index deduplicates concurrent creation while
 // the per-type lock guarantees only one runner executes the task.
 func runSystemTaskScheduler() {
-	now := common.GetTimestamp()
+	nowTime := time.Now()
+	now := nowTime.Unix()
 	handlers := registeredSystemTaskHandlers()
-	scheduledHandlers := make([]ScheduledSystemTaskHandler, 0, len(handlers))
+	scheduledHandlers := make([]SystemTaskHandler, 0, len(handlers))
 	taskTypes := make([]string, 0, len(handlers))
 	for _, handler := range handlers {
-		scheduled, ok := handler.(ScheduledSystemTaskHandler)
-		if !ok || !scheduled.Enabled() {
-			continue
+		enabled := false
+		switch scheduled := handler.(type) {
+		case ScheduledSystemTaskHandler:
+			enabled = scheduled.Enabled()
+		case CalendarSystemTaskHandler:
+			enabled = scheduled.Enabled()
 		}
-		scheduledHandlers = append(scheduledHandlers, scheduled)
-		taskTypes = append(taskTypes, scheduled.Type())
+		if enabled {
+			scheduledHandlers = append(scheduledHandlers, handler)
+			taskTypes = append(taskTypes, handler.Type())
+		}
 	}
 	latestTasks, err := model.GetLatestSystemTasks(taskTypes)
 	if err != nil {
@@ -284,11 +299,25 @@ func runSystemTaskScheduler() {
 			if latest.Status == model.SystemTaskStatusPending || latest.Status == model.SystemTaskStatusRunning {
 				continue // an active row already exists
 			}
-			if now-latest.UpdatedAt < int64(scheduled.Interval().Seconds()) {
-				continue // not due yet
-			}
 		}
-		if _, err := model.CreateSystemTask(scheduled.Type(), scheduled.NewPayload(), nil); err != nil {
+		due := false
+		switch typed := scheduled.(type) {
+		case CalendarSystemTaskHandler:
+			due = typed.Due(nowTime, latest)
+		case ScheduledSystemTaskHandler:
+			due = latest == nil || now-latest.UpdatedAt >= int64(typed.Interval().Seconds())
+		}
+		if !due {
+			continue
+		}
+		var payload any
+		switch typed := scheduled.(type) {
+		case CalendarSystemTaskHandler:
+			payload = typed.NewPayload()
+		case ScheduledSystemTaskHandler:
+			payload = typed.NewPayload()
+		}
+		if _, err := model.CreateSystemTask(scheduled.Type(), payload, nil); err != nil {
 			activeTask, activeErr := model.GetActiveSystemTask(scheduled.Type())
 			if activeErr == nil && activeTask != nil {
 				continue

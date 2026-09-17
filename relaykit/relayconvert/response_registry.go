@@ -903,12 +903,16 @@ func convertOAIChatStreamResponseToClaudeMessages(_ context.Context, info convme
 	return StreamResponseOpenAI2Claude(chatResponse, info), canonicalUsageFromResponse(chatResponse), nil
 }
 
+func FinalizeOpenAIChatStreamToClaudeMessages(info convmeta.Meta) []*dto.ClaudeResponse {
+	return oaichat.FinalizeStreamResponseOpenAI2Claude(info)
+}
+
 func finalizeOAIChatStreamResponseToClaudeMessages(_ context.Context, info convmeta.Meta, _ any) ([]any, *dto.Usage, error) {
 	if info == nil {
 		info = &convmeta.Values{}
 	}
 	usage := info.EnsureClaudeConvertInfo().Usage
-	responses := oaichat.FinalizeStreamResponseOpenAI2Claude(info)
+	responses := FinalizeOpenAIChatStreamToClaudeMessages(info)
 	return streamValuesFromAny(responses), usage, nil
 }
 
