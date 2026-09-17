@@ -121,7 +121,7 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 		if len(pinned.Route.Models) > 0 {
 			bodyValue, _ := bodyObject["value"].(map[string]any)
 			claimedModel, _ := bodyValue["model"].(string)
-			if claimedModel == "" || !slices.Contains(pinned.Route.Models, claimedModel) {
+			if claimedModel == "" || !taskPluginRouteAllowsModel(pinned, claimedModel) {
 				logger.LogWarn(
 					c,
 					"task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=resolve_request reason=model_not_allowed model=%q",
@@ -191,7 +191,7 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 				abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, "decoded request is missing a model")
 				return
 			}
-			owned := slices.Contains(pinned.Plugin.Meta.Models, modelName)
+			_, owned := taskPluginDeclaredModel(pinned, modelName)
 			if !owned {
 				logger.LogWarn(
 					c,
@@ -203,7 +203,7 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 				abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, fmt.Sprintf("model %q is not served by this plugin", modelName))
 				return
 			}
-			if len(pinned.Route.Models) > 0 && !slices.Contains(pinned.Route.Models, modelName) {
+			if len(pinned.Route.Models) > 0 && !taskPluginRouteAllowsModel(pinned, modelName) {
 				logger.LogWarn(
 					c,
 					"task_plugin subsystem=route event=prepare_rejected generation=%d plugin=%q stage=resolve_request reason=resolved_model_not_allowed model=%q",
@@ -310,6 +310,31 @@ func PrepareTaskPluginRoute() gin.HandlerFunc {
 			abortTaskPluginRouteErrorDetail(c, http.StatusBadRequest, taskPluginInvalidRouteResult)
 		}
 	}
+}
+
+func taskPluginDeclaredModel(pinned pluginruntime.PinnedRoute, modelName string) (string, bool) {
+	if pinned.Plugin == nil {
+		return "", false
+	}
+	if slices.Contains(pinned.Plugin.Meta.Models, modelName) {
+		return modelName, true
+	}
+	target, ok := model.ResolveTaskModelAlias(pinned.Generation, modelName)
+	if !ok ||
+		target.Declared == "" ||
+		target.PluginKey != pinned.Plugin.Meta.Key ||
+		!slices.Contains(pinned.Plugin.Meta.Models, target.Declared) {
+		return "", false
+	}
+	return target.Declared, true
+}
+
+func taskPluginRouteAllowsModel(pinned pluginruntime.PinnedRoute, modelName string) bool {
+	if len(pinned.Route.Models) == 0 {
+		return true
+	}
+	declared, ok := taskPluginDeclaredModel(pinned, modelName)
+	return ok && slices.Contains(pinned.Route.Models, declared)
 }
 
 // PinTaskPluginEndpoint decides shared-endpoint ownership without executing

@@ -191,6 +191,79 @@ export function parseTaskResult() { return {status: "SUCCESS"}; }
 	}
 }
 
+func TestPrepareTaskPluginRouteAcceptsMappedAlias(t *testing.T) {
+	previousDB := model.DB
+	previousType := common.MainDatabaseType()
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate(&model.Channel{}))
+	model.DB = database
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.SetMainDatabaseType(previousType)
+	})
+
+	const pluginKey = "route-model-alias-test"
+	plugin, err := jsplugin.DefaultRegistry.Register(`
+export const meta = {
+  apiVersion: 1, key: "route-model-alias-test", name: "Alias", version: "1.0.0",
+  author: {name: "Test"},
+  models: ["video-concrete"], fetchMode: "per_task",
+  routes: [{method: "POST", path: "/vendor/videos", type: "submit", models: ["video-concrete"], decode: "decodeVideo", render: "created"}],
+};
+export const native = {
+  decodeVideo: function(ctx) { return {kind: "submit", model: ctx.body.value.model, requestBody: ctx.body.value}; },
+  created: function(ctx, task) { return task; },
+};
+export function buildSubmitRequest() { return {url: "https://example.com"}; }
+export function parseSubmitResponse() { return {taskId: "one"}; }
+export function buildQueryRequest() { return {url: "https://example.com"}; }
+export function parseTaskResult() { return {status: "SUCCESS"}; }
+`, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
+
+	mapping := `{"video-alias":"video-concrete"}`
+	require.NoError(t, model.DB.Create(&model.Channel{
+		Type:         constant.ChannelTypeTaskPlugin,
+		Key:          "test-key",
+		Status:       common.ChannelStatusEnabled,
+		Name:         "alias-channel",
+		Models:       "video-alias",
+		ModelMapping: &mapping,
+	}).Error)
+
+	router := gin.New()
+	router.POST(
+		"/vendor/videos",
+		func(c *gin.Context) {
+			c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{
+				Generation: jsplugin.DefaultRegistry.Generation(),
+				Plugin:     plugin,
+				Route:      plugin.Meta.Routes[0],
+			})
+			c.Next()
+		},
+		PrepareTaskPluginRoute(),
+		func(c *gin.Context) {
+			assert.Equal(t, "video-alias", c.GetString("resolved_task_model"))
+			c.Status(http.StatusNoContent)
+		},
+	)
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/vendor/videos",
+		strings.NewReader(`{"model":"video-alias"}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, request)
+
+	assert.Equal(t, http.StatusNoContent, recorder.Code)
+}
+
 func TestPrepareTaskPluginRouteRejectsResolvedModelOutsideRouteScope(t *testing.T) {
 	plugin := compileTaskRoutePlugin(t, `
 export const meta = {

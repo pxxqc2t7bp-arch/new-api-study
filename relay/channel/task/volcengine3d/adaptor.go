@@ -73,9 +73,13 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 	if request.Model == "" {
 		return taskError(fmt.Errorf("model is required"), "missing_model", http.StatusBadRequest)
 	}
+	modelName := request.Model
+	if info.IsModelMapped && info.UpstreamModelName != "" {
+		modelName = info.UpstreamModelName
+	}
 	images := collectImages(&request)
 	prompt := collectPrompt(&request)
-	switch request.Model {
+	switch modelName {
 	case "doubao-seed3d-2-0-260328":
 		if len(images) != 1 {
 			return taskError(fmt.Errorf("Seed3D requires exactly one image"), "invalid_images", http.StatusBadRequest)
@@ -94,13 +98,13 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 	default:
 		return taskError(fmt.Errorf("unsupported 3D model: %s", request.Model), "unsupported_model", http.StatusBadRequest)
 	}
-	if err := validateParameters(request.Model, request.Parameters); err != nil {
+	if err := validateParameters(modelName, request.Parameters); err != nil {
 		return taskError(err, "invalid_parameters", http.StatusBadRequest)
 	}
 	if request.Seed != nil && (*request.Seed < 0 || *request.Seed > 65535) {
 		return taskError(fmt.Errorf("seed must be between 0 and 65535"), "invalid_seed", http.StatusBadRequest)
 	}
-	if request.Seed != nil && request.Model != "hyper3d-gen2-260112" {
+	if request.Seed != nil && modelName != "hyper3d-gen2-260112" {
 		return taskError(fmt.Errorf("seed is only supported by Hyper3D"), "invalid_seed", http.StatusBadRequest)
 	}
 	request.Images = images

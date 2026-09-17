@@ -77,6 +77,20 @@ func TestValidateThreeDRequests(t *testing.T) {
 	}
 }
 
+func TestValidateThreeDRequestAcceptsMappedAlias(t *testing.T) {
+	ctx, info := threeDContext(
+		t,
+		`{"model":"doubao-seed3d-2-0","image":"https://example.com/a.png"}`,
+	)
+	info.OriginModelName = "doubao-seed3d-2-0"
+	info.UpstreamModelName = "doubao-seed3d-2-0-260328"
+	info.IsModelMapped = true
+
+	result := (&TaskAdaptor{}).ValidateRequestAndSetAction(ctx, info)
+
+	require.Nil(t, result)
+}
+
 func TestBuildThreeDRequestBody(t *testing.T) {
 	ctx, info := threeDContext(t, `{
 		"model":"hyper3d-gen2-260112",
