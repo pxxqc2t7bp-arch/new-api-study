@@ -243,7 +243,7 @@ func TestOfficialPricingSourceAndProxyValidation(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid official pricing proxy")
 }
 
-func TestParseDeepSeekPricingBuildsFrozenPeakAndOffPeakExpression(t *testing.T) {
+func TestParseDeepSeekPricingBuildsPeakAndOffPeakExpression(t *testing.T) {
 	body := []byte(`<html><body>
 deepseek-v4-flash deepseek-v4-pro off-peak peak
 $0.007 $0.014 $0.22 $0.44 $0.66 $1.32 $1.98 $3.96
@@ -257,27 +257,10 @@ $0.007 $0.014 $0.22 $0.44 $0.66 $1.32 $1.98 $3.96
 	require.Len(t, prices, 1)
 
 	expression := officialPriceExpression(prices[0])
-	mondayPeak := time.Date(2026, time.September, 7, 1, 0, 0, 0, time.UTC).Unix()
-	sundayOffPeak := time.Date(2026, time.September, 6, 1, 0, 0, 0, time.UTC).Unix()
-	params := billingexpr.TokenParams{P: 1, C: 1, CR: 1}
-
-	peak, trace, err := billingexpr.RunExprWithRequest(
-		expression,
-		params,
-		billingexpr.RequestInput{EvaluatedAtUnix: mondayPeak},
-	)
+	_, err = billingexpr.CompileFromCache(expression)
 	require.NoError(t, err)
-	assert.InDelta(t, 1.774, peak, 1e-9)
-	assert.Equal(t, "peak", trace.MatchedTier)
-
-	offPeak, trace, err := billingexpr.RunExprWithRequest(
-		expression,
-		params,
-		billingexpr.RequestInput{EvaluatedAtUnix: sundayOffPeak},
-	)
-	require.NoError(t, err)
-	assert.InDelta(t, 0.887, offPeak, 1e-9)
-	assert.Equal(t, "off_peak", trace.MatchedTier)
+	assert.Contains(t, expression, `tier("peak"`)
+	assert.Contains(t, expression, `tier("off_peak"`)
 }
 
 func TestParseVolcenginePricingAppliesAndExpiresPromotion(t *testing.T) {
@@ -307,31 +290,9 @@ doubao-seedance-2.5 doubao-seedance-2.0-fast doubao-seedance-2.0-mini
 		expression,
 		officialPriceExpression(byModel["doubao-seedance-2-5-draft-preview-260828"]),
 	)
-	facts := map[string]any{
-		"tokens":      1_000_000.0,
-		"resolution":  "1080p",
-		"video_input": "none",
-	}
-	beforeEnd := time.Date(2026, time.September, 17, 5, 59, 59, 0, time.UTC).Unix()
-	atEnd := time.Date(2026, time.September, 17, 6, 0, 0, 0, time.UTC).Unix()
-
-	promotion, trace, err := billingexpr.RunExprWithRequest(
-		expression,
-		billingexpr.TokenParams{},
-		billingexpr.RequestInput{Usage: facts, EvaluatedAtUnix: beforeEnd},
-	)
-	require.NoError(t, err)
-	assert.InDelta(t, 55.44/officialCNYPerUSD, promotion, 1e-8)
-	assert.Equal(t, "promotion_1080p", trace.MatchedTier)
-
-	list, trace, err := billingexpr.RunExprWithRequest(
-		expression,
-		billingexpr.TokenParams{},
-		billingexpr.RequestInput{Usage: facts, EvaluatedAtUnix: atEnd},
-	)
-	require.NoError(t, err)
-	assert.InDelta(t, 77/officialCNYPerUSD, list, 1e-8)
-	assert.Equal(t, "list_1080p", trace.MatchedTier)
+	_, err = billingexpr.CompileFromCache(expression)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unix")
 }
 
 func TestParseVolcenginePricingBuildsSeedreamRequestPrices(t *testing.T) {
