@@ -95,7 +95,7 @@ func defaultPricingMaps() map[string]map[string]any {
 
 func readModelPricingMaps(db *gorm.DB) (map[string]map[string]any, map[string]bool, []string, error) {
 	var rows []Option
-	if err := db.Where(commonKeyCol+" IN ?", modelPricingOptionKeys).Find(&rows).Error; err != nil {
+	if err := db.Where(map[string]any{"key": modelPricingOptionKeys}).Find(&rows).Error; err != nil {
 		return nil, nil, nil, err
 	}
 	values := defaultPricingMaps()
@@ -234,6 +234,20 @@ func PreviewModelPricing(name string, draft PricingValues) (PricingValues, error
 	}
 	replaceModelPricing(values, name, draft)
 	return effectiveModelPricing(values, name), nil
+}
+
+// GetEffectiveModelPricingTx shares the pricing engine's resolution while
+// reading authoritative options in the caller's current transaction.
+func GetEffectiveModelPricingTx(tx *gorm.DB, names []string) (map[string]PricingValues, error) {
+	values, _, _, err := readModelPricingMaps(lockForUpdate(tx))
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]PricingValues, len(names))
+	for _, name := range names {
+		result[name] = effectiveModelPricing(values, name)
+	}
+	return result, nil
 }
 
 func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
@@ -566,7 +580,10 @@ func mutateModelPricingOptions(mutate func(*gorm.DB, map[string]map[string]any) 
 			if err != nil {
 				return err
 			}
-			if err := tx.Model(&Option{}).Where(commonKeyCol+" = ?", key).Update("value", string(encoded)).Error; err != nil {
+			if err := tx.Model(&Option{}).Where(clause.Eq{
+				Column: clause.Column{Name: "key"},
+				Value:  key,
+			}).Update("value", string(encoded)).Error; err != nil {
 				return err
 			}
 		}

@@ -894,6 +894,8 @@ func setupAppPluginControllerTest(t *testing.T) {
 	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
 	previousRedis := common.RedisEnabled
 	previousFlag := operation_setting.AppPluginV1Enabled
+	previousSeedance, previousEmbedded, previousGrants := operation_setting.AppPluginSeedanceEnabled,
+		operation_setting.AppPluginEmbeddedSurfaceEnabled, operation_setting.AppExecutionGrantsEnabled
 
 	db := openAppPluginControllerDB(t)
 	t.Cleanup(func() {
@@ -901,6 +903,8 @@ func setupAppPluginControllerTest(t *testing.T) {
 		common.SetDatabaseTypes(previousMain, previousLog)
 		common.RedisEnabled = previousRedis
 		operation_setting.AppPluginV1Enabled = previousFlag
+		operation_setting.AppPluginSeedanceEnabled, operation_setting.AppPluginEmbeddedSurfaceEnabled = previousSeedance, previousEmbedded
+		operation_setting.AppExecutionGrantsEnabled = previousGrants
 	})
 	dbType := map[string]common.DatabaseType{
 		"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL,
@@ -911,6 +915,8 @@ func setupAppPluginControllerTest(t *testing.T) {
 	model.DB, model.LOG_DB = db, db
 	common.RedisEnabled = false
 	operation_setting.AppPluginV1Enabled = true
+	operation_setting.AppPluginSeedanceEnabled, operation_setting.AppPluginEmbeddedSurfaceEnabled = true, true
+	operation_setting.AppExecutionGrantsEnabled = true
 	require.NoError(t, db.Create(&model.TaskPlugin{
 		Key:        "doubao",
 		APIVersion: 1,
@@ -951,7 +957,7 @@ func openAppPluginControllerDB(t *testing.T) *gorm.DB {
 		require.True(t, parseErr == nil, "invalid mysql test DSN")
 		admin, openErr := gorm.Open(mysql.Open(dsn), config)
 		require.True(t, openErr == nil, "cannot open mysql test database")
-		require.NoError(t, admin.Exec("CREATE DATABASE `"+name+"`").Error)
+		require.NoError(t, admin.Exec("CREATE DATABASE `"+name+"` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci").Error)
 		t.Cleanup(func() {
 			assert.NoError(t, admin.Exec("DROP DATABASE `"+name+"`").Error)
 			sqlDB, err := admin.DB()

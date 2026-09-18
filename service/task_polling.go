@@ -235,13 +235,14 @@ func UpdateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, task
 }
 
 func updateBatchTasks(ctx context.Context, adaptor BatchTaskPollingAdaptor, channelId int, taskIds []string, taskM map[string]*model.Task) error {
-	logger.LogInfo(ctx, fmt.Sprintf("渠道 #%d 未完成的任务有: %d", channelId, len(taskIds)))
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	taskIds = legacyPollTaskIDs(taskIds, taskM)
 	if len(taskIds) == 0 {
 		return nil
 	}
+	logger.LogInfo(ctx, fmt.Sprintf("渠道 #%d 未完成的任务有: %d", channelId, len(taskIds)))
 	ch, err := model.CacheGetChannel(channelId)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("CacheGetChannel: %v", err))
@@ -415,13 +416,14 @@ func UpdateVideoTasks(ctx context.Context, platform constant.TaskPlatform, taskC
 }
 
 func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, channelId int, taskIds []string, taskM map[string]*model.Task) error {
-	logger.LogInfo(ctx, fmt.Sprintf("Channel #%d pending video tasks: %d", channelId, len(taskIds)))
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	taskIds = legacyPollTaskIDs(taskIds, taskM)
 	if len(taskIds) == 0 {
 		return nil
 	}
+	logger.LogInfo(ctx, fmt.Sprintf("Channel #%d pending video tasks: %d", channelId, len(taskIds)))
 	cacheGetChannel, err := model.CacheGetChannel(channelId)
 	if err != nil {
 		// Collect DB primary key IDs for bulk update (taskIds are upstream IDs, not task_id column values)
@@ -487,6 +489,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if task == nil {
 		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
 		return fmt.Errorf("task %s not found", taskId)
+	}
+	if task.IsAppManaged() {
+		return nil
 	}
 	key := ch.Key
 
@@ -685,6 +690,9 @@ func truncateBase64(s string) string {
 //
 // 表达式求值失败会保留预扣额度，因此也视为已接管，避免错误全退。
 func settleTaskBillingOnComplete(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, taskResult *relaycommon.TaskInfo) bool {
+	if task.IsAppManaged() {
+		return false
+	}
 	if bc := task.PrivateData.BillingContext; bc != nil && bc.TieredSnapshot != nil {
 		// 用量表达式结算只适用于成功任务；失败或取消任务由调用方全额退款。
 		if task.Status == model.TaskStatusFailure || task.Status == model.TaskStatusCancelled {
@@ -785,6 +793,9 @@ func unrecognizedPollDetail(reason string, body []byte) string {
 }
 
 func recordPollFailure(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, class string, statusCode int, detail string) error {
+	if task.IsAppManaged() {
+		return nil
+	}
 	task.PrivateData.PollFailures++
 	if class == pollClassUnrecognized || class == pollClassHookError {
 		// The redacted body is intentionally not persisted to Task.Data on these
@@ -817,6 +828,9 @@ func recordPollFailureForTasks(ctx context.Context, adaptor TaskPollingAdaptor, 
 }
 
 func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *model.Task, fromStatus model.TaskStatus, reason string) error {
+	if task.IsAppManaged() {
+		return nil
+	}
 	now := time.Now().Unix()
 	task.Status = model.TaskStatusFailure
 	task.Progress = taskcommon.ProgressComplete
@@ -837,6 +851,18 @@ func failTaskFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, task *mod
 		RefundTaskQuota(ctx, task, reason)
 	}
 	return nil
+}
+
+// Guard before channel lookup: its legacy failure paths can otherwise bulk
+// mark tasks failed before the per-task query or funding guards are reached.
+func legacyPollTaskIDs(ids []string, tasks map[string]*model.Task) []string {
+	result := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if task := tasks[id]; task != nil && !task.IsAppManaged() {
+			result = append(result, id)
+		}
+	}
+	return result
 }
 
 func failTasksFromPoll(ctx context.Context, adaptor TaskPollingAdaptor, tasks []*model.Task, reason string) error {

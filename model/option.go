@@ -1,6 +1,7 @@
 package model
 
 import (
+	"fmt"
 	"maps"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Option struct {
@@ -227,6 +229,11 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	for _, protected := range []string{AppModelInvokePolicyKey, AppArkImportDelegationsKey} {
+		if strings.EqualFold(strings.TrimRight(key, " "), protected) {
+			return fmt.Errorf("controlled option requires authenticated policy publication")
+		}
+	}
 	if key == operation_setting.ToolPriceOptionKey {
 		return operation_setting.ValidateToolPricesJSON(value)
 	}
@@ -237,6 +244,29 @@ func validateOptionValue(key string, value string) error {
 		return setting.ValidateMaxTokenAutoGroups(value)
 	}
 	return nil
+}
+
+func saveGenericOptionTx(tx *gorm.DB, key, value string) error {
+	option := Option{Key: key}
+	if err := lockForUpdate(tx).Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).
+		FirstOrCreate(&option).Error; err != nil {
+		return err
+	}
+	// The locked (or newly inserted) row must not equal a protected key under
+	// the column's collation, including aliases predating canonical publication.
+	var protected Option
+	result := lockForUpdate(tx).Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).
+		Where(clause.IN{Column: clause.Column{Name: "key"}, Values: []any{
+			AppModelInvokePolicyKey, AppArkImportDelegationsKey,
+		}}).Limit(1).Find(&protected)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 0 {
+		return fmt.Errorf("controlled option requires authenticated policy publication")
+	}
+	option.Value = value
+	return tx.Save(&option).Error
 }
 
 func UpdateOption(key string, value string) error {
@@ -250,17 +280,11 @@ func UpdateOption(key string, value string) error {
 	if err := validateOptionValue(key, value); err != nil {
 		return err
 	}
-	// Save to database first
-	option := Option{
-		Key: key,
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		return saveGenericOptionTx(tx, key, value)
+	}); err != nil {
+		return err
 	}
-	// https://gorm.io/docs/update.html#Save-All-Fields
-	DB.FirstOrCreate(&option, Option{Key: key})
-	option.Value = value
-	// Save is a combination function.
-	// If save value does not contain primary key, it will execute Create,
-	// otherwise it will execute Update (with all fields).
-	DB.Save(&option)
 	// Update OptionMap
 	return updateOptionMap(key, value)
 }
@@ -287,12 +311,7 @@ func UpdateOptionsBulk(values map[string]string) error {
 	}
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		for k, v := range values {
-			option := Option{Key: k}
-			if err := tx.FirstOrCreate(&option, Option{Key: k}).Error; err != nil {
-				return err
-			}
-			option.Value = v
-			if err := tx.Save(&option).Error; err != nil {
+			if err := saveGenericOptionTx(tx, k, v); err != nil {
 				return err
 			}
 		}

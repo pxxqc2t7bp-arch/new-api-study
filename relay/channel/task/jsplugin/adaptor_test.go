@@ -13,6 +13,7 @@ import (
 	"net/textproto"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -25,6 +26,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/service"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1397,6 +1399,111 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 	require.Nil(t, taskErr)
 	require.NotNil(t, parsed)
 	assert.JSONEq(t, `{"req_key":"from-submit"}`, string(parsed.PluginState))
+}
+
+func TestAppGrantProviderAssetFence(t *testing.T) {
+	service.InitHttpClient()
+	var sends int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sends++
+		_, _ = io.WriteString(w, `{"id":"upstream-1"}`)
+	}))
+	t.Cleanup(server.Close)
+	plugin, err := pluginruntime.NewRegistry().Register(mockPlugin, pluginruntime.Options{})
+	require.NoError(t, err)
+	expected := []hosttypes.AppRelayAssetInput{
+		{MediaType: "image", AssetURI: "asset://image-1", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+		{MediaType: "video", AssetURI: "asset://video-1", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+	}
+	tests := []struct {
+		name     string
+		body     string
+		expected []hosttypes.AppRelayAssetInput
+		wantSend bool
+	}{
+		{
+			name: "exact typed multiset",
+			body: `{"model":"model","content":[` +
+				`{"type":"image_url","image_url":{"url":"asset://image-1"}},` +
+				`{"type":"video_url","video_url":{"url":"asset://video-1"}}]}`,
+			expected: expected,
+			wantSend: true,
+		},
+		{
+			name:     "missing",
+			body:     `{"content":[{"type":"image_url","image_url":{"url":"asset://image-1"}}]}`,
+			expected: expected,
+		},
+		{
+			name: "extra",
+			body: `{"content":[` +
+				`{"type":"image_url","image_url":{"url":"asset://image-1"}},` +
+				`{"type":"video_url","video_url":{"url":"asset://video-1"}},` +
+				`{"type":"audio_url","audio_url":{"url":"asset://audio-1"}}]}`,
+			expected: expected,
+		},
+		{
+			name: "replaced",
+			body: `{"content":[` +
+				`{"type":"image_url","image_url":{"url":"asset://image-2"}},` +
+				`{"type":"video_url","video_url":{"url":"asset://video-1"}}]}`,
+			expected: expected,
+		},
+		{
+			name: "wrong media",
+			body: `{"content":[` +
+				`{"type":"video_url","video_url":{"url":"asset://image-1"}},` +
+				`{"type":"video_url","video_url":{"url":"asset://video-1"}}]}`,
+			expected: expected,
+		},
+		{
+			name: "untyped asset",
+			body: `{"metadata":{"url":"asset://hidden"},` +
+				`"content":[{"type":"image_url","image_url":{"url":"asset://image-1"}},` +
+				`{"type":"video_url","video_url":{"url":"asset://video-1"}}]}`,
+			expected: expected,
+		},
+		{
+			name: "expired",
+			body: `{"content":[` +
+				`{"type":"image_url","image_url":{"url":"asset://image-1"}},` +
+				`{"type":"video_url","video_url":{"url":"asset://video-1"}}]}`,
+			expected: []hosttypes.AppRelayAssetInput{
+				{MediaType: "image", AssetURI: "asset://image-1", ExpiresAt: time.Now().Add(-time.Second).Unix()},
+				{MediaType: "video", AssetURI: "asset://video-1", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+			},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			adaptor := New(plugin)
+			adaptor.submit = &requestDescriptor{
+				URL:    server.URL + "/api/v3/contents/generations/tasks",
+				Method: http.MethodPost,
+			}
+			info := &relaycommon.RelayInfo{
+				ChannelMeta:   &relaycommon.ChannelMeta{ChannelBaseUrl: server.URL},
+				TaskRelayInfo: &relaycommon.TaskRelayInfo{},
+				AppSubject: &hosttypes.AppRelaySubject{
+					Protocol: "openai_video", PublicModel: "model", AssetInputs: testCase.expected,
+				},
+			}
+			context, _ := gin.CreateTestContext(httptest.NewRecorder())
+			context.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+			before := sends
+			response, err := adaptor.DoRequest(context, info, strings.NewReader(testCase.body))
+			if testCase.wantSend {
+				require.NoError(t, err)
+				require.NotNil(t, response)
+				require.NoError(t, response.Body.Close())
+				assert.Equal(t, before+1, sends)
+				return
+			}
+			require.Error(t, err)
+			assert.Nil(t, response)
+			assert.Equal(t, before, sends)
+		})
+	}
 }
 
 func TestTaskAdaptorBatchQueryReceivesTaskObjects(t *testing.T) {

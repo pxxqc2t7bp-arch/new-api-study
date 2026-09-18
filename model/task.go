@@ -50,7 +50,8 @@ const (
 )
 
 const (
-	TaskExecutionModeDeferred = "deferred"
+	TaskExecutionModeDeferred   = "deferred"
+	TaskExecutionModeAppManaged = "app_managed"
 
 	TaskDispatchStatusPending    TaskDispatchStatus = "pending"
 	TaskDispatchStatusRunning    TaskDispatchStatus = "running"
@@ -92,6 +93,10 @@ type Task struct {
 	// 禁止返回给用户，内部可能包含key等隐私信息
 	PrivateData TaskPrivateData `json:"-" gorm:"column:private_data;type:json"`
 	Data        json.RawMessage `json:"data" gorm:"type:json"`
+}
+
+func (t *Task) IsAppManaged() bool {
+	return t != nil && t.ExecutionMode == TaskExecutionModeAppManaged
 }
 
 func (t *Task) SetData(data any) {
@@ -153,6 +158,9 @@ type TaskPrivateData struct {
 	// PluginState is plugin-owned cross-round data. Unlike Task.Data it is
 	// only replaced when a hook explicitly returns state.
 	PluginState json.RawMessage `json:"plugin_state,omitempty"`
+	// Host-observed credentialless artifact descriptors. PrivateData is never
+	// serialized by public Task APIs; reads use the existing safe content proxy.
+	AppArtifactURLs map[string]string `json:"app_artifact_urls,omitempty"`
 	// PollFailures counts consecutive unrecognized or transient poll outcomes.
 	PollFailures int `json:"poll_failures,omitempty"`
 }
@@ -388,6 +396,7 @@ func TaskGetAllTasks(startIdx int, num int, queryParams SyncTaskQueryParams) []*
 func GetTimedOutUnfinishedTasks(cutoffUnix int64, limit int) []*Task {
 	var tasks []*Task
 	err := DB.Where("progress != ?", "100%").
+		Where("(execution_mode IS NULL OR execution_mode <> ?)", TaskExecutionModeAppManaged).
 		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess, TaskStatusCancelled}).
 		Where("submit_time < ?", cutoffUnix).
 		Order("submit_time").
@@ -404,6 +413,7 @@ func GetAllUnFinishSyncTasks(limit int) []*Task {
 	var err error
 	// get all tasks progress is not 100%
 	err = DB.Where("progress != ?", "100%").
+		Where("(execution_mode IS NULL OR execution_mode <> ?)", TaskExecutionModeAppManaged).
 		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess, TaskStatusCancelled}).
 		Where("(execution_mode IS NULL OR execution_mode <> ? OR dispatch_status = ?)",
 			TaskExecutionModeDeferred, TaskDispatchStatusDispatched).
@@ -422,6 +432,7 @@ func HasUnfinishedSyncTasks() bool {
 	var id int64
 	err := DB.Model(&Task{}).
 		Where("progress != ?", "100%").
+		Where("(execution_mode IS NULL OR execution_mode <> ?)", TaskExecutionModeAppManaged).
 		Where("status NOT IN ?", []string{TaskStatusFailure, TaskStatusSuccess, TaskStatusCancelled}).
 		Where("(execution_mode IS NULL OR execution_mode <> ? OR dispatch_status = ?)",
 			TaskExecutionModeDeferred, TaskDispatchStatusDispatched).

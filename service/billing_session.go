@@ -534,6 +534,9 @@ func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preCons
 	if relayInfo == nil {
 		return nil, types.NewError(fmt.Errorf("relayInfo is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
+	if relayInfo.AppSubject != nil {
+		return nil, types.NewError(fmt.Errorf("App execution requires AppBillingSession"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
 
 	pref := common.NormalizeBillingPreference(relayInfo.UserSetting.BillingPreference)
 

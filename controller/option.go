@@ -190,6 +190,10 @@ func UpdateOption(c *gin.Context) {
 		})
 		return
 	}
+	if model.IsAppExecutionPolicyOption(option.Key) {
+		publishAppExecutionPolicyOption(c, option)
+		return
+	}
 	switch option.Value.(type) {
 	case bool:
 		option.Value = common.Interface2String(option.Value.(bool))

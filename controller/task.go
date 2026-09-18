@@ -25,7 +25,7 @@ type taskArtifactResponse struct {
 	Key        string `json:"key"`
 	Type       string `json:"type"`
 	MimeType   string `json:"mime_type,omitempty"`
-	ContentURL string `json:"content_url"`
+	ContentURL string `json:"content_url,omitempty"`
 }
 
 var (
@@ -35,14 +35,21 @@ var (
 )
 
 func GetTask(c *gin.Context) {
-	task, exists, err := model.GetByTaskId(c.GetInt("id"), c.Param("key"))
-	if err != nil {
-		videoProxyError(c, http.StatusInternalServerError, "server_error", "Failed to query task")
-		return
-	}
-	if !exists {
-		videoProxyError(c, http.StatusNotFound, "invalid_request_error", "Task not found")
-		return
+	var task *model.Task
+	if retrieval, ok := middleware.GetAppGrantTaskRetrieval(c); ok {
+		task = &retrieval.Task
+	} else {
+		var exists bool
+		var err error
+		task, exists, err = model.GetByTaskId(c.GetInt("id"), c.Param("key"))
+		if err != nil {
+			videoProxyError(c, http.StatusInternalServerError, "server_error", "Failed to query task")
+			return
+		}
+		if !exists {
+			videoProxyError(c, http.StatusNotFound, "invalid_request_error", "Task not found")
+			return
+		}
 	}
 	createdAt := task.CreatedAt
 	if createdAt == 0 {
@@ -64,6 +71,10 @@ func GetTask(c *gin.Context) {
 }
 
 func GetTaskArtifacts(c *gin.Context) {
+	if retrieval, ok := middleware.GetAppGrantTaskRetrieval(c); ok {
+		writeAppGrantTaskArtifacts(c, retrieval)
+		return
+	}
 	task, exists, err := model.GetByTaskId(c.GetInt("id"), c.Param("key"))
 	if err != nil {
 		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_internal_error", "Failed to query task")
@@ -74,6 +85,26 @@ func GetTaskArtifacts(c *gin.Context) {
 		return
 	}
 	writeTaskArtifacts(c, task, false)
+}
+
+func writeAppGrantTaskArtifacts(c *gin.Context, retrieval *service.AppTaskRetrieval) {
+	c.Header("Cache-Control", "private, no-store")
+	items := make([]taskArtifactResponse, 0, len(retrieval.Artifacts))
+	for _, artifact := range retrieval.Artifacts {
+		contentURL := ""
+		if source := retrieval.Task.PrivateData.AppArtifactURLs[artifact.Key]; source != "" && source == strings.TrimSpace(source) {
+			var err error
+			contentURL, err = service.BuildAppGrantTaskArtifactContentURL(retrieval.Task.TaskID, artifact.Key)
+			if err != nil {
+				writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_url_error", "Failed to build artifact content URL")
+				return
+			}
+		}
+		items = append(items, taskArtifactResponse{
+			Key: artifact.Key, Type: artifact.Type, MimeType: artifact.MimeType, ContentURL: contentURL,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"task_id": retrieval.Task.TaskID, "artifacts": items})
 }
 
 func GetDashboardTaskArtifacts(c *gin.Context) {
@@ -231,10 +262,19 @@ func legacyVideoAvailable(task *model.Task) bool {
 }
 
 func getTaskForArtifactRequest(c *gin.Context, taskID string) (*model.Task, bool, error) {
+	if retrieval, ok := middleware.GetAppGrantTaskRetrieval(c); ok {
+		if retrieval.Task.TaskID != taskID {
+			return nil, false, nil
+		}
+		return &retrieval.Task, true, nil
+	}
 	if middleware.IsTaskArtifactAccess(c) {
 		task, exists, err := model.GetUniqueByOnlyTaskId(taskID)
 		if err != nil || !exists || task == nil {
 			return task, exists, err
+		}
+		if task.ExecutionMode == model.TaskExecutionModeAppManaged {
+			return nil, false, nil
 		}
 		owner, err := model.GetUserCache(task.UserId)
 		if err != nil || owner == nil || owner.Status != common.UserStatusEnabled {
@@ -258,6 +298,10 @@ func writeTaskArtifactProjectionError(c *gin.Context, err error) {
 
 func writeTaskArtifactError(c *gin.Context, status int, code, message string) {
 	c.Header("Cache-Control", "private, no-store")
+	if middleware.IsAppGrantTaskRetrieval(c) {
+		writeAppPluginError(c, http.StatusNotFound, "not_found", "")
+		return
+	}
 	if middleware.IsTaskArtifactAccess(c) {
 		status = http.StatusNotFound
 		code = "artifact_not_found"
@@ -277,6 +321,44 @@ func writeTaskArtifactError(c *gin.Context, status int, code, message string) {
 }
 
 func TaskArtifactContent(c *gin.Context) {
+	if access, ok := middleware.GetAppTaskArtifactAccess(c); ok {
+		task, source, err := service.NewAppExecutionService(
+			model.DB, service.ConfiguredAppPluginAuthOptions(),
+		).ResolveAppTaskArtifactContent(c.Request.Context(), access, c.Request.Method)
+		if err != nil || task == nil {
+			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+			return
+		}
+		descriptor := &relaychannel.TaskContentRequest{
+			URL:            source,
+			Method:         c.Request.Method,
+			Credentialless: true,
+		}
+		if err := proxyTaskMedia(c, task, descriptor); err != nil {
+			writeTaskMediaProxyError(c, err)
+		}
+		return
+	}
+	if retrieval, ok := middleware.GetAppGrantTaskRetrieval(c); ok {
+		artifactKey := c.Param("artifact_key")
+		var source string
+		for _, artifact := range retrieval.Artifacts {
+			if artifact.Key == artifactKey {
+				source = retrieval.Task.PrivateData.AppArtifactURLs[artifact.Key]
+				break
+			}
+		}
+		if retrieval.Task.Status != model.TaskStatusSuccess || source == "" || source != strings.TrimSpace(source) {
+			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+			return
+		}
+		if err := proxyTaskMedia(c, &retrieval.Task, &relaychannel.TaskContentRequest{
+			URL: source, Method: c.Request.Method, Credentialless: true,
+		}); err != nil {
+			writeTaskMediaProxyError(c, err)
+		}
+		return
+	}
 	task, exists, err := getTaskForArtifactRequest(c, c.Param("key"))
 	if err != nil {
 		writeTaskArtifactError(c, http.StatusInternalServerError, "artifact_internal_error", "Failed to query task")

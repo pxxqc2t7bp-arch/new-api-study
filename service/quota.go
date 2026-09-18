@@ -470,6 +470,9 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 }
 
 func PreConsumeTokenQuota(relayInfo *relaycommon.RelayInfo, quota int) error {
+	if relayInfo != nil && relayInfo.AppSubject != nil {
+		return errors.New("app_execution_has_no_token_account")
+	}
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
@@ -502,6 +505,9 @@ func PostConsumeQuota(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQu
 }
 
 func postConsumeQuotaWithResult(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQuota int, sendEmail bool) (result postConsumeQuotaResult, err error) {
+	if relayInfo != nil && relayInfo.AppSubject != nil {
+		return result, errors.New("app_task_requires_host_settlement")
+	}
 
 	// 1) Consume from wallet quota OR subscription item
 	if relayInfo != nil && relayInfo.BillingSource == BillingSourceSubscription {

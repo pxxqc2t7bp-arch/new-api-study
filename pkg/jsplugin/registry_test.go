@@ -1,6 +1,7 @@
 package jsplugin
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"strings"
@@ -11,6 +12,36 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestLoadedPluginSourceSHA256(t *testing.T) {
+	registry := NewRegistry()
+	source := routingTestPluginSource("source-digest", 0, `["model"]`, "", "")
+	changed := source + "\nexport function runtimeRevision() { return 2; }\n"
+	factory, err := registry.RegisterFactory(source, Options{})
+	require.NoError(t, err)
+	override, err := registry.Register(changed, Options{})
+	require.NoError(t, err)
+	require.Equal(t, factory.Meta, override.Meta)
+	for _, tc := range []struct {
+		plugin *LoadedPlugin
+		source string
+	}{{factory, source}, {override, changed}} {
+		digest, ok := any(tc.plugin).(interface{ SourceSHA256() string })
+		require.True(t, ok, "loaded runtime must expose its exact compiled source digest")
+		assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte(tc.source))), digest.SourceSHA256())
+	}
+	current, ok := registry.Get("source-digest")
+	require.True(t, ok)
+	assert.Same(t, override, current)
+	registry.SetOverrideEnabled(false)
+	current, ok = registry.Get("source-digest")
+	require.True(t, ok)
+	assert.Same(t, factory, current)
+	registry.SetOverrideEnabled(true)
+	current, ok = registry.Generation().Get("source-digest")
+	require.True(t, ok)
+	assert.Same(t, override, current)
+}
 
 func TestRegistryOverrideTakesPrecedenceOverFactory(t *testing.T) {
 	registry := NewRegistry()

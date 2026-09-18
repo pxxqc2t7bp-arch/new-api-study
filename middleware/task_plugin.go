@@ -25,6 +25,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -346,6 +347,13 @@ func taskPluginRouteAllowsModel(pinned pluginruntime.PinnedRoute, modelName stri
 // through so the existing endpoint remains responsible for its validation.
 func PinTaskPluginEndpoint() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if subject, ok := common.GetContextKeyType[*hosttypes.AppRelaySubject](
+			c, hosttypes.AppRelaySubjectContextKey,
+		); ok && subject != nil &&
+			subject.ExecutionKind == model.AppExecutionModelKindNativeResponse {
+			c.Next()
+			return
+		}
 		generation := pluginruntime.DefaultRegistry.Generation()
 		if generation == nil {
 			c.Next()

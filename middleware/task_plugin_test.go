@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/service"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -1514,6 +1515,45 @@ func TestPrepareTaskPluginEndpointSurfacesDecodeHookMessage(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, recorder.Code)
 	assert.Contains(t, recorder.Body.String(), "model is required")
 	assert.NotContains(t, recorder.Body.String(), "Invalid task protocol request")
+}
+
+func TestPinTaskPluginEndpointBypassesNativeAppResponse(t *testing.T) {
+	const key = "native-overlap-pin-test"
+	_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+		key,
+		"1.0.0",
+		`["overlapping-model"]`,
+		"/v1/responses",
+		`return {model: ctx.model, action: "task"};`,
+	), jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(key)) })
+
+	router := gin.New()
+	router.POST(
+		"/v1/responses",
+		func(c *gin.Context) {
+			c.Set(hosttypes.AppRelaySubjectContextKey, &hosttypes.AppRelaySubject{
+				ExecutionKind: model.AppExecutionModelKindNativeResponse,
+			})
+			c.Next()
+		},
+		PinTaskPluginEndpoint(),
+		PrepareTaskPluginEndpoint(),
+		func(c *gin.Context) {
+			_, pinned := c.Get(jsplugin.ContextKeyPinnedEndpoint)
+			assert.False(t, pinned)
+			c.Status(http.StatusNoContent)
+		},
+	)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(`{"model":"overlapping-model","input":"hello","max_output_tokens":16}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, request)
+
+	assert.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
 }
 
 func TestPinTaskPluginEndpointRejectsUnsupportedRequestForms(t *testing.T) {

@@ -19,6 +19,10 @@ const (
 
 func OrdinaryRequestPolicy() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if _, exists := c.Get(hosttypes.AppRelaySubjectContextKey); exists {
+			c.Next()
+			return
+		}
 		routing, status, err := resolveRoutingStrategy(c)
 		if err != nil {
 			abortWithOpenAiMessage(c, status, err.Error(), requestPolicyErrorCode(status))

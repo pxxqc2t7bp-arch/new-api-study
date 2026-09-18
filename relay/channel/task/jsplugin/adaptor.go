@@ -123,6 +123,11 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 			return taskErr
 		}
 	}
+	if info.AppSubject != nil {
+		if err := service.PrepareAppTaskPassthrough(c, info); err != nil {
+			return service.TaskErrorWrapperLocal(fmt.Errorf("App passthrough validation failed"), "app_passthrough_invalid", http.StatusBadRequest)
+		}
+	}
 	request, hasRequest := c.Get("task_request")
 	hasUsageProfiles := len(a.plugin.Meta.UsageProfiles) > 0
 	if hasRequest && !hasUsageProfiles {
@@ -440,6 +445,21 @@ func encodeFilePlaceholder(placeholder map[string]any, form *multipart.Form, lim
 }
 
 func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, body io.Reader) (*http.Response, error) {
+	if info.AppSubject != nil {
+		if a.submit == nil || a.submit.Method != http.MethodPost ||
+			a.submit.URL != strings.TrimRight(info.ChannelBaseUrl, "/")+"/api/v3/contents/generations/tasks" {
+			return nil, fmt.Errorf("invalid App provider request")
+		}
+		if body == nil {
+			return nil, fmt.Errorf("invalid App provider assets")
+		}
+		outbound, err := io.ReadAll(io.LimitReader(body, 64*1024+1))
+		if err != nil || len(outbound) > 64*1024 ||
+			service.ValidateAppProviderAssetInputs(outbound, info.AppSubject.AssetInputs, time.Now()) != nil {
+			return nil, fmt.Errorf("invalid App provider assets")
+		}
+		body = bytes.NewReader(outbound)
+	}
 	wasStream := info.IsStream
 	info.IsStream = false
 	defer func() { info.IsStream = wasStream }()
@@ -601,18 +621,47 @@ func (a *TaskAdaptor) FetchBatchTasks(baseURL, key string, tasks []*model.Task, 
 }
 
 func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
+	return a.fetchTask(context.Background(), baseURL, key, task, proxy, false)
+}
+
+func (a *TaskAdaptor) TaskPluginIdentity() (string, string, string) {
+	return a.plugin.Meta.Key, a.plugin.Meta.Version, a.plugin.SourceSHA256()
+}
+
+func (a *TaskAdaptor) ValidateAppTaskUsage(facts map[string]any) (map[string]any, error) {
+	validated, err := a.validatedCompletionUsageFacts(facts, "")
+	if err != nil {
+		return nil, err
+	}
+	for key := range validated {
+		if _, declared := a.plugin.Meta.UsageSchema[key]; !declared {
+			delete(validated, key)
+		}
+	}
+	return validated, nil
+}
+
+func (a *TaskAdaptor) FetchTaskWithContext(runCtx context.Context, baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
+	return a.fetchTask(runCtx, baseURL, key, task, proxy, true)
+}
+
+func (a *TaskAdaptor) fetchTask(runCtx context.Context, baseURL, key string, task *model.Task, proxy string, readOnly bool) (*http.Response, error) {
 	ctx, err := a.queryContext(task, key, baseURL, proxy)
 	if err != nil {
 		return nil, err
 	}
-	value, err := a.plugin.Engine.Call(context.Background(), "buildQueryRequest", ctx)
+	value, err := a.plugin.Engine.Call(runCtx, "buildQueryRequest", ctx)
 	if err != nil {
 		return nil, err
 	}
-	return a.doFetchDescriptor(baseURL, proxy, value)
+	return a.doFetchDescriptorWithContext(runCtx, baseURL, proxy, value, readOnly)
 }
 
 func (a *TaskAdaptor) doFetchDescriptor(baseURL, proxy string, value any) (*http.Response, error) {
+	return a.doFetchDescriptorWithContext(context.Background(), baseURL, proxy, value, false)
+}
+
+func (a *TaskAdaptor) doFetchDescriptorWithContext(runCtx context.Context, baseURL, proxy string, value any, readOnly bool) (*http.Response, error) {
 	var descriptor requestDescriptor
 	if err := convert(value, &descriptor); err != nil {
 		return nil, err
@@ -636,7 +685,10 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, proxy string, value any) (*http
 	if method == "" {
 		method = http.MethodGet
 	}
-	req, err := http.NewRequest(method, descriptor.URL, requestBody)
+	if readOnly && (method != http.MethodGet || descriptor.Body != nil) {
+		return nil, fmt.Errorf("host task observation must use GET without a body")
+	}
+	req, err := http.NewRequestWithContext(runCtx, method, descriptor.URL, requestBody)
 	if err != nil {
 		return nil, err
 	}
@@ -646,6 +698,12 @@ func (a *TaskAdaptor) doFetchDescriptor(baseURL, proxy string, value any) (*http
 	client, err := service.GetHttpClientWithProxy(proxy)
 	if err != nil {
 		return nil, err
+	}
+	if readOnly {
+		// A redirect is not authority to observe another resource.
+		copyClient := *client
+		copyClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		client = &copyClient
 	}
 	started := time.Now()
 	resp, err := client.Do(req)
@@ -760,6 +818,14 @@ func (a *TaskAdaptor) ParseBatchResult(tasks []*model.Task, resp *http.Response,
 }
 
 func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, body []byte) (*relaycommon.TaskInfo, error) {
+	return a.parseTaskResult(context.Background(), task, resp, body, false)
+}
+
+func (a *TaskAdaptor) ParseTaskResultWithContext(runCtx context.Context, task *model.Task, resp *http.Response, body []byte) (*relaycommon.TaskInfo, error) {
+	return a.parseTaskResult(runCtx, task, resp, body, true)
+}
+
+func (a *TaskAdaptor) parseTaskResult(runCtx context.Context, task *model.Task, resp *http.Response, body []byte, strictUsage bool) (*relaycommon.TaskInfo, error) {
 	started := time.Now()
 	input := any(string(body))
 	var decoded any
@@ -774,7 +840,7 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 	if err != nil {
 		return nil, err
 	}
-	value, err := a.plugin.Engine.Call(context.Background(), "parseTaskResult", ctx, input, hookHTTPResponse(resp))
+	value, err := a.plugin.Engine.Call(runCtx, "parseTaskResult", ctx, input, hookHTTPResponse(resp))
 	if err != nil {
 		logger.LogDebug(context.Background(), "task_plugin subsystem=adaptor event=parse_task_failed plugin=%q reason=hook_failed body_bytes=%d elapsed_ms=%d", a.plugin.Meta.Key, len(body), time.Since(started).Milliseconds())
 		return nil, err
@@ -804,10 +870,18 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 	}
 	// The raw polling response only exists at this boundary. Capture upstream
 	// units here so the host settlement path can consume them from TaskInfo.
-	if a.hasHook(context.Background(), "extractUsageOnComplete") {
-		facts, hookErr := a.plugin.Engine.Call(context.Background(), "extractUsageOnComplete", ctx, jsonValue(result), input)
+	if a.hasHook(runCtx, "extractUsageOnComplete") {
+		facts, hookErr := a.plugin.Engine.Call(runCtx, "extractUsageOnComplete", ctx, jsonValue(result), input)
+		usageModel, _ := ctx["upstreamModel"].(string)
+		if strictUsage {
+			if hookErr != nil {
+				return nil, hookErr
+			}
+			if _, err := a.validatedCompletionUsageFacts(facts, usageModel); err != nil {
+				return nil, err
+			}
+		}
 		if hookErr == nil {
-			usageModel, _ := ctx["upstreamModel"].(string)
 			a.applyCompletionUsageFacts(result, facts, usageModel)
 		}
 	}
@@ -820,6 +894,9 @@ func (a *TaskAdaptor) ParseTaskResult(task *model.Task, resp *http.Response, bod
 		len(body),
 		time.Since(started).Milliseconds(),
 	)
+	if err := runCtx.Err(); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -892,14 +969,18 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(task *model.Task) ([]byte, error) {
 }
 
 func (a *TaskAdaptor) ListArtifacts(task *model.Task) ([]channel.TaskArtifact, error) {
-	if !a.hasHook(context.Background(), "listArtifacts") {
+	return a.ListArtifactsWithContext(context.Background(), task)
+}
+
+func (a *TaskAdaptor) ListArtifactsWithContext(runCtx context.Context, task *model.Task) ([]channel.TaskArtifact, error) {
+	if !a.hasHook(runCtx, "listArtifacts") {
 		return nil, nil
 	}
 	ctx, err := taskArtifactContext(task)
 	if err != nil {
 		return nil, err
 	}
-	value, err := a.plugin.Engine.Call(context.Background(), "listArtifacts", ctx)
+	value, err := a.plugin.Engine.Call(runCtx, "listArtifacts", ctx)
 	if err != nil {
 		return nil, fmt.Errorf("plugin artifact listing failed")
 	}
@@ -907,7 +988,11 @@ func (a *TaskAdaptor) ListArtifacts(task *model.Task) ([]channel.TaskArtifact, e
 }
 
 func (a *TaskAdaptor) BuildContentRequest(task *model.Task, artifactKey string, clientRequest channel.TaskArtifactClientRequest) (*channel.TaskContentRequest, error) {
-	if !a.hasHook(context.Background(), "buildContentRequest") {
+	return a.BuildContentRequestWithContext(context.Background(), task, artifactKey, clientRequest)
+}
+
+func (a *TaskAdaptor) BuildContentRequestWithContext(runCtx context.Context, task *model.Task, artifactKey string, clientRequest channel.TaskArtifactClientRequest) (*channel.TaskContentRequest, error) {
+	if !a.hasHook(runCtx, "buildContentRequest") {
 		return nil, nil
 	}
 	if a.info == nil {
@@ -934,7 +1019,7 @@ func (a *TaskAdaptor) BuildContentRequest(task *model.Task, artifactKey string, 
 	if a.plugin.Meta.Auth.Type == "" || a.plugin.Meta.Auth.Type == "none" || a.plugin.Meta.Auth.Type == "api_key" {
 		ctx["apiKey"] = a.info.ApiKey
 	}
-	value, err := a.plugin.Engine.Call(context.Background(), "buildContentRequest", ctx)
+	value, err := a.plugin.Engine.Call(runCtx, "buildContentRequest", ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -984,6 +1069,31 @@ func (a *TaskAdaptor) BuildContentRequest(task *model.Task, artifactKey string, 
 		Body:           body,
 		Credentialless: descriptor.Credentialless,
 	}, nil
+}
+
+func (a *TaskAdaptor) AppTaskArtifactsWithContext(runCtx context.Context, task *model.Task) ([]channel.TaskArtifact, map[string]string, error) {
+	artifacts, err := a.ListArtifactsWithContext(runCtx, task)
+	if err != nil {
+		return nil, nil, err
+	}
+	urls := make(map[string]string, len(artifacts))
+	for _, artifact := range artifacts {
+		descriptor, err := a.BuildContentRequestWithContext(runCtx, task, artifact.Key,
+			channel.TaskArtifactClientRequest{Method: http.MethodGet})
+		if err != nil {
+			return nil, nil, err
+		}
+		if descriptor == nil || !descriptor.Credentialless || descriptor.Method != http.MethodGet ||
+			len(descriptor.Headers) != 0 || len(descriptor.Body) != 0 || len(descriptor.URL) > 8192 {
+			return nil, nil, fmt.Errorf("unsupported host artifact descriptor")
+		}
+		parsed, err := url.Parse(descriptor.URL)
+		if err != nil || parsed.User != nil || parsed.Fragment != "" {
+			return nil, nil, fmt.Errorf("invalid host artifact descriptor")
+		}
+		urls[artifact.Key] = descriptor.URL
+	}
+	return artifacts, urls, nil
 }
 
 func taskArtifactContext(task *model.Task) (map[string]any, error) {

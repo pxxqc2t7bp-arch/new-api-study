@@ -13,6 +13,8 @@ import (
 
 func registerAppPluginRoutes(apiRouter *gin.RouterGroup) {
 	apiRouter.GET("/app_plugins", normalizeAppPluginAuthErrors(), middleware.UserAuth(), controller.ListAppPlugins)
+	apiRouter.GET("/app_plugins/:key/launch-context", appPluginNoStore(), normalizeAppPluginAuthErrors(),
+		middleware.UserAuth(), controller.GetAppPluginLaunchContext)
 	apiRouter.POST("/app_plugins/:key/authorize", appPluginNoStore(), normalizeAppPluginAuthErrors(),
 		middleware.CriticalRateLimit(), middleware.UserAuth(), middleware.UserCriticalRateLimit("app-plugin-authorize"), controller.AuthorizeAppPlugin)
 
@@ -36,6 +38,10 @@ func registerAppPluginRoutes(apiRouter *gin.RouterGroup) {
 	internal.POST("/launch-codes/exchange", controller.ExchangeAppPluginLaunchCode)
 	internal.POST("/sessions/introspect", controller.IntrospectAppPluginSession)
 	internal.POST("/sessions/revoke", controller.RevokeAppPluginSession)
+	internal.POST("/execution-grants", controller.IssueAppExecutionGrant)
+	internal.POST("/tasks/lookup", controller.LookupAppTask)
+	internal.POST("/tasks/cancel", controller.CancelAppTask)
+	internal.POST("/imports/ark-task-lookup", controller.LookupAppArkImport)
 }
 
 func appPluginNoStore() gin.HandlerFunc {
@@ -52,6 +58,7 @@ func appPluginAPIErrorBoundary() gin.HandlerFunc {
 		// Match registered routes, not prefixes that could include other APIs.
 		switch c.Request.Method + " " + c.FullPath() {
 		case "GET /api/app_plugins",
+			"GET /api/app_plugins/:key/launch-context",
 			"GET /api/app_plugins/installations",
 			"POST /api/app_plugins/installations",
 			"PATCH /api/app_plugins/installations",
@@ -61,7 +68,11 @@ func appPluginAPIErrorBoundary() gin.HandlerFunc {
 			"DELETE /api/app_plugins/installations/:id/service-credentials/:credential_id",
 			"POST /internal/apps/v1/launch-codes/exchange",
 			"POST /internal/apps/v1/sessions/introspect",
-			"POST /internal/apps/v1/sessions/revoke":
+			"POST /internal/apps/v1/sessions/revoke",
+			"POST /internal/apps/v1/execution-grants",
+			"POST /internal/apps/v1/tasks/lookup",
+			"POST /internal/apps/v1/tasks/cancel",
+			"POST /internal/apps/v1/imports/ark-task-lookup":
 			normalize(c)
 		default:
 			c.Next()

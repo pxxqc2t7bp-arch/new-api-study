@@ -582,7 +582,11 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	service.MarkStreamRecoverySubmissionStarted(c)
 	resp, err := relayClient.Do(req)
 	if err != nil {
-		logger.LogError(c, "do request failed: "+err.Error())
+		if info.AppSubject != nil {
+			logger.LogError(c, "App provider submission outcome unknown")
+		} else {
+			logger.LogError(c, "do request failed: "+err.Error())
+		}
 		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
 	}
 	if resp == nil {
@@ -631,6 +635,13 @@ func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, req
 	err = a.BuildRequestHeader(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
+	}
+	if info.AppSubject != nil {
+		// A durable App claim permits one logical send. Do not let a transport
+		// treat client idempotency headers as permission to replay the POST.
+		req.GetBody = nil
+		req.Header.Del("Idempotency-Key")
+		req.Header.Del("X-Idempotency-Key")
 	}
 	resp, err := doRequest(c, req, info)
 	if err != nil {

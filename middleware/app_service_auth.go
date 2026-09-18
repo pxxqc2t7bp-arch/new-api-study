@@ -24,19 +24,33 @@ func AppServiceAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 		c.Header("Referrer-Policy", "no-referrer")
-		if !operation_setting.AppPluginV1Enabled {
-			writeAppServiceAuthError(c, http.StatusForbidden, "app_plugin_disabled")
-			return
-		}
-		allowed := false
+		var required []string
 		if c.Request.Method == http.MethodPost {
 			switch c.Request.URL.Path {
 			case "/internal/apps/v1/launch-codes/exchange", "/internal/apps/v1/sessions/introspect", "/internal/apps/v1/sessions/revoke":
-				allowed = c.FullPath() == c.Request.URL.Path
+				required = []string{"identity.read"}
+			case "/internal/apps/v1/execution-grants":
+				required = []string{"model.invoke"}
+			case "/internal/apps/v1/tasks/lookup":
+				required = []string{"task.read"}
+			case "/internal/apps/v1/tasks/cancel":
+				required = []string{"task.read", "model.invoke"}
+			case "/internal/apps/v1/imports/ark-task-lookup":
+				required = []string{"task.import"}
 			}
 		}
-		if !allowed {
+		if len(required) == 0 || c.FullPath() != c.Request.URL.Path {
 			writeAppServiceAuthError(c, http.StatusForbidden, "forbidden")
+			return
+		}
+		// A rollout stop must retain authenticated Task facts and allow session
+		// invalidation. These exact routes still perform all current-authority
+		// checks below and in their services.
+		retained := c.Request.URL.Path == "/internal/apps/v1/tasks/lookup" ||
+			c.Request.URL.Path == "/internal/apps/v1/sessions/introspect" ||
+			c.Request.URL.Path == "/internal/apps/v1/sessions/revoke"
+		if !operation_setting.AppPluginV1Enabled && !retained {
+			writeAppServiceAuthError(c, http.StatusForbidden, "app_plugin_disabled")
 			return
 		}
 		headers := c.Request.Header.Values("Authorization")
@@ -54,9 +68,11 @@ func AppServiceAuth() gin.HandlerFunc {
 			writeAppServiceAuthError(c, http.StatusUnauthorized, "service_identity_invalid")
 			return
 		}
-		if !slices.Contains(identity.Scopes, "identity.read") {
-			writeAppServiceAuthError(c, http.StatusForbidden, "scope_denied")
-			return
+		for _, scope := range required {
+			if !slices.Contains(identity.Scopes, scope) {
+				writeAppServiceAuthError(c, http.StatusForbidden, "scope_denied")
+				return
+			}
 		}
 		c.Set(appServiceIdentityKey, identity)
 		c.Next()

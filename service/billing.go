@@ -37,6 +37,12 @@ func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycom
 			types.ErrOptionWithSkipRetry(),
 		)
 	}
+	if relayInfo != nil && relayInfo.AppSubject != nil {
+		relayInfo.Billing = &AppBillingSession{
+			service: NewAppExecutionService(model.DB, ConfiguredAppPluginAuthOptions()), info: relayInfo,
+		}
+		return nil
+	}
 	streamID := common.GetContextKeyString(c, constant.ContextKeyStreamRecoveryID)
 	if streamID != "" {
 		execution, shouldReserve, err := beginStreamBillingReservation(streamID)

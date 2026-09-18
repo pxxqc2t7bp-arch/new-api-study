@@ -42,7 +42,7 @@ func openAppCredentialTestDB(t *testing.T) *gorm.DB {
 		require.NoError(t, parseErr)
 		admin, openErr := gorm.Open(mysql.Open(dsn), config)
 		require.NoError(t, openErr)
-		require.NoError(t, admin.Exec("CREATE DATABASE `"+name+"`").Error)
+		require.NoError(t, admin.Exec("CREATE DATABASE `"+name+"` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci").Error)
 		t.Cleanup(func() {
 			assert.NoError(t, admin.Exec("DROP DATABASE `"+name+"`").Error)
 			conn, err := admin.DB()

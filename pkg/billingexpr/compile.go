@@ -2,6 +2,7 @@ package billingexpr
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"strings"
 	"sync"
@@ -300,24 +301,11 @@ func UsedVarsByHash(exprStr, hash string) map[string]bool {
 	if exprStr == "" {
 		return nil
 	}
-	cacheMu.RLock()
-	if entry, ok := cache[hash]; ok {
-		cacheMu.RUnlock()
-		return entry.usedVars
-	}
-	cacheMu.RUnlock()
-
-	// Compile (and cache) to populate usedVars
-	if _, err := compileFromCacheByHash(exprStr, hash); err != nil {
+	entry, err := compileEntryFromCacheByHash(exprStr, hash)
+	if err != nil {
 		return nil
 	}
-	cacheMu.RLock()
-	entry, ok := cache[hash]
-	cacheMu.RUnlock()
-	if ok {
-		return entry.usedVars
-	}
-	return nil
+	return maps.Clone(entry.usedVars)
 }
 
 // UsedUsageKeys returns literal keys referenced by u("...") calls. Calls with
@@ -328,23 +316,11 @@ func UsedUsageKeys(exprStr string) map[string]bool {
 		return nil
 	}
 	hash := ExprHashString(exprStr)
-	cacheMu.RLock()
-	if entry, ok := cache[hash]; ok {
-		cacheMu.RUnlock()
-		return entry.usedUsageKeys
-	}
-	cacheMu.RUnlock()
-
-	if _, err := compileFromCacheByHash(exprStr, hash); err != nil {
+	entry, err := compileEntryFromCacheByHash(exprStr, hash)
+	if err != nil {
 		return nil
 	}
-	cacheMu.RLock()
-	entry, ok := cache[hash]
-	cacheMu.RUnlock()
-	if ok {
-		return entry.usedUsageKeys
-	}
-	return nil
+	return maps.Clone(entry.usedUsageKeys)
 }
 
 // InvalidateCache clears the compiled-expression cache.

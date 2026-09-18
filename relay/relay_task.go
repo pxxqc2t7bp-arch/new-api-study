@@ -29,6 +29,7 @@ import (
 )
 
 type TaskSubmitResult struct {
+	AppExecution    *model.AppTaskExecution
 	UpstreamTaskID  string
 	TaskData        []byte
 	ClientResponse  any
@@ -246,6 +247,9 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		if err := helper.ModelMappedHelper(c, info, nil); err != nil {
 			return nil, service.TaskErrorWrapperLocal(err, "model_mapping_failed", http.StatusBadRequest)
 		}
+	}
+	if info.AppSubject != nil {
+		return submitAppTask(c, info, adaptor, platform)
 	}
 
 	// 4. 价格计算：基础模型价格
@@ -719,24 +723,37 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 	if taskId == "" {
 		taskId = c.GetString("task_id")
 	}
-	userId := c.GetInt("id")
-
-	originTask, exist, err := model.GetByTaskId(userId, taskId)
-	if err != nil {
-		taskResp = service.TaskErrorWrapper(err, "get_task_failed", http.StatusInternalServerError)
-		return
+	var err error
+	var originTask *model.Task
+	value, appRequest := c.Get(types.AppTaskRetrievalContextKey)
+	appRetrieval, appRequest := value.(*service.AppTaskRetrieval)
+	if appRequest {
+		if appRetrieval == nil || appRetrieval.Task.TaskID != taskId {
+			taskResp = service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "not_found", http.StatusNotFound)
+			return
+		}
+		originTask = &appRetrieval.Task
+	} else {
+		var exist bool
+		originTask, exist, err = model.GetByTaskId(c.GetInt("id"), taskId)
+		if err != nil {
+			taskResp = service.TaskErrorWrapper(err, "get_task_failed", http.StatusInternalServerError)
+			return
+		}
+		if !exist {
+			taskResp = service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusBadRequest)
+			return
+		}
 	}
-	if !exist {
-		taskResp = service.TaskErrorWrapperLocal(errors.New("task_not_exist"), "task_not_exist", http.StatusBadRequest)
-		return
-	}
 
-	isOpenAIVideoAPI := strings.HasPrefix(c.Request.RequestURI, "/v1/videos/")
+	isOpenAIVideoAPI := strings.HasPrefix(c.Request.URL.Path, "/v1/videos/")
 
 	// Gemini/Vertex 支持实时查询：用户 fetch 时直接从上游拉取最新状态
-	if realtimeResp := tryRealtimeFetch(originTask, isOpenAIVideoAPI); len(realtimeResp) > 0 {
-		respBody = realtimeResp
-		return
+	if !appRequest {
+		if realtimeResp := tryRealtimeFetch(originTask, isOpenAIVideoAPI); len(realtimeResp) > 0 {
+			respBody = realtimeResp
+			return
+		}
 	}
 
 	// OpenAI Video API 格式: 走各 adaptor 的 ConvertToOpenAIVideo
@@ -745,6 +762,21 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 		if adaptor == nil {
 			taskResp = service.TaskErrorWrapperLocal(fmt.Errorf("invalid channel id: %d", originTask.ChannelId), "invalid_channel_id", http.StatusBadRequest)
 			return
+		}
+		if appRequest {
+			identity, ok := adaptor.(interface {
+				TaskPluginIdentity() (key, version, sourceSHA256 string)
+			})
+			if !ok {
+				taskResp = service.TaskErrorWrapperLocal(errors.New("task plugin identity unavailable"), "service_unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			key, version, digest := identity.TaskPluginIdentity()
+			if key != appRetrieval.Execution.PluginKey || version != appRetrieval.Execution.PluginVersion ||
+				digest != appRetrieval.Execution.PluginSHA256 {
+				taskResp = service.TaskErrorWrapperLocal(errors.New("task plugin identity changed"), "service_unavailable", http.StatusServiceUnavailable)
+				return
+			}
 		}
 		if converter, ok := adaptor.(channel.OpenAIVideoConverter); ok {
 			openAIVideoData, err := converter.ConvertToOpenAIVideo(originTask)

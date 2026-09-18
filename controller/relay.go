@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +28,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/samber/lo"
@@ -755,6 +757,22 @@ func RelayNotFound(c *gin.Context) {
 // existing handler while claimed requests enter the generation-pinned
 // host-owned protocol bridge.
 func RelayTaskPluginEndpoint(c *gin.Context, fallback gin.HandlerFunc) {
+	relayTaskPluginEndpointWith(c, fallback, func(
+		ctx context.Context, subject hosttypes.AppRelaySubject, raw []byte,
+	) (service.AppResponseExecutionResult, error) {
+		return service.NewAppExecutionService(
+			model.DB, service.ConfiguredAppPluginAuthOptions(),
+		).ExecuteAppResponse(ctx, subject, raw)
+	})
+}
+
+func relayTaskPluginEndpointWith(c *gin.Context, fallback gin.HandlerFunc, execute appResponseExecuteFunc) {
+	if subject, ok := common.GetContextKeyType[*hosttypes.AppRelaySubject](
+		c, hosttypes.AppRelaySubjectContextKey,
+	); ok && subject != nil && subject.ExecutionKind == model.AppExecutionModelKindNativeResponse {
+		relayAppNativeResponse(c, subject, execute)
+		return
+	}
 	pinnedValue, exists := c.Get(pluginruntime.ContextKeyPinnedEndpoint)
 	if !exists {
 		fallback(c)
@@ -779,6 +797,12 @@ func RelayTaskPluginEndpoint(c *gin.Context, fallback gin.HandlerFunc) {
 }
 
 func RelayTaskFetch(c *gin.Context) {
+	if middleware.IsAppGrantTaskRetrieval(c) {
+		if taskErr := relay.RelayTaskFetch(c, relayconstant.RelayModeVideoFetchByID); taskErr != nil {
+			respondTaskError(c, taskErr)
+		}
+		return
+	}
 	relayInfo, err := relaycommon.GenRelayInfo(c, types.RelayFormatTask, nil, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, &taskdto.TaskError{
@@ -860,6 +884,9 @@ func executeTaskSubmissionWith(
 	relayInfo *relaycommon.RelayInfo,
 	submit taskSubmitAttempt,
 ) (*taskSubmissionOutcome, *taskdto.TaskError) {
+	if relayInfo.AppSubject != nil {
+		return executeAppTaskSubmission(c, relayInfo, submit)
+	}
 	diagnostics := newTaskPluginSubmitDiagnostics(c)
 	diagnostics.start(relayInfo)
 	var result *relay.TaskSubmitResult

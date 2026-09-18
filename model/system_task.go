@@ -6,6 +6,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type SystemTaskStatus string
@@ -28,6 +29,7 @@ const (
 	SystemTaskTypeUpstreamReconcile       = "upstream_reconcile"
 	SystemTaskTypeUpstreamDaily           = "upstream_daily"
 	SystemTaskTypeStreamRecoveryReconcile = "stream_recovery_reconcile"
+	SystemTaskTypeAppTaskReconcile        = "app_task_reconcile"
 )
 
 var ErrSystemTaskLockLost = errors.New("system task lock lost")
@@ -123,6 +125,28 @@ func CreateSystemTask(taskType string, payload any, state any) (*SystemTask, err
 		return nil, err
 	}
 	return task, nil
+}
+
+// EnsureSystemTaskTx coalesces the wakeup inside the caller's primary-DB
+// transaction. Per-execution reconciliation rows remain the durable queue.
+func EnsureSystemTaskTx(tx *gorm.DB, taskType string) error {
+	taskID, err := GenerateSystemTaskID()
+	if err != nil {
+		return err
+	}
+	task := SystemTask{TaskID: taskID, Type: taskType, Status: SystemTaskStatusPending, ActiveKey: &taskType}
+	if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "active_key"}}, DoNothing: true}).
+		Create(&task).Error; err != nil {
+		return err
+	}
+	var current SystemTask
+	if err := lockForUpdate(tx).Where("active_key = ?", taskType).First(&current).Error; err != nil {
+		return err
+	}
+	if current.Type != taskType || (current.Status != SystemTaskStatusPending && current.Status != SystemTaskStatusRunning) {
+		return errors.New("invalid_system_task")
+	}
+	return nil
 }
 
 func GetSystemTaskByTaskID(taskID string) (*SystemTask, error) {

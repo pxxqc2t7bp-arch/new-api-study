@@ -10,7 +10,15 @@ import (
 // expression version. This is the central dispatch point for future versions
 // that may use a different conversion formula.
 func quotaConversion(exprOutput float64, snap *BillingSnapshot) float64 {
-	if snap.TaskUsageBilling {
+	basis := snap.BillingBasis
+	if basis == "" {
+		if snap.TaskUsageBilling {
+			basis = BillingBasisTask
+		} else {
+			basis = BillingBasisToken
+		}
+	}
+	if basis == BillingBasisRequest || basis == BillingBasisTask {
 		return exprOutput * snap.QuotaPerUnit
 	}
 	switch snap.ExprVersion {
@@ -26,8 +34,15 @@ func ComputeTieredQuota(snap *BillingSnapshot, params TokenParams) (TieredResult
 }
 
 func ComputeTieredQuotaWithRequest(snap *BillingSnapshot, params TokenParams, request RequestInput) (TieredResult, error) {
-	if snap.TaskUsageBilling && UsesFixedPricingByHash(snap.ExprString, snap.ExprHash) {
+	basis := snap.BillingBasis
+	if basis == "" && snap.TaskUsageBilling {
+		basis = BillingBasisTask
+	}
+	if basis == BillingBasisTask && UsesFixedPricingByHash(snap.ExprString, snap.ExprHash) {
 		return TieredResult{}, fmt.Errorf("fixed pricing is not supported for task usage expressions")
+	}
+	if request.EvaluatedAtUnix == 0 {
+		request.EvaluatedAtUnix = snap.PricingTimeUnix
 	}
 	cost, trace, err := RunExprByHashWithRequest(snap.ExprString, snap.ExprHash, params, request)
 	if err != nil {

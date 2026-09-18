@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -33,6 +34,19 @@ type ModelRequest struct {
 
 func Distribute() func(c *gin.Context) {
 	return func(c *gin.Context) {
+		if _, exists := c.Get(hosttypes.AppTaskRetrievalContextKey); exists {
+			c.Next()
+			return
+		}
+		if value, exists := c.Get(hosttypes.AppRelaySubjectContextKey); exists {
+			subject, ok := value.(*hosttypes.AppRelaySubject)
+			if !ok || subject == nil {
+				writeAppServiceAuthError(c, http.StatusUnauthorized, "invalid_grant")
+				return
+			}
+			distributeAppRelay(c, subject)
+			return
+		}
 		var channel *model.Channel
 		constraints := service.GetChannelConstraints(c)
 		constraints.AddFilter(taskdto.ChannelFilter{

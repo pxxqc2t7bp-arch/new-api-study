@@ -111,6 +111,15 @@ func ListAppPlugins(c *gin.Context) {
 		if !appPluginUserPolicyAllows(installation.AllowedUserPolicy, userGroup) {
 			continue
 		}
+		surfaces := make([]string, 0, len(installation.EnabledSurfaces))
+		for _, surface := range installation.EnabledSurfaces {
+			if appPluginEntryAllowed(installation.AppKey, surface) {
+				surfaces = append(surfaces, surface)
+			}
+		}
+		if len(surfaces) == 0 {
+			continue
+		}
 		var version model.AppVersion
 		if err := model.DB.WithContext(c.Request.Context()).
 			Where("id = ?", installation.AppVersionID).
@@ -124,7 +133,7 @@ func ListAppPlugins(c *gin.Context) {
 			return
 		}
 		directURL := ""
-		if slices.Contains(installation.EnabledSurfaces, "direct") {
+		if slices.Contains(surfaces, "direct") {
 			var err error
 			directURL, err = appPluginEndpoint(installation.BaseURL, manifest.Surfaces.Direct.StartPath)
 			if err != nil {
@@ -136,7 +145,7 @@ func ListAppPlugins(c *gin.Context) {
 			Key:             installation.AppKey,
 			Name:            manifest.Name,
 			Version:         installation.ManifestVersion,
-			EnabledSurfaces: appPluginStrings(installation.EnabledSurfaces),
+			EnabledSurfaces: surfaces,
 			DashboardPath:   "/apps/" + installation.AppKey,
 			DirectURL:       directURL,
 			GrantedScopes:   appPluginStrings(manifest.RequestedScopes),
@@ -868,6 +877,14 @@ func appPluginFeatureEnabled(c *gin.Context) bool {
 	return false
 }
 
+// Entry gates stop new work without changing existing Task/session records.
+// Installation, user and surface authorization remain separate service checks.
+func appPluginEntryAllowed(appKey, surface string) bool {
+	return operation_setting.AppPluginV1Enabled &&
+		(appKey != "seedance-repro" || operation_setting.AppPluginSeedanceEnabled) &&
+		(surface != "embedded" || operation_setting.AppPluginEmbeddedSurfaceEnabled)
+}
+
 func writeAppPluginRequestError(c *gin.Context, err error) {
 	var apiErr *appPluginAPIError
 	if errors.As(err, &apiErr) {
@@ -943,6 +960,8 @@ func writeAppPluginError(c *gin.Context, status int, code, fieldPath string) {
 		"identity_not_configured":         "App identity is not configured",
 		"service_identity_invalid":        "App service identity is invalid",
 		"scope_denied":                    "App permission denied",
+		"model_policy_denied":             "Model policy denied",
+		"price_version_unavailable":       "Model pricing is unavailable",
 		"launch_code_expired":             "Launch code expired",
 		"launch_code_replayed":            "Launch code already consumed",
 		"state_mismatch":                  "Launch state does not match",
@@ -1116,8 +1135,40 @@ func AuthorizeAppPlugin(c *gin.Context) {
 	if !decodeAppPluginAuthObject(c, []string{"surface", "transaction_id", "state", "code_challenge", "code_challenge_method", "nonce"}, &request) {
 		return
 	}
+	if !appPluginEntryAllowed(c.Param("key"), request.Surface) {
+		writeAppPluginError(c, http.StatusForbidden, "app_plugin_disabled", "")
+		return
+	}
 	result, err := service.NewAppPluginAuthService(model.DB, service.ConfiguredAppPluginAuthOptions()).
 		Authorize(c.Request.Context(), identity, c.Param("key"), c.GetHeader("Origin"), c.GetHeader("Idempotency-Key"), request)
+	if err != nil {
+		writeAppPluginServiceError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}
+
+func GetAppPluginLaunchContext(c *gin.Context) {
+	appPluginSensitiveResponse(c)
+	if !appPluginFeatureEnabled(c) {
+		return
+	}
+	identity, ok := middleware.GetSessionAuthIdentity(c)
+	if !ok {
+		writeAppPluginError(c, http.StatusUnauthorized, "unauthenticated", "")
+		return
+	}
+	query, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil || len(query) != 1 || len(query["surface"]) != 1 {
+		writeAppPluginError(c, http.StatusBadRequest, "invalid_request", "")
+		return
+	}
+	if !appPluginEntryAllowed(c.Param("key"), query.Get("surface")) {
+		writeAppPluginError(c, http.StatusForbidden, "app_plugin_disabled", "")
+		return
+	}
+	result, err := service.NewAppPluginAuthService(model.DB, service.ConfiguredAppPluginAuthOptions()).
+		LaunchContext(c.Request.Context(), identity, c.Param("key"), query.Get("surface"))
 	if err != nil {
 		writeAppPluginServiceError(c, err)
 		return
@@ -1159,6 +1210,10 @@ func IntrospectAppPluginSession(c *gin.Context) {
 	if err != nil {
 		writeAppPluginServiceError(c, err)
 		return
+	}
+	if result.Active && result.ModelPolicyVersion > 0 && operation_setting.AppExecutionGrantsEnabled &&
+		appPluginEntryAllowed(request.AppKey, "") {
+		c.Header("X-App-Model-Policy-Version", strconv.FormatInt(result.ModelPolicyVersion, 10))
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
 }

@@ -82,6 +82,7 @@ type TokenCountMeta struct {
 }
 
 type RelayInfo struct {
+	AppSubject        *hosttypes.AppRelaySubject
 	TokenId           int
 	TokenKey          string
 	TokenGroup        string
@@ -658,6 +659,13 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 
 	if info.RelayMode == relayconstant.RelayModeUnknown {
 		info.RelayMode = c.GetInt("relay_mode")
+	}
+	if subject, ok := common.GetContextKeyType[*hosttypes.AppRelaySubject](c, hosttypes.AppRelaySubjectContextKey); ok {
+		info.AppSubject = subject
+		info.UserId = subject.UserID
+		info.TokenId, info.TokenKey, info.TokenGroup = 0, "", ""
+		info.TokenUnlimited = false
+		info.RequestHeaders = nil
 	}
 
 	if strings.HasPrefix(c.Request.URL.Path, "/pg") {

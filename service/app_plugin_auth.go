@@ -122,6 +122,76 @@ type AppPluginIntrospectResult struct {
 	Entitlements       model.AppJSONMap `json:"entitlements"`
 	EntitlementVersion string           `json:"entitlement_version"`
 	CheckedAt          time.Time        `json:"checked_at"`
+	ModelPolicyVersion int64            `json:"-"`
+}
+
+type AppPluginLaunchContext struct {
+	AppKey   string `json:"app_key"`
+	Surface  string `json:"surface"`
+	StartURL string `json:"start_url"`
+	Origin   string `json:"origin"`
+}
+
+func (s *AppPluginAuthService) LaunchContext(ctx context.Context, identity AuthIdentity, appKey, surface string) (AppPluginLaunchContext, error) {
+	if !appControlOpaque(appKey, 128) || (surface != "direct" && surface != "embedded") {
+		return AppPluginLaunchContext{}, appAuthError("invalid_request")
+	}
+	var result AppPluginLaunchContext
+	err := model.RunAppPluginTransaction(s.db.WithContext(ctx), func(tx *gorm.DB) error {
+		result = AppPluginLaunchContext{}
+		installation, err := model.LockAppPluginInstallation(tx, appKey, "")
+		if err != nil {
+			return err
+		}
+		if installation.AppKey != appKey {
+			return appAuthError("not_found")
+		}
+		user, dashboard, err := AppPluginDashboardIdentity(tx, identity, s.options.Now())
+		if err != nil {
+			return err
+		}
+		if dashboard.SID != identity.SessionID {
+			return appAuthError("unauthenticated")
+		}
+		if installation.Status != model.AppInstallationStatusEnabled {
+			return appAuthError("app_plugin_disabled")
+		}
+		if len(installation.AllowedUserPolicy.Groups) != 0 && !slices.Contains(installation.AllowedUserPolicy.Groups, user.Group) {
+			return appAuthError("not_found")
+		}
+		manifest, _, err := ValidateAppPluginRegistration(tx, installation)
+		if err != nil {
+			return err
+		}
+		if !slices.Contains(installation.EnabledSurfaces, surface) {
+			return appAuthError("forbidden")
+		}
+		startPath := manifest.Surfaces.Direct.StartPath
+		if surface == "embedded" {
+			parent, err := url.Parse(s.options.Issuer)
+			if err != nil || !AppPluginTrustedOrigin(s.options.Issuer, "https://"+parent.Host) ||
+				!slices.Contains(installation.AllowedParentOrigins, "https://"+parent.Host) ||
+				!AppPluginSameSiteHTTPS(installation.BaseURL, "https://"+parent.Host) {
+				return appAuthError("forbidden")
+			}
+			startPath = manifest.Surfaces.Embedded.StartPath
+		}
+		endpoint := absoluteManifestEndpoint(installation.BaseURL, startPath)
+		var claim model.AppRouteClaim
+		if err := model.AppPluginCurrentRead(tx).Where("installation_id = ? AND kind = ?", installation.InstallationID, surface).First(&claim).Error; err != nil {
+			return appAuthError("not_found")
+		}
+		if claim.AppKey != appKey || claim.InstallationID != installation.InstallationID || claim.AbsoluteEndpoint != endpoint {
+			return appAuthError("not_found")
+		}
+		target, err := url.Parse(endpoint)
+		if err != nil {
+			return appAuthError("service_unavailable")
+		}
+		result = AppPluginLaunchContext{AppKey: appKey, Surface: surface, StartURL: endpoint, Origin: target.Scheme + "://" + target.Host}
+		return nil
+	})
+	return result, err
 }
 
 type AppPluginSessionRevokeRequest struct {
@@ -562,6 +632,11 @@ func (s *AppPluginAuthService) Introspect(ctx context.Context, service model.App
 			request.AppSessionID, service.InstallationID, request.AppKey, request.Subject).First(&session).Error; err != nil {
 			return appAuthError("not_found")
 		}
+		if session.AppSessionID != request.AppSessionID || session.Subject != request.Subject ||
+			session.AppKey != request.AppKey || session.InstallationID != service.InstallationID ||
+			installation.AppKey != service.AppKey || installation.InstallationID != service.InstallationID {
+			return appAuthError("not_found")
+		}
 		result.AppStatus = installation.Status
 		result.AuthVersion, result.SessionVersion = session.AuthVersion, session.SessionVersion
 		if installation.Status == model.AppInstallationStatusRevoked {
@@ -585,6 +660,9 @@ func (s *AppPluginAuthService) Introspect(ctx context.Context, service model.App
 				return identityErr
 			}
 			result.Reason = authErr.Code
+			return nil
+		}
+		if dashboard.SID != session.DashboardSessionID || dashboard.UserID != session.UserID || user.Id != session.UserID {
 			return nil
 		}
 		if session.RevokedAt != 0 || session.UpstreamExpiresAt <= now.Unix() ||
@@ -626,6 +704,22 @@ func (s *AppPluginAuthService) Introspect(ctx context.Context, service model.App
 					result.Reason = "scope_denied"
 					return nil
 				}
+			}
+		}
+		if installation.Status == model.AppInstallationStatusEnabled && slices.Contains(result.GrantedScopes, "model.invoke") {
+			// Distinguish an unconfigured head from a dangling/corrupt version.
+			var head model.Option
+			q := model.AppPluginCurrentRead(tx).Where(map[string]any{"key": model.AppModelInvokePolicyKey}).Limit(1).Find(&head)
+			if q.Error != nil {
+				return q.Error
+			}
+			if q.RowsAffected != 0 {
+				policy, err := model.GetAppExecutionPolicyTx(tx, model.AppModelInvokePolicyKey)
+				var document AppModelInvokePolicy
+				if err != nil || decodeAppExecutionJSON([]byte(policy.CanonicalJSON), &document) != nil {
+					return appAuthError("service_unavailable")
+				}
+				result.ModelPolicyVersion = policy.Version
 			}
 		}
 		result.Active = true

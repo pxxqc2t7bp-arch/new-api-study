@@ -147,6 +147,11 @@ func main() {
 		}
 		return a
 	}
+	service.AppTaskAdaptorFactory = func(key string) service.AppTaskPollingAdaptor {
+		adaptor := relay.GetTaskAdaptor(constant.TaskPlatform(key))
+		host, _ := adaptor.(service.AppTaskPollingAdaptor)
+		return host
+	}
 
 	// Register the periodic channel test, upstream model update, and async task
 	// polling (Midjourney / Suno / video) jobs as scheduled system tasks
