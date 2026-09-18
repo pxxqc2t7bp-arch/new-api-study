@@ -358,7 +358,7 @@ func applyDeferredTaskResult(task *model.Task, result *relay.TaskSubmitResult) {
 }
 
 func deferredTaskErrorRetryable(taskErr *taskdto.TaskError) bool {
-	if taskErr == nil {
+	if taskErr == nil || taskErr.NoRetry {
 		return false
 	}
 	return taskErr.StatusCode == http.StatusRequestTimeout ||

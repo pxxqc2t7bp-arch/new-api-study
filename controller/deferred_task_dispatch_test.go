@@ -11,6 +11,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -142,6 +143,22 @@ func TestApplyDeferredTaskResultPersistsPluginState(t *testing.T) {
 
 	assert.JSONEq(t, `{"round":"submitted"}`, string(task.PrivateData.PluginState))
 	assert.Nil(t, task.PrivateData.DeferredRequest)
+}
+
+func TestDeferredTaskErrorRetryable(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		taskErr  *dto.TaskError
+		expected bool
+	}{
+		{"accepted stream 502", &dto.TaskError{StatusCode: http.StatusBadGateway, NoRetry: true}, false},
+		{"ordinary 502", &dto.TaskError{StatusCode: http.StatusBadGateway}, true},
+		{"ordinary 400", &dto.TaskError{StatusCode: http.StatusBadRequest}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, deferredTaskErrorRetryable(tc.taskErr))
+		})
+	}
 }
 
 func TestDeferredSubmissionPersistsBeforeCallingUpstream(t *testing.T) {
