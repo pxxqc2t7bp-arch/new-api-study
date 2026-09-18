@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	channelconstant "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
@@ -326,6 +327,68 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 }
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
+	input := bytes.TrimSpace(request.Input)
+	if len(input) == 0 || input[0] != '[' {
+		return request, nil
+	}
+
+	var items []json.RawMessage
+	if err := common.Unmarshal(request.Input, &items); err != nil {
+		return nil, fmt.Errorf("failed to parse Volcengine Responses input: %w", err)
+	}
+
+	changed := false
+	for index, rawItem := range items {
+		itemJSON := bytes.TrimSpace(rawItem)
+		if len(itemJSON) == 0 || itemJSON[0] != '{' {
+			continue
+		}
+
+		var item map[string]json.RawMessage
+		if err := common.Unmarshal(rawItem, &item); err != nil {
+			return nil, fmt.Errorf("failed to parse Volcengine Responses input item %d: %w", index, err)
+		}
+
+		itemChanged := false
+		if _, hasType := item["type"]; !hasType {
+			var role string
+			if roleJSON, hasRole := item["role"]; hasRole {
+				_ = common.Unmarshal(roleJSON, &role)
+			}
+			if role != "" {
+				item["type"] = json.RawMessage(`"message"`)
+				itemChanged = true
+				changed = true
+			}
+		}
+
+		var itemType string
+		if typeJSON, hasType := item["type"]; hasType {
+			_ = common.Unmarshal(typeJSON, &itemType)
+		}
+		if (itemType == "function_call" || itemType == "function_call_output") && item["status"] == nil {
+			item["status"] = json.RawMessage(`"completed"`)
+			itemChanged = true
+			changed = true
+		}
+
+		if !itemChanged {
+			continue
+		}
+		changedItem, err := common.Marshal(item)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode Volcengine Responses input item %d: %w", index, err)
+		}
+		items[index] = changedItem
+	}
+
+	if changed {
+		normalizedInput, err := common.Marshal(items)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode Volcengine Responses input: %w", err)
+		}
+		request.Input = normalizedInput
+	}
 	return request, nil
 }
 
