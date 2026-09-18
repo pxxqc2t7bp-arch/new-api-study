@@ -276,6 +276,7 @@ def prune_unverified_alias(plan: dict[str, Any], alias: str) -> None:
     plan["models"] = [
         model for model in plan["models"] if model != alias
     ]
+    plan["changed"] = True
     plan["model_mapping"].pop(alias, None)
     plan["selected"].pop(alias, None)
     plan["selected_candidates"].pop(alias, None)
@@ -401,9 +402,9 @@ def build_manifest(
     for plan in all_plans:
         successes = recent_success_by_channel.get(plan["channel_id"], {})
         for alias, candidate in list(plan["selected_candidates"].items()):
-            if candidate == alias:
-                continue
             target = plan["selected"][alias]
+            if candidate == alias and target == alias:
+                continue
             if max(
                 successes.get(candidate, 0),
                 successes.get(target, 0),

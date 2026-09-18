@@ -515,8 +515,8 @@ def write_checksums(output_dir: Path, files: list[Path]) -> dict[str, str]:
 
 def main() -> int:
     args = parse_args()
-    if args.rounds < 0:
-        raise RuntimeError("--rounds must not be negative")
+    if args.rounds < 3:
+        raise RuntimeError("--rounds must be at least 3")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = Path(args.manifest)
