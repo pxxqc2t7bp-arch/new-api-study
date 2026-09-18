@@ -12,6 +12,8 @@ import (
 	"github.com/samber/lo"
 )
 
+const responsesInputStatusCompleted = "completed"
+
 func normalizeChatImageURLToString(v any) any {
 	switch vv := v.(type) {
 	case string:
@@ -122,6 +124,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 				"type":    "function_call_output",
 				"call_id": callID,
 				"output":  output,
+				"status":  responsesInputStatusCompleted,
 			})
 			continue
 		}
@@ -178,6 +181,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 						"call_id":   tc.ID,
 						"name":      name,
 						"arguments": tc.Function.Arguments,
+						"status":    responsesInputStatusCompleted,
 					})
 				}
 			}
@@ -205,6 +209,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 						"call_id":   tc.ID,
 						"name":      name,
 						"arguments": tc.Function.Arguments,
+						"status":    responsesInputStatusCompleted,
 					})
 				}
 			}
@@ -270,6 +275,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 					"call_id":   tc.ID,
 					"name":      name,
 					"arguments": tc.Function.Arguments,
+					"status":    responsesInputStatusCompleted,
 				})
 			}
 		}

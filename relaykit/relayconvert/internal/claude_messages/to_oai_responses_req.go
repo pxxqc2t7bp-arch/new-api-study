@@ -12,6 +12,8 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 )
 
+const responsesInputStatusCompleted = "completed"
+
 func ClaudeMessagesRequestToOpenAIResponses(claudeRequest dto.ClaudeRequest, info convmeta.Meta) (*dto.OpenAIResponsesRequest, error) {
 	if strings.TrimSpace(claudeRequest.Model) == "" {
 		return nil, errors.New("model is required")
@@ -196,6 +198,7 @@ func claudeMessagesToResponsesInput(messages []dto.ClaudeMessage) (json.RawMessa
 					"call_id":   block.Id,
 					"name":      block.Name,
 					"arguments": string(arguments),
+					"status":    responsesInputStatusCompleted,
 				})
 			case "tool_result":
 				flushContent()
@@ -207,6 +210,7 @@ func claudeMessagesToResponsesInput(messages []dto.ClaudeMessage) (json.RawMessa
 					"type":    "function_call_output",
 					"call_id": block.ToolUseId,
 					"output":  output,
+					"status":  responsesInputStatusCompleted,
 				})
 			}
 		}

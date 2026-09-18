@@ -33,22 +33,26 @@
         "arguments": "{\"city\":\"Paris\"}",
         "call_id": "call_abc",
         "name": "get_weather",
+        "status": "completed",
         "type": "function_call"
       },
       {
         "arguments": "{\"city\":\"London\"}",
         "call_id": "call_xyz",
         "name": "get_weather",
+        "status": "completed",
         "type": "function_call"
       },
       {
         "call_id": "call_abc",
         "output": "{\"result\":\"15 degrees\"}",
+        "status": "completed",
         "type": "function_call_output"
       },
       {
         "call_id": "call_xyz",
         "output": "{\"result\":\"12 degrees\"}",
+        "status": "completed",
         "type": "function_call_output"
       }
     ],
