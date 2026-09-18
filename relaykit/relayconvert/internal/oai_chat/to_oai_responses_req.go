@@ -113,6 +113,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 
 			if callID == "" {
 				inputItems = append(inputItems, map[string]any{
+					"type":    "message",
 					"role":    "user",
 					"content": fmt.Sprintf("[tool_output_missing_call_id] %v", output),
 				})
@@ -156,6 +157,7 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 		}
 
 		item := map[string]any{
+			"type": "message",
 			"role": role,
 		}
 

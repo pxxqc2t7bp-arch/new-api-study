@@ -12,11 +12,13 @@
           "type": "input_image"
         }
       ],
-      "role": "user"
+      "role": "user",
+      "type": "message"
     },
     {
       "content": "",
-      "role": "assistant"
+      "role": "assistant",
+      "type": "message"
     },
     {
       "arguments": "{\"city\":\"Paris\"}",

@@ -33,7 +33,9 @@ func TestChatCompletionsRequestToResponsesRequestInstructionsAndTools(t *testing
 
 	assert.Equal(t, "gpt-test", got.Model)
 	assert.Equal(t, `"system rules\n\ndeveloper rules"`, string(got.Instructions))
+	assert.Equal(t, "message", gjson.GetBytes(got.Input, "0.type").String())
 	assert.Equal(t, "input_image", gjson.GetBytes(got.Input, "0.content.1.type").String())
+	assert.Equal(t, "message", gjson.GetBytes(got.Input, "1.type").String())
 	assert.Equal(t, "function_call", gjson.GetBytes(got.Input, "2.type").String())
 	assert.Equal(t, "call_1", gjson.GetBytes(got.Input, "2.call_id").String())
 	assert.Equal(t, "completed", gjson.GetBytes(got.Input, "2.status").String())
@@ -96,6 +98,7 @@ func TestChatCompletionsRequestToResponsesRequestMarksHistoricalToolItemsComplet
 					assert.Equal(t, "completed", item["status"])
 					assert.Equal(t, "call_1", item["call_id"])
 				default:
+					assert.Equal(t, "message", item["type"])
 					_, hasStatus := item["status"]
 					assert.False(t, hasStatus)
 				}
@@ -104,6 +107,20 @@ func TestChatCompletionsRequestToResponsesRequestMarksHistoricalToolItemsComplet
 			assert.Equal(t, 1, functionCallOutputs)
 		})
 	}
+}
+
+func TestChatCompletionsRequestToResponsesRequestMarksFallbackToolOutputAsMessage(t *testing.T) {
+	got, err := ChatCompletionsRequestToResponsesRequest(&dto.GeneralOpenAIRequest{
+		Model: "gpt-test",
+		Messages: []dto.Message{
+			{Role: "tool", Content: "orphaned result"},
+		},
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, "message", gjson.GetBytes(got.Input, "0.type").String())
+	assert.Equal(t, "user", gjson.GetBytes(got.Input, "0.role").String())
+	assert.Contains(t, gjson.GetBytes(got.Input, "0.content").String(), "orphaned result")
 }
 
 func TestChatCompletionsRequestToResponsesRequestPreservesPromptCacheKey(t *testing.T) {
