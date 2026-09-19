@@ -211,3 +211,46 @@ func claudeDefaultsMeta(defaultMaxTokens func(string) int) convmeta.Meta {
 		Claude: convmeta.ClaudeOptions{DefaultMaxTokens: defaultMaxTokens},
 	}}
 }
+
+func TestClaudeManualThinkingBoundsAreCoerced(t *testing.T) {
+	// OpenAI requests to a manual-thinking Claude model used to be rejected with
+	// 400 when budget_tokens or max_tokens fell outside Anthropic's bounds. The
+	// renderer now adjusts them and reports what changed.
+	tests := []struct {
+		name          string
+		reasoning     string
+		maxTokens     uint
+		wantBudget    int
+		wantMaxTokens uint
+		wantCode      string
+	}{
+		{name: "budget below 1024 is raised", reasoning: `{"max_tokens":512}`, maxTokens: 4096, wantBudget: 1024, wantMaxTokens: 4096, wantCode: "claude_budget_adjusted"},
+		{name: "budget at max_tokens is lowered", reasoning: `{"max_tokens":4096}`, maxTokens: 4096, wantBudget: 4095, wantMaxTokens: 4096, wantCode: "claude_budget_adjusted"},
+		{name: "max_tokens too small for manual thinking is raised", reasoning: `{"max_tokens":2048}`, maxTokens: 1000, wantBudget: 2048, wantMaxTokens: 2049, wantCode: "claude_max_tokens_raised"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			maxTokens := tt.maxTokens
+			request := dto.GeneralOpenAIRequest{
+				Model:     "claude-3-7-sonnet",
+				MaxTokens: &maxTokens,
+				Reasoning: []byte(tt.reasoning),
+				Messages:  []dto.Message{{Role: "user", Content: "hello"}},
+			}
+			result, err := ConvertRequest(context.Background(), &convmeta.Values{}, types.RelayFormatClaude, &request)
+			require.NoError(t, err)
+			converted, ok := result.Value.(*dto.ClaudeRequest)
+			require.True(t, ok)
+			require.NotNil(t, converted.Thinking)
+			require.NotNil(t, converted.Thinking.BudgetTokens)
+			assert.Equal(t, tt.wantBudget, *converted.Thinking.BudgetTokens)
+			require.NotNil(t, converted.MaxTokens)
+			assert.Equal(t, tt.wantMaxTokens, *converted.MaxTokens)
+			codes := make([]string, 0, len(result.Diagnostics))
+			for _, diagnostic := range result.Diagnostics {
+				codes = append(codes, diagnostic.Code)
+			}
+			assert.Contains(t, codes, tt.wantCode)
+		})
+	}
+}

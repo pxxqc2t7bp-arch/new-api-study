@@ -16,10 +16,18 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { render, screen, within } from '@testing-library/react'
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { Dialog } from '@/components/dialog'
 
 import { Combobox } from '../combobox'
 import {
@@ -85,6 +93,25 @@ function FilterDrawer(props: { children: ReactNode }) {
   )
 }
 
+function elementRect(
+  left: number,
+  top: number,
+  width: number,
+  height: number
+): DOMRect {
+  return {
+    x: left,
+    y: top,
+    left,
+    top,
+    right: left + width,
+    bottom: top + height,
+    width,
+    height,
+    toJSON: () => ({}),
+  }
+}
+
 // JSDOM does not implement the pointer-capture API used by the drawer.
 const pointerCapture = Object.getOwnPropertyDescriptor(
   HTMLElement.prototype,
@@ -147,6 +174,94 @@ describe('popups inside a drawer', () => {
 
     expect(change).toHaveBeenCalledWith('gemini', expect.anything())
     expect(screen.getByRole('dialog', { name: 'Filters' })).toBeInTheDocument()
+  })
+})
+
+describe('popups inside a transformed dialog', () => {
+  it('positions an editable combobox in dialog coordinates and follows scrolling', async () => {
+    const change = vi.fn()
+    render(
+      <Dialog open title='Advanced Custom'>
+        <Combobox
+          options={options}
+          value='openai'
+          onValueChange={change}
+          allowCustomValue
+          aria-label='Request Model Name'
+        />
+      </Dialog>
+    )
+    const user = userEvent.setup()
+    const dialog = screen.getByRole('dialog', { name: 'Advanced Custom' })
+    const input = within(dialog).getByRole('combobox', {
+      name: 'Request Model Name',
+    })
+    vi.spyOn(dialog, 'getBoundingClientRect').mockReturnValue(
+      elementRect(100, 50, 800, 600)
+    )
+    const inputRect = vi
+      .spyOn(input, 'getBoundingClientRect')
+      .mockReturnValue(elementRect(260, 180, 240, 40))
+
+    await user.click(input)
+    const listbox = await within(dialog).findByRole('listbox')
+    const dropdown = listbox.parentElement
+    expect(dropdown).toHaveStyle({
+      position: 'fixed',
+      top: '174px',
+      left: '160px',
+      width: '240px',
+    })
+
+    inputRect.mockReturnValue(elementRect(240, 140, 240, 40))
+    fireEvent.scroll(dialog)
+    await waitFor(() =>
+      expect(dropdown).toHaveStyle({ top: '134px', left: '140px' })
+    )
+
+    await user.click(within(listbox).getByRole('option', { name: 'Google' }))
+    expect(change).toHaveBeenCalledWith('gemini')
+    expect(dialog).toBeVisible()
+  })
+
+  it('normalizes coordinates measured during the dialog scale animation', async () => {
+    render(
+      <Dialog open title='Animated Advanced Custom'>
+        <Combobox
+          options={options}
+          value='openai'
+          onValueChange={vi.fn()}
+          allowCustomValue
+          aria-label='Upstream Model Name'
+        />
+      </Dialog>
+    )
+    const user = userEvent.setup()
+    const dialog = screen.getByRole('dialog', {
+      name: 'Animated Advanced Custom',
+    })
+    const input = within(dialog).getByRole('combobox', {
+      name: 'Upstream Model Name',
+    })
+    Object.defineProperties(dialog, {
+      offsetWidth: { configurable: true, value: 800 },
+      offsetHeight: { configurable: true, value: 600 },
+    })
+    vi.spyOn(dialog, 'getBoundingClientRect').mockReturnValue(
+      elementRect(260, 115, 760, 570)
+    )
+    vi.spyOn(input, 'getBoundingClientRect').mockReturnValue(
+      elementRect(412, 267, 228, 38)
+    )
+
+    await user.click(input)
+    const dropdown = (await within(dialog).findByRole('listbox')).parentElement
+    expect(dropdown).toHaveStyle({
+      position: 'fixed',
+      top: '204px',
+      left: '160px',
+      width: '240px',
+    })
   })
 })
 

@@ -42,6 +42,7 @@ const (
 	FilterExcludeChannelIDs  ChannelFilterKind = "exclude_channel_ids"
 	FilterChannelTypes       ChannelFilterKind = "channel_types"
 	FilterGeminiLive         ChannelFilterKind = "gemini_live"
+	FilterResponsesWebSocket ChannelFilterKind = "responses_websocket"
 )
 
 type ChannelFilter struct {

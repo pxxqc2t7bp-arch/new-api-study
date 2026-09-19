@@ -148,7 +148,7 @@ func takeRealtimeTicket(request *http.Request) (string, bool, error) {
 	}
 	request.Header.Del(RealtimeTicketHeader)
 
-	protocols := splitWebsocketSubprotocols(request.Header.Get("Sec-WebSocket-Protocol"))
+	protocols := websocketSubprotocols(request)
 	cleanProtocols := make([]string, 0, len(protocols))
 	for _, protocol := range protocols {
 		switch {
@@ -197,6 +197,15 @@ func splitWebsocketSubprotocols(value string) []string {
 	return result
 }
 
+func websocketSubprotocols(request *http.Request) []string {
+	if request == nil {
+		return nil
+	}
+	return splitWebsocketSubprotocols(
+		strings.Join(request.Header.Values("Sec-WebSocket-Protocol"), ","),
+	)
+}
+
 func removeCredentialSubprotocols(protocols []string) []string {
 	result := make([]string, 0, len(protocols))
 	for _, protocol := range protocols {
@@ -221,7 +230,7 @@ func takeOpenAIRealtimeAPIKey(request *http.Request) (string, bool) {
 	if request == nil {
 		return "", false
 	}
-	protocols := splitWebsocketSubprotocols(request.Header.Get("Sec-WebSocket-Protocol"))
+	protocols := websocketSubprotocols(request)
 	cleanProtocols := make([]string, 0, len(protocols))
 	var key string
 	for _, protocol := range protocols {

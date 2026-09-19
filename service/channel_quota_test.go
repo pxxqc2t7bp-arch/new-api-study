@@ -3,11 +3,13 @@ package service
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/wsmanager"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,6 +65,67 @@ func setupPlanQuotaDomainTest(t *testing.T) *gorm.DB {
 	return db
 }
 
+func TestRegisterActiveWebSocketForChannelChecksStatusAfterRegistration(t *testing.T) {
+	t.Run("disabled before registration fails closed", func(t *testing.T) {
+		db := setupPlanQuotaDomainTest(t)
+		channel := &model.Channel{
+			Id:     31,
+			Name:   "disabled-before-registration",
+			Status: common.ChannelStatusManuallyDisabled,
+		}
+		require.NoError(t, db.Create(channel).Error)
+
+		var closeReasons []string
+		unregister, err := RegisterActiveWebSocketForChannel(
+			channel.Id,
+			wsmanager.KindRealtime,
+			func(reason string) {
+				closeReasons = append(closeReasons, reason)
+			},
+		)
+
+		require.Error(t, err)
+		assert.Equal(t, []string{ChannelDisabledCloseReason}, closeReasons)
+		assert.Zero(t, wsmanager.CloseChannel(channel.Id, "stale registration"))
+		unregister()
+	})
+
+	t.Run("close during status read fails closed", func(t *testing.T) {
+		db := setupPlanQuotaDomainTest(t)
+		channel := &model.Channel{
+			Id:     32,
+			Name:   "disabled-during-registration",
+			Status: common.ChannelStatusEnabled,
+		}
+		require.NoError(t, db.Create(channel).Error)
+
+		var closeDuringRead sync.Once
+		callbackName := "test:close-during-channel-status-read"
+		require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(*gorm.DB) {
+			closeDuringRead.Do(func() {
+				assert.Equal(t, 1, wsmanager.CloseChannel(channel.Id, "disabled during status read"))
+			})
+		}))
+		t.Cleanup(func() {
+			db.Callback().Query().Remove(callbackName)
+		})
+
+		var closeReasons []string
+		unregister, err := RegisterActiveWebSocketForChannel(
+			channel.Id,
+			wsmanager.KindResponses,
+			func(reason string) {
+				closeReasons = append(closeReasons, reason)
+			},
+		)
+
+		require.Error(t, err)
+		assert.Equal(t, []string{"disabled during status read"}, closeReasons)
+		assert.Zero(t, wsmanager.CloseChannel(channel.Id, "stale registration"))
+		unregister()
+	})
+}
+
 func TestDisableAndEnablePlanQuotaDomainLifecycle(t *testing.T) {
 	db := setupPlanQuotaDomainTest(t)
 
@@ -75,6 +138,7 @@ func TestDisableAndEnablePlanQuotaDomainLifecycle(t *testing.T) {
 		{Id: 12, Name: "responses", Key: "shared", Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan},
 		{Id: 13, Name: "other-plan", Key: "shared", Status: common.ChannelStatusEnabled, Tag: &otherPlanTag, AutoBan: &autoBan},
 		{Id: 14, Name: "ordinary", Key: "shared", Status: common.ChannelStatusEnabled, Tag: &ordinaryTag, AutoBan: &autoBan},
+		{Id: 15, Name: "already-disabled", Key: "shared", Status: common.ChannelStatusAutoDisabled, Tag: &tag, AutoBan: &autoBan},
 	}
 	channels[0].Models = "gpt-3.5-turbo"
 	channels[0].Group = "default"
@@ -85,16 +149,30 @@ func TestDisableAndEnablePlanQuotaDomainLifecycle(t *testing.T) {
 	require.NoError(t, channels[0].AddAbilities(nil))
 	require.NoError(t, channels[1].AddAbilities(nil))
 
+	closeReasons := map[int][]string{}
+	for _, channelID := range []int{11, 12, 13, 14, 15} {
+		unregister := wsmanager.Register(channelID, wsmanager.KindResponses, func(reason string) {
+			closeReasons[channelID] = append(closeReasons[channelID], reason)
+		})
+		t.Cleanup(unregister)
+	}
+
 	resetAt := time.Now().Add(time.Hour).Unix()
 	disablePlanQuotaDomain(tag, "quota exhausted", resetAt)
 
 	var stored []model.Channel
 	require.NoError(t, db.Order("id").Find(&stored).Error)
-	require.Len(t, stored, 4)
+	require.Len(t, stored, 5)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[0].Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[1].Status)
 	assert.Equal(t, common.ChannelStatusEnabled, stored[2].Status)
 	assert.Equal(t, common.ChannelStatusEnabled, stored[3].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[4].Status)
+	assert.Equal(t, []string{ChannelDisabledCloseReason}, closeReasons[11])
+	assert.Equal(t, []string{ChannelDisabledCloseReason}, closeReasons[12])
+	assert.Empty(t, closeReasons[13])
+	assert.Empty(t, closeReasons[14])
+	assert.Empty(t, closeReasons[15])
 	assert.Equal(t, resetAt+60, stored[0].GetDisabledUntil())
 	assert.Equal(t, resetAt+60, stored[1].GetDisabledUntil())
 	assert.Zero(t, stored[2].GetDisabledUntil())

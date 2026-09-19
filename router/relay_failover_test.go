@@ -436,6 +436,7 @@ func TestRelayChannelFailoverDoesNotRetry400(t *testing.T) {
 
 func TestRelayChannelFailoverCapsAttemptsAtFivePriorities(t *testing.T) {
 	engine, user := setupRelayFailoverTest(t, false)
+	enableManagedOrchestrationForFailoverTest(t, 90)
 	trace := &failoverCallTrace{}
 	priorities := []int64{30, 20, 10, 0, -10, -20}
 	upstreams := make([]*failoverUpstream, 0, len(priorities))

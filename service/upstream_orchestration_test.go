@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/wsmanager"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -42,6 +43,251 @@ func setupUpstreamOrchestrationTest(t *testing.T) {
 	model.DB = db
 	t.Cleanup(func() {
 		model.DB = originalDB
+	})
+}
+
+func TestDisableChannelManagedWebSocketLifecycle(t *testing.T) {
+	for _, testCase := range []struct {
+		name                string
+		createChannel       bool
+		consecutiveFailures int
+		wantStatus          int
+		wantCloseReasons    []string
+	}{
+		{
+			name:                "quarantine closes active websocket",
+			createChannel:       true,
+			consecutiveFailures: 1,
+			wantStatus:          common.ChannelStatusAutoDisabled,
+			wantCloseReasons:    []string{ChannelDisabledCloseReason},
+		},
+		{
+			name:          "handled failure below threshold keeps websocket open",
+			createChannel: true,
+			wantStatus:    common.ChannelStatusEnabled,
+		},
+		{
+			name:                "failed status update keeps websocket open",
+			consecutiveFailures: 1,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			setupUpstreamOrchestrationTest(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+
+			setting := operation_setting.GetUpstreamOrchestrationSetting()
+			original := *setting
+			setting.Enabled = true
+			setting.FailureThreshold = 2
+			setting.FailureWindowMinutes = 5
+			t.Cleanup(func() {
+				*setting = original
+			})
+
+			channelID := 901
+			if testCase.createChannel {
+				channel := model.Channel{
+					Id:     channelID,
+					Name:   "managed-websocket",
+					Status: common.ChannelStatusEnabled,
+					Group:  "default",
+					Models: "gpt-managed",
+				}
+				require.NoError(t, model.DB.Create(&channel).Error)
+				require.NoError(t, channel.AddAbilities(nil))
+			}
+			require.NoError(t, model.DB.Create(&model.UpstreamManagedRoute{
+				SourceID:            1,
+				ExternalGroupID:     "managed-websocket",
+				Platform:            "openai",
+				Protocol:            model.UpstreamProtocolOpenAI,
+				ChannelID:           channelID,
+				State:               model.UpstreamRouteStateActive,
+				ConsecutiveFailures: testCase.consecutiveFailures,
+				FailureWindowStart:  common.GetTimestamp(),
+			}).Error)
+
+			var closeReasons []string
+			unregister := wsmanager.Register(channelID, wsmanager.KindResponses, func(reason string) {
+				closeReasons = append(closeReasons, reason)
+			})
+			t.Cleanup(unregister)
+
+			DisableChannel(relaytypes.ChannelError{
+				ChannelId:   channelID,
+				ChannelName: "managed-websocket",
+				AutoBan:     true,
+			}, "managed failure")
+
+			assert.Equal(t, testCase.wantCloseReasons, closeReasons)
+			if testCase.createChannel {
+				channel, err := model.GetChannelById(channelID, true)
+				require.NoError(t, err)
+				assert.Equal(t, testCase.wantStatus, channel.Status)
+			}
+		})
+	}
+}
+
+func TestManagedRouteStatusChangesCloseWebSockets(t *testing.T) {
+	newFixture := func(t *testing.T, channelStatus int, routeState, healthStatus string, createChannel bool) (time.Time, model.UpstreamManagedRoute, *[]string) {
+		t.Helper()
+		setupUpstreamOrchestrationTest(t)
+		require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+
+		now := time.Unix(1_788_320_000, 0)
+		source := model.UpstreamSource{
+			Key:              model.UpstreamSourceKeyHualong,
+			Name:             "Managed Status",
+			ConsoleURL:       "https://api.hualong.online",
+			SelectedEndpoint: "https://api.hualong.online",
+			Status:           model.UpstreamHealthOperational,
+			Enabled:          true,
+			LastSnapshotAt:   now.Unix(),
+		}
+		require.NoError(t, model.DB.Create(&source).Error)
+		group := model.UpstreamGroup{
+			SourceID:            source.ID,
+			ExternalID:          "managed-status",
+			Name:                "Managed Status",
+			Platform:            "openai",
+			EffectiveMultiplier: 1,
+			HealthStatus:        healthStatus,
+			ObservedAt:          now.Unix(),
+			RedSince:            now.Add(-time.Hour).Unix(),
+			Models:              `["gpt-managed"]`,
+		}
+		require.NoError(t, model.DB.Create(&group).Error)
+
+		channelID := 902
+		if createChannel {
+			channel := model.Channel{
+				Id:     channelID,
+				Name:   "managed-status",
+				Status: channelStatus,
+				Group:  "default",
+				Models: "gpt-managed",
+			}
+			require.NoError(t, model.DB.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+		}
+		route := model.UpstreamManagedRoute{
+			SourceID:        source.ID,
+			ExternalGroupID: group.ExternalID,
+			Platform:        group.Platform,
+			Protocol:        model.UpstreamProtocolOpenAI,
+			ChannelID:       channelID,
+			State:           routeState,
+		}
+		require.NoError(t, model.DB.Create(&route).Error)
+
+		closeReasons := make([]string, 0, 1)
+		unregister := wsmanager.Register(channelID, wsmanager.KindResponses, func(reason string) {
+			closeReasons = append(closeReasons, reason)
+		})
+		t.Cleanup(unregister)
+		return now, route, &closeReasons
+	}
+
+	t.Run("reconciliation disable closes once", func(t *testing.T) {
+		now, _, closeReasons := newFixture(
+			t,
+			common.ChannelStatusEnabled,
+			model.UpstreamRouteStateActive,
+			model.UpstreamHealthFailed,
+			true,
+		)
+		setting := operation_setting.GetUpstreamOrchestrationSetting()
+		original := *setting
+		setting.Enabled = true
+		setting.AutoEnroll = false
+		t.Cleanup(func() { *setting = original })
+
+		_, err := ReconcileManagedUpstreams(now)
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{ChannelDisabledCloseReason}, *closeReasons)
+		assert.Zero(t, wsmanager.CloseChannel(902, "duplicate close"))
+	})
+
+	t.Run("reconciliation enable does not close", func(t *testing.T) {
+		now, _, closeReasons := newFixture(
+			t,
+			common.ChannelStatusAutoDisabled,
+			model.UpstreamRouteStateShadow,
+			model.UpstreamHealthOperational,
+			true,
+		)
+		setting := operation_setting.GetUpstreamOrchestrationSetting()
+		original := *setting
+		setting.Enabled = true
+		setting.AutoEnroll = false
+		setting.ShadowSuccessesRequired = 0
+		t.Cleanup(func() { *setting = original })
+
+		_, err := ReconcileManagedUpstreams(now)
+
+		require.NoError(t, err)
+		assert.Empty(t, *closeReasons)
+		assert.Equal(t, 1, wsmanager.CloseChannel(902, "test cleanup"))
+	})
+
+	t.Run("reconciliation no change does not close", func(t *testing.T) {
+		now, _, closeReasons := newFixture(
+			t,
+			common.ChannelStatusAutoDisabled,
+			model.UpstreamRouteStateQuarantined,
+			model.UpstreamHealthFailed,
+			true,
+		)
+		setting := operation_setting.GetUpstreamOrchestrationSetting()
+		original := *setting
+		setting.Enabled = true
+		setting.AutoEnroll = false
+		t.Cleanup(func() { *setting = original })
+
+		_, err := ReconcileManagedUpstreams(now)
+
+		require.NoError(t, err)
+		assert.Empty(t, *closeReasons)
+		assert.Equal(t, 1, wsmanager.CloseChannel(902, "test cleanup"))
+	})
+
+	t.Run("manual pause closes once", func(t *testing.T) {
+		_, route, closeReasons := newFixture(
+			t,
+			common.ChannelStatusEnabled,
+			model.UpstreamRouteStateActive,
+			model.UpstreamHealthOperational,
+			true,
+		)
+
+		require.NoError(t, PauseManagedRoute(route.ID, "maintenance"))
+
+		assert.Equal(t, []string{ChannelDisabledCloseReason}, *closeReasons)
+		assert.Zero(t, wsmanager.CloseChannel(902, "duplicate close"))
+	})
+
+	t.Run("status update failure does not close", func(t *testing.T) {
+		now, route, closeReasons := newFixture(
+			t,
+			common.ChannelStatusEnabled,
+			model.UpstreamRouteStateActive,
+			model.UpstreamHealthFailed,
+			false,
+		)
+		setting := operation_setting.GetUpstreamOrchestrationSetting()
+		original := *setting
+		setting.Enabled = true
+		setting.AutoEnroll = false
+		t.Cleanup(func() { *setting = original })
+
+		_, err := ReconcileManagedUpstreams(now)
+		require.NoError(t, err)
+		assert.Empty(t, *closeReasons)
+		require.NoError(t, PauseManagedRoute(route.ID, "maintenance"))
+		assert.Empty(t, *closeReasons)
+		assert.Equal(t, 1, wsmanager.CloseChannel(902, "test cleanup"))
 	})
 }
 

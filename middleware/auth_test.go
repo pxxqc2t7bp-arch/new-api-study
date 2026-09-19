@@ -282,3 +282,96 @@ func TestTryUserAuthCredentialClassification(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, databaseFailureResponse.Code)
 	assert.Contains(t, databaseFailureResponse.Body.String(), "AUTH_INTERNAL_ERROR")
 }
+
+func TestTakeOpenAIRealtimeAPIKey(t *testing.T) {
+	tests := []struct {
+		name          string
+		protocols     string
+		wantKey       string
+		wantOK        bool
+		wantProtocols string
+	}{
+		{
+			name:          "responses protocol only",
+			protocols:     "responses",
+			wantProtocols: "responses",
+		},
+		{
+			name:          "realtime protocol only",
+			protocols:     "realtime",
+			wantProtocols: "realtime",
+		},
+		{
+			name:          "responses with insecure key",
+			protocols:     "responses, openai-insecure-api-key.sk-test",
+			wantKey:       "sk-test",
+			wantOK:        true,
+			wantProtocols: "responses",
+		},
+		{
+			name:          "realtime with beta and insecure key",
+			protocols:     "realtime, openai-insecure-api-key.sk-realtime, openai-beta.realtime-v1",
+			wantKey:       "sk-realtime",
+			wantOK:        true,
+			wantProtocols: "realtime, openai-beta.realtime-v1",
+		},
+		{
+			name:          "empty insecure key",
+			protocols:     "responses, openai-insecure-api-key.",
+			wantProtocols: "responses",
+		},
+		{
+			name:          "bare insecure marker is not a key",
+			protocols:     "openai-insecure-api-key",
+			wantProtocols: "openai-insecure-api-key",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+			request.Header.Set("Sec-WebSocket-Protocol", test.protocols)
+
+			gotKey, gotOK := takeOpenAIRealtimeAPIKey(request)
+
+			assert.Equal(t, test.wantOK, gotOK)
+			assert.Equal(t, test.wantKey, gotKey)
+			assert.Equal(
+				t,
+				test.wantProtocols,
+				request.Header.Get("Sec-WebSocket-Protocol"),
+			)
+		})
+	}
+}
+
+func TestApplyWebSocketSubprotocolAuthorizationDoesNotOverrideProtocolOnly(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	request.Header.Set("Authorization", "Bearer sk-original")
+	request.Header.Set("Sec-WebSocket-Protocol", "responses")
+	request.Header.Add("Sec-WebSocket-Protocol", "openai-beta.realtime-v1")
+
+	assert.False(t, applyWebSocketSubprotocolAuthorization(request))
+	assert.Equal(t, "Bearer sk-original", request.Header.Get("Authorization"))
+}
+
+func TestApplyWebSocketSubprotocolAuthorizationOverridesWithInsecureKey(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	request.Header.Set("Authorization", "Bearer sk-original")
+	request.Header.Set("Sec-WebSocket-Protocol", "responses, openai-insecure-api-key.sk-from-protocol")
+
+	assert.True(t, applyWebSocketSubprotocolAuthorization(request))
+	assert.Equal(t, "Bearer sk-from-protocol", request.Header.Get("Authorization"))
+	assert.Equal(t, "responses", request.Header.Get("Sec-WebSocket-Protocol"))
+}
+
+func TestApplyWebSocketSubprotocolAuthorizationReadsRepeatedHeaders(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	request.Header.Set("Authorization", "Bearer sk-original")
+	request.Header.Add("Sec-WebSocket-Protocol", "responses")
+	request.Header.Add("Sec-WebSocket-Protocol", "openai-insecure-api-key.sk-later-field")
+
+	assert.True(t, applyWebSocketSubprotocolAuthorization(request))
+	assert.Equal(t, "Bearer sk-later-field", request.Header.Get("Authorization"))
+	assert.Equal(t, "responses", request.Header.Get("Sec-WebSocket-Protocol"))
+}

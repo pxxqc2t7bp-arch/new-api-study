@@ -95,7 +95,7 @@ func init() {
 		openAIModelsMap[aiModel.Id] = aiModel
 	}
 	channelId2Models = make(map[int][]string)
-	for i := 1; i <= constant.ChannelTypeDummy; i++ {
+	for i := 1; i <= constant.ChannelTypeMax; i++ {
 		apiType, success := common.ChannelType2APIType(i)
 		if !success || apiType == constant.APITypeAIProxyLibrary {
 			if plugin, ok := jsplugin.DefaultRegistry.GetByChannelType(i); ok {
@@ -327,7 +327,7 @@ func DashboardListModels(c *gin.Context) {
 	for channelType, models := range channelId2Models {
 		modelsByChannel[channelType] = append([]string(nil), models...)
 	}
-	for channelType := 1; channelType <= constant.ChannelTypeDummy; channelType++ {
+	for channelType := 1; channelType <= constant.ChannelTypeMax; channelType++ {
 		if plugin, ok := jsplugin.DefaultRegistry.GetByChannelType(channelType); ok {
 			modelsByChannel[channelType] = append([]string(nil), plugin.Meta.Models...)
 		}

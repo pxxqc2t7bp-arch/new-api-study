@@ -363,10 +363,7 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 func TokenAuth() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		// 先检测是否为ws
-		if key, ok := takeOpenAIRealtimeAPIKey(c.Request); ok {
-			// Sec-WebSocket-Protocol: realtime, openai-insecure-api-key.sk-xxx, openai-beta.realtime-v1
-			c.Request.Header.Set("Authorization", "Bearer "+key)
-		}
+		applyWebSocketSubprotocolAuthorization(c.Request)
 		if c.Request.URL.Path == GeminiLivePath {
 			key, found, err := takeGeminiLiveAPIKey(c.Request)
 			hasAuthorization := strings.TrimSpace(c.Request.Header.Get("Authorization")) != ""
@@ -503,6 +500,15 @@ func setupValidatedTokenContext(c *gin.Context, token *model.Token, parts ...str
 	if err := SetupContextForToken(c, token, parts...); err != nil {
 		return false
 	}
+	return true
+}
+
+func applyWebSocketSubprotocolAuthorization(request *http.Request) bool {
+	key, ok := takeOpenAIRealtimeAPIKey(request)
+	if !ok {
+		return false
+	}
+	request.Header.Set("Authorization", "Bearer "+key)
 	return true
 }
 

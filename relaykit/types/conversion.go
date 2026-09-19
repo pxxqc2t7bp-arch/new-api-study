@@ -23,6 +23,11 @@ const (
 	ConversionDiagnosticCodeSessionReferenceUnsupported    = "session_reference_unsupported"
 	ConversionDiagnosticCodeClaudeSamplingRemoved          = "claude_sampling_removed"
 	ConversionDiagnosticCodeClaudeSamplingConstrained      = "claude_sampling_constrained"
+	ConversionDiagnosticCodeClaudeThinkingTypeCoerced      = "claude_thinking_type_coerced"
+	ConversionDiagnosticCodeClaudeBudgetAdjusted           = "claude_budget_adjusted"
+	ConversionDiagnosticCodeClaudeMaxTokensRaised          = "claude_max_tokens_raised"
+	ConversionDiagnosticCodeGeminiBudgetToLevel            = "gemini_budget_to_level"
+	ConversionDiagnosticCodeGeminiLevelAdjusted            = "gemini_level_adjusted"
 	ConversionDiagnosticCodeCustomToolOmitted              = "custom_tool_omitted"
 	ConversionDiagnosticCodeUnsupportedOpaqueTool          = "unsupported_opaque_tool"
 )
@@ -79,6 +84,9 @@ func RejectConversionLoss(policy ConversionLossPolicy, diagnostics []ConversionD
 	}
 	rejected := make([]ConversionDiagnostic, 0, len(diagnostics))
 	for _, diagnostic := range diagnostics {
+		if policy == ConversionLossPolicyStrict && isBenignConversionNormalization(diagnostic) {
+			continue
+		}
 		if policy == ConversionLossPolicyStrict || diagnostic.Severity == ConversionDiagnosticError {
 			rejected = append(rejected, diagnostic)
 		}
@@ -87,4 +95,20 @@ func RejectConversionLoss(policy ConversionLossPolicy, diagnostics []ConversionD
 		return nil
 	}
 	return &ConversionLossError{Diagnostics: rejected}
+}
+
+func isBenignConversionNormalization(diagnostic ConversionDiagnostic) bool {
+	if diagnostic.Severity != ConversionDiagnosticWarning {
+		return false
+	}
+	switch diagnostic.Code {
+	case ConversionDiagnosticCodeClaudeThinkingTypeCoerced,
+		ConversionDiagnosticCodeClaudeBudgetAdjusted,
+		ConversionDiagnosticCodeClaudeMaxTokensRaised,
+		ConversionDiagnosticCodeGeminiBudgetToLevel,
+		ConversionDiagnosticCodeGeminiLevelAdjusted:
+		return true
+	default:
+		return false
+	}
 }

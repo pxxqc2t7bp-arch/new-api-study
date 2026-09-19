@@ -294,7 +294,7 @@ func RecordManagedChannelFailure(channelError types.ChannelError, reason string)
 	}
 	if quarantined {
 		invalidateManagedRouteAdminInfo(channelError.ChannelId)
-		if model.UpdateChannelStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason) {
+		if updateManagedChannelStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason) {
 			if err := NotifyRootBark(
 				fmt.Sprintf("%s_managed_%d", dto.NotifyTypeChannelUpdate, channelError.ChannelId),
 				fmt.Sprintf("受管通道「%s」（#%d）已隔离", channelError.ChannelName, channelError.ChannelId),
@@ -374,7 +374,7 @@ func PauseManagedRoute(routeID int64, reason string) error {
 	}).Error; err != nil {
 		return err
 	}
-	model.UpdateChannelStatus(route.ChannelID, "", common.ChannelStatusManuallyDisabled, "upstream orchestration manual pause")
+	updateManagedChannelStatus(route.ChannelID, "", common.ChannelStatusManuallyDisabled, "upstream orchestration manual pause")
 	invalidateManagedRouteAdminInfo(route.ChannelID)
 	return nil
 }

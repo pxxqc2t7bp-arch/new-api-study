@@ -196,9 +196,9 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 			state,
 		))
 		if state == model.UpstreamRouteStateActive {
-			model.UpdateChannelStatus(route.ChannelID, "", common.ChannelStatusEnabled, "")
+			updateManagedChannelStatus(route.ChannelID, "", common.ChannelStatusEnabled, "")
 		} else {
-			model.UpdateChannelStatus(route.ChannelID, "", common.ChannelStatusAutoDisabled, reason)
+			updateManagedChannelStatus(route.ChannelID, "", common.ChannelStatusAutoDisabled, reason)
 		}
 		route.State = state
 	}

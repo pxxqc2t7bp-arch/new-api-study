@@ -269,6 +269,28 @@ func TestRealtimeAuthPreservesNativeSDKAuthenticationAndScrubsSubprotocolKey(t *
 	assert.Contains(t, subprotocolResponse.Body.String(), `"subprotocol":"realtime"`)
 }
 
+func TestRealtimeAuthAuthenticatesKeyFromRepeatedSubprotocolHeader(t *testing.T) {
+	_, token := setupRealtimeTicketMiddlewareTest(t)
+	router := realtimeAuthTestRouter(t)
+	request := httptest.NewRequest(http.MethodGet, "/v1/realtime?model=gpt-realtime", nil)
+	request.Header.Add("Sec-WebSocket-Protocol", "realtime")
+	request.Header.Add(
+		"Sec-WebSocket-Protocol",
+		"openai-insecure-api-key."+token.Key+", openai-beta.realtime-v1",
+	)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusOK, response.Code)
+	assert.NotContains(t, response.Body.String(), token.Key)
+	assert.Contains(
+		t,
+		response.Body.String(),
+		`"subprotocol":"realtime, openai-beta.realtime-v1"`,
+	)
+}
+
 func TestRealtimeAuthRejectsAmbiguousTicketSourcesWithoutConsuming(t *testing.T) {
 	user, token := setupRealtimeTicketMiddlewareTest(t)
 	router := realtimeAuthTestRouter(t)

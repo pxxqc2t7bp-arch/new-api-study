@@ -52,6 +52,7 @@ type LegacyComboboxProps = {
   className?: string
   id?: string
   openOnFocus?: boolean
+  portal?: boolean
   disabled?: boolean
   name?: string
   onBlur?: React.FocusEventHandler<HTMLInputElement>
@@ -89,6 +90,7 @@ function Combobox(
         className={props.className}
         allowCustomValue={props.allowCustomValue}
         openOnFocus={props.openOnFocus}
+        portal={props.portal}
       />
     )
   }
@@ -114,9 +116,9 @@ function OptionCombobox(props: LegacyComboboxProps) {
       onInputValueChange={(value, details) => {
         if (details.reason === 'input-change') setSearch(value)
       }}
-      onOpenChange={(nextOpen) => {
+      onOpenChange={(nextOpen, details) => {
         setOpen(nextOpen)
-        setSearch('')
+        if (details.reason !== 'input-change') setSearch('')
       }}
       onValueChange={(option) => {
         if (option) props.onValueChange?.(option.value)
@@ -138,7 +140,8 @@ function OptionCombobox(props: LegacyComboboxProps) {
           onBlur={props.onBlur}
           onKeyDown={props.onKeyDown}
           onFocus={() => {
-            if (props.openOnFocus !== false) setOpen(true)
+            // Dialog autofocus should not expand a select-style combobox.
+            if (props.openOnFocus) setOpen(true)
           }}
           aria-label={props['aria-label']}
           aria-labelledby={props['aria-labelledby']}

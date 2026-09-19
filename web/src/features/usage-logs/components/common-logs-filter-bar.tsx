@@ -348,6 +348,7 @@ export function CommonLogsFilterBar<TData>(
       <Combobox
         options={groupOptions}
         allowCustomValue
+        portal={sensitiveVisible}
         aria-label={t('Group')}
         emptyText={t('No group found.')}
         placeholder={t('Group')}
