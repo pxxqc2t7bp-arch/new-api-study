@@ -24,6 +24,19 @@ import (
 	"gorm.io/gorm"
 )
 
+type legacyAppPluginExchangeReplay struct {
+	ScopeHash      string `gorm:"primaryKey;size:64"`
+	RequestHash    string `gorm:"size:64;not null"`
+	InstallationID string `gorm:"size:64;not null;index"`
+	ResponseJSON   string `gorm:"type:text;not null"`
+	ResponseMAC    string `gorm:"size:64"`
+	ExpiresAt      int64  `gorm:"not null;index"`
+}
+
+func (legacyAppPluginExchangeReplay) TableName() string {
+	return "app_plugin_exchange_replays"
+}
+
 func TestAppPluginMigrationFreshUpgradeReplay(t *testing.T) {
 	db := openAppPluginModelDB(t)
 	logAppPluginDBVersion(t, db)
@@ -70,6 +83,60 @@ func TestAppPluginMigrationFreshUpgradeReplay(t *testing.T) {
 	t.Run("model main migration integration calls the same app plugin migrator", func(t *testing.T) {
 		require.NoError(t, MigrateAppPluginTables(db))
 		assert.True(t, db.Migrator().HasTable(&AppInstallation{}))
+	})
+
+	t.Run("launch table upgrade adds nullable replay authentication linkage and preserves rows", func(t *testing.T) {
+		oldDB := openAppPluginModelDB(t)
+		require.NoError(t, oldDB.Migrator().DropTable(&AppPluginExchangeReplay{}))
+		require.NoError(t, oldDB.AutoMigrate(&legacyAppPluginExchangeReplay{}))
+		legacy := legacyAppPluginExchangeReplay{
+			ScopeHash: "legacy-scope", RequestHash: "legacy-request",
+			InstallationID: "legacy-installation", ResponseJSON: `{"legacy":true}`,
+			ResponseMAC: "legacy-response-mac", ExpiresAt: 123,
+		}
+		require.NoError(t, oldDB.Create(&legacy).Error)
+
+		require.NoError(t, MigrateAppPluginLaunchTables(oldDB))
+		require.NoError(t, MigrateAppPluginLaunchTables(oldDB))
+
+		require.True(t, oldDB.Migrator().HasColumn(
+			"app_plugin_exchange_replays", "response_mac",
+		))
+		require.True(t, oldDB.Migrator().HasColumn(
+			"app_plugin_exchange_replays", "launch_code_hash",
+		))
+		require.True(t, oldDB.Migrator().HasColumn(
+			"app_plugin_exchange_replays", "app_session_id",
+		))
+		require.True(t, oldDB.Migrator().HasIndex(
+			&AppPluginExchangeReplay{}, "idx_app_plugin_exchange_replay_launch",
+		))
+		var preserved legacyAppPluginExchangeReplay
+		require.NoError(t, oldDB.Where("scope_hash = ?", legacy.ScopeHash).First(&preserved).Error)
+		assert.Equal(t, legacy.ResponseJSON, preserved.ResponseJSON)
+		var integrity struct {
+			ResponseMAC    *string
+			LaunchCodeHash *string
+			AppSessionID   *string
+		}
+		require.NoError(t, oldDB.Table("app_plugin_exchange_replays").
+			Select("response_mac", "launch_code_hash", "app_session_id").
+			Where("scope_hash = ?", legacy.ScopeHash).Take(&integrity).Error)
+		require.NotNil(t, integrity.ResponseMAC)
+		assert.Equal(t, legacy.ResponseMAC, *integrity.ResponseMAC)
+		assert.Nil(t, integrity.LaunchCodeHash)
+		assert.Nil(t, integrity.AppSessionID)
+
+		launchCodeHash, appSessionID := strings.Repeat("a", 64), "linked-session"
+		linked := AppPluginExchangeReplay{
+			ScopeHash: "linked-scope", RequestHash: strings.Repeat("b", 64),
+			InstallationID: legacy.InstallationID, LaunchCodeHash: &launchCodeHash,
+			AppSessionID: &appSessionID, ResponseJSON: `{}`, ResponseMAC: "linked-mac", ExpiresAt: 456,
+		}
+		require.NoError(t, oldDB.Create(&linked).Error)
+		linked.ScopeHash = "duplicate-linked-scope"
+		require.Error(t, oldDB.Create(&linked).Error,
+			"one installation and launch code identity can authenticate only one replay")
 	})
 
 	t.Run("upgrade preserves legacy app installation public identifier rows", func(t *testing.T) {

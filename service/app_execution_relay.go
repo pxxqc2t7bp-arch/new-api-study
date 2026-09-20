@@ -22,7 +22,6 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -38,9 +37,11 @@ type AppTaskRetrieval struct {
 func (s *AppExecutionService) appGrantAuthorityTx(tx *gorm.DB, subject types.AppRelaySubject,
 	required []string) (model.AppExecutionGrant, model.User, error) {
 	var grant model.AppExecutionGrant
-	if len(subject.TokenHash) != 64 || len(s.options.DerivationKey) < 32 ||
-		tx.Where("token_hash = ?", subject.TokenHash).First(&grant).Error != nil {
+	if len(subject.TokenHash) != 64 || len(s.options.DerivationKey) < 32 {
 		return grant, model.User{}, appAuthError("invalid_grant")
+	}
+	if err := tx.Where("token_hash = ?", subject.TokenHash).First(&grant).Error; err != nil {
+		return grant, model.User{}, appGrantQueryError(err)
 	}
 	if !hmac.Equal([]byte(grant.TokenHash), []byte(subject.TokenHash)) ||
 		(subject.GrantID != "" && subject.GrantID != grant.GrantID) ||
@@ -65,10 +66,6 @@ func (s *AppExecutionService) appGrantAuthorityTx(tx *gorm.DB, subject types.App
 		return grant, model.User{}, appAuthError("invalid_grant")
 	}
 	now := s.options.Now()
-	if !operation_setting.AppPluginV1Enabled || !operation_setting.AppExecutionGrantsEnabled ||
-		(grant.AppKey == "seedance-repro" && !operation_setting.AppPluginSeedanceEnabled) {
-		return grant, model.User{}, appAuthError("app_execution_disabled")
-	}
 	if grant.ExpiresAt <= now.Unix() {
 		return grant, model.User{}, appAuthError("execution_grant_expired")
 	}
@@ -89,10 +86,20 @@ func (s *AppExecutionService) appGrantAuthorityTx(tx *gorm.DB, subject types.App
 	if err != nil {
 		return grant, model.User{}, err
 	}
+	rolloutAllowed, err := model.AppExecutionRolloutAllowsTx(tx, grant.AppKey)
+	if err != nil {
+		return grant, model.User{}, appAuthError("service_unavailable")
+	}
+	if !rolloutAllowed {
+		return grant, model.User{}, appAuthError("app_execution_disabled")
+	}
 	var current model.AppExecutionGrant
 	if err := model.AppPluginCurrentRead(tx).Where(
 		"token_hash = ?", subject.TokenHash,
-	).First(&current).Error; err != nil || current != grant {
+	).First(&current).Error; err != nil {
+		return grant, model.User{}, appGrantQueryError(err)
+	}
+	if current != grant {
 		return grant, model.User{}, appAuthError("invalid_grant")
 	}
 	grant = current
@@ -100,6 +107,13 @@ func (s *AppExecutionService) appGrantAuthorityTx(tx *gorm.DB, subject types.App
 		return grant, model.User{}, appAuthError("invalid_grant")
 	}
 	return grant, authority.user, nil
+}
+
+func appGrantQueryError(err error) error {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return appAuthError("invalid_grant")
+	}
+	return appAuthError("service_unavailable")
 }
 
 func (s *AppExecutionService) appRelayAuthorityTx(tx *gorm.DB, subject types.AppRelaySubject) (model.AppExecutionGrant, model.User, error) {
@@ -209,7 +223,10 @@ func (s *AppExecutionService) AuthenticateAppRelay(ctx context.Context, token, p
 		user = current
 		return nil
 	})
-	return subject, user, err
+	if err != nil {
+		return types.AppRelaySubject{}, model.User{}, appExecutionBoundaryError(err)
+	}
+	return subject, user, nil
 }
 
 // AuthenticateAppTaskRetrieval binds a short-lived create grant to the one
@@ -234,7 +251,7 @@ func (s *AppExecutionService) AuthenticateAppTaskRetrieval(ctx context.Context, 
 		if err := model.AppPluginCurrentRead(tx).Where(
 			"grant_id = ? AND execution_kind = ?", grant.GrantID, model.AppExecutionKindTask,
 		).First(&execution).Error; err != nil {
-			return appAuthError("not_found")
+			return classifyDBLookup(err, "not_found")
 		}
 		if execution.GrantID != grant.GrantID || execution.AppKey != grant.AppKey ||
 			execution.InstallationID != grant.InstallationID || execution.AppSessionID != grant.AppSessionID ||
@@ -256,7 +273,10 @@ func (s *AppExecutionService) AuthenticateAppTaskRetrieval(ctx context.Context, 
 			AppKey: execution.AppKey, InstallationID: execution.InstallationID,
 			Subject: execution.Subject, UserID: execution.UserID,
 		}, execution.TaskID, "")
-		if err != nil || task.GrantID != grant.GrantID {
+		if err != nil {
+			return appTaskQueryError(err, "not_found")
+		}
+		if task.GrantID != grant.GrantID {
 			return appAuthError("not_found")
 		}
 		var projection model.Task
@@ -264,7 +284,7 @@ func (s *AppExecutionService) AuthenticateAppTaskRetrieval(ctx context.Context, 
 			"task_id = ? AND user_id = ? AND execution_mode = ?",
 			execution.TaskID, execution.UserID, model.TaskExecutionModeAppManaged,
 		).First(&projection).Error; err != nil {
-			return appAuthError("not_found")
+			return classifyDBLookup(err, "not_found")
 		}
 		if projection.TaskID != execution.TaskID || projection.UserId != execution.UserID ||
 			projection.ChannelId != execution.ChannelID || string(projection.Platform) != execution.PluginKey ||
@@ -316,7 +336,7 @@ func (s *AppExecutionService) AuthenticateAppTaskRetrieval(ctx context.Context, 
 		return nil
 	})
 	if err != nil {
-		return AppTaskRetrieval{}, model.User{}, err
+		return AppTaskRetrieval{}, model.User{}, appExecutionBoundaryError(err)
 	}
 	return result, user, nil
 }
@@ -726,7 +746,7 @@ func appTaskOptionAllowed(rules []AppPassthroughRule, protocol, name, pointer st
 func PrepareAppTaskPassthrough(c *gin.Context, info *relaycommon.RelayInfo) error {
 	var grant model.AppExecutionGrant
 	if err := model.DB.WithContext(c.Request.Context()).Where("grant_id = ?", info.AppSubject.GrantID).First(&grant).Error; err != nil {
-		return err
+		return classifyDBLookup(err, "invalid_grant")
 	}
 	value, exists := c.Get(jsplugin.ContextKeyProtocolRequest)
 	protocol, ok := value.(jsplugin.ProtocolRequestContext)
@@ -901,6 +921,10 @@ func (s *AppExecutionService) SelectAppRelayChannel(ctx context.Context, subject
 				current, err = validateAppRelayChannelTx(tx, grant, user, candidate, constraints.Filters)
 			}
 			if err != nil {
+				var authErr *AppPluginAuthError
+				if !errors.As(err, &authErr) || authErr.Code == "service_unavailable" {
+					return appExecutionBoundaryError(err)
+				}
 				continue
 			}
 			channel, selected = &current, candidate
@@ -908,7 +932,10 @@ func (s *AppExecutionService) SelectAppRelayChannel(ctx context.Context, subject
 		}
 		return appAuthError("model_not_supported")
 	})
-	return channel, selected, err
+	if err != nil {
+		return nil, model.AppExecutionModel{}, appExecutionBoundaryError(err)
+	}
+	return channel, selected, nil
 }
 
 func validateNativeAppRelayChannelTx(tx *gorm.DB, grant model.AppExecutionGrant, user model.User,
@@ -924,11 +951,21 @@ func validateNativeAppRelayChannelTx(tx *gorm.DB, grant model.AppExecutionGrant,
 		return channel, appAuthError("scope_denied")
 	}
 	head, err := model.GetAppExecutionPolicyTx(tx, model.AppModelInvokePolicyKey)
-	if err != nil || head.Version != grant.PolicyVersion || head.DocumentSHA256 != grant.PolicyDigest {
+	if err != nil {
+		return channel, classifyDBLookup(err, "model_policy_version_conflict")
+	}
+	if head.Version != grant.PolicyVersion || head.DocumentSHA256 != grant.PolicyDigest {
 		return channel, appAuthError("model_policy_version_conflict")
 	}
 	groups, err := effectiveAppExecutionGroups(tx, user)
-	if err != nil || !slices.ContainsFunc(groups, func(group appExecutionGroup) bool {
+	if err != nil {
+		var authErr *AppPluginAuthError
+		if errors.As(err, &authErr) && authErr.Code == "invalid_group_policy" {
+			return channel, appAuthError("scope_denied")
+		}
+		return channel, appExecutionBoundaryError(err)
+	}
+	if !slices.ContainsFunc(groups, func(group appExecutionGroup) bool {
 		return group.name == candidate.Group && group.ratio == candidate.GroupRatio
 	}) {
 		return channel, appAuthError("scope_denied")
@@ -936,14 +973,16 @@ func validateNativeAppRelayChannelTx(tx *gorm.DB, grant model.AppExecutionGrant,
 	if err := model.AppPluginCurrentRead(tx).Where(
 		"id = ? AND status = ?", candidate.ChannelID, common.ChannelStatusEnabled,
 	).First(&channel).Error; err != nil {
-		return channel, appAuthError("model_not_supported")
+		return channel, classifyDBLookup(err, "model_not_supported")
 	}
 	var ability model.Ability
-	if model.AppPluginCurrentRead(tx).Where(map[string]any{
+	if err := model.AppPluginCurrentRead(tx).Where(map[string]any{
 		"channel_id": channel.Id, "group": candidate.Group,
 		"model": candidate.PublicModel, "enabled": true,
-	}).First(&ability).Error != nil ||
-		!slices.Contains(channel.GetModels(), candidate.PublicModel) ||
+	}).First(&ability).Error; err != nil {
+		return channel, classifyDBLookup(err, "scope_denied")
+	}
+	if !slices.Contains(channel.GetModels(), candidate.PublicModel) ||
 		!slices.Contains(channel.GetGroups(), candidate.Group) {
 		return channel, appAuthError("scope_denied")
 	}
@@ -989,20 +1028,32 @@ func validateAppRelayChannelTx(tx *gorm.DB, grant model.AppExecutionGrant, user 
 		return channel, appAuthError("scope_denied")
 	}
 	head, err := model.GetAppExecutionPolicyTx(tx, model.AppModelInvokePolicyKey)
-	if err != nil || head.Version != grant.PolicyVersion || head.DocumentSHA256 != grant.PolicyDigest {
+	if err != nil {
+		return channel, classifyDBLookup(err, "model_policy_version_conflict")
+	}
+	if head.Version != grant.PolicyVersion || head.DocumentSHA256 != grant.PolicyDigest {
 		return channel, appAuthError("model_policy_version_conflict")
 	}
 	groups, err := effectiveAppExecutionGroups(tx, user)
-	if err != nil || !slices.ContainsFunc(groups, func(group appExecutionGroup) bool { return group.name == candidate.Group }) {
+	if err != nil {
+		var authErr *AppPluginAuthError
+		if errors.As(err, &authErr) && authErr.Code == "invalid_group_policy" {
+			return channel, appAuthError("scope_denied")
+		}
+		return channel, appExecutionBoundaryError(err)
+	}
+	if !slices.ContainsFunc(groups, func(group appExecutionGroup) bool { return group.name == candidate.Group }) {
 		return channel, appAuthError("scope_denied")
 	}
 	if err := model.AppPluginCurrentRead(tx).Where("id = ? AND status = ?", candidate.ChannelID, common.ChannelStatusEnabled).First(&channel).Error; err != nil {
-		return channel, appAuthError("model_not_supported")
+		return channel, classifyDBLookup(err, "model_not_supported")
 	}
 	var ability model.Ability
-	if model.AppPluginCurrentRead(tx).Where(map[string]any{"channel_id": channel.Id, "group": candidate.Group,
-		"model": candidate.PublicModel, "enabled": true}).First(&ability).Error != nil ||
-		!slices.Contains(channel.GetModels(), candidate.PublicModel) || !slices.Contains(channel.GetGroups(), candidate.Group) {
+	if err := model.AppPluginCurrentRead(tx).Where(map[string]any{"channel_id": channel.Id, "group": candidate.Group,
+		"model": candidate.PublicModel, "enabled": true}).First(&ability).Error; err != nil {
+		return channel, classifyDBLookup(err, "scope_denied")
+	}
+	if !slices.Contains(channel.GetModels(), candidate.PublicModel) || !slices.Contains(channel.GetGroups(), candidate.Group) {
 		return channel, appAuthError("scope_denied")
 	}
 	plugin, ok := jsplugin.DefaultRegistry.Generation().Get(candidate.PluginKey)
@@ -1053,12 +1104,15 @@ func AppRelayErrorStatus(err error) int {
 			return http.StatusPaymentRequired
 		case "not_found":
 			return http.StatusNotFound
+		case "service_unavailable":
+			return http.StatusServiceUnavailable
 		case "invalid_grant", "execution_grant_expired", "unauthenticated", "service_identity_invalid":
 			return http.StatusUnauthorized
 		}
+		return http.StatusForbidden
 	}
 	if strings.Contains(err.Error(), "idempotency_conflict") {
 		return http.StatusConflict
 	}
-	return http.StatusForbidden
+	return http.StatusServiceUnavailable
 }

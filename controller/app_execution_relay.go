@@ -28,7 +28,7 @@ func executeAppTaskSubmission(c *gin.Context, info *relaycommon.RelayInfo, submi
 	}
 	task, err := relay.AppTaskProjection(c, result.AppExecution)
 	if err != nil {
-		return nil, service.TaskErrorWrapperLocal(errors.New("submission_unknown"), "submission_unknown", http.StatusServiceUnavailable)
+		return nil, service.TaskErrorWrapperLocal(errors.New("service_unavailable"), "service_unavailable", http.StatusServiceUnavailable)
 	}
 	return &taskSubmissionOutcome{Result: result, Task: task, RelayInfo: info}, nil
 }

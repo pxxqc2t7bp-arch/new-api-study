@@ -87,11 +87,14 @@ type AppPluginSession struct {
 }
 
 type AppPluginExchangeReplay struct {
-	ScopeHash      string `gorm:"primaryKey;size:64" json:"-"`
-	RequestHash    string `gorm:"size:64;not null" json:"-"`
-	InstallationID string `gorm:"size:64;not null;index" json:"-"`
-	ResponseJSON   string `gorm:"type:text;not null" json:"-"`
-	ExpiresAt      int64  `gorm:"not null;index" json:"-"`
+	ScopeHash      string  `gorm:"primaryKey;size:64" json:"-"`
+	RequestHash    string  `gorm:"size:64;not null" json:"-"`
+	InstallationID string  `gorm:"size:64;not null;index;uniqueIndex:idx_app_plugin_exchange_replay_launch,priority:1" json:"-"`
+	LaunchCodeHash *string `gorm:"size:64;uniqueIndex:idx_app_plugin_exchange_replay_launch,priority:2" json:"-"`
+	AppSessionID   *string `gorm:"size:64" json:"-"`
+	ResponseJSON   string  `gorm:"type:text;not null" json:"-"`
+	ResponseMAC    string  `gorm:"size:64" json:"-"`
+	ExpiresAt      int64   `gorm:"not null;index" json:"-"`
 }
 
 type AppPluginSessionRevokeReplay struct {
@@ -228,9 +231,8 @@ func IssueAppServiceCredential(ctx context.Context, db *gorm.DB, installationID 
 }
 
 func AuthenticateAppServiceCredential(ctx context.Context, db *gorm.DB, raw string, now time.Time) (AppServiceIdentity, error) {
-	invalid := errors.New("service_identity_invalid")
 	if len(raw) != 43 {
-		return AppServiceIdentity{}, invalid
+		return AppServiceIdentity{}, ErrAppServiceIdentityInvalid
 	}
 	digest := appPluginSHA256([]byte(raw))
 	var identity AppServiceIdentity
@@ -238,18 +240,30 @@ func AuthenticateAppServiceCredential(ctx context.Context, db *gorm.DB, raw stri
 		identity = AppServiceIdentity{}
 		var locator AppServiceCredential
 		if err := tx.Where("credential_hash = ?", digest).First(&locator).Error; err != nil {
-			return invalid
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrAppServiceIdentityInvalid
+			}
+			return err
 		}
 		installation, err := LockAppPluginInstallation(tx, locator.AppKey, locator.InstallationID)
-		if err != nil || installation.Status == AppInstallationStatusRevoked {
-			return invalid
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrAppServiceIdentityInvalid
+			}
+			return err
+		}
+		if installation.Status == AppInstallationStatusRevoked {
+			return ErrAppServiceIdentityInvalid
 		}
 		var current AppServiceCredential
 		if err := lockForUpdate(tx).Where("id = ?", locator.ID).First(&current).Error; err != nil {
-			return invalid
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrAppServiceIdentityInvalid
+			}
+			return err
 		}
 		if !hmac.Equal([]byte(current.CredentialHash), []byte(digest)) {
-			return invalid
+			return ErrAppServiceIdentityInvalid
 		}
 		identity = AppServiceIdentity{InstallationID: current.InstallationID, AppKey: current.AppKey,
 			CredentialID: current.CredentialID, Version: current.CredentialVersion}
@@ -265,20 +279,25 @@ func AuthenticateAppServiceCredential(ctx context.Context, db *gorm.DB, raw stri
 // ValidateAppServiceIdentity rechecks a middleware identity inside the operation
 // transaction. Callers already hold ownership and installation locks.
 func ValidateAppServiceIdentity(tx *gorm.DB, identity AppServiceIdentity, now time.Time) (AppServiceIdentity, error) {
-	invalid := errors.New("service_identity_invalid")
 	var stored AppServiceCredential
 	if err := lockForUpdate(tx).Where("credential_id = ? AND installation_id = ? AND app_key = ?",
 		identity.CredentialID, identity.InstallationID, identity.AppKey).First(&stored).Error; err != nil {
-		return AppServiceIdentity{}, invalid
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return AppServiceIdentity{}, ErrAppServiceIdentityInvalid
+		}
+		return AppServiceIdentity{}, err
 	}
 	var binding AppServiceCredentialBinding
 	if err := lockForUpdate(tx).Where("credential_row_id = ?", stored.ID).First(&binding).Error; err != nil {
-		return AppServiceIdentity{}, invalid
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return AppServiceIdentity{}, ErrAppServiceIdentityInvalid
+		}
+		return AppServiceIdentity{}, err
 	}
 	if stored.Status != "active" || stored.ExpiresAt <= now.Unix() ||
 		stored.CredentialVersion != identity.Version || binding.Version != identity.Version ||
 		binding.CredentialID != identity.CredentialID || len(binding.Scopes) == 0 {
-		return AppServiceIdentity{}, invalid
+		return AppServiceIdentity{}, ErrAppServiceIdentityInvalid
 	}
 	identity.Scopes = slices.Clone(binding.Scopes)
 	return identity, nil

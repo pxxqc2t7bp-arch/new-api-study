@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"net"
 	"net/http"
@@ -29,6 +30,38 @@ type AppPluginAuthError struct{ Code string }
 func (e *AppPluginAuthError) Error() string { return e.Code }
 
 func appAuthError(code string) error { return &AppPluginAuthError{Code: code} }
+
+func classifyDBLookup(err error, notFoundCode string) error {
+	if err == nil {
+		return nil
+	}
+	var authErr *AppPluginAuthError
+	if errors.As(err, &authErr) {
+		return err
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return appAuthError(notFoundCode)
+	}
+	return appAuthError("service_unavailable")
+}
+
+func appExecutionBoundaryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var authErr *AppPluginAuthError
+	if errors.As(err, &authErr) {
+		return err
+	}
+	return appAuthError("service_unavailable")
+}
+
+func appServiceIdentityRevalidationError(err error) error {
+	if errors.Is(err, model.ErrAppServiceIdentityInvalid) {
+		return appAuthError("service_identity_invalid")
+	}
+	return appAuthError("service_unavailable")
+}
 
 type AppPluginAuthOptions struct {
 	Issuer             string
@@ -141,7 +174,7 @@ func (s *AppPluginAuthService) LaunchContext(ctx context.Context, identity AuthI
 		result = AppPluginLaunchContext{}
 		installation, err := model.LockAppPluginInstallation(tx, appKey, "")
 		if err != nil {
-			return err
+			return classifyDBLookup(err, "not_found")
 		}
 		if installation.AppKey != appKey {
 			return appAuthError("not_found")
@@ -161,7 +194,7 @@ func (s *AppPluginAuthService) LaunchContext(ctx context.Context, identity AuthI
 		}
 		manifest, _, err := ValidateAppPluginRegistration(tx, installation)
 		if err != nil {
-			return err
+			return classifyDBLookup(err, "not_found")
 		}
 		if !slices.Contains(installation.EnabledSurfaces, surface) {
 			return appAuthError("forbidden")
@@ -179,7 +212,7 @@ func (s *AppPluginAuthService) LaunchContext(ctx context.Context, identity AuthI
 		endpoint := absoluteManifestEndpoint(installation.BaseURL, startPath)
 		var claim model.AppRouteClaim
 		if err := model.AppPluginCurrentRead(tx).Where("installation_id = ? AND kind = ?", installation.InstallationID, surface).First(&claim).Error; err != nil {
-			return appAuthError("not_found")
+			return classifyDBLookup(err, "not_found")
 		}
 		if claim.AppKey != appKey || claim.InstallationID != installation.InstallationID || claim.AbsoluteEndpoint != endpoint {
 			return appAuthError("not_found")
@@ -191,7 +224,7 @@ func (s *AppPluginAuthService) LaunchContext(ctx context.Context, identity AuthI
 		result = AppPluginLaunchContext{AppKey: appKey, Surface: surface, StartURL: endpoint, Origin: target.Scheme + "://" + target.Host}
 		return nil
 	})
-	return result, err
+	return result, appExecutionBoundaryError(err)
 }
 
 type AppPluginSessionRevokeRequest struct {
@@ -268,11 +301,24 @@ func ValidateAppPluginRegistration(tx *gorm.DB, installation model.AppInstallati
 		return AppManifest{}, "", appAuthError("forbidden")
 	}
 	callback := absoluteManifestEndpoint(base, manifest.CallbackPath)
-	var claim model.AppRouteClaim
-	if err := model.AppPluginCurrentRead(tx).Where("installation_id = ? AND kind = ?", installation.InstallationID, "callback").First(&claim).Error; err != nil {
-		return AppManifest{}, "", err
+	expectedClaimKey := serviceDigestBytes([]byte("route\x00" + callback))
+	var claims []model.AppRouteClaim
+	query := model.AppPluginCurrentRead(tx).Where(
+		"claim_key = ? OR (installation_id = ? AND kind = ?)",
+		expectedClaimKey, installation.InstallationID, "callback",
+	).Limit(2).Find(&claims)
+	if query.Error != nil {
+		return AppManifest{}, "", query.Error
 	}
-	if claim.AppKey != installation.AppKey || claim.AbsoluteEndpoint != callback {
+	if len(claims) == 0 {
+		return AppManifest{}, "", gorm.ErrRecordNotFound
+	}
+	if len(claims) != 1 ||
+		claims[0].InstallationID != installation.InstallationID ||
+		claims[0].AppKey != installation.AppKey ||
+		claims[0].Kind != "callback" ||
+		claims[0].AbsoluteEndpoint != callback ||
+		claims[0].ClaimKey != expectedClaimKey {
 		return AppManifest{}, "", appAuthError("forbidden")
 	}
 	return manifest, callback, nil
@@ -317,6 +363,142 @@ func (s *AppPluginAuthService) launchCode(row model.AppPluginLaunchCode) string 
 	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
+func (s *AppPluginAuthService) validLaunchCode(row model.AppPluginLaunchCode, code string) bool {
+	codeMatches := hmac.Equal([]byte(s.launchCode(row)), []byte(code))
+	hashMatches := hmac.Equal([]byte(row.CodeHash), []byte(serviceDigestBytes([]byte(code))))
+	return codeMatches && hashMatches
+}
+
+func (s *AppPluginAuthService) exchangeReplayMAC(replay model.AppPluginExchangeReplay) string {
+	key := hmac.New(sha256.New, s.options.DerivationKey)
+	key.Write([]byte("new-api/app-plugin/exchange-replay-key/v1"))
+	mac := hmac.New(sha256.New, key.Sum(nil))
+	var encoded [8]byte
+	launchCodeHash, appSessionID := "", ""
+	if replay.LaunchCodeHash != nil {
+		launchCodeHash = *replay.LaunchCodeHash
+	}
+	if replay.AppSessionID != nil {
+		appSessionID = *replay.AppSessionID
+	}
+	for _, value := range []string{
+		replay.ScopeHash,
+		replay.RequestHash,
+		replay.InstallationID,
+		launchCodeHash,
+		appSessionID,
+	} {
+		binary.BigEndian.PutUint64(encoded[:], uint64(len(value)))
+		mac.Write(encoded[:])
+		mac.Write([]byte(value))
+	}
+	binary.BigEndian.PutUint64(encoded[:], uint64(replay.ExpiresAt))
+	mac.Write(encoded[:])
+	binary.BigEndian.PutUint64(encoded[:], uint64(len(replay.ResponseJSON)))
+	mac.Write(encoded[:])
+	mac.Write([]byte(replay.ResponseJSON))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (s *AppPluginAuthService) authenticateExchangeReplay(
+	tx *gorm.DB,
+	replay model.AppPluginExchangeReplay,
+	code model.AppPluginLaunchCode,
+	installation model.AppInstallation,
+	request AppPluginExchangeRequest,
+) (AppPluginExchangeResult, model.AppPluginSession, error) {
+	var result AppPluginExchangeResult
+	var session model.AppPluginSession
+	expectedMAC := s.exchangeReplayMAC(replay)
+	requestCodeHash := serviceDigestBytes([]byte(request.Code))
+	if replay.LaunchCodeHash == nil || replay.AppSessionID == nil ||
+		*replay.LaunchCodeHash == "" || *replay.AppSessionID == "" ||
+		!hmac.Equal([]byte(replay.ResponseMAC), []byte(expectedMAC)) ||
+		len(replay.ScopeHash) != 64 || len(replay.RequestHash) != 64 ||
+		replay.InstallationID != installation.InstallationID ||
+		!hmac.Equal([]byte(*replay.LaunchCodeHash), []byte(requestCodeHash)) ||
+		!hmac.Equal([]byte(*replay.LaunchCodeHash), []byte(code.CodeHash)) ||
+		*replay.AppSessionID != code.AppSessionID ||
+		!s.validLaunchCode(code, request.Code) {
+		return result, session, appAuthError("not_found")
+	}
+	var binding model.AppPluginLaunchBinding
+	if err := common.UnmarshalJsonStr(code.BindingJSON, &binding); err != nil {
+		return result, session, appAuthError("not_found")
+	}
+	challenge := sha256.Sum256([]byte(request.CodeVerifier))
+	upstreamExpiry := time.Unix(binding.UpstreamExpiresAt, 0).UTC()
+	expectedReplayExpiry := code.ConsumedAt + int64(5*time.Minute)
+	if code.ConsumedAt <= 0 ||
+		code.ConsumedAt >= code.ExpiresAt ||
+		code.ConsumedAt >= upstreamExpiry.UnixNano() ||
+		expectedReplayExpiry < code.ConsumedAt ||
+		replay.ExpiresAt != expectedReplayExpiry {
+		return result, session, appAuthError("not_found")
+	}
+	_, callback, err := ValidateAppPluginRegistration(tx, installation)
+	if err != nil {
+		var authErr *AppPluginAuthError
+		if errors.As(err, &authErr) && authErr.Code == "forbidden" {
+			return result, session, appAuthError("not_found")
+		}
+		return result, session, classifyDBLookup(err, "not_found")
+	}
+	if code.InstallationID != installation.InstallationID ||
+		code.ExpiresAt != binding.ExpiresAt ||
+		binding.InstallationID != installation.InstallationID ||
+		binding.AppKey != request.AppKey ||
+		binding.AppKey != installation.AppKey ||
+		binding.Generation != installation.AppVersionID ||
+		binding.Callback != callback ||
+		binding.Issuer != s.options.Issuer ||
+		binding.Surface != request.Surface ||
+		!slices.Contains(installation.EnabledSurfaces, binding.Surface) ||
+		binding.TransactionID != request.TransactionID ||
+		!hmac.Equal([]byte(binding.StateHash), []byte(serviceDigestBytes([]byte(request.State)))) ||
+		!hmac.Equal([]byte(binding.NonceHash), []byte(serviceDigestBytes([]byte(request.Nonce)))) ||
+		!hmac.Equal([]byte(binding.CodeChallenge), []byte(base64.RawURLEncoding.EncodeToString(challenge[:]))) {
+		return result, session, appAuthError("not_found")
+	}
+	if err := common.UnmarshalJsonStr(replay.ResponseJSON, &result); err != nil {
+		return AppPluginExchangeResult{}, session, appAuthError("not_found")
+	}
+	if err := model.AppPluginCurrentRead(tx).Where(
+		"app_session_id = ? AND installation_id = ?",
+		*replay.AppSessionID, installation.InstallationID,
+	).First(&session).Error; err != nil {
+		return AppPluginExchangeResult{}, session, classifyDBLookup(err, "not_found")
+	}
+	if session.AppSessionID != *replay.AppSessionID ||
+		session.AppSessionID != result.AppSessionID ||
+		session.InstallationID != binding.InstallationID ||
+		session.InstallationID != installation.InstallationID ||
+		session.AppKey != binding.AppKey ||
+		session.AppKey != installation.AppKey ||
+		session.Generation != binding.Generation ||
+		session.Generation != installation.AppVersionID ||
+		session.Issuer != binding.Issuer ||
+		session.Issuer != result.Issuer ||
+		session.UserID != binding.UserID ||
+		session.UserID != result.UserID ||
+		session.DashboardSessionID != binding.DashboardSessionID ||
+		session.AuthVersion != binding.AuthVersion ||
+		session.AuthVersion != result.AuthVersion ||
+		session.SessionVersion != binding.SessionVersion ||
+		session.SessionVersion != result.SessionVersion ||
+		session.Subject != "user_"+strconv.Itoa(binding.UserID) ||
+		session.Subject != result.Subject ||
+		!slices.Equal(session.GrantedScopes, result.GrantedScopes) ||
+		session.UpstreamExpiresAt != binding.UpstreamExpiresAt ||
+		!result.UpstreamExpiresAt.Equal(upstreamExpiry) ||
+		result.Entitlements == nil ||
+		result.EntitlementVersion == "" ||
+		!result.IssuedAt.Equal(time.Unix(0, code.ConsumedAt).UTC()) {
+		return AppPluginExchangeResult{}, model.AppPluginSession{}, appAuthError("not_found")
+	}
+	return result, session, nil
+}
+
 func (s *AppPluginAuthService) Authorize(ctx context.Context, identity AuthIdentity, appKey, origin, key string, request AppPluginAuthorizeRequest) (AppPluginAuthorizeResult, error) {
 	if identity.SessionID == "" {
 		return AppPluginAuthorizeResult{}, appAuthError("unauthenticated")
@@ -347,7 +529,7 @@ func (s *AppPluginAuthService) Authorize(ctx context.Context, identity AuthIdent
 		now := s.options.Now().UTC()
 		installation, err := model.LockAppPluginInstallation(tx, appKey, "")
 		if err != nil {
-			return err
+			return classifyDBLookup(err, "not_found")
 		}
 		user, dashboard, err := AppPluginDashboardIdentity(tx, identity, now)
 		if err != nil {
@@ -361,7 +543,7 @@ func (s *AppPluginAuthService) Authorize(ctx context.Context, identity AuthIdent
 		}
 		_, callback, err := ValidateAppPluginRegistration(tx, installation)
 		if err != nil {
-			return err
+			return classifyDBLookup(err, "not_found")
 		}
 		if !slices.Contains(installation.EnabledSurfaces, request.Surface) ||
 			(request.Surface == "embedded" && (!slices.Contains(installation.AllowedParentOrigins, origin) || !AppPluginSameSiteHTTPS(installation.BaseURL, origin))) {
@@ -427,7 +609,7 @@ func (s *AppPluginAuthService) Authorize(ctx context.Context, identity AuthIdent
 		result = AppPluginAuthorizeResult{LaunchURL: target.String(), Surface: request.Surface, ExpiresIn: 60}
 		return nil
 	})
-	return result, err
+	return result, appExecutionBoundaryError(err)
 }
 
 func (s *AppPluginAuthService) Exchange(ctx context.Context, service model.AppServiceIdentity, request AppPluginExchangeRequest) (AppPluginExchangeResult, error) {
@@ -457,11 +639,11 @@ func (s *AppPluginAuthService) Exchange(ctx context.Context, service model.AppSe
 		now := s.options.Now().UTC()
 		installation, err := model.LockAppPluginInstallation(tx, service.AppKey, service.InstallationID)
 		if err != nil {
-			return err
+			return classifyDBLookup(err, "not_found")
 		}
 		currentService, err := model.ValidateAppServiceIdentity(tx, service, now)
 		if err != nil {
-			return err
+			return appServiceIdentityRevalidationError(err)
 		}
 		if !slices.Contains(currentService.Scopes, "identity.read") {
 			return appAuthError("scope_denied")
@@ -472,31 +654,96 @@ func (s *AppPluginAuthService) Exchange(ctx context.Context, service model.AppSe
 			return q.Error
 		}
 		if q.RowsAffected == 1 {
+			if replay.ScopeHash != scope ||
+				!hmac.Equal([]byte(replay.ResponseMAC), []byte(s.exchangeReplayMAC(replay))) {
+				return appAuthError("not_found")
+			}
 			if replay.RequestHash != hash {
 				return appAuthError("idempotency_conflict")
+			}
+			var code model.AppPluginLaunchCode
+			if err := model.AppPluginCurrentRead(tx).Where(
+				"code_hash = ? AND installation_id = ?",
+				serviceDigestBytes([]byte(request.Code)), service.InstallationID,
+			).First(&code).Error; err != nil {
+				return classifyDBLookup(err, "not_found")
+			}
+			var replayErr error
+			result, _, replayErr = s.authenticateExchangeReplay(
+				tx, replay, code, installation, request,
+			)
+			if replayErr != nil {
+				return replayErr
 			}
 			if replay.ExpiresAt <= now.UnixNano() {
 				return appAuthError("launch_code_replayed")
 			}
-			return common.UnmarshalJsonStr(replay.ResponseJSON, &result)
+			return nil
 		}
 		var code model.AppPluginLaunchCode
 		if err := model.AppPluginCurrentRead(tx).Where("code_hash = ? AND installation_id = ?",
 			serviceDigestBytes([]byte(request.Code)), service.InstallationID).First(&code).Error; err != nil {
+			return classifyDBLookup(err, "not_found")
+		}
+		if !s.validLaunchCode(code, request.Code) {
 			return appAuthError("not_found")
+		}
+		if code.ConsumedAt != 0 {
+			var originalReplays []model.AppPluginExchangeReplay
+			q := model.AppPluginCurrentRead(tx).Where(
+				"installation_id = ? AND launch_code_hash = ?",
+				service.InstallationID, code.CodeHash,
+			).Limit(2).Find(&originalReplays)
+			if q.Error != nil {
+				return q.Error
+			}
+			if len(originalReplays) != 1 {
+				return appAuthError("not_found")
+			}
+			originalReplay := originalReplays[0]
+			if originalReplay.ScopeHash == scope {
+				return appAuthError("not_found")
+			}
+			authenticated, session, replayErr := s.authenticateExchangeReplay(
+				tx, originalReplay, code, installation, request,
+			)
+			if replayErr != nil {
+				return replayErr
+			}
+			if originalReplay.RequestHash == hash {
+				if originalReplay.ExpiresAt <= now.UnixNano() {
+					return appAuthError("launch_code_replayed")
+				}
+				result = authenticated
+				return nil
+			}
+			if session.RevokedAt == 0 {
+				update := tx.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ? AND installation_id = ? AND revoked_at = ?",
+					session.AppSessionID, installation.InstallationID, 0,
+				).Update("revoked_at", now.UnixNano())
+				if update.Error != nil {
+					return update.Error
+				}
+				if update.RowsAffected != 1 {
+					return errors.New("exchange session revocation affected unexpected row count")
+				}
+			}
+			rejection = appAuthError("launch_code_replayed")
+			return nil
 		}
 		var binding model.AppPluginLaunchBinding
 		if err := common.UnmarshalJsonStr(code.BindingJSON, &binding); err != nil {
-			return err
+			return appAuthError("not_found")
 		}
 		manifest, callback, err := ValidateAppPluginRegistration(tx, installation)
 		if err != nil {
-			return err
+			return classifyDBLookup(err, "not_found")
 		}
 		if binding.InstallationID != service.InstallationID || binding.AppKey != request.AppKey ||
 			binding.Generation != installation.AppVersionID || binding.Callback != callback ||
 			binding.Surface != request.Surface || binding.TransactionID != request.TransactionID ||
-			binding.Issuer != s.options.Issuer {
+			binding.Issuer != s.options.Issuer || binding.ExpiresAt != code.ExpiresAt {
 			return appAuthError("not_found")
 		}
 		if !hmac.Equal([]byte(binding.StateHash), []byte(serviceDigestBytes([]byte(request.State)))) {
@@ -509,17 +756,6 @@ func (s *AppPluginAuthService) Exchange(ctx context.Context, service model.AppSe
 		if !hmac.Equal([]byte(binding.CodeChallenge), []byte(base64.RawURLEncoding.EncodeToString(challenge[:]))) {
 			return appAuthError("pkce_verification_failed")
 		}
-		if code.ConsumedAt != 0 {
-			// A second VALID logical operation revokes its issued session. The
-			// API rejection is returned only after this transaction commits.
-			if err := tx.Model(&model.AppPluginSession{}).
-				Where("app_session_id = ? AND installation_id = ? AND revoked_at = ?", code.AppSessionID, service.InstallationID, 0).
-				Update("revoked_at", now.UnixNano()).Error; err != nil {
-				return err
-			}
-			rejection = appAuthError("launch_code_replayed")
-			return nil
-		}
 		if code.ExpiresAt <= now.UnixNano() {
 			return appAuthError("launch_code_expired")
 		}
@@ -530,6 +766,9 @@ func (s *AppPluginAuthService) Exchange(ctx context.Context, service model.AppSe
 			SessionID: binding.DashboardSessionID, UserAuthVersion: binding.AuthVersion, SessionVersion: binding.SessionVersion}, now)
 		if err != nil {
 			return err
+		}
+		if dashboard.ExpiresAt != binding.UpstreamExpiresAt {
+			return appAuthError("unauthenticated")
 		}
 		if len(installation.AllowedUserPolicy.Groups) != 0 && !slices.Contains(installation.AllowedUserPolicy.Groups, user.Group) {
 			return appAuthError("not_found")
@@ -549,7 +788,7 @@ func (s *AppPluginAuthService) Exchange(ctx context.Context, service model.AppSe
 		session := model.AppPluginSession{AppSessionID: id, InstallationID: installation.InstallationID, AppKey: installation.AppKey,
 			Generation: installation.AppVersionID, Issuer: binding.Issuer, Subject: "user_" + strconv.Itoa(user.Id),
 			UserID: user.Id, DashboardSessionID: dashboard.SID, AuthVersion: binding.AuthVersion, SessionVersion: binding.SessionVersion,
-			GrantedScopes: scopes, UpstreamExpiresAt: min(dashboard.ExpiresAt, binding.UpstreamExpiresAt)}
+			GrantedScopes: scopes, UpstreamExpiresAt: binding.UpstreamExpiresAt}
 		if session.UpstreamExpiresAt <= now.Unix() {
 			return appAuthError("unauthenticated")
 		}
@@ -572,11 +811,17 @@ func (s *AppPluginAuthService) Exchange(ctx context.Context, service model.AppSe
 		if err != nil {
 			return err
 		}
-		return tx.Create(&model.AppPluginExchangeReplay{ScopeHash: scope, RequestHash: hash, InstallationID: service.InstallationID,
-			ResponseJSON: string(raw), ExpiresAt: now.Add(5 * time.Minute).UnixNano()}).Error
+		launchCodeHash, appSessionID := code.CodeHash, session.AppSessionID
+		replay = model.AppPluginExchangeReplay{
+			ScopeHash: scope, RequestHash: hash, InstallationID: service.InstallationID,
+			LaunchCodeHash: &launchCodeHash, AppSessionID: &appSessionID,
+			ResponseJSON: string(raw), ExpiresAt: now.Add(5 * time.Minute).UnixNano(),
+		}
+		replay.ResponseMAC = s.exchangeReplayMAC(replay)
+		return tx.Create(&replay).Error
 	})
 	if err != nil {
-		return AppPluginExchangeResult{}, err
+		return AppPluginExchangeResult{}, appExecutionBoundaryError(err)
 	}
 	return result, rejection
 }
@@ -618,11 +863,11 @@ func (s *AppPluginAuthService) Introspect(ctx context.Context, service model.App
 			UserStatus: "inactive", GrantedScopes: []string{}, Entitlements: model.AppJSONMap{}, EntitlementVersion: "none"}
 		installation, err := model.LockAppPluginInstallation(tx, service.AppKey, service.InstallationID)
 		if err != nil {
-			return err
+			return classifyDBLookup(err, "not_found")
 		}
 		currentService, err := model.ValidateAppServiceIdentity(tx, service, now)
 		if err != nil {
-			return err
+			return appServiceIdentityRevalidationError(err)
 		}
 		if !slices.Contains(currentService.Scopes, "identity.read") {
 			return appAuthError("scope_denied")
@@ -630,7 +875,7 @@ func (s *AppPluginAuthService) Introspect(ctx context.Context, service model.App
 		var session model.AppPluginSession
 		if err := model.AppPluginCurrentRead(tx).Where("app_session_id = ? AND installation_id = ? AND app_key = ? AND subject = ?",
 			request.AppSessionID, service.InstallationID, request.AppKey, request.Subject).First(&session).Error; err != nil {
-			return appAuthError("not_found")
+			return classifyDBLookup(err, "not_found")
 		}
 		if session.AppSessionID != request.AppSessionID || session.Subject != request.Subject ||
 			session.AppKey != request.AppKey || session.InstallationID != service.InstallationID ||
@@ -675,7 +920,7 @@ func (s *AppPluginAuthService) Introspect(ctx context.Context, service model.App
 		}
 		manifest, _, err := ValidateAppPluginRegistration(tx, installation)
 		if err != nil {
-			return err
+			return classifyDBLookup(err, "not_found")
 		}
 		result.GrantedScopes = appPluginScopeIntersection(session.GrantedScopes, appPluginScopeIntersection(manifest.RequestedScopes, currentService.Scopes))
 		result.Entitlements, result.EntitlementVersion, err = s.entitlements(ctx, tx, installation, user)
@@ -725,7 +970,7 @@ func (s *AppPluginAuthService) Introspect(ctx context.Context, service model.App
 		result.Active = true
 		return nil
 	})
-	return result, err
+	return result, appExecutionBoundaryError(err)
 }
 
 func (s *AppPluginAuthService) RevokeSession(ctx context.Context, service model.AppServiceIdentity, key string, request AppPluginSessionRevokeRequest) (AppPluginSessionRevokeResult, error) {
@@ -748,11 +993,11 @@ func (s *AppPluginAuthService) RevokeSession(ctx context.Context, service model.
 		result = AppPluginSessionRevokeResult{}
 		now := s.options.Now().UTC()
 		if _, err := model.LockAppPluginInstallation(tx, service.AppKey, service.InstallationID); err != nil {
-			return appAuthError("not_found")
+			return classifyDBLookup(err, "not_found")
 		}
 		currentService, err := model.ValidateAppServiceIdentity(tx, service, now)
 		if err != nil {
-			return err
+			return appServiceIdentityRevalidationError(err)
 		}
 		if !slices.Contains(currentService.Scopes, "identity.read") {
 			return appAuthError("scope_denied")
@@ -760,7 +1005,7 @@ func (s *AppPluginAuthService) RevokeSession(ctx context.Context, service model.
 		var session model.AppPluginSession
 		if err := model.AppPluginCurrentRead(tx).Where("app_session_id = ? AND installation_id = ? AND app_key = ? AND subject = ?",
 			request.AppSessionID, service.InstallationID, request.AppKey, request.Subject).First(&session).Error; err != nil {
-			return appAuthError("not_found")
+			return classifyDBLookup(err, "not_found")
 		}
 		var replay model.AppPluginSessionRevokeReplay
 		q := model.AppPluginCurrentRead(tx).Where("scope_hash = ?", scope).Limit(1).Find(&replay)
@@ -788,7 +1033,7 @@ func (s *AppPluginAuthService) RevokeSession(ctx context.Context, service model.
 		return tx.Create(&model.AppPluginSessionRevokeReplay{ScopeHash: scope, RequestHash: hash,
 			InstallationID: service.InstallationID, ResponseJSON: string(raw)}).Error
 	})
-	return result, err
+	return result, appExecutionBoundaryError(err)
 }
 
 // Match authz.Can's role/override semantics using current DB rows, not the

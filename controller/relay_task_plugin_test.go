@@ -131,6 +131,38 @@ func TestPresentTaskSubmissionUsesHostOpenAIVideoCreateReceipt(t *testing.T) {
 	assert.NotContains(t, recorder.Body.String(), "task_id")
 }
 
+func TestExecuteAppTaskSubmissionMapsProjectionStorageFailureToServiceUnavailable(t *testing.T) {
+	events := []string{}
+	database := setupTaskSubmissionDatabase(t, true, &events)
+	const privateDetail = "private projection storage detail"
+	require.NoError(t, database.Callback().Query().Before("gorm:query").
+		Register("test:app-task-projection-storage-failure", func(tx *gorm.DB) {
+			if tx.Statement.Table == "tasks" {
+				tx.AddError(errors.New(privateDetail))
+			}
+		}))
+	t.Cleanup(func() {
+		require.NoError(t, database.Callback().Query().Remove("test:app-task-projection-storage-failure"))
+	})
+	c := taskSubmissionTestContext()
+	info := taskSubmissionRelayInfo(&taskSubmissionTestBilling{events: &events})
+	info.AppSubject = &types.AppRelaySubject{GrantID: "grant"}
+
+	outcome, taskErr := executeAppTaskSubmission(c, info, func(
+		*gin.Context, *relaycommon.RelayInfo,
+	) (*relay.TaskSubmitResult, *dto.TaskError) {
+		return &relay.TaskSubmitResult{AppExecution: &model.AppTaskExecution{
+			TaskID: "task_public", UserID: 1,
+		}}, nil
+	})
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "service_unavailable", taskErr.Code)
+	assert.Equal(t, http.StatusServiceUnavailable, taskErr.StatusCode)
+	assert.NotContains(t, taskErr.Message, privateDetail)
+}
+
 func TestExecuteTaskSubmissionRefundsWhenInsertFails(t *testing.T) {
 	events := make([]string, 0, 3)
 	database := setupTaskSubmissionDatabase(t, false, &events)

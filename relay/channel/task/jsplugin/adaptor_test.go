@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"mime/multipart"
@@ -28,8 +29,10 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 const mockPlugin = `
@@ -81,6 +84,46 @@ func TestTaskAdaptorRejectsDeprecatedClientResponse(t *testing.T) {
 	require.NotNil(t, taskErr)
 	require.Error(t, taskErr.Error)
 	assert.Contains(t, taskErr.Error.Error(), "must not return clientResponse")
+}
+
+func TestTaskAdaptorPreservesAppPassthroughStorageFailure(t *testing.T) {
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate(&model.AppExecutionGrant{}))
+	previousDB := model.DB
+	model.DB = database
+	t.Cleanup(func() { model.DB = previousDB })
+	const privateDetail = "private passthrough database detail"
+	require.NoError(t, database.Callback().Query().Before("gorm:query").
+		Register("test:app-passthrough-storage-failure", func(tx *gorm.DB) {
+			if tx.Statement.Table == "app_execution_grants" {
+				tx.AddError(errors.New(privateDetail))
+			}
+		}))
+	t.Cleanup(func() {
+		require.NoError(t, database.Callback().Query().Remove("test:app-passthrough-storage-failure"))
+	})
+	plugin, err := pluginruntime.NewRegistry().Register(mockPlugin, pluginruntime.Options{})
+	require.NoError(t, err)
+	adaptor := New(plugin)
+	info := &relaycommon.RelayInfo{
+		AppSubject: &hosttypes.AppRelaySubject{GrantID: "grant"},
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelBaseUrl: "https://provider.example",
+		},
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{},
+	}
+	adaptor.Init(info)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+	c.Set("task_request", map[string]any{"model": "mock-v1", "prompt": "hello"})
+
+	taskErr := adaptor.ValidateRequestAndSetAction(c, info)
+
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "service_unavailable", taskErr.Code)
+	assert.Equal(t, http.StatusServiceUnavailable, taskErr.StatusCode)
+	assert.NotContains(t, taskErr.Message, privateDetail)
 }
 
 func TestTaskAdaptorBuildsMultipartFromOpaqueFileReference(t *testing.T) {

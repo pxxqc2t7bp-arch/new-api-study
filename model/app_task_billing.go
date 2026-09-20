@@ -21,22 +21,22 @@ func ReserveAppExecutionFundingTx(tx *gorm.DB, grant AppExecutionGrant, amount i
 	var funding AppExecutionFunding
 	if amount < 0 || amount > 2147483647 || common.UnmarshalJsonStr(grant.FundingSnapshotJSON, &funding) != nil ||
 		funding.Source != grant.FundingSource || funding.Reference != grant.FundingRef {
-		return funding, errors.New("invalid_funding")
+		return funding, ErrAppExecutionInvalidFunding
 	}
 	var user User
 	if err := lockForUpdate(tx).Where("id = ?", grant.UserID).First(&user).Error; err != nil {
 		return funding, err
 	}
 	if user.Status != common.UserStatusEnabled {
-		return funding, errors.New("identity_inactive")
+		return funding, ErrAppExecutionIdentityInactive
 	}
 	switch funding.Source {
 	case "wallet":
 		if common.RedisEnabled || common.BatchUpdateEnabled {
-			return funding, errors.New("wallet_accounting_unavailable")
+			return funding, ErrAppExecutionAccountingUnavailable
 		}
 		if user.Quota < 0 || int64(user.Quota) > common.MaxWalletQuota || int64(user.Quota) < amount {
-			return funding, errors.New("insufficient_quota")
+			return funding, ErrAppExecutionInsufficientQuota
 		}
 		return funding, tx.Model(&User{}).Where("id = ?", user.Id).
 			Update("quota", gorm.Expr("quota - ?", amount)).Error
@@ -52,16 +52,16 @@ func ReserveAppExecutionFundingTx(tx *gorm.DB, grant AppExecutionGrant, amount i
 		if sub.Status != "active" || sub.StartTime > now.Unix() || sub.EndTime <= now.Unix() ||
 			sub.StartTime != funding.PeriodStart || sub.EndTime != funding.PeriodEnd || sub.LastResetTime != funding.PeriodReset ||
 			NormalizeResetPeriod(plan.QuotaResetPeriod) != SubscriptionResetNever || sub.NextResetTime != 0 {
-			return funding, errors.New("funding_period_changed")
+			return funding, ErrAppExecutionFundingPeriodChanged
 		}
 		if sub.AmountUsed < 0 || sub.AmountTotal < 0 || sub.AmountUsed > common.MaxWalletQuota-amount ||
 			(sub.AmountTotal > 0 && (sub.AmountUsed > sub.AmountTotal || amount > sub.AmountTotal-sub.AmountUsed)) {
-			return funding, errors.New("insufficient_quota")
+			return funding, ErrAppExecutionInsufficientQuota
 		}
 		return funding, tx.Model(&UserSubscription{}).Where("id = ?", sub.Id).
 			Update("amount_used", gorm.Expr("amount_used + ?", amount)).Error
 	default:
-		return funding, errors.New("invalid_funding")
+		return funding, ErrAppExecutionInvalidFunding
 	}
 }
 
@@ -94,7 +94,7 @@ func lockAppTaskFundingTx(tx *gorm.DB, execution AppTaskExecution) (User, *UserS
 		return user, nil, nil
 	}
 	if execution.FundingSource != "subscription" || execution.SubscriptionID <= 0 {
-		return user, nil, errors.New("invalid_funding")
+		return user, nil, ErrAppExecutionInvalidFunding
 	}
 	var sub UserSubscription
 	if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", execution.SubscriptionID, execution.UserID).

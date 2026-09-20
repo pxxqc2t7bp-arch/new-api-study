@@ -6,6 +6,7 @@ import (
 	"maps"
 	"math"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -234,13 +235,9 @@ func UpdateRequestPolicyOptions(values map[string]string) error {
 	if err != nil {
 		return err
 	}
-	if err := DB.Transaction(func(tx *gorm.DB) error {
-		for key, value := range values {
-			option := Option{Key: key}
-			if err := tx.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
-				return err
-			}
-			if err := tx.Model(&option).Update("value", value).Error; err != nil {
+	if err := runOptionWriteTransaction(DB, func(tx *gorm.DB) error {
+		for _, key := range slices.Sorted(maps.Keys(values)) {
+			if err := saveOptionTx(tx, key, values[key], optionWriteRequestPolicy); err != nil {
 				return err
 			}
 		}

@@ -41,8 +41,10 @@ func TestScopedTaskLookupCannotReadAnotherUser(t *testing.T) {
 		alias.Subject = strings.ToUpper(scope.Subject)
 		_, err = GetScopedAppTask(t.Context(), db, alias, taskID, grantID)
 		require.ErrorContains(t, err, "not_found", "database collation cannot change subject authority")
+		require.ErrorIs(t, err, ErrAppTaskNotFound)
 		_, err = GetScopedAppTask(t.Context(), db, scope, strings.ToUpper(taskID), strings.ToUpper(grantID))
 		require.ErrorContains(t, err, "not_found", "opaque selectors are exact")
+		require.ErrorIs(t, err, ErrAppTaskNotFound)
 		current := scope
 		current.AppSessionID = "new-active-session"
 		found, err = GetScopedAppTask(t.Context(), db, current, taskID, grantID)
@@ -106,6 +108,25 @@ func TestTaskPathsExcludeResponseExecutions(t *testing.T) {
 	_, _, won, err := ClaimAppTaskReconcile(t.Context(), db, "task-worker", now, time.Minute)
 	require.NoError(t, err)
 	assert.False(t, won)
+}
+
+func TestHasPendingAppTaskReconciliationDoesNotHideStorageFailure(t *testing.T) {
+	db, _, _ := appCredentialFixture(t)
+	require.NoError(t, MigrateAppExecutionTables(db))
+	previousDB := DB
+	DB = db
+	t.Cleanup(func() { DB = previousDB })
+	const callbackName = "test:pending-app-task-storage-failure"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").
+		Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table == "app_task_reconciles" {
+				tx.AddError(errors.New("private pending task database detail"))
+			}
+		}))
+	t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove(callbackName)) })
+
+	assert.True(t, HasPendingAppTaskReconciliation(),
+		"a storage fault must conservatively schedule the worker instead of becoming no pending work")
 }
 
 func TestAppTaskCancelReplayMigration(t *testing.T) {

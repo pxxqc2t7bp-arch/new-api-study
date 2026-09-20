@@ -198,7 +198,7 @@ func (s *AppExecutionService) enrichAppTaskArtifactsTx(tx *gorm.DB, identity mod
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return artifacts, nil
 		}
-		return nil, appAuthError("invalid_evidence")
+		return nil, appAuthError("service_unavailable")
 	}
 	if projection.TaskID != task.TaskID || projection.UserId != task.UserID ||
 		projection.Status != model.TaskStatusSuccess || projection.ExecutionMode != model.TaskExecutionModeAppManaged {
@@ -254,12 +254,17 @@ func (s *AppExecutionService) ResolveAppTaskArtifactContent(ctx context.Context,
 			CredentialID: access.CredentialID, Version: access.CredentialVersion}
 		authority, err := s.taskAuthorityTx(tx, identity, access.AppKey, access.AppSessionID,
 			access.Subject, []string{"task.read"}, false)
-		if err != nil || authority.session.AppSessionID != access.AppSessionID ||
-			authority.user.Id != access.UserID {
+		if err != nil {
+			return err
+		}
+		if authority.session.AppSessionID != access.AppSessionID || authority.user.Id != access.UserID {
 			return appAuthError("not_found")
 		}
 		task, err := ownedAppTaskTx(ctx, tx, authority, access.TaskID, "")
-		if err != nil || task.TaskID != access.TaskID || task.GrantID != access.GrantID ||
+		if err != nil {
+			return err
+		}
+		if task.TaskID != access.TaskID || task.GrantID != access.GrantID ||
 			!task.ProviderAccepted || task.ProviderState != "succeeded" {
 			return appAuthError("not_found")
 		}
@@ -273,7 +278,7 @@ func (s *AppExecutionService) ResolveAppTaskArtifactContent(ctx context.Context,
 		}
 		if err := model.AppPluginCurrentRead(tx).Where("task_id = ? AND user_id = ? AND execution_mode = ?",
 			task.TaskID, task.UserID, model.TaskExecutionModeAppManaged).First(&projection).Error; err != nil {
-			return appAuthError("not_found")
+			return appTaskQueryError(err, "not_found")
 		}
 		source = projection.PrivateData.AppArtifactURLs[access.ArtifactKey]
 		if projection.TaskID != task.TaskID || projection.UserId != task.UserID ||
@@ -284,7 +289,7 @@ func (s *AppExecutionService) ResolveAppTaskArtifactContent(ctx context.Context,
 		return nil
 	})
 	if err != nil {
-		return nil, "", err
+		return nil, "", appExecutionBoundaryError(err)
 	}
 	return &projection, source, nil
 }

@@ -2,17 +2,24 @@ package service
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -21,6 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"gorm.io/gorm/logger"
 )
 
 const appExecutionTestModel = "doubao-seedance-2-5-260628"
@@ -31,6 +39,113 @@ type appExecutionFixture struct {
 	appSession AppPluginExchangeResult
 	request    AppExecutionGrantRequest
 	publisher  AuthIdentity
+}
+
+type appExecutionGrantBarrier struct {
+	logger.Interface
+	once              sync.Once
+	reached           chan struct{}
+	continueExecution chan struct{}
+}
+
+func (barrier *appExecutionGrantBarrier) Trace(
+	ctx context.Context,
+	begin time.Time,
+	sql func() (string, int64),
+	err error,
+) {
+	statement, _ := sql()
+	if strings.Contains(statement, "app_route_claims") {
+		barrier.once.Do(func() {
+			close(barrier.reached)
+			<-barrier.continueExecution
+		})
+	}
+	barrier.Interface.Trace(ctx, begin, sql, err)
+}
+
+type appExecutionProviderContextKey struct{}
+
+type appExecutionFaultConnPool struct {
+	gorm.ConnPool
+	beginErr         error
+	commitErr        error
+	commitOccurrence int32
+	commitCount      atomic.Int32
+}
+
+func (pool *appExecutionFaultConnPool) BeginTx(ctx context.Context, options *sql.TxOptions) (gorm.ConnPool, error) {
+	if pool.beginErr != nil {
+		return nil, pool.beginErr
+	}
+	beginner, ok := pool.ConnPool.(gorm.TxBeginner)
+	if !ok {
+		return nil, errors.New("test connection pool cannot begin transactions")
+	}
+	tx, err := beginner.BeginTx(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &appExecutionFaultTx{Tx: tx, pool: pool}, nil
+}
+
+type appExecutionFaultTx struct {
+	*sql.Tx
+	pool *appExecutionFaultConnPool
+}
+
+func (tx *appExecutionFaultTx) Commit() error {
+	if tx.pool.commitErr != nil && tx.pool.commitCount.Add(1) == tx.pool.commitOccurrence {
+		_ = tx.Tx.Rollback()
+		return tx.pool.commitErr
+	}
+	return tx.Tx.Commit()
+}
+
+func appExecutionDBWithTransactionFault(t *testing.T, db *gorm.DB, beginErr, commitErr error) *gorm.DB {
+	t.Helper()
+	return appExecutionDBWithTransactionFaultAt(t, db, beginErr, commitErr, 1)
+}
+
+func appExecutionDBWithTransactionFaultAt(t *testing.T, db *gorm.DB, beginErr, commitErr error,
+	commitOccurrence int32,
+) *gorm.DB {
+	t.Helper()
+	faultDB := db.Session(&gorm.Session{NewDB: true})
+	faultDB.Statement.ConnPool = &appExecutionFaultConnPool{
+		ConnPool: db.Statement.ConnPool,
+		beginErr: beginErr, commitErr: commitErr, commitOccurrence: commitOccurrence,
+	}
+	return faultDB
+}
+
+func registerAppExecutionDBFault(t *testing.T, db *gorm.DB, operation, table string,
+	occurrence int32, injected error,
+) *atomic.Bool {
+	t.Helper()
+	var observed atomic.Int32
+	var failed atomic.Bool
+	callbackName := "test:app-execution-storage-taxonomy:" + uuid.NewString()
+	inject := func(tx *gorm.DB) {
+		if tx.Statement.Table == table && observed.Add(1) == occurrence {
+			failed.Store(true)
+			tx.AddError(injected)
+		}
+	}
+	switch operation {
+	case "query":
+		require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, inject))
+		t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove(callbackName)) })
+	case "create":
+		require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, inject))
+		t.Cleanup(func() { require.NoError(t, db.Callback().Create().Remove(callbackName)) })
+	case "update":
+		require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, inject))
+		t.Cleanup(func() { require.NoError(t, db.Callback().Update().Remove(callbackName)) })
+	default:
+		t.Fatalf("unsupported callback operation %q", operation)
+	}
+	return &failed
 }
 
 func appExecutionTestAsset(subject, protocol, pointer, mediaType, uri string, expiresAt time.Time) map[string]any {
@@ -65,13 +180,53 @@ func appExecutionRequestWithAssets(t *testing.T, request AppExecutionGrantReques
 }
 
 func newAppExecutionFixture(t *testing.T) *appExecutionFixture {
+	return newAppExecutionFixtureForKey(t, "launch-app")
+}
+
+func newAppExecutionFixtureForKey(t *testing.T, appKey string) *appExecutionFixture {
 	t.Helper()
-	launch := newAppLaunchFixture(t)
+	common.OptionMapRWMutex.Lock()
+	previousFlags := [4]bool{
+		operation_setting.AppPluginV1Enabled,
+		operation_setting.AppPluginSeedanceEnabled,
+		operation_setting.AppPluginEmbeddedSurfaceEnabled,
+		operation_setting.AppExecutionGrantsEnabled,
+	}
+	previousOptions := common.OptionMap
+	common.OptionMap = maps.Clone(common.OptionMap)
+	if common.OptionMap == nil {
+		common.OptionMap = map[string]string{}
+	}
+	operation_setting.AppPluginV1Enabled = true
+	operation_setting.AppPluginSeedanceEnabled = true
+	operation_setting.AppPluginEmbeddedSurfaceEnabled = true
+	operation_setting.AppExecutionGrantsEnabled = true
+	common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] = "true"
+	common.OptionMap[operation_setting.AppPluginSeedanceEnabledOptionKey] = "true"
+	common.OptionMap[operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey] = "true"
+	common.OptionMap[operation_setting.AppExecutionGrantsEnabledOptionKey] = "true"
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		operation_setting.AppPluginV1Enabled = previousFlags[0]
+		operation_setting.AppPluginSeedanceEnabled = previousFlags[1]
+		operation_setting.AppPluginEmbeddedSurfaceEnabled = previousFlags[2]
+		operation_setting.AppExecutionGrantsEnabled = previousFlags[3]
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+	})
+	launch := newAppLaunchFixtureForKey(t, appKey)
 	redis, batch := common.RedisEnabled, common.BatchUpdateEnabled
 	common.RedisEnabled, common.BatchUpdateEnabled = false, false
 	t.Cleanup(func() { common.RedisEnabled, common.BatchUpdateEnabled = redis, batch })
 	require.NoError(t, launch.db.AutoMigrate(&model.Option{}, &model.Channel{}, &model.Ability{},
 		&model.Task{}, &model.Token{}, &model.SystemTask{}, &model.UserSubscription{}, &model.SubscriptionPlan{}))
+	require.NoError(t, launch.db.Create(&[]model.Option{
+		{Key: operation_setting.AppPluginV1EnabledOptionKey, Value: "true"},
+		{Key: operation_setting.AppPluginSeedanceEnabledOptionKey, Value: "true"},
+		{Key: operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey, Value: "true"},
+		{Key: operation_setting.AppExecutionGrantsEnabledOptionKey, Value: "true"},
+	}).Error)
 	require.NoError(t, model.MigrateAppExecutionTables(launch.db))
 	previousDB, previousRegistry := model.DB, pluginruntime.DefaultRegistry
 	model.DB, pluginruntime.DefaultRegistry = launch.db, pluginruntime.NewRegistry()
@@ -142,6 +297,178 @@ func newAppExecutionFixture(t *testing.T) *appExecutionFixture {
 		PassthroughSelections: []AppPassthroughSelection{},
 	}
 	return f
+}
+
+func TestIssueExecutionGrantMapsCredentialRevalidationFailures(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		invalidate func(*testing.T, *appExecutionFixture)
+		wantCode   string
+		wantStatus int
+	}{
+		{
+			name: "credential deleted after middleware authentication",
+			invalidate: func(t *testing.T, f *appExecutionFixture) {
+				require.NoError(t, f.db.Where("credential_id = ?", f.serviceID.CredentialID).
+					Delete(&model.AppServiceCredential{}).Error)
+			},
+			wantCode:   "service_identity_invalid",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "credential revoked after middleware authentication",
+			invalidate: func(t *testing.T, f *appExecutionFixture) {
+				require.NoError(t, f.db.Model(&model.AppServiceCredential{}).
+					Where("credential_id = ?", f.serviceID.CredentialID).
+					Update("status", "revoked").Error)
+			},
+			wantCode:   "service_identity_invalid",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "credential query failure",
+			invalidate: func(t *testing.T, f *appExecutionFixture) {
+				injected := errors.New("private credential query failure")
+				callbackName := "test:grant-credential-query-failure:" + uuid.NewString()
+				require.NoError(t, f.db.Callback().Query().Before("gorm:query").
+					Register(callbackName, func(tx *gorm.DB) {
+						if tx.Statement.Table == "app_service_credentials" {
+							tx.AddError(injected)
+						}
+					}))
+				t.Cleanup(func() {
+					require.NoError(t, f.db.Callback().Query().Remove(callbackName))
+				})
+			},
+			wantCode:   "service_unavailable",
+			wantStatus: http.StatusServiceUnavailable,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppExecutionFixture(t)
+			test.invalidate(t, f)
+
+			_, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, test.wantCode, authErr.Code)
+			assert.Equal(t, test.wantStatus, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), f.credential.Credential)
+			assert.NotContains(t, err.Error(), f.credential.CredentialID)
+			assert.NotContains(t, err.Error(), "private credential query failure")
+		})
+	}
+}
+
+func TestIssueExecutionGrantMapsEveryStorageBoundaryToServiceUnavailable(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		operation  string
+		table      string
+		occurrence int32
+	}{
+		{name: "installation lock", operation: "query", table: "app_route_claims", occurrence: 1},
+		{name: "app session", operation: "query", table: "app_plugin_sessions", occurrence: 1},
+		{name: "dashboard user", operation: "query", table: "users", occurrence: 1},
+		{name: "dashboard session", operation: "query", table: "user_sessions", occurrence: 1},
+		{name: "registration version", operation: "query", table: "app_versions", occurrence: 1},
+		{name: "registration callback", operation: "query", table: "app_route_claims", occurrence: 2},
+		{name: "idempotent grant lookup", operation: "query", table: "app_execution_grants", occurrence: 1},
+		{name: "policy", operation: "query", table: "options", occurrence: 1},
+		{name: "groups", operation: "query", table: "options", occurrence: 2},
+		{name: "pricing", operation: "query", table: "options", occurrence: 3},
+		{name: "ability", operation: "query", table: "abilities", occurrence: 1},
+		{name: "channel", operation: "query", table: "channels", occurrence: 1},
+		{name: "subscription", operation: "query", table: "user_subscriptions", occurrence: 1},
+		{name: "rollout", operation: "query", table: "options", occurrence: 4},
+		{name: "grant create", operation: "create", table: "app_execution_grants", occurrence: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppExecutionFixture(t)
+			privateDetail := "private " + test.name + " storage detail"
+			failed := registerAppExecutionDBFault(
+				t, f.db, test.operation, test.table, test.occurrence, errors.New(privateDetail),
+			)
+
+			_, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+
+			require.True(t, failed.Load(), "the intended storage boundary must be exercised")
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), privateDetail)
+		})
+	}
+}
+
+func TestIssueExecutionGrantMapsTransactionBeginAndCommitFailuresToServiceUnavailable(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		beginErr  error
+		commitErr error
+	}{
+		{name: "begin", beginErr: errors.New("private begin storage detail")},
+		{name: "commit", commitErr: errors.New("private commit storage detail")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppExecutionFixture(t)
+			faultDB := appExecutionDBWithTransactionFault(t, f.db, test.beginErr, test.commitErr)
+			execution := NewAppExecutionService(faultDB, f.options)
+
+			_, err := execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), "private")
+			var grants int64
+			require.NoError(t, f.db.Model(&model.AppExecutionGrant{}).Count(&grants).Error)
+			assert.Zero(t, grants)
+		})
+	}
+}
+
+func TestIssueExecutionGrantPreservesMissingBusinessResults(t *testing.T) {
+	t.Run("installation missing", func(t *testing.T) {
+		f := newAppExecutionFixture(t)
+		f.serviceID.InstallationID = "missing-installation"
+
+		_, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "not_found", authErr.Code)
+		assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+	})
+
+	t.Run("session missing", func(t *testing.T) {
+		f := newAppExecutionFixture(t)
+		require.NoError(t, f.db.Where("app_session_id = ?", f.request.AppSessionID).
+			Delete(&model.AppPluginSession{}).Error)
+
+		_, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "not_found", authErr.Code)
+		assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+	})
+
+	t.Run("policy missing", func(t *testing.T) {
+		f := newAppExecutionFixture(t)
+		require.NoError(t, f.db.Where(map[string]any{"key": model.AppModelInvokePolicyKey}).
+			Delete(&model.Option{}).Error)
+
+		_, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "scope_denied", authErr.Code)
+		assert.Equal(t, http.StatusForbidden, AppRelayErrorStatus(err))
+	})
 }
 
 func TestExecutionGrantBindsRegisteredAssetInputs(t *testing.T) {
@@ -225,11 +552,6 @@ func TestValidateAppRegisteredAssetInputsScopesPointersByModelAndProtocol(t *tes
 }
 
 func TestExecutionGrantRejectsTamperedFrozenSnapshot(t *testing.T) {
-	pluginEnabled, grantsEnabled := operation_setting.AppPluginV1Enabled, operation_setting.AppExecutionGrantsEnabled
-	operation_setting.AppPluginV1Enabled, operation_setting.AppExecutionGrantsEnabled = true, true
-	t.Cleanup(func() {
-		operation_setting.AppPluginV1Enabled, operation_setting.AppExecutionGrantsEnabled = pluginEnabled, grantsEnabled
-	})
 	tests := []struct {
 		name   string
 		column string
@@ -575,6 +897,445 @@ func TestAppExecutionPolicyPublicationRequiresCurrentRoot(t *testing.T) {
 	assert.Equal(t, strconv.FormatInt(version, 10), head.Value, "invalid publication must not advance the immutable policy head")
 }
 
+func TestRequestPolicyCannotBypassAppExecutionPolicyOrRolloutStop(t *testing.T) {
+	setPermissiveRequestPolicy := func(t *testing.T) {
+		t.Helper()
+		previousPolicy := model.CurrentRequestPolicy()
+		previousValues := map[string]string{
+			"RetryTimes":                                 previousPolicy.Options["RetryTimes"],
+			"channel_affinity_setting.enabled":           previousPolicy.Options["channel_affinity_setting.enabled"],
+			"channel_affinity_setting.session_mode":      previousPolicy.Options["channel_affinity_setting.session_mode"],
+			"channel_affinity_setting.switch_on_success": previousPolicy.Options["channel_affinity_setting.switch_on_success"],
+		}
+		common.OptionMapRWMutex.Lock()
+		previousMap := maps.Clone(common.OptionMap)
+		common.OptionMap = maps.Clone(common.OptionMap)
+		if common.OptionMap == nil {
+			common.OptionMap = map[string]string{}
+		}
+		maps.Copy(common.OptionMap, previousPolicy.Options)
+		common.OptionMapRWMutex.Unlock()
+		require.NoError(t, model.UpdateRequestPolicyOptions(map[string]string{
+			"RetryTimes":                                 "99",
+			"channel_affinity_setting.enabled":           "true",
+			"channel_affinity_setting.session_mode":      "prefer",
+			"channel_affinity_setting.switch_on_success": "true",
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, model.UpdateRequestPolicyOptions(previousValues))
+			common.OptionMapRWMutex.Lock()
+			common.OptionMap = previousMap
+			common.OptionMapRWMutex.Unlock()
+		})
+	}
+
+	t.Run("app policy remains authoritative", func(t *testing.T) {
+		f := newAppExecutionFixture(t)
+		setPermissiveRequestPolicy(t)
+		deniedVersion, err := PublishAppModelInvokePolicy(
+			t.Context(), f.db, f.publisher, []byte(`{"operations":{}}`), f.options.Now(),
+		)
+		require.NoError(t, err)
+		f.request.ModelPolicyVersion = deniedVersion
+		f.request.RequestID = uuid.NewString()
+		f.request.RunID = uuid.NewString()
+		f.request.ExecutionRequestID = uuid.NewString()
+
+		_, err = f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+		require.ErrorContains(t, err, "scope_denied")
+	})
+
+	for _, test := range []struct {
+		name string
+		key  string
+	}{
+		{name: "master rollout stop", key: operation_setting.AppPluginV1EnabledOptionKey},
+		{name: "execution grants rollout stop", key: operation_setting.AppExecutionGrantsEnabledOptionKey},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppExecutionFixture(t)
+			setPermissiveRequestPolicy(t)
+			require.NoError(t, model.UpdateOption(test.key, "false"))
+
+			_, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+			require.ErrorContains(t, err, "app_execution_disabled")
+			var grants int64
+			require.NoError(t, f.db.Model(&model.AppExecutionGrant{}).Count(&grants).Error)
+			assert.Zero(t, grants)
+		})
+	}
+}
+
+func TestIssueExecutionGrantLinearizesWithRolloutDisable(t *testing.T) {
+	if dialect := os.Getenv("APP_PLUGIN_TEST_DIALECT"); dialect != "mysql" && dialect != "postgres" {
+		t.Skip("requires real row-level locks")
+	}
+	for _, test := range []struct {
+		name string
+		key  string
+	}{
+		{name: "master", key: operation_setting.AppPluginV1EnabledOptionKey},
+		{name: "execution grants", key: operation_setting.AppExecutionGrantsEnabledOptionKey},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppExecutionFixture(t)
+			common.OptionMapRWMutex.Lock()
+			previousOptions := maps.Clone(common.OptionMap)
+			common.OptionMap = maps.Clone(common.OptionMap)
+			if common.OptionMap == nil {
+				common.OptionMap = map[string]string{}
+			}
+			common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] = "true"
+			common.OptionMap[operation_setting.AppExecutionGrantsEnabledOptionKey] = "true"
+			common.OptionMapRWMutex.Unlock()
+			t.Cleanup(func() {
+				common.OptionMapRWMutex.Lock()
+				common.OptionMap = previousOptions
+				common.OptionMapRWMutex.Unlock()
+			})
+			barrier := &appExecutionGrantBarrier{
+				Interface:         logger.Default.LogMode(logger.Silent),
+				reached:           make(chan struct{}),
+				continueExecution: make(chan struct{}),
+			}
+			execution := NewAppExecutionService(
+				f.db.Session(&gorm.Session{Logger: barrier}),
+				f.options,
+			)
+			grantDone := make(chan error, 1)
+			go func() {
+				_, err := execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+				grantDone <- err
+			}()
+			select {
+			case <-barrier.reached:
+			case <-time.After(5 * time.Second):
+				t.Fatal("grant did not pass the initial rollout check")
+			}
+
+			writerDone := make(chan error, 1)
+			go func() {
+				writerDone <- model.UpdateOptionsBulk(map[string]string{test.key: "false"})
+			}()
+			var writerErr error
+			select {
+			case writerErr = <-writerDone:
+			case <-time.After(5 * time.Second):
+				close(barrier.continueExecution)
+				grantErr := <-grantDone
+				writerErr = <-writerDone
+				t.Fatalf("rollout writer did not commit before grant resumed: writer=%v grant=%v", writerErr, grantErr)
+			}
+			close(barrier.continueExecution)
+			grantErr := <-grantDone
+
+			require.NoError(t, writerErr)
+			require.ErrorContains(t, grantErr, "app_execution_disabled")
+			for _, table := range []any{
+				&model.AppExecutionGrant{},
+				&model.AppTaskExecution{},
+				&model.AppTaskOutbox{},
+			} {
+				var count int64
+				require.NoError(t, f.db.Model(table).Count(&count).Error)
+				assert.Zero(t, count)
+			}
+			var user model.User
+			require.NoError(t, f.db.First(&user, f.user.Id).Error)
+			assert.Equal(t, 1000000, user.Quota, "denied grant must not reserve wallet quota")
+		})
+	}
+}
+
+func TestExecutionGrantAndProviderPathsUseOneLockOrder(t *testing.T) {
+	if dialect := os.Getenv("APP_PLUGIN_TEST_DIALECT"); dialect != "mysql" && dialect != "postgres" {
+		t.Skip("requires real row-level locks")
+	}
+	for round := range 3 {
+		t.Run(fmt.Sprintf("round-%d", round+1), func(t *testing.T) {
+			f := newAppExecutionFixture(t)
+			issued, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+			require.NoError(t, err)
+
+			issueBarrier := &appExecutionGrantBarrier{
+				Interface:         logger.Default.LogMode(logger.Silent),
+				reached:           make(chan struct{}),
+				continueExecution: make(chan struct{}),
+			}
+			issueRequest := f.request
+			issueRequest.RequestID = uuid.NewString()
+			issueRequest.RunID = uuid.NewString()
+			issueRequest.ExecutionRequestID = uuid.NewString()
+			issueDone := make(chan error, 1)
+			go func() {
+				_, issueErr := NewAppExecutionService(
+					f.db.Session(&gorm.Session{Logger: issueBarrier}), f.options,
+				).IssueExecutionGrant(t.Context(), f.serviceID, issueRequest)
+				issueDone <- issueErr
+			}()
+			select {
+			case <-issueBarrier.reached:
+			case <-time.After(5 * time.Second):
+				t.Fatal("grant issuance did not acquire the route lock")
+			}
+
+			const callbackName = "test:provider_route_lock_attempt"
+			var routeAttemptOnce sync.Once
+			providerRouteAttempted := make(chan struct{})
+			require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register(
+				callbackName,
+				func(tx *gorm.DB) {
+					if tx.Statement.Context.Value(appExecutionProviderContextKey{}) == true &&
+						tx.Statement.Table == "app_route_claims" {
+						routeAttemptOnce.Do(func() { close(providerRouteAttempted) })
+					}
+				},
+			))
+			t.Cleanup(func() {
+				require.NoError(t, f.db.Callback().Query().Remove(callbackName))
+			})
+			providerDone := make(chan error, 1)
+			go func() {
+				ctx := context.WithValue(t.Context(), appExecutionProviderContextKey{}, true)
+				_, _, providerErr := f.execution.AuthenticateAppRelay(
+					ctx,
+					issued.GrantToken,
+					"openai_video",
+					[]byte(`{"model":"`+appExecutionTestModel+`","prompt":"test"}`),
+				)
+				providerDone <- providerErr
+			}()
+			select {
+			case <-providerRouteAttempted:
+			case <-time.After(5 * time.Second):
+				close(issueBarrier.continueExecution)
+				t.Fatal("provider authorization did not attempt the route lock")
+			}
+
+			writerDone := make(chan error, 1)
+			go func() {
+				writerDone <- model.UpdateOption(
+					operation_setting.AppExecutionGrantsEnabledOptionKey, "false",
+				)
+			}()
+			var writerErr error
+			writerCommittedBeforeRelease := false
+			select {
+			case writerErr = <-writerDone:
+				writerCommittedBeforeRelease = true
+			case <-time.After(time.Second):
+			}
+			close(issueBarrier.continueExecution)
+			issueErr := <-issueDone
+			providerErr := <-providerDone
+			if !writerCommittedBeforeRelease {
+				writerErr = <-writerDone
+			}
+
+			require.NoError(t, writerErr)
+			assert.True(t, writerCommittedBeforeRelease,
+				"provider authorization must not lock rollout rows before the route")
+			require.ErrorContains(t, issueErr, "app_execution_disabled")
+			require.ErrorContains(t, providerErr, "app_execution_disabled")
+		})
+	}
+}
+
+func TestAppRelayErrorStatusDistinguishesStorageFailureFromDisabledRollout(t *testing.T) {
+	assert.Equal(t, http.StatusServiceUnavailable,
+		AppRelayErrorStatus(errors.New("private rollout storage failure")))
+	assert.Equal(t, http.StatusForbidden,
+		AppRelayErrorStatus(appAuthError("app_execution_disabled")))
+}
+
+func TestProviderRolloutStorageFailureRemainsRetryable(t *testing.T) {
+	f := newAppExecutionFixture(t)
+	issued, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+	require.NoError(t, err)
+	const callbackName = "test:provider_rollout_storage_failure"
+	privateError := "private rollout storage failure"
+	require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "options" {
+			tx.AddError(errors.New(privateError))
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, f.db.Callback().Query().Remove(callbackName))
+	})
+
+	_, _, err = f.execution.AuthenticateAppRelay(
+		t.Context(),
+		issued.GrantToken,
+		"openai_video",
+		[]byte(`{"model":"`+appExecutionTestModel+`","prompt":"test"}`),
+	)
+
+	var authErr *AppPluginAuthError
+	require.ErrorAs(t, err, &authErr)
+	assert.Equal(t, "service_unavailable", authErr.Code)
+	assert.NotContains(t, err.Error(), privateError)
+	assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+}
+
+func TestIssueExecutionGrantRolloutFastCheckIsRaceFree(t *testing.T) {
+	f := newAppExecutionFixture(t)
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
+	common.OptionMap = maps.Clone(common.OptionMap)
+	if common.OptionMap == nil {
+		common.OptionMap = map[string]string{}
+	}
+	common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] = "true"
+	common.OptionMap[operation_setting.AppPluginSeedanceEnabledOptionKey] = "true"
+	common.OptionMap[operation_setting.AppExecutionGrantsEnabledOptionKey] = "true"
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+	})
+	request := f.request
+	request.RequestID = "invalid-before-transaction"
+	const iterations = 200
+	start := make(chan struct{})
+	writerDone := make(chan error, 1)
+	go func() {
+		<-start
+		for i := 0; i < iterations; i++ {
+			value := "false"
+			if i%2 == 0 {
+				value = "true"
+			}
+			if err := model.UpdateOption(operation_setting.AppPluginV1EnabledOptionKey, value); err != nil {
+				writerDone <- err
+				return
+			}
+		}
+		writerDone <- nil
+	}()
+
+	close(start)
+	for i := 0; i < iterations; i++ {
+		_, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, request)
+		require.Error(t, err)
+		assert.True(t,
+			strings.Contains(err.Error(), "invalid_request") ||
+				strings.Contains(err.Error(), "app_execution_disabled"),
+			"unexpected grant error: %v", err,
+		)
+	}
+	require.NoError(t, <-writerDone)
+}
+
+func TestIssuedGrantProviderPathsUseCommittedRolloutDatabaseTruth(t *testing.T) {
+	for _, optionKey := range []string{
+		operation_setting.AppPluginV1EnabledOptionKey,
+		operation_setting.AppExecutionGrantsEnabledOptionKey,
+		operation_setting.AppPluginSeedanceEnabledOptionKey,
+	} {
+		for _, providerPath := range []string{"authenticate", "select"} {
+			t.Run(optionKey+"/"+providerPath, func(t *testing.T) {
+				appKey := "launch-app"
+				if optionKey == operation_setting.AppPluginSeedanceEnabledOptionKey {
+					appKey = "seedance-repro"
+				}
+				f := newAppExecutionFixtureForKey(t, appKey)
+				issued, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+				require.NoError(t, err)
+				raw := []byte(`{"model":"` + appExecutionTestModel + `","prompt":"test"}`)
+				subject, _, err := f.execution.AuthenticateAppRelay(
+					t.Context(), issued.GrantToken, "openai_video", raw,
+				)
+				require.NoError(t, err)
+
+				common.OptionMapRWMutex.Lock()
+				cacheLocked := true
+				t.Cleanup(func() {
+					if cacheLocked {
+						common.OptionMapRWMutex.Unlock()
+					}
+				})
+				writerDone := make(chan error, 1)
+				go func() {
+					writerDone <- model.UpdateOption(optionKey, "false")
+				}()
+				deadline := time.Now().Add(5 * time.Second)
+				for {
+					var stored string
+					queryErr := f.db.Table("options").Select("value").
+						Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: optionKey}).
+						Scan(&stored).Error
+					if queryErr == nil && stored == "false" {
+						break
+					}
+					if time.Now().After(deadline) {
+						common.OptionMapRWMutex.Unlock()
+						cacheLocked = false
+						t.Fatalf("rollout disable did not commit before cache refresh: %v", queryErr)
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+
+				switch providerPath {
+				case "authenticate":
+					_, _, err = f.execution.AuthenticateAppRelay(
+						t.Context(), issued.GrantToken, "openai_video", raw,
+					)
+				case "select":
+					_, _, err = f.execution.SelectAppRelayChannel(
+						t.Context(), subject, &taskdto.ChannelConstraints{},
+					)
+				}
+				common.OptionMapRWMutex.Unlock()
+				cacheLocked = false
+				require.NoError(t, <-writerDone)
+				require.ErrorContains(t, err, "app_execution_disabled")
+			})
+		}
+	}
+}
+
+func TestIssuedGrantProviderPathsRolloutChecksAreRaceFree(t *testing.T) {
+	if dialect := os.Getenv("APP_PLUGIN_TEST_DIALECT"); dialect != "" && dialect != "sqlite" {
+		t.Skip("race detector regression uses SQLite")
+	}
+	f := newAppExecutionFixture(t)
+	issued, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+	require.NoError(t, err)
+	raw := []byte(`{"model":"` + appExecutionTestModel + `","prompt":"test"}`)
+	subject, _, err := f.execution.AuthenticateAppRelay(
+		t.Context(), issued.GrantToken, "openai_video", raw,
+	)
+	require.NoError(t, err)
+
+	const iterations = 50
+	writerDone := make(chan error, 1)
+	go func() {
+		keys := []string{
+			operation_setting.AppPluginV1EnabledOptionKey,
+			operation_setting.AppExecutionGrantsEnabledOptionKey,
+			operation_setting.AppPluginSeedanceEnabledOptionKey,
+		}
+		for i := 0; i < iterations; i++ {
+			if err := model.UpdateOption(keys[i%len(keys)], strconv.FormatBool(i%2 == 0)); err != nil {
+				writerDone <- err
+				return
+			}
+		}
+		writerDone <- nil
+	}()
+
+	for range iterations {
+		_, _, _ = f.execution.AuthenticateAppRelay(
+			t.Context(), issued.GrantToken, "openai_video", raw,
+		)
+		_, _, _ = f.execution.SelectAppRelayChannel(
+			t.Context(), subject, &taskdto.ChannelConstraints{},
+		)
+	}
+	require.NoError(t, <-writerDone)
+}
+
 func TestAppExecutionPolicyGenericWritersRejectAliases(t *testing.T) {
 	for _, key := range []string{model.AppModelInvokePolicyKey, model.AppArkImportDelegationsKey} {
 		for _, alias := range []struct {
@@ -634,7 +1395,21 @@ func TestAppExecutionPolicyGenericWritersRejectAliases(t *testing.T) {
 						if state == "preexisting-alias" {
 							require.NoError(t, f.db.Create(&model.Option{Key: alias.key, Value: "0"}).Error)
 						}
-						if state != "unpublished" {
+						if state == "preexisting-alias" {
+							version, err := publish(allowed)
+							require.Zero(t, version)
+							require.ErrorContains(t, err, "protected option")
+							var heads []model.Option
+							require.NoError(t, f.db.Find(&heads).Error)
+							require.Equal(t, []model.Option{{Key: alias.key, Value: "0"}}, heads)
+							var versions int64
+							require.NoError(t, f.db.Model(&model.AppExecutionPolicyVersion{}).Count(&versions).Error)
+							assert.Zero(t, versions)
+							common.OptionMapRWMutex.RLock()
+							_, cached := common.OptionMap[key]
+							common.OptionMapRWMutex.RUnlock()
+							assert.False(t, cached)
+						} else if state == "published" {
 							version, err := publish(allowed)
 							require.NoError(t, err)
 							require.Equal(t, int64(1), version)
@@ -688,7 +1463,7 @@ func TestAppExecutionPolicyGenericWritersRejectAliases(t *testing.T) {
 						var afterVersions int64
 						require.NoError(t, f.db.Model(&model.AppExecutionPolicyVersion{}).Count(&afterVersions).Error)
 						assert.Equal(t, versions, afterVersions)
-						if state != "unpublished" {
+						if state == "published" {
 							head, err := model.GetAppExecutionPolicyTx(f.db, key)
 							require.NoError(t, err)
 							assert.Equal(t, int64(2), head.Version, "generic aliases must not reactivate allowed v1")

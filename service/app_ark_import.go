@@ -40,7 +40,7 @@ func (s *AppExecutionService) LookupArkImport(ctx context.Context, identity mode
 		}
 		head, err := model.GetAppExecutionPolicyTx(tx, model.AppArkImportDelegationsKey)
 		if err != nil {
-			return appAuthError("not_found")
+			return classifyDBLookup(err, "not_found")
 		}
 		var policy AppArkImportDelegations
 		if decodeAppExecutionJSON([]byte(head.CanonicalJSON), &policy) != nil {
@@ -72,7 +72,7 @@ func (s *AppExecutionService) LookupArkImport(ctx context.Context, identity mode
 		return nil
 	})
 	if err != nil {
-		return AppArkImportLookupResult{}, err
+		return AppArkImportLookupResult{}, appExecutionBoundaryError(err)
 	}
 	if s.ArkSource == nil {
 		return AppArkImportLookupResult{}, appAuthError("service_unavailable")
@@ -161,13 +161,16 @@ func (s *AppExecutionService) LookupArkImport(ctx context.Context, identity mode
 			return err
 		}
 		head, err := model.GetAppExecutionPolicyTx(tx, model.AppArkImportDelegationsKey)
-		if err != nil || head.Version != result.PolicyVersion {
+		if err != nil {
+			return classifyDBLookup(err, "scope_denied")
+		}
+		if head.Version != result.PolicyVersion {
 			return appAuthError("scope_denied")
 		}
 		return nil
 	})
 	if err != nil {
-		return AppArkImportLookupResult{}, err
+		return AppArkImportLookupResult{}, appExecutionBoundaryError(err)
 	}
 	result.EvidenceDigest, err = appPluginHash(result)
 	if err != nil {

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -27,6 +29,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -46,6 +49,14 @@ type appLaunchFixture struct {
 }
 
 func newAppLaunchFixture(t *testing.T) *appLaunchFixture {
+	return newAppLaunchFixtureForKey(t, "launch-app")
+}
+
+func newAppLaunchFixtureForKey(t *testing.T, appKey string) *appLaunchFixture {
+	return newAppLaunchFixtureForKeyAndScopes(t, appKey, []string{"identity.read"})
+}
+
+func newAppLaunchFixtureForKeyAndScopes(t *testing.T, appKey string, requestedScopes []string) *appLaunchFixture {
 	t.Helper()
 	db := openAppLaunchTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}))
@@ -74,13 +85,18 @@ func newAppLaunchFixture(t *testing.T) *appLaunchFixture {
 		ExpiresAt: f.options.Now().Add(time.Hour).Unix()}
 	require.NoError(t, db.Create(&f.session).Error)
 	f.identity = AuthIdentity{UserID: f.user.Id, SessionID: f.session.SID, UserAuthVersion: 4, SessionVersion: 7}
-	cmd := appPluginInstallCommand("launch-app", "1.0.0")
+	cmd := appPluginInstallCommand(appKey, "1.0.0")
 	cmd.ServiceCredential = AppServiceCredentialInput{}
 	cmd.NetworkPolicy = model.AppNetworkPolicy{AllowHosts: []string{"apps.example.com"}, DenyPrivateIPRanges: true}
 	cmd.EntitlementPolicyDraft = &AppEntitlementPolicyDraft{
 		Key: "launch-policy", Rules: map[string][]string{"app_plugin": {"manage"}, "task": {"read"}},
 	}
 	var err error
+	var manifest AppManifest
+	require.NoError(t, common.Unmarshal(cmd.ManifestJSON, &manifest))
+	manifest.RequestedScopes = requestedScopes
+	cmd.ManifestJSON, err = common.Marshal(manifest)
+	require.NoError(t, err)
 	f.installation, err = NewAppPluginInstallationService(db, AppPluginInstallationOptions{
 		TaskPluginChecker: fixedTaskPluginChecker{"doubao": "1.2.0"},
 		CurrentAuthz:      map[string][]string{"app_plugin": {"manage"}, "task": {"read"}},
@@ -137,6 +153,324 @@ func (f *appLaunchFixture) exchange(t *testing.T) AppPluginExchangeResult {
 	result, err := f.service.Exchange(t.Context(), f.serviceID, request)
 	require.NoError(t, err)
 	return result
+}
+
+func (f *appLaunchFixture) rotateServiceCredential(t *testing.T, scopes []string) model.AppServiceIdentity {
+	t.Helper()
+	credential, err := model.IssueAppServiceCredential(
+		t.Context(), f.db, f.installation.InstallationID, scopes,
+		f.options.Now(), f.options.Now().Add(24*time.Hour), true,
+	)
+	require.NoError(t, err)
+	identity, err := model.AuthenticateAppServiceCredential(
+		t.Context(), f.db, credential.Credential, f.options.Now(),
+	)
+	require.NoError(t, err)
+	return identity
+}
+
+func TestAppPluginLifecycleMapsTransactionBoundaryFailuresToServiceUnavailable(t *testing.T) {
+	for _, boundary := range []struct {
+		name      string
+		beginErr  error
+		commitErr error
+	}{
+		{name: "begin", beginErr: errors.New("private lifecycle begin detail")},
+		{name: "commit", commitErr: errors.New("private lifecycle commit detail")},
+	} {
+		for _, operation := range []string{"launch_context", "authorize", "exchange", "introspect", "revoke"} {
+			t.Run(boundary.name+"/"+operation, func(t *testing.T) {
+				f := newAppLaunchFixture(t)
+				var invoke func(*AppPluginAuthService) error
+				switch operation {
+				case "launch_context":
+					invoke = func(auth *AppPluginAuthService) error {
+						_, err := auth.LaunchContext(t.Context(), f.identity, f.installation.AppKey, "direct")
+						return err
+					}
+				case "authorize":
+					invoke = func(auth *AppPluginAuthService) error {
+						_, err := auth.Authorize(t.Context(), f.identity, f.installation.AppKey,
+							f.options.Issuer, uuid.NewString(), f.request)
+						return err
+					}
+				case "exchange":
+					request := f.exchangeRequest(t, f.authorize(t, uuid.NewString()))
+					invoke = func(auth *AppPluginAuthService) error {
+						_, err := auth.Exchange(t.Context(), f.serviceID, request)
+						return err
+					}
+				case "introspect":
+					session := f.exchange(t)
+					request := AppPluginIntrospectRequest{
+						AppKey: f.installation.AppKey, AppSessionID: session.AppSessionID, Subject: session.Subject,
+						RequiredScopes: []string{}, RequiredEntitlements: model.AppJSONMap{},
+					}
+					invoke = func(auth *AppPluginAuthService) error {
+						_, err := auth.Introspect(t.Context(), f.serviceID, request)
+						return err
+					}
+				case "revoke":
+					session := f.exchange(t)
+					request := AppPluginSessionRevokeRequest{
+						RequestID: uuid.NewString(), AppKey: f.installation.AppKey,
+						AppSessionID: session.AppSessionID, Subject: session.Subject, Reason: "user_logout",
+					}
+					invoke = func(auth *AppPluginAuthService) error {
+						_, err := auth.RevokeSession(t.Context(), f.serviceID, uuid.NewString(), request)
+						return err
+					}
+				}
+				faultDB := appExecutionDBWithTransactionFault(t, f.db, boundary.beginErr, boundary.commitErr)
+
+				err := invoke(NewAppPluginAuthService(faultDB, f.options))
+
+				var authErr *AppPluginAuthError
+				require.ErrorAs(t, err, &authErr)
+				assert.Equal(t, "service_unavailable", authErr.Code)
+				assert.NotContains(t, err.Error(), "private")
+			})
+		}
+	}
+}
+
+func TestAppPluginLifecycleMapsWriteFailuresToServiceUnavailable(t *testing.T) {
+	for _, operation := range []string{"authorize", "exchange", "revoke"} {
+		t.Run(operation, func(t *testing.T) {
+			f := newAppLaunchFixture(t)
+			var invoke func() error
+			var failed *atomic.Bool
+			privateDetail := "private lifecycle " + operation + " write detail"
+			switch operation {
+			case "authorize":
+				failed = registerAppExecutionDBFault(
+					t, f.db, "create", "app_plugin_launch_codes", 1, errors.New(privateDetail),
+				)
+				invoke = func() error {
+					_, err := f.service.Authorize(t.Context(), f.identity, f.installation.AppKey,
+						f.options.Issuer, uuid.NewString(), f.request)
+					return err
+				}
+			case "exchange":
+				request := f.exchangeRequest(t, f.authorize(t, uuid.NewString()))
+				failed = registerAppExecutionDBFault(
+					t, f.db, "create", "app_plugin_sessions", 1, errors.New(privateDetail),
+				)
+				invoke = func() error {
+					_, err := f.service.Exchange(t.Context(), f.serviceID, request)
+					return err
+				}
+			case "revoke":
+				session := f.exchange(t)
+				request := AppPluginSessionRevokeRequest{
+					RequestID: uuid.NewString(), AppKey: f.installation.AppKey,
+					AppSessionID: session.AppSessionID, Subject: session.Subject, Reason: "user_logout",
+				}
+				failed = registerAppExecutionDBFault(
+					t, f.db, "update", "app_plugin_sessions", 1, errors.New(privateDetail),
+				)
+				invoke = func() error {
+					_, err := f.service.RevokeSession(t.Context(), f.serviceID, uuid.NewString(), request)
+					return err
+				}
+			}
+
+			err := invoke()
+
+			require.True(t, failed.Load(), "the intended lifecycle write must be exercised")
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.NotContains(t, err.Error(), privateDetail)
+		})
+	}
+}
+
+func TestAppPluginLifecycleMapsRegistrationAbsenceToNotFound(t *testing.T) {
+	for _, resource := range []string{"current app version", "callback claim"} {
+		for _, operation := range []string{"launch_context", "authorize", "exchange", "introspect"} {
+			t.Run(resource+"/"+operation, func(t *testing.T) {
+				f := newAppLaunchFixture(t)
+				var invoke func() error
+				switch operation {
+				case "launch_context":
+					invoke = func() error {
+						_, err := f.service.LaunchContext(
+							t.Context(), f.identity, f.installation.AppKey, "direct",
+						)
+						return err
+					}
+				case "authorize":
+					invoke = func() error {
+						_, err := f.service.Authorize(
+							t.Context(), f.identity, f.installation.AppKey,
+							f.options.Issuer, uuid.NewString(), f.request,
+						)
+						return err
+					}
+				case "exchange":
+					request := f.exchangeRequest(t, f.authorize(t, uuid.NewString()))
+					invoke = func() error {
+						_, err := f.service.Exchange(t.Context(), f.serviceID, request)
+						return err
+					}
+				case "introspect":
+					session := f.exchange(t)
+					request := AppPluginIntrospectRequest{
+						AppKey: f.installation.AppKey, AppSessionID: session.AppSessionID,
+						Subject: session.Subject, RequiredScopes: []string{},
+						RequiredEntitlements: model.AppJSONMap{},
+					}
+					invoke = func() error {
+						_, err := f.service.Introspect(t.Context(), f.serviceID, request)
+						return err
+					}
+				}
+				switch resource {
+				case "current app version":
+					require.NoError(t, f.db.Where("id = ?", f.installation.AppVersionID).
+						Delete(&model.AppVersion{}).Error)
+				case "callback claim":
+					require.NoError(t, f.db.Where(
+						"installation_id = ? AND kind = ?",
+						f.installation.InstallationID, "callback",
+					).Delete(&model.AppRouteClaim{}).Error)
+				}
+
+				err := invoke()
+
+				var authErr *AppPluginAuthError
+				require.ErrorAs(t, err, &authErr)
+				assert.Equal(t, "not_found", authErr.Code)
+				assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+			})
+		}
+	}
+}
+
+func TestValidateAppPluginRegistrationRequiresExactCallbackClaimOwnership(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *gorm.DB, model.AppRouteClaim)
+	}{
+		{name: "current registration"},
+		{
+			name: "claim key case",
+			mutate: func(t *testing.T, db *gorm.DB, claim model.AppRouteClaim) {
+				t.Helper()
+				alias := strings.ToUpper(claim.ClaimKey)
+				require.NotEqual(t, claim.ClaimKey, alias)
+				require.NoError(t, db.Model(&model.AppRouteClaim{}).Where("id = ?", claim.ID).
+					UpdateColumn("claim_key", alias).Error)
+			},
+		},
+		{
+			name: "installation ID case",
+			mutate: func(t *testing.T, db *gorm.DB, claim model.AppRouteClaim) {
+				t.Helper()
+				alias := strings.ToUpper(claim.InstallationID)
+				require.NotEqual(t, claim.InstallationID, alias)
+				require.NoError(t, db.Model(&model.AppRouteClaim{}).Where("id = ?", claim.ID).
+					UpdateColumn("installation_id", alias).Error)
+			},
+		},
+		{
+			name: "kind case",
+			mutate: func(t *testing.T, db *gorm.DB, claim model.AppRouteClaim) {
+				t.Helper()
+				require.NoError(t, db.Model(&model.AppRouteClaim{}).Where("id = ?", claim.ID).
+					UpdateColumn("kind", "CALLBACK").Error)
+			},
+		},
+		{
+			name: "app key case",
+			mutate: func(t *testing.T, db *gorm.DB, claim model.AppRouteClaim) {
+				t.Helper()
+				require.NoError(t, db.Model(&model.AppRouteClaim{}).Where("id = ?", claim.ID).
+					UpdateColumn("app_key", strings.ToUpper(claim.AppKey)).Error)
+			},
+		},
+		{
+			name: "absolute endpoint case",
+			mutate: func(t *testing.T, db *gorm.DB, claim model.AppRouteClaim) {
+				t.Helper()
+				require.NoError(t, db.Model(&model.AppRouteClaim{}).Where("id = ?", claim.ID).
+					UpdateColumn("absolute_endpoint", strings.ToUpper(claim.AbsoluteEndpoint)).Error)
+			},
+		},
+		{
+			name: "duplicate callback candidate",
+			mutate: func(t *testing.T, db *gorm.DB, claim model.AppRouteClaim) {
+				t.Helper()
+				claim.ID = 0
+				claim.ClaimKey = strings.Repeat("0", 64)
+				claim.CreatedAt = time.Time{}
+				require.NoError(t, db.Create(&claim).Error)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppLaunchFixture(t)
+			var installation model.AppInstallation
+			require.NoError(t, f.db.Where(
+				"installation_id = ?", f.installation.InstallationID,
+			).First(&installation).Error)
+			var claim model.AppRouteClaim
+			require.NoError(t, f.db.Where(
+				"installation_id = ? AND kind = ?", installation.InstallationID, "callback",
+			).First(&claim).Error)
+			expectedCallback := "https://apps.example.com/" + installation.AppKey + "/callback"
+			require.Equal(t, serviceDigestBytes([]byte("route\x00"+expectedCallback)), claim.ClaimKey)
+
+			if test.mutate != nil {
+				test.mutate(t, f.db, claim)
+			}
+			manifest, callback, err := ValidateAppPluginRegistration(f.db, installation)
+
+			if test.mutate == nil {
+				require.NoError(t, err)
+				assert.Equal(t, installation.AppKey, manifest.Key)
+				assert.Equal(t, expectedCallback, callback)
+				return
+			}
+			assert.Empty(t, manifest)
+			assert.Empty(t, callback)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "forbidden", authErr.Code)
+		})
+	}
+}
+
+func TestAppPluginLaunchContextPreservesRegistrationStorageFailures(t *testing.T) {
+	for _, resource := range []struct {
+		name       string
+		table      string
+		occurrence int32
+	}{
+		{name: "current app version", table: "app_versions", occurrence: 1},
+		{name: "callback claim", table: "app_route_claims", occurrence: 2},
+	} {
+		t.Run(resource.name, func(t *testing.T) {
+			f := newAppLaunchFixture(t)
+			privateDetail := "private registration " + resource.name + " query detail"
+			failed := registerAppExecutionDBFault(
+				t, f.db, "query", resource.table, resource.occurrence,
+				errors.New(privateDetail),
+			)
+
+			_, err := f.service.LaunchContext(
+				t.Context(), f.identity, f.installation.AppKey, "direct",
+			)
+
+			require.True(t, failed.Load(), "the registration query must be exercised")
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), privateDetail)
+		})
+	}
 }
 
 func TestAuthorizeBindsOriginCallbackPKCEAndSessionVersions(t *testing.T) {
@@ -214,6 +548,48 @@ func TestAuthorizeBindsOriginCallbackPKCEAndSessionVersions(t *testing.T) {
 			var count int64
 			require.NoError(t, f.db.Model(&model.AppPluginSession{}).Count(&count).Error)
 			assert.Zero(t, count)
+		})
+	}
+}
+
+func TestExchangeRejectsDashboardExpiryChangesBeforeMutation(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		delta time.Duration
+	}{
+		{name: "shortened", delta: -time.Minute},
+		{name: "extended", delta: time.Minute},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppLaunchFixture(t)
+			request := f.exchangeRequest(t, f.authorize(t, "dashboard-expiry-"+test.name))
+			changedExpiry := f.session.ExpiresAt + int64(test.delta/time.Second)
+			require.Greater(t, changedExpiry, f.options.Now().Unix())
+			require.NoError(t, f.db.Model(&model.UserSession{}).
+				Where("sid = ?", f.session.SID).
+				Update("expires_at", changedExpiry).Error)
+
+			result, err := f.service.Exchange(t.Context(), f.serviceID, request)
+
+			assert.Empty(t, result)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "unauthenticated", authErr.Code)
+			assert.Equal(t, http.StatusUnauthorized, AppRelayErrorStatus(err))
+			var code model.AppPluginLaunchCode
+			require.NoError(t, f.db.Where(
+				"installation_id = ?", f.installation.InstallationID,
+			).First(&code).Error)
+			assert.Zero(t, code.ConsumedAt)
+			assert.Empty(t, code.AppSessionID)
+			for _, table := range []any{
+				&model.AppPluginSession{},
+				&model.AppPluginExchangeReplay{},
+			} {
+				var count int64
+				require.NoError(t, f.db.Model(table).Count(&count).Error)
+				assert.Zero(t, count)
+			}
 		})
 	}
 }
@@ -378,6 +754,15 @@ func TestExchangeHasOneLogicalWinnerAndFiveMinuteReplay(t *testing.T) {
 	var count int64
 	require.NoError(t, f.db.Model(&model.AppPluginSession{}).Count(&count).Error)
 	assert.EqualValues(t, 1, count)
+	var persistedReplay model.AppPluginExchangeReplay
+	replayScope, err := appPluginHash([]string{"exchange/v1", f.serviceID.InstallationID,
+		f.serviceID.CredentialID, f.serviceID.Version, request.ExchangeRequestID})
+	require.NoError(t, err)
+	require.NoError(t, f.db.Where("scope_hash = ?", replayScope).First(&persistedReplay).Error)
+	require.NotNil(t, persistedReplay.LaunchCodeHash)
+	require.NotNil(t, persistedReplay.AppSessionID)
+	assert.Equal(t, serviceDigestBytes([]byte(request.Code)), *persistedReplay.LaunchCodeHash)
+	assert.Equal(t, original.AppSessionID, *persistedReplay.AppSessionID)
 	assert.Equal(t, f.options.Issuer, original.Issuer)
 	assert.NotEmpty(t, original.Subject)
 	assert.NotEqual(t, f.user.Username, original.Subject)
@@ -417,7 +802,7 @@ func TestExchangeHasOneLogicalWinnerAndFiveMinuteReplay(t *testing.T) {
 	}
 	changed := request
 	changed.Nonce = base64.RawURLEncoding.EncodeToString(bytesForAppLaunch(5))
-	_, err := f.service.Exchange(t.Context(), f.serviceID, changed)
+	_, err = f.service.Exchange(t.Context(), f.serviceID, changed)
 	require.ErrorContains(t, err, "idempotency_conflict")
 	changed = request
 	changed.ExchangeRequestID = uuid.NewString()
@@ -427,7 +812,11 @@ func TestExchangeHasOneLogicalWinnerAndFiveMinuteReplay(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, current.Active, "valid second logical consumption commits session revocation despite returning an error")
 	f.now.Add(int64(299 * time.Second))
-	replayed, err := NewAppPluginAuthService(f.db, f.options).Exchange(t.Context(), f.serviceID, request)
+	replayOptions := f.options
+	replayOptions.CurrentPermissions = func(context.Context, *gorm.DB, model.User) (model.AppJSONMap, error) {
+		return nil, errors.New("frozen replay must not recompute current entitlements")
+	}
+	replayed, err := NewAppPluginAuthService(f.db, replayOptions).Exchange(t.Context(), f.serviceID, request)
 	require.NoError(t, err)
 	assert.Equal(t, original, replayed)
 	current, err = f.service.Introspect(t.Context(), f.serviceID, introspection)
@@ -456,6 +845,957 @@ func TestExchangeHasOneLogicalWinnerAndFiveMinuteReplay(t *testing.T) {
 		require.NoError(t, outcomes[0])
 		require.ErrorContains(t, outcomes[1], "launch_code_replayed")
 	})
+}
+
+func TestExchangeReplayWithRotatedCredential(t *testing.T) {
+	t.Run("broader credential revokes only the exact original session", func(t *testing.T) {
+		f := newAppLaunchFixtureForKeyAndScopes(
+			t, "rotated-broader-revocation", []string{"identity.read", "task.read"},
+		)
+		request := f.exchangeRequest(t, f.authorize(t, "rotated-broader-revocation"))
+		original, err := f.service.Exchange(t.Context(), f.serviceID, request)
+		require.NoError(t, err)
+		require.Equal(t, []string{"identity.read"}, original.GrantedScopes)
+		other := f.exchange(t)
+		rotated := f.rotateServiceCredential(t, []string{"identity.read", "task.read"})
+
+		second := request
+		second.ExchangeRequestID = uuid.NewString()
+		result, err := f.service.Exchange(t.Context(), rotated, second)
+
+		assert.Empty(t, result)
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "launch_code_replayed", authErr.Code)
+		var originalSession model.AppPluginSession
+		require.NoError(t, f.db.Where(
+			"app_session_id = ?", original.AppSessionID,
+		).First(&originalSession).Error)
+		assert.Equal(t, model.AppStringList{"identity.read"}, originalSession.GrantedScopes)
+		assert.NotZero(t, originalSession.RevokedAt)
+		var otherSession model.AppPluginSession
+		require.NoError(t, f.db.Where(
+			"app_session_id = ?", other.AppSessionID,
+		).First(&otherSession).Error)
+		assert.Zero(t, otherSession.RevokedAt)
+	})
+
+	t.Run("narrower credential returns the exact frozen response", func(t *testing.T) {
+		f := newAppLaunchFixtureForKeyAndScopes(
+			t, "rotated-narrower-replay", []string{"identity.read", "task.read"},
+		)
+		originalCredential := f.rotateServiceCredential(t, []string{"identity.read", "task.read"})
+		request := f.exchangeRequest(t, f.authorize(t, "rotated-narrower-replay"))
+		original, err := f.service.Exchange(t.Context(), originalCredential, request)
+		require.NoError(t, err)
+		require.Equal(t, []string{"identity.read", "task.read"}, original.GrantedScopes)
+		rotated := f.rotateServiceCredential(t, []string{"identity.read"})
+
+		replayed, err := f.service.Exchange(t.Context(), rotated, request)
+
+		require.NoError(t, err)
+		assert.Equal(t, original, replayed)
+		assert.Equal(t, []string{"identity.read", "task.read"}, replayed.GrantedScopes)
+		var session model.AppPluginSession
+		require.NoError(t, f.db.Where(
+			"app_session_id = ?", original.AppSessionID,
+		).First(&session).Error)
+		assert.Zero(t, session.RevokedAt)
+	})
+
+	t.Run("credential without identity read cannot mutate", func(t *testing.T) {
+		f := newAppLaunchFixtureForKeyAndScopes(
+			t, "rotated-scope-denied", []string{"identity.read", "task.read"},
+		)
+		request := f.exchangeRequest(t, f.authorize(t, "rotated-scope-denied"))
+		original, err := f.service.Exchange(t.Context(), f.serviceID, request)
+		require.NoError(t, err)
+		rotated := f.rotateServiceCredential(t, []string{"task.read"})
+
+		second := request
+		second.ExchangeRequestID = uuid.NewString()
+		result, err := f.service.Exchange(t.Context(), rotated, second)
+
+		assert.Empty(t, result)
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "scope_denied", authErr.Code)
+		assert.Equal(t, http.StatusForbidden, AppRelayErrorStatus(err))
+		var session model.AppPluginSession
+		require.NoError(t, f.db.Where(
+			"app_session_id = ?", original.AppSessionID,
+		).First(&session).Error)
+		assert.Zero(t, session.RevokedAt)
+		var replayCount int64
+		require.NoError(t, f.db.Model(&model.AppPluginExchangeReplay{}).Count(&replayCount).Error)
+		assert.EqualValues(t, 1, replayCount)
+	})
+}
+
+func TestExchangeDifferentRequestRejectsTamperedLaunchSessionWithoutRevocation(t *testing.T) {
+	f := newAppLaunchFixture(t)
+	request := f.exchangeRequest(t, f.authorize(t, "wrong-session-revocation"))
+	original, err := f.service.Exchange(t.Context(), f.serviceID, request)
+	require.NoError(t, err)
+	other := f.exchange(t)
+	require.NotEqual(t, original.AppSessionID, other.AppSessionID)
+	require.NoError(t, f.db.Model(&model.AppPluginLaunchCode{}).Where(
+		"code_hash = ? AND installation_id = ?",
+		serviceDigestBytes([]byte(request.Code)), f.installation.InstallationID,
+	).Update("app_session_id", other.AppSessionID).Error)
+
+	second := request
+	second.ExchangeRequestID = uuid.NewString()
+	result, err := f.service.Exchange(t.Context(), f.serviceID, second)
+
+	assert.Empty(t, result)
+	var authErr *AppPluginAuthError
+	require.ErrorAs(t, err, &authErr)
+	assert.Equal(t, "not_found", authErr.Code)
+	assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+	for _, sessionID := range []string{original.AppSessionID, other.AppSessionID} {
+		var session model.AppPluginSession
+		require.NoError(t, f.db.Where("app_session_id = ?", sessionID).First(&session).Error)
+		assert.Zero(t, session.RevokedAt)
+	}
+}
+
+func TestExchangeDifferentRequestRequiresAuthenticatedOriginalReplay(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *appLaunchFixture, model.AppPluginExchangeReplay, AppPluginExchangeResult)
+	}{
+		{
+			name: "legacy replay without linkage",
+			mutate: func(t *testing.T, f *appLaunchFixture, replay model.AppPluginExchangeReplay, _ AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&replay).Updates(map[string]any{
+					"launch_code_hash": "", "app_session_id": "", "response_mac": "",
+				}).Error)
+			},
+		},
+		{
+			name: "launch code linkage drift",
+			mutate: func(t *testing.T, f *appLaunchFixture, replay model.AppPluginExchangeReplay, _ AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&replay).
+					Update("launch_code_hash", strings.Repeat("1", 64)).Error)
+			},
+		},
+		{
+			name: "session linkage drift",
+			mutate: func(t *testing.T, f *appLaunchFixture, replay model.AppPluginExchangeReplay, _ AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&replay).
+					Update("app_session_id", "different-session").Error)
+			},
+		},
+		{
+			name: "response MAC drift",
+			mutate: func(t *testing.T, f *appLaunchFixture, replay model.AppPluginExchangeReplay, _ AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&replay).
+					Update("response_mac", strings.Repeat("m", 43)).Error)
+			},
+		},
+		{
+			name: "response drift",
+			mutate: func(t *testing.T, f *appLaunchFixture, replay model.AppPluginExchangeReplay, _ AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&replay).
+					Update("response_json", `{"app_session_id":"different-session"}`).Error)
+			},
+		},
+		{
+			name: "consumed at drift",
+			mutate: func(t *testing.T, f *appLaunchFixture, _ model.AppPluginExchangeReplay, _ AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginLaunchCode{}).Where(
+					"installation_id = ?", f.installation.InstallationID,
+				).Update("consumed_at", gorm.Expr("consumed_at + 1")).Error)
+			},
+		},
+		{
+			name: "persisted session drift",
+			mutate: func(t *testing.T, f *appLaunchFixture, _ model.AppPluginExchangeReplay, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("subject", "user_999999").Error)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppLaunchFixture(t)
+			request := f.exchangeRequest(t, f.authorize(t, "different-request-linkage"))
+			original, err := f.service.Exchange(t.Context(), f.serviceID, request)
+			require.NoError(t, err)
+			var replay model.AppPluginExchangeReplay
+			require.NoError(t, f.db.First(&replay).Error)
+			test.mutate(t, f, replay, original)
+
+			second := request
+			second.ExchangeRequestID = uuid.NewString()
+			result, err := NewAppPluginAuthService(f.db, f.options).
+				Exchange(t.Context(), f.serviceID, second)
+
+			assert.Empty(t, result)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "not_found", authErr.Code)
+			assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+			var session model.AppPluginSession
+			require.NoError(t, f.db.Where(
+				"app_session_id = ?", original.AppSessionID,
+			).First(&session).Error)
+			assert.Zero(t, session.RevokedAt)
+		})
+	}
+}
+
+func TestExchangeDifferentRequestStorageFaultsAreRetryable(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		operation  string
+		table      string
+		occurrence int32
+	}{
+		{name: "original replay query", operation: "query", table: "app_plugin_exchange_replays", occurrence: 2},
+		{name: "persisted session query", operation: "query", table: "app_plugin_sessions", occurrence: 1},
+		{name: "session revoke update", operation: "update", table: "app_plugin_sessions", occurrence: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppLaunchFixture(t)
+			request := f.exchangeRequest(t, f.authorize(t, "different-request-fault"))
+			original, err := f.service.Exchange(t.Context(), f.serviceID, request)
+			require.NoError(t, err)
+			privateDetail := "private different request " + test.name + " detail"
+			failed := registerAppExecutionDBFault(
+				t, f.db, test.operation, test.table, test.occurrence, errors.New(privateDetail),
+			)
+
+			second := request
+			second.ExchangeRequestID = uuid.NewString()
+			result, err := NewAppPluginAuthService(f.db, f.options).
+				Exchange(t.Context(), f.serviceID, second)
+
+			require.True(t, failed.Load())
+			assert.Empty(t, result)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), privateDetail)
+			var session model.AppPluginSession
+			require.NoError(t, f.db.Where(
+				"app_session_id = ?", original.AppSessionID,
+			).First(&session).Error)
+			assert.Zero(t, session.RevokedAt)
+		})
+	}
+}
+
+func TestExchangeDifferentRequestRejectsZeroRowRevocation(t *testing.T) {
+	f := newAppLaunchFixture(t)
+	request := f.exchangeRequest(t, f.authorize(t, "different-request-zero-row"))
+	original, err := f.service.Exchange(t.Context(), f.serviceID, request)
+	require.NoError(t, err)
+	var intercepted atomic.Bool
+	callbackName := "test:exchange-zero-row-revocation"
+	require.NoError(t, f.db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table != "app_plugin_sessions" || !intercepted.CompareAndSwap(false, true) {
+			return
+		}
+		tx.Statement.AddClause(clause.Where{Exprs: []clause.Expression{
+			clause.Eq{Column: clause.Column{Name: "app_session_id"}, Value: "missing-session"},
+		}})
+	}))
+	t.Cleanup(func() { require.NoError(t, f.db.Callback().Update().Remove(callbackName)) })
+
+	second := request
+	second.ExchangeRequestID = uuid.NewString()
+	result, err := NewAppPluginAuthService(f.db, f.options).
+		Exchange(t.Context(), f.serviceID, second)
+
+	require.True(t, intercepted.Load())
+	assert.Empty(t, result)
+	var authErr *AppPluginAuthError
+	require.ErrorAs(t, err, &authErr)
+	assert.Equal(t, "service_unavailable", authErr.Code)
+	assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+	var session model.AppPluginSession
+	require.NoError(t, f.db.Where("app_session_id = ?", original.AppSessionID).First(&session).Error)
+	assert.Zero(t, session.RevokedAt)
+}
+
+func TestExchangeDifferentRequestAlreadyRevokedIsIdempotent(t *testing.T) {
+	f := newAppLaunchFixture(t)
+	request := f.exchangeRequest(t, f.authorize(t, "different-request-already-revoked"))
+	original, err := f.service.Exchange(t.Context(), f.serviceID, request)
+	require.NoError(t, err)
+	other := f.exchange(t)
+	require.NotEqual(t, original.AppSessionID, other.AppSessionID)
+
+	second := request
+	second.ExchangeRequestID = uuid.NewString()
+	_, err = f.service.Exchange(t.Context(), f.serviceID, second)
+	require.ErrorContains(t, err, "launch_code_replayed")
+	var revoked model.AppPluginSession
+	require.NoError(t, f.db.Where("app_session_id = ?", original.AppSessionID).First(&revoked).Error)
+	require.NotZero(t, revoked.RevokedAt)
+
+	f.now.Add(int64(time.Second))
+	third := request
+	third.ExchangeRequestID = uuid.NewString()
+	result, err := NewAppPluginAuthService(f.db, f.options).
+		Exchange(t.Context(), f.serviceID, third)
+
+	assert.Empty(t, result)
+	require.ErrorContains(t, err, "launch_code_replayed")
+	var unchanged model.AppPluginSession
+	require.NoError(t, f.db.Where("app_session_id = ?", original.AppSessionID).First(&unchanged).Error)
+	assert.Equal(t, revoked.RevokedAt, unchanged.RevokedAt)
+	var otherSession model.AppPluginSession
+	require.NoError(t, f.db.Where("app_session_id = ?", other.AppSessionID).First(&otherSession).Error)
+	assert.Zero(t, otherSession.RevokedAt)
+}
+
+func TestExchangeReplayRequiresCurrentAppPluginRegistration(t *testing.T) {
+	for _, resource := range []string{
+		"current app version",
+		"callback claim",
+		"callback claim mismatch",
+		"enabled surface",
+	} {
+		t.Run(resource, func(t *testing.T) {
+			f := newAppLaunchFixture(t)
+			request := f.exchangeRequest(t, f.authorize(t, "registration-replay"))
+			original, err := f.service.Exchange(t.Context(), f.serviceID, request)
+			require.NoError(t, err)
+			require.NotEmpty(t, original.AppSessionID)
+
+			switch resource {
+			case "current app version":
+				require.NoError(t, f.db.Where("id = ?", f.installation.AppVersionID).
+					Delete(&model.AppVersion{}).Error)
+			case "callback claim":
+				require.NoError(t, f.db.Where(
+					"installation_id = ? AND kind = ?",
+					f.installation.InstallationID, "callback",
+				).Delete(&model.AppRouteClaim{}).Error)
+			case "callback claim mismatch":
+				require.NoError(t, f.db.Model(&model.AppRouteClaim{}).Where(
+					"installation_id = ? AND kind = ?",
+					f.installation.InstallationID, "callback",
+				).Update("absolute_endpoint", "https://apps.example.com/wrong-callback").Error)
+			case "enabled surface":
+				require.NoError(t, f.db.Model(&model.AppInstallation{}).Where(
+					"installation_id = ?", f.installation.InstallationID,
+				).Update("enabled_surfaces", model.AppStringList{"embedded"}).Error)
+			}
+
+			replayed, err := NewAppPluginAuthService(f.db, f.options).
+				Exchange(t.Context(), f.serviceID, request)
+
+			assert.Empty(t, replayed)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "not_found", authErr.Code)
+		})
+	}
+}
+
+func TestExchangeReplayRejectsValidGenerationUpgrade(t *testing.T) {
+	f := newAppLaunchFixture(t)
+	request := f.exchangeRequest(t, f.authorize(t, "generation-upgrade-replay"))
+	original, err := f.service.Exchange(t.Context(), f.serviceID, request)
+	require.NoError(t, err)
+	require.NotEmpty(t, original.AppSessionID)
+
+	cmd := appPluginInstallCommand(f.installation.AppKey, "2.0.0")
+	cmd.ServiceCredential = AppServiceCredentialInput{}
+	cmd.NetworkPolicy = model.AppNetworkPolicy{
+		AllowHosts: []string{"apps.example.com"}, DenyPrivateIPRanges: true,
+	}
+	cmd.EntitlementPolicyID = f.installation.EntitlementPolicyVersion
+	upgraded, err := NewAppPluginInstallationService(f.db, AppPluginInstallationOptions{
+		TaskPluginChecker: fixedTaskPluginChecker{"doubao": "1.2.0"},
+		CurrentAuthz:      map[string][]string{"app_plugin": {"manage"}, "task": {"read"}},
+	}).Install(t.Context(), cmd)
+	require.NoError(t, err)
+	require.NotEqual(t, f.installation.AppVersionID, upgraded.AppVersionID)
+	require.Equal(t, "2.0.0", upgraded.ManifestVersion)
+	var callback model.AppRouteClaim
+	require.NoError(t, f.db.Where(
+		"installation_id = ? AND kind = ?", upgraded.InstallationID, "callback",
+	).First(&callback).Error)
+	require.Equal(t, "https://apps.example.com/"+f.installation.AppKey+"/callback",
+		callback.AbsoluteEndpoint)
+	enabled, err := model.CompareAndSwapAppInstallationStatus(
+		t.Context(), f.db, upgraded.InstallationID, upgraded.Revision,
+		model.AppInstallationStatusEnabled,
+	)
+	require.NoError(t, err)
+	require.Equal(t, model.AppInstallationStatusEnabled, enabled.Status)
+
+	replayed, err := NewAppPluginAuthService(f.db, f.options).
+		Exchange(t.Context(), f.serviceID, request)
+
+	assert.Empty(t, replayed)
+	var authErr *AppPluginAuthError
+	require.ErrorAs(t, err, &authErr)
+	assert.Equal(t, "not_found", authErr.Code)
+	assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+}
+
+func TestExchangeReplayOriginalLaunchBindingQueryFaultIsRetryable(t *testing.T) {
+	f := newAppLaunchFixture(t)
+	request := f.exchangeRequest(t, f.authorize(t, "launch-binding-query-fault"))
+	_, err := f.service.Exchange(t.Context(), f.serviceID, request)
+	require.NoError(t, err)
+	privateDetail := "private original launch binding query detail"
+	failed := registerAppExecutionDBFault(
+		t, f.db, "query", "app_plugin_launch_codes", 1, errors.New(privateDetail),
+	)
+
+	replayed, err := NewAppPluginAuthService(f.db, f.options).
+		Exchange(t.Context(), f.serviceID, request)
+
+	require.True(t, failed.Load(), "replay must reload the original launch binding")
+	assert.Empty(t, replayed)
+	var authErr *AppPluginAuthError
+	require.ErrorAs(t, err, &authErr)
+	assert.Equal(t, "service_unavailable", authErr.Code)
+	assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+	assert.NotContains(t, err.Error(), privateDetail)
+}
+
+func TestExchangeReplayRequiresOriginalLaunchBinding(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *appLaunchFixture)
+	}{
+		{
+			name: "missing launch code",
+			mutate: func(t *testing.T, f *appLaunchFixture) {
+				t.Helper()
+				require.NoError(t, f.db.Where(
+					"installation_id = ?", f.installation.InstallationID,
+				).Delete(&model.AppPluginLaunchCode{}).Error)
+			},
+		},
+		{
+			name: "launch code no longer consumed",
+			mutate: func(t *testing.T, f *appLaunchFixture) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginLaunchCode{}).Where(
+					"installation_id = ?", f.installation.InstallationID,
+				).Update("consumed_at", 0).Error)
+			},
+		},
+		{
+			name: "launch code session mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginLaunchCode{}).Where(
+					"installation_id = ?", f.installation.InstallationID,
+				).Update("app_session_id", "different-session").Error)
+			},
+		},
+		{
+			name: "malformed binding",
+			mutate: func(t *testing.T, f *appLaunchFixture) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginLaunchCode{}).Where(
+					"installation_id = ?", f.installation.InstallationID,
+				).Update("binding_json", "{").Error)
+			},
+		},
+		{
+			name: "salt mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginLaunchCode{}).Where(
+					"installation_id = ?", f.installation.InstallationID,
+				).Update("salt", strings.Repeat("s", 43)).Error)
+			},
+		},
+		{
+			name: "code hash mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginLaunchCode{}).Where(
+					"installation_id = ?", f.installation.InstallationID,
+				).Update("code_hash", strings.Repeat("0", 64)).Error)
+			},
+		},
+		{
+			name: "installation ID binding mismatch",
+			mutate: mutateAppPluginLaunchBinding(func(binding *model.AppPluginLaunchBinding) {
+				binding.InstallationID = "different-installation"
+			}),
+		},
+		{
+			name: "app key binding mismatch",
+			mutate: mutateAppPluginLaunchBinding(func(binding *model.AppPluginLaunchBinding) {
+				binding.AppKey = "different-app"
+			}),
+		},
+		{
+			name: "generation binding mismatch",
+			mutate: mutateAppPluginLaunchBinding(func(binding *model.AppPluginLaunchBinding) {
+				binding.Generation = "different-generation"
+			}),
+		},
+		{
+			name: "callback binding mismatch",
+			mutate: mutateAppPluginLaunchBinding(func(binding *model.AppPluginLaunchBinding) {
+				binding.Callback = "https://apps.example.com/different-callback"
+			}),
+		},
+		{
+			name: "issuer binding mismatch",
+			mutate: mutateAppPluginLaunchBinding(func(binding *model.AppPluginLaunchBinding) {
+				binding.Issuer = "https://different.example.com"
+			}),
+		},
+		{
+			name: "surface binding mismatch",
+			mutate: mutateAppPluginLaunchBinding(func(binding *model.AppPluginLaunchBinding) {
+				binding.Surface = "embedded"
+			}),
+		},
+		{
+			name: "transaction binding mismatch",
+			mutate: mutateAppPluginLaunchBinding(func(binding *model.AppPluginLaunchBinding) {
+				binding.TransactionID = uuid.NewString()
+			}),
+		},
+		{
+			name: "state hash binding mismatch",
+			mutate: mutateAppPluginLaunchBinding(func(binding *model.AppPluginLaunchBinding) {
+				binding.StateHash = strings.Repeat("1", 64)
+			}),
+		},
+		{
+			name: "nonce hash binding mismatch",
+			mutate: mutateAppPluginLaunchBinding(func(binding *model.AppPluginLaunchBinding) {
+				binding.NonceHash = strings.Repeat("2", 64)
+			}),
+		},
+		{
+			name: "PKCE challenge binding mismatch",
+			mutate: mutateAppPluginLaunchBinding(func(binding *model.AppPluginLaunchBinding) {
+				binding.CodeChallenge = strings.Repeat("c", 43)
+			}),
+		},
+		{
+			name: "binding expiry mismatch",
+			mutate: mutateAppPluginLaunchBinding(func(binding *model.AppPluginLaunchBinding) {
+				binding.ExpiresAt++
+			}),
+		},
+		{
+			name: "code expiry mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginLaunchCode{}).Where(
+					"installation_id = ?", f.installation.InstallationID,
+				).Update("expires_at", gorm.Expr("expires_at + 1")).Error)
+			},
+		},
+		{
+			name: "consumed after code expiry",
+			mutate: func(t *testing.T, f *appLaunchFixture) {
+				t.Helper()
+				var code model.AppPluginLaunchCode
+				require.NoError(t, f.db.Where(
+					"installation_id = ?", f.installation.InstallationID,
+				).First(&code).Error)
+				require.NoError(t, f.db.Model(&code).Update("consumed_at", code.ExpiresAt+1).Error)
+			},
+		},
+		{
+			name: "consumed at upstream expiry",
+			mutate: func(t *testing.T, f *appLaunchFixture) {
+				t.Helper()
+				var code model.AppPluginLaunchCode
+				require.NoError(t, f.db.Where(
+					"installation_id = ?", f.installation.InstallationID,
+				).First(&code).Error)
+				var binding model.AppPluginLaunchBinding
+				require.NoError(t, common.UnmarshalJsonStr(code.BindingJSON, &binding))
+				require.NoError(t, f.db.Model(&code).
+					Update("consumed_at", time.Unix(binding.UpstreamExpiresAt, 0).UnixNano()).Error)
+			},
+		},
+		{
+			name: "upstream expiry binding mismatch",
+			mutate: mutateAppPluginLaunchBinding(func(binding *model.AppPluginLaunchBinding) {
+				binding.UpstreamExpiresAt--
+			}),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppLaunchFixture(t)
+			request := f.exchangeRequest(t, f.authorize(t, "original-launch-binding"))
+			_, err := f.service.Exchange(t.Context(), f.serviceID, request)
+			require.NoError(t, err)
+			test.mutate(t, f)
+
+			replayed, err := NewAppPluginAuthService(f.db, f.options).
+				Exchange(t.Context(), f.serviceID, request)
+
+			assert.Empty(t, replayed)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "not_found", authErr.Code)
+			assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+		})
+	}
+}
+
+func mutateAppPluginLaunchBinding(
+	mutate func(*model.AppPluginLaunchBinding),
+) func(*testing.T, *appLaunchFixture) {
+	return func(t *testing.T, f *appLaunchFixture) {
+		t.Helper()
+		var code model.AppPluginLaunchCode
+		require.NoError(t, f.db.Where(
+			"installation_id = ?", f.installation.InstallationID,
+		).First(&code).Error)
+		var binding model.AppPluginLaunchBinding
+		require.NoError(t, common.UnmarshalJsonStr(code.BindingJSON, &binding))
+		mutate(&binding)
+		raw, err := common.Marshal(binding)
+		require.NoError(t, err)
+		require.NoError(t, f.db.Model(&code).Update("binding_json", string(raw)).Error)
+	}
+}
+
+func TestExchangeReplayRequiresPersistedSession(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *appLaunchFixture, AppPluginExchangeResult)
+	}{
+		{
+			name: "missing session",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Delete(&model.AppPluginSession{}).Error)
+			},
+		},
+		{
+			name: "app session ID mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("app_session_id", "different-session").Error)
+			},
+		},
+		{
+			name: "installation ID mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("installation_id", "different-installation").Error)
+			},
+		},
+		{
+			name: "app key mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("app_key", "different-app").Error)
+			},
+		},
+		{
+			name: "generation mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("generation", "different-generation").Error)
+			},
+		},
+		{
+			name: "issuer mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("issuer", "https://different.example.com").Error)
+			},
+		},
+		{
+			name: "user ID mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("user_id", original.UserID+1).Error)
+			},
+		},
+		{
+			name: "dashboard session ID mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("dashboard_session_id", "different-dashboard-session").Error)
+			},
+		},
+		{
+			name: "auth version mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("auth_version", original.AuthVersion+1).Error)
+			},
+		},
+		{
+			name: "session version mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("session_version", original.SessionVersion+1).Error)
+			},
+		},
+		{
+			name: "subject mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("subject", "user_999999").Error)
+			},
+		},
+		{
+			name: "granted scopes mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("granted_scopes", model.AppStringList{"identity.read", "task.read"}).Error)
+			},
+		},
+		{
+			name: "upstream expiry mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, original AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("upstream_expires_at", original.UpstreamExpiresAt.Unix()-1).Error)
+			},
+		},
+		{
+			name: "replay installation linkage mismatch",
+			mutate: func(t *testing.T, f *appLaunchFixture, _ AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppPluginExchangeReplay{}).Where(
+					"installation_id = ?", f.installation.InstallationID,
+				).
+					Update("installation_id", "different-installation").Error)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppLaunchFixture(t)
+			request := f.exchangeRequest(t, f.authorize(t, "persisted-session-replay"))
+			original, err := f.service.Exchange(t.Context(), f.serviceID, request)
+			require.NoError(t, err)
+			test.mutate(t, f, original)
+
+			replayed, err := NewAppPluginAuthService(f.db, f.options).
+				Exchange(t.Context(), f.serviceID, request)
+
+			assert.Empty(t, replayed)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "not_found", authErr.Code)
+			assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+		})
+	}
+}
+
+func TestExchangeReplayAuthenticatesExactCachedResponse(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*AppPluginExchangeResult)
+	}{
+		{name: "issuer", mutate: func(result *AppPluginExchangeResult) {
+			result.Issuer = "https://different.example.com"
+		}},
+		{name: "subject", mutate: func(result *AppPluginExchangeResult) {
+			result.Subject = "user_999999"
+		}},
+		{name: "user ID", mutate: func(result *AppPluginExchangeResult) {
+			result.UserID++
+		}},
+		{name: "app session ID", mutate: func(result *AppPluginExchangeResult) {
+			result.AppSessionID = "different-session"
+		}},
+		{name: "auth version", mutate: func(result *AppPluginExchangeResult) {
+			result.AuthVersion++
+		}},
+		{name: "session version", mutate: func(result *AppPluginExchangeResult) {
+			result.SessionVersion++
+		}},
+		{name: "granted scopes", mutate: func(result *AppPluginExchangeResult) {
+			result.GrantedScopes = append(result.GrantedScopes, "task.read")
+		}},
+		{name: "entitlements", mutate: func(result *AppPluginExchangeResult) {
+			result.Entitlements = model.AppJSONMap{"app_plugin": {"tampered"}}
+		}},
+		{name: "entitlement version", mutate: func(result *AppPluginExchangeResult) {
+			result.EntitlementVersion = "tampered-version"
+		}},
+		{name: "issued at", mutate: func(result *AppPluginExchangeResult) {
+			result.IssuedAt = result.IssuedAt.Add(time.Nanosecond)
+		}},
+		{name: "upstream expiry", mutate: func(result *AppPluginExchangeResult) {
+			result.UpstreamExpiresAt = result.UpstreamExpiresAt.Add(time.Second)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppLaunchFixture(t)
+			request := f.exchangeRequest(t, f.authorize(t, "cached-response-integrity"))
+			_, err := f.service.Exchange(t.Context(), f.serviceID, request)
+			require.NoError(t, err)
+			var replay model.AppPluginExchangeReplay
+			require.NoError(t, f.db.First(&replay).Error)
+			var response AppPluginExchangeResult
+			require.NoError(t, common.UnmarshalJsonStr(replay.ResponseJSON, &response))
+			test.mutate(&response)
+			raw, err := common.Marshal(response)
+			require.NoError(t, err)
+			require.NoError(t, f.db.Model(&replay).Update("response_json", string(raw)).Error)
+
+			replayed, err := NewAppPluginAuthService(f.db, f.options).
+				Exchange(t.Context(), f.serviceID, request)
+
+			assert.Empty(t, replayed)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "not_found", authErr.Code)
+			assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+		})
+	}
+}
+
+func TestExchangeReplayRequiresResponseMAC(t *testing.T) {
+	for _, value := range []string{"", strings.Repeat("m", 43)} {
+		name := "missing"
+		if value != "" {
+			name = "invalid"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newAppLaunchFixture(t)
+			request := f.exchangeRequest(t, f.authorize(t, "response-mac"))
+			_, err := f.service.Exchange(t.Context(), f.serviceID, request)
+			require.NoError(t, err)
+			require.NoError(t, f.db.Table("app_plugin_exchange_replays").
+				Where("installation_id = ?", f.installation.InstallationID).
+				Update("response_mac", value).Error)
+
+			replayed, err := NewAppPluginAuthService(f.db, f.options).
+				Exchange(t.Context(), f.serviceID, request)
+
+			assert.Empty(t, replayed)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "not_found", authErr.Code)
+			assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+		})
+	}
+}
+
+func TestExchangeReplayAuthenticatesReplayLinkageAndExpiry(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *appLaunchFixture, model.AppPluginExchangeReplay)
+	}{
+		{
+			name: "scope hash",
+			mutate: func(t *testing.T, f *appLaunchFixture, replay model.AppPluginExchangeReplay) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&replay).
+					Update("scope_hash", strings.Repeat("3", 64)).Error)
+			},
+		},
+		{
+			name: "request hash",
+			mutate: func(t *testing.T, f *appLaunchFixture, replay model.AppPluginExchangeReplay) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&replay).
+					Update("request_hash", strings.Repeat("4", 64)).Error)
+			},
+		},
+		{
+			name: "installation ID",
+			mutate: func(t *testing.T, f *appLaunchFixture, replay model.AppPluginExchangeReplay) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&replay).
+					Update("installation_id", "different-installation").Error)
+			},
+		},
+		{
+			name: "expiry",
+			mutate: func(t *testing.T, f *appLaunchFixture, replay model.AppPluginExchangeReplay) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&replay).
+					Update("expires_at", replay.ExpiresAt+1).Error)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppLaunchFixture(t)
+			request := f.exchangeRequest(t, f.authorize(t, "replay-linkage"))
+			_, err := f.service.Exchange(t.Context(), f.serviceID, request)
+			require.NoError(t, err)
+			var replay model.AppPluginExchangeReplay
+			require.NoError(t, f.db.First(&replay).Error)
+			test.mutate(t, f, replay)
+
+			replayed, err := NewAppPluginAuthService(f.db, f.options).
+				Exchange(t.Context(), f.serviceID, request)
+
+			assert.Empty(t, replayed)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "not_found", authErr.Code)
+			assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+		})
+	}
+}
+
+func TestExchangeReplayPersistedSessionQueryFaultIsRetryable(t *testing.T) {
+	f := newAppLaunchFixture(t)
+	request := f.exchangeRequest(t, f.authorize(t, "session-query-fault"))
+	_, err := f.service.Exchange(t.Context(), f.serviceID, request)
+	require.NoError(t, err)
+	privateDetail := "private persisted session query detail"
+	failed := registerAppExecutionDBFault(
+		t, f.db, "query", "app_plugin_sessions", 1, errors.New(privateDetail),
+	)
+
+	replayed, err := NewAppPluginAuthService(f.db, f.options).
+		Exchange(t.Context(), f.serviceID, request)
+
+	require.True(t, failed.Load(), "replay must reload the persisted session")
+	assert.Empty(t, replayed)
+	var authErr *AppPluginAuthError
+	require.ErrorAs(t, err, &authErr)
+	assert.Equal(t, "service_unavailable", authErr.Code)
+	assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+	assert.NotContains(t, err.Error(), privateDetail)
 }
 
 // Hold the first operation at the ownership read until the second reaches the

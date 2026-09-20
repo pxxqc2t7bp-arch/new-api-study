@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,8 +22,11 @@ import (
 	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -774,6 +778,386 @@ func TestAuthenticateAppRelaySelectsNativeResponseProfile(t *testing.T) {
 	require.ErrorContains(t, err, "invalid_request")
 }
 
+func TestAuthenticateAppRelayMapsGrantQueryFailures(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		failAt int32
+	}{
+		{name: "initial grant lookup", failAt: 1},
+		{name: "current grant reread", failAt: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, issued, _ := issueNativeAppResponseGrant(t)
+			privateError := "private grant storage failure: " + test.name
+			callbackName := "test:native-grant-query-failure:" + uuid.NewString()
+			var grantReads atomic.Int32
+			require.NoError(t, f.db.Callback().Query().Before("gorm:query").
+				Register(callbackName, func(tx *gorm.DB) {
+					if tx.Statement.Table == "app_execution_grants" &&
+						grantReads.Add(1) == test.failAt {
+						tx.AddError(errors.New(privateError))
+					}
+				}))
+			t.Cleanup(func() {
+				require.NoError(t, f.db.Callback().Query().Remove(callbackName))
+			})
+
+			_, _, err := f.execution.AuthenticateAppRelay(
+				t.Context(), issued.GrantToken, "openai_responses",
+				[]byte(`{"model":"registered-native-http","input":"hello","max_output_tokens":32}`),
+			)
+
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), privateError)
+			assert.Equal(t, test.failAt, grantReads.Load())
+		})
+	}
+}
+
+func TestAuthenticateAppRelayKeepsInvalidExpiredAndRevokedGrantsNonRetryable(t *testing.T) {
+	raw := []byte(`{"model":"registered-native-http","input":"hello","max_output_tokens":32}`)
+	for _, test := range []struct {
+		name     string
+		mutate   func(*testing.T, *appExecutionFixture, AppExecutionGrantResult)
+		token    func(AppExecutionGrantResult) string
+		wantCode string
+	}{
+		{
+			name: "invalid token",
+			token: func(issued AppExecutionGrantResult) string {
+				return issued.GrantToken[:len(issued.GrantToken)-1]
+			},
+			wantCode: "invalid_grant",
+		},
+		{
+			name: "missing grant",
+			mutate: func(t *testing.T, f *appExecutionFixture, issued AppExecutionGrantResult) {
+				require.NoError(t, f.db.Where("grant_id = ?", issued.GrantID).
+					Delete(&model.AppExecutionGrant{}).Error)
+			},
+			wantCode: "invalid_grant",
+		},
+		{
+			name: "expired grant",
+			mutate: func(_ *testing.T, f *appExecutionFixture, issued AppExecutionGrantResult) {
+				f.execution.options.Now = func() time.Time { return issued.ExpiresAt.Add(time.Second) }
+			},
+			wantCode: "execution_grant_expired",
+		},
+		{
+			name: "revoked session",
+			mutate: func(t *testing.T, f *appExecutionFixture, _ AppExecutionGrantResult) {
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).
+					Where("app_session_id = ?", f.appSession.AppSessionID).
+					Update("revoked_at", f.options.Now().UnixNano()).Error)
+			},
+			wantCode: "unauthenticated",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, issued, _ := issueNativeAppResponseGrant(t)
+			if test.mutate != nil {
+				test.mutate(t, f, issued)
+			}
+			token := issued.GrantToken
+			if test.token != nil {
+				token = test.token(issued)
+			}
+
+			_, _, err := f.execution.AuthenticateAppRelay(
+				t.Context(), token, "openai_responses", raw,
+			)
+
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, test.wantCode, authErr.Code)
+			assert.Equal(t, http.StatusUnauthorized, AppRelayErrorStatus(err))
+		})
+	}
+}
+
+func TestAuthenticateAppRelayMapsTransactionBeginAndCommitFailuresToServiceUnavailable(t *testing.T) {
+	raw := []byte(`{"model":"registered-native-http","input":"hello","max_output_tokens":32}`)
+	for _, test := range []struct {
+		name      string
+		beginErr  error
+		commitErr error
+	}{
+		{name: "begin", beginErr: errors.New("private relay begin detail")},
+		{name: "commit", commitErr: errors.New("private relay commit detail")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, issued, _ := issueNativeAppResponseGrant(t)
+			faultDB := appExecutionDBWithTransactionFault(t, f.db, test.beginErr, test.commitErr)
+			execution := NewAppExecutionService(faultDB, f.options)
+
+			_, _, err := execution.AuthenticateAppRelay(
+				t.Context(), issued.GrantToken, "openai_responses", raw,
+			)
+
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), "private")
+		})
+	}
+}
+
+func TestSelectAppRelayChannelAbortsOnStorageFaults(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		table      string
+		occurrence int32
+	}{
+		{name: "policy", table: "options", occurrence: 2},
+		{name: "groups", table: "options", occurrence: 3},
+		{name: "channel", table: "channels", occurrence: 1},
+		{name: "ability", table: "abilities", occurrence: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, issued, _ := issueNativeAppResponseGrant(t)
+			raw := []byte(`{"model":"registered-native-http","input":"hello","max_output_tokens":32}`)
+			subject, _, err := f.execution.AuthenticateAppRelay(
+				t.Context(), issued.GrantToken, "openai_responses", raw,
+			)
+			require.NoError(t, err)
+			privateDetail := "private candidate " + test.name + " storage detail"
+			failed := registerAppExecutionDBFault(
+				t, f.db, "query", test.table, test.occurrence, errors.New(privateDetail),
+			)
+
+			channel, _, err := f.execution.SelectAppRelayChannel(
+				t.Context(), subject, &taskdto.ChannelConstraints{},
+			)
+
+			require.True(t, failed.Load(), "the intended candidate query must be exercised")
+			assert.Nil(t, channel)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), privateDetail)
+		})
+	}
+}
+
+func TestSelectTaskBackedAppRelayChannelAbortsOnStorageFaults(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		table      string
+		occurrence int32
+	}{
+		{name: "policy", table: "options", occurrence: 2},
+		{name: "groups", table: "options", occurrence: 3},
+		{name: "channel", table: "channels", occurrence: 1},
+		{name: "ability", table: "abilities", occurrence: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppExecutionFixture(t)
+			issued, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+			require.NoError(t, err)
+			subject, _, err := f.execution.AuthenticateAppRelay(
+				t.Context(), issued.GrantToken, "openai_video",
+				[]byte(`{"model":"`+appExecutionTestModel+`","prompt":"hello"}`),
+			)
+			require.NoError(t, err)
+			privateDetail := "private task candidate " + test.name + " storage detail"
+			failed := registerAppExecutionDBFault(
+				t, f.db, "query", test.table, test.occurrence, errors.New(privateDetail),
+			)
+
+			channel, _, err := f.execution.SelectAppRelayChannel(
+				t.Context(), subject, &taskdto.ChannelConstraints{},
+			)
+
+			require.True(t, failed.Load(), "the intended task candidate query must be exercised")
+			assert.Nil(t, channel)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), privateDetail)
+		})
+	}
+}
+
+func TestSelectAppRelayChannelMapsTransactionBeginAndCommitFailuresToServiceUnavailable(t *testing.T) {
+	raw := []byte(`{"model":"registered-native-http","input":"hello","max_output_tokens":32}`)
+	for _, test := range []struct {
+		name      string
+		beginErr  error
+		commitErr error
+	}{
+		{name: "begin", beginErr: errors.New("private selection begin detail")},
+		{name: "commit", commitErr: errors.New("private selection commit detail")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, issued, _ := issueNativeAppResponseGrant(t)
+			subject, _, err := f.execution.AuthenticateAppRelay(
+				t.Context(), issued.GrantToken, "openai_responses", raw,
+			)
+			require.NoError(t, err)
+			faultDB := appExecutionDBWithTransactionFault(t, f.db, test.beginErr, test.commitErr)
+			execution := NewAppExecutionService(faultDB, f.options)
+
+			channel, _, err := execution.SelectAppRelayChannel(
+				t.Context(), subject, &taskdto.ChannelConstraints{},
+			)
+
+			assert.Nil(t, channel)
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), "private")
+		})
+	}
+}
+
+func TestPrepareAppTaskPassthroughDistinguishesMissingGrantFromStorageFailure(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		inject     bool
+		wantCode   string
+		wantStatus int
+	}{
+		{name: "missing", wantCode: "invalid_grant", wantStatus: http.StatusUnauthorized},
+		{name: "storage failure", inject: true, wantCode: "service_unavailable", wantStatus: http.StatusServiceUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppExecutionFixture(t)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", nil)
+			info := &relaycommon.RelayInfo{AppSubject: &hosttypes.AppRelaySubject{
+				GrantID: "missing-grant",
+			}}
+			if test.inject {
+				registerAppExecutionDBFault(
+					t, f.db, "query", "app_execution_grants", 1,
+					errors.New("private passthrough storage detail"),
+				)
+			}
+
+			err := PrepareAppTaskPassthrough(c, info)
+
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, test.wantCode, authErr.Code)
+			assert.Equal(t, test.wantStatus, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), "private")
+		})
+	}
+}
+
+func acceptedAppTaskRetrievalFixture(t *testing.T) (*appExecutionFixture, AppExecutionGrantResult, model.AppTaskExecution) {
+	t.Helper()
+	f := newAppExecutionFixture(t)
+	issued, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+	require.NoError(t, err)
+	var grant model.AppExecutionGrant
+	require.NoError(t, f.db.Where("grant_id = ?", issued.GrantID).First(&grant).Error)
+	var candidates []model.AppExecutionModel
+	require.NoError(t, common.UnmarshalJsonStr(grant.ModelsJSON, &candidates))
+	require.NotEmpty(t, candidates)
+	candidate := candidates[0]
+	execution := model.AppTaskExecution{
+		ExecutionKind: model.AppExecutionKindTask,
+		LogicalHash:   serviceDigest("retrieval-logical"),
+		TaskID:        "task-retrieval",
+		GrantID:       grant.GrantID,
+		AppKey:        grant.AppKey, InstallationID: grant.InstallationID,
+		AppSessionID: grant.AppSessionID, Subject: grant.Subject, UserID: grant.UserID,
+		RunID: grant.RunID, ExecutionRequestID: grant.ExecutionRequestID, Operation: grant.Operation,
+		SubmissionHash: "retrieval-submission",
+		PublicModel:    candidate.PublicModel, ActualModel: candidate.ActualModel,
+		ActualGroup: candidate.Group, ChannelID: candidate.ChannelID,
+		PluginKey: candidate.PluginKey, PluginVersion: candidate.PluginVersion,
+		PluginSHA256: candidate.PluginSHA256, Protocol: candidate.Protocol,
+		ProviderTaskID: "cgt-retrieval", ProviderAccepted: true,
+		Status: "accepted", ProviderState: "queued", BillingState: "reserved",
+		FundingSource: grant.FundingSource, FundingRef: grant.FundingRef,
+		UpdatedAt: f.options.Now().Unix(), CreatedAt: f.options.Now().Unix(),
+	}
+	require.NoError(t, f.db.Create(&execution).Error)
+	projection := model.Task{
+		TaskID: execution.TaskID, Platform: constant.TaskPlatform(execution.PluginKey),
+		UserId: execution.UserID, Group: execution.ActualGroup, ChannelId: execution.ChannelID,
+		Status: model.TaskStatusQueued, ExecutionMode: model.TaskExecutionModeAppManaged,
+		Properties: model.Properties{
+			OriginModelName: execution.PublicModel, UpstreamModelName: execution.ActualModel,
+		},
+		PrivateData: model.TaskPrivateData{UpstreamTaskID: execution.ProviderTaskID},
+	}
+	require.NoError(t, f.db.Create(&projection).Error)
+	return f, issued, execution
+}
+
+func TestAuthenticateAppTaskRetrievalDistinguishesStorageFaultsFromMissingResources(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		table      string
+		occurrence int32
+	}{
+		{name: "execution lookup", table: "app_task_executions", occurrence: 1},
+		{name: "scoped task lookup", table: "app_task_executions", occurrence: 2},
+		{name: "projection lookup", table: "tasks", occurrence: 1},
+	} {
+		t.Run(test.name+" storage failure", func(t *testing.T) {
+			f, issued, execution := acceptedAppTaskRetrievalFixture(t)
+			privateDetail := "private retrieval " + test.name + " storage detail"
+			failed := registerAppExecutionDBFault(
+				t, f.db, "query", test.table, test.occurrence, errors.New(privateDetail),
+			)
+
+			_, _, err := f.execution.AuthenticateAppTaskRetrieval(
+				t.Context(), issued.GrantToken, execution.Protocol, execution.TaskID,
+			)
+
+			require.True(t, failed.Load(), "the intended retrieval query must be exercised")
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), privateDetail)
+		})
+	}
+
+	t.Run("missing execution", func(t *testing.T) {
+		f, issued, execution := acceptedAppTaskRetrievalFixture(t)
+		require.NoError(t, f.db.Where("id = ?", execution.ID).
+			Delete(&model.AppTaskExecution{}).Error)
+
+		_, _, err := f.execution.AuthenticateAppTaskRetrieval(
+			t.Context(), issued.GrantToken, execution.Protocol, execution.TaskID,
+		)
+
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "not_found", authErr.Code)
+		assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+	})
+
+	t.Run("missing projection", func(t *testing.T) {
+		f, issued, execution := acceptedAppTaskRetrievalFixture(t)
+		require.NoError(t, f.db.Where("task_id = ?", execution.TaskID).
+			Delete(&model.Task{}).Error)
+
+		_, _, err := f.execution.AuthenticateAppTaskRetrieval(
+			t.Context(), issued.GrantToken, execution.Protocol, execution.TaskID,
+		)
+
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "not_found", authErr.Code)
+		assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+	})
+}
+
 func TestAuthenticateAppRelayLocksInstallationBeforeGrant(t *testing.T) {
 	f, issued, _ := issueNativeAppResponseGrant(t)
 	type queryLock struct {
@@ -882,6 +1266,286 @@ func TestAuthenticateAppRelayPreservesTaskBackedFlow(t *testing.T) {
 		Strategy: subject.Strategy, ConversionPolicy: subject.ConversionPolicy,
 		AssetInputs: subject.AssetInputs,
 	}, subject)
+}
+
+func appTaskBillingCaptureFixture(t *testing.T) (*appExecutionFixture, *gin.Context, *relaycommon.RelayInfo) {
+	t.Helper()
+	f := newAppExecutionFixture(t)
+	issued, err := f.execution.IssueExecutionGrant(t.Context(), f.serviceID, f.request)
+	require.NoError(t, err)
+	raw := []byte(`{"model":"` + appExecutionTestModel + `","prompt":"hello"}`)
+	subject, _, err := f.execution.AuthenticateAppRelay(
+		t.Context(), issued.GrantToken, "openai_video", raw,
+	)
+	require.NoError(t, err)
+	_, selected, err := f.execution.SelectAppRelayChannel(
+		t.Context(), subject, &taskdto.ChannelConstraints{},
+	)
+	require.NoError(t, err)
+	subject.ChannelID, subject.Group = selected.ChannelID, selected.Group
+	subject.PluginSHA256 = selected.PluginSHA256
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", bytes.NewReader(raw))
+	c.Set(pluginruntime.ContextKeyProtocolRequest, pluginruntime.ProtocolRequestContext{
+		RouteRequestContext: pluginruntime.RouteRequestContext{
+			Body: map[string]any{
+				"kind":  "json",
+				"value": map[string]any{"model": appExecutionTestModel, "prompt": "hello"},
+			},
+		},
+		Protocol: "openai_video",
+		Model:    appExecutionTestModel,
+	})
+	return f, c, &relaycommon.RelayInfo{AppSubject: &subject}
+}
+
+type appTaskBillingGrantReadBarrier struct {
+	reached     chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+func (b *appTaskBillingGrantReadBarrier) unblock() {
+	b.releaseOnce.Do(func() {
+		close(b.release)
+	})
+}
+
+func registerAppTaskBillingGrantReadBarrier(
+	t *testing.T,
+	db *gorm.DB,
+	occurrence int32,
+) *appTaskBillingGrantReadBarrier {
+	t.Helper()
+	var reads atomic.Int32
+	barrier := &appTaskBillingGrantReadBarrier{
+		reached: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	callbackName := "test:billing-grant-read-barrier:" + uuid.NewString()
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table != "app_execution_grants" || reads.Add(1) != occurrence {
+			return
+		}
+		close(barrier.reached)
+		<-barrier.release
+	}))
+	t.Cleanup(func() {
+		barrier.unblock()
+		require.NoError(t, db.Callback().Query().Remove(callbackName))
+	})
+	return barrier
+}
+
+func TestCaptureAppTaskBillingInputsClassifiesStorageAndInputFailures(t *testing.T) {
+	t.Run("grant disappears before billing reread", func(t *testing.T) {
+		f, c, info := appTaskBillingCaptureFixture(t)
+		barrier := registerAppTaskBillingGrantReadBarrier(t, f.db, 1)
+		result := make(chan error, 1)
+		go func() {
+			_, err := CaptureAppTaskBillingInputs(c, info, map[string]any{"tokens": float64(1)})
+			result <- err
+		}()
+		select {
+		case <-barrier.reached:
+		case <-time.After(5 * time.Second):
+			t.Fatal("billing grant reread did not reach the deletion barrier")
+		}
+		require.NoError(t, f.db.Where("grant_id = ?", info.AppSubject.GrantID).
+			Delete(&model.AppExecutionGrant{}).Error)
+		barrier.unblock()
+
+		var err error
+		select {
+		case err = <-result:
+		case <-time.After(5 * time.Second):
+			t.Fatal("billing input capture did not finish after deleting the grant")
+		}
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "invalid_grant", authErr.Code)
+		assert.Equal(t, http.StatusUnauthorized, AppRelayErrorStatus(err))
+	})
+
+	t.Run("grant query storage failure", func(t *testing.T) {
+		f, c, info := appTaskBillingCaptureFixture(t)
+		const privateDetail = "private billing input grant query detail"
+		failed := registerAppExecutionDBFault(
+			t, f.db, "query", "app_execution_grants", 1, errors.New(privateDetail),
+		)
+
+		_, err := CaptureAppTaskBillingInputs(c, info, map[string]any{"tokens": float64(1)})
+
+		require.True(t, failed.Load(), "billing input capture must read the frozen grant")
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "service_unavailable", authErr.Code)
+		assert.NotContains(t, err.Error(), privateDetail)
+	})
+
+	t.Run("invalid request price fact", func(t *testing.T) {
+		f, c, info := appTaskBillingCaptureFixture(t)
+		var grant model.AppExecutionGrant
+		require.NoError(t, f.db.Where("grant_id = ?", info.AppSubject.GrantID).First(&grant).Error)
+		var candidates []model.AppExecutionModel
+		require.NoError(t, common.UnmarshalJsonStr(grant.ModelsJSON, &candidates))
+		require.Len(t, candidates, 1)
+		candidates[0].BillingBasis = billingexpr.BillingBasisTask
+		candidates[0].Price = model.PricingValues{
+			"billing_setting.billing_expr": `v1:tier("base", u("tokens") * 9.8 / 1000000) * ` +
+				`(header("x-service-tier") == "fast" ? 2 : 1)`,
+		}
+		modelsJSON, err := common.Marshal(candidates)
+		require.NoError(t, err)
+		grant.ModelsJSON = string(modelsJSON)
+		require.NoError(t, f.db.Model(&grant).Update("models_json", grant.ModelsJSON).Error)
+		c.Request.Header["X-Service-Tier"] = []string{"fast", "slow"}
+
+		_, err = CaptureAppTaskBillingInputs(c, info, map[string]any{"tokens": float64(1)})
+
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "invalid_price_inputs", authErr.Code)
+	})
+}
+
+func appTaskClaimFixture(t *testing.T) (
+	*appExecutionFixture,
+	*gin.Context,
+	*AppBillingSession,
+	AppTaskBillingInputs,
+	[]byte,
+) {
+	t.Helper()
+	f, c, info := appTaskBillingCaptureFixture(t)
+	var channel model.Channel
+	require.NoError(t, f.db.First(&channel, info.AppSubject.ChannelID).Error)
+	baseURL := channel.GetBaseURL()
+	if baseURL == "" {
+		baseURL = constant.GetChannelBaseURL(channel.Type)
+	}
+	info.UserId = info.AppSubject.UserID
+	info.OriginModelName = info.AppSubject.PublicModel
+	info.ChannelMeta = &relaycommon.ChannelMeta{
+		ChannelId:            channel.Id,
+		ChannelBaseUrl:       baseURL,
+		ApiKey:               channel.Key,
+		ChannelMultiKeyIndex: 0,
+		ChannelSetting:       channel.GetSetting(),
+		UpstreamModelName:    info.AppSubject.PublicModel,
+	}
+	inputs, err := CaptureAppTaskBillingInputs(
+		c, info, map[string]any{"tokens": float64(1)},
+	)
+	require.NoError(t, err)
+	outbound, err := common.Marshal(map[string]any{
+		"model": info.AppSubject.PublicModel,
+		"content": []any{
+			map[string]any{"type": "text", "text": "hello"},
+		},
+	})
+	require.NoError(t, err)
+	return f, c, &AppBillingSession{service: f.execution, info: info}, inputs, outbound
+}
+
+func TestAppBillingSessionClaimClassifiesBusinessAndStorageFailures(t *testing.T) {
+	t.Run("insufficient quota", func(t *testing.T) {
+		f, c, session, inputs, outbound := appTaskClaimFixture(t)
+		require.NoError(t, f.db.Model(&model.User{}).
+			Where("id = ?", session.info.AppSubject.UserID).Update("quota", 0).Error)
+
+		_, _, err := session.Claim(c, inputs, outbound)
+
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "insufficient_quota", authErr.Code)
+		assert.Equal(t, http.StatusPaymentRequired, AppRelayErrorStatus(err))
+	})
+
+	t.Run("grant expires after authority revalidation", func(t *testing.T) {
+		f, c, session, inputs, outbound := appTaskClaimFixture(t)
+		var reads atomic.Int32
+		var expired atomic.Bool
+		callbackName := "test:claim-grant-expiry:" + uuid.NewString()
+		require.NoError(t, f.db.Callback().Query().After("gorm:query").
+			Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement.Table != "app_execution_grants" || reads.Add(1) != 3 {
+					return
+				}
+				grant, ok := tx.Statement.Dest.(*model.AppExecutionGrant)
+				if !ok {
+					return
+				}
+				grant.ExpiresAt = f.options.Now().Add(-time.Minute).Unix()
+				expired.Store(true)
+			}))
+		t.Cleanup(func() {
+			require.NoError(t, f.db.Callback().Query().Remove(callbackName))
+		})
+
+		_, _, err := session.Claim(c, inputs, outbound)
+
+		require.True(t, expired.Load(), "grant must expire at the durable claim read")
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "execution_grant_expired", authErr.Code)
+		assert.Equal(t, http.StatusUnauthorized, AppRelayErrorStatus(err))
+	})
+
+	for _, failure := range []struct {
+		name       string
+		operation  string
+		table      string
+		occurrence int32
+	}{
+		{name: "claim grant query", operation: "query", table: "app_execution_grants", occurrence: 3},
+		{name: "funding write", operation: "update", table: "users", occurrence: 1},
+		{name: "execution create", operation: "create", table: "app_task_executions", occurrence: 1},
+	} {
+		t.Run(failure.name, func(t *testing.T) {
+			f, c, session, inputs, outbound := appTaskClaimFixture(t)
+			privateDetail := "private " + failure.name + " detail"
+			failed := registerAppExecutionDBFault(
+				t, f.db, failure.operation, failure.table, failure.occurrence,
+				errors.New(privateDetail),
+			)
+
+			_, _, err := session.Claim(c, inputs, outbound)
+
+			require.True(t, failed.Load(), "the intended claim boundary must be exercised")
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), privateDetail)
+		})
+	}
+
+	for _, boundary := range []struct {
+		name      string
+		beginErr  error
+		commitErr error
+	}{
+		{name: "begin", beginErr: errors.New("private claim begin detail")},
+		{name: "commit", commitErr: errors.New("private claim commit detail")},
+	} {
+		t.Run(boundary.name, func(t *testing.T) {
+			f, c, session, inputs, outbound := appTaskClaimFixture(t)
+			session.service = NewAppExecutionService(
+				appExecutionDBWithTransactionFault(t, f.db, boundary.beginErr, boundary.commitErr),
+				f.options,
+			)
+
+			_, _, err := session.Claim(c, inputs, outbound)
+
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), "private")
+		})
+	}
 }
 
 type appResponseRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -1070,6 +1734,130 @@ func TestExecuteAppResponseDoesNotSendBeforeDurableReservation(t *testing.T) {
 	var executions int64
 	require.NoError(t, f.db.Model(&model.AppTaskExecution{}).Count(&executions).Error)
 	assert.Zero(t, executions)
+}
+
+func TestExecuteAppResponseMapsClaimAndCandidateStorageFaultsToServiceUnavailable(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		operation  string
+		table      string
+		occurrence int32
+	}{
+		{name: "execution lookup", operation: "query", table: "app_task_executions", occurrence: 1},
+		{name: "candidate policy", operation: "query", table: "options", occurrence: 2},
+		{name: "candidate groups", operation: "query", table: "options", occurrence: 3},
+		{name: "candidate channel", operation: "query", table: "channels", occurrence: 1},
+		{name: "candidate ability", operation: "query", table: "abilities", occurrence: 1},
+		{name: "claim grant", operation: "query", table: "app_execution_grants", occurrence: 4},
+		{name: "claim replay", operation: "query", table: "app_task_executions", occurrence: 2},
+		{name: "funding read", operation: "query", table: "users", occurrence: 2},
+		{name: "funding write", operation: "update", table: "users", occurrence: 1},
+		{name: "execution create", operation: "create", table: "app_task_executions", occurrence: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, issued, _ := issueNativeAppResponseGrant(t)
+			raw := []byte(`{"model":"registered-native-http","input":"hello","max_output_tokens":32}`)
+			subject := selectedNativeAppResponseSubject(t, f, issued, raw)
+			privateDetail := "private response " + test.name + " storage detail"
+			failed := registerAppExecutionDBFault(
+				t, f.db, test.operation, test.table, test.occurrence, errors.New(privateDetail),
+			)
+			var sends atomic.Int32
+			f.execution.ResponseRoundTripper = appResponseRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				sends.Add(1)
+				return nil, errors.New("storage failure reached provider")
+			})
+
+			_, err := f.execution.ExecuteAppResponse(t.Context(), subject, raw)
+
+			require.True(t, failed.Load(), "the intended execution boundary must be exercised")
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), privateDetail)
+			assert.Zero(t, sends.Load())
+		})
+	}
+}
+
+func TestExecuteAppResponseMapsClaimTransactionBeginAndCommitFailuresToServiceUnavailable(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		beginErr  error
+		commitErr error
+	}{
+		{name: "begin", beginErr: errors.New("private response begin detail")},
+		{name: "commit", commitErr: errors.New("private response claim commit detail")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, issued, _ := issueNativeAppResponseGrant(t)
+			raw := []byte(`{"model":"registered-native-http","input":"hello","max_output_tokens":32}`)
+			subject := selectedNativeAppResponseSubject(t, f, issued, raw)
+			faultDB := appExecutionDBWithTransactionFault(t, f.db, test.beginErr, test.commitErr)
+			execution := NewAppExecutionService(faultDB, f.options)
+			var sends atomic.Int32
+			execution.ResponseRoundTripper = appResponseRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				sends.Add(1)
+				return nil, errors.New("failed transaction reached provider")
+			})
+
+			_, err := execution.ExecuteAppResponse(t.Context(), subject, raw)
+
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), "private")
+			assert.Zero(t, sends.Load())
+		})
+	}
+}
+
+func TestExecuteAppResponseDistinguishesReplayResultStorageFailureFromMissingResult(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		injectError bool
+		wantCode    string
+		wantStatus  int
+	}{
+		{name: "query failure", injectError: true, wantCode: "service_unavailable", wantStatus: http.StatusServiceUnavailable},
+		{name: "missing result", wantCode: "execution_outcome_unknown", wantStatus: http.StatusConflict},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, issued, _ := issueNativeAppResponseGrant(t)
+			raw := []byte(`{"model":"registered-native-http","input":"hello","max_output_tokens":32}`)
+			subject := selectedNativeAppResponseSubject(t, f, issued, raw)
+			f.execution.ResponseRoundTripper = appResponseRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body: io.NopCloser(strings.NewReader(
+						`{"id":"resp_replay_taxonomy","status":"completed","model":"gpt-native-http","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`,
+					)),
+				}, nil
+			})
+			first, err := f.execution.ExecuteAppResponse(t.Context(), subject, raw)
+			require.NoError(t, err)
+			if test.injectError {
+				registerAppExecutionDBFault(
+					t, f.db, "query", "app_response_results", 1,
+					errors.New("private replay result storage detail"),
+				)
+			} else {
+				require.NoError(t, f.db.Where("execution_id = ?", first.Execution.ID).
+					Delete(&model.AppResponseResult{}).Error)
+			}
+
+			_, err = f.execution.ExecuteAppResponse(t.Context(), subject, raw)
+
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, test.wantCode, authErr.Code)
+			assert.Equal(t, test.wantStatus, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), "private")
+		})
+	}
 }
 
 func TestExecuteAppResponseRejectsInvalidChannelHeadersBeforeClaim(t *testing.T) {
@@ -1279,43 +2067,139 @@ func TestExecuteAppResponsePersistsDefiniteRejectionAndRefunds(t *testing.T) {
 	}
 }
 
-func TestExecuteAppResponseFinalizeFailureBecomesUnknown(t *testing.T) {
-	var sends atomic.Int32
+func TestExecuteAppResponseFinalizeStorageFailuresReturnServiceUnavailable(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		operation  string
+		table      string
+		occurrence int32
+	}{
+		{name: "locator read", operation: "query", table: "app_task_executions", occurrence: 3},
+		{name: "funding read", operation: "query", table: "users", occurrence: 3},
+		{name: "execution reread", operation: "query", table: "app_task_executions", occurrence: 4},
+		{name: "settlement read", operation: "query", table: "app_task_settlements", occurrence: 1},
+		{name: "result write", operation: "create", table: "app_response_results", occurrence: 1},
+		{name: "execution write", operation: "update", table: "app_task_executions", occurrence: 1},
+		{name: "funding write", operation: "update", table: "users", occurrence: 2},
+		{name: "channel write", operation: "update", table: "channels", occurrence: 1},
+		{name: "settlement write", operation: "create", table: "app_task_settlements", occurrence: 1},
+		{name: "outbox write", operation: "create", table: "app_task_outboxes", occurrence: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var sends atomic.Int32
+			f, issued, _ := issueNativeAppResponseGrant(t)
+			raw := []byte(`{"model":"registered-native-http","input":"hello","max_output_tokens":32}`)
+			subject := selectedNativeAppResponseSubject(t, f, issued, raw)
+			f.execution.ResponseRoundTripper = appResponseRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				sends.Add(1)
+				return &http.Response{StatusCode: http.StatusOK,
+					Header: http.Header{"Content-Type": {"application/json"}},
+					Body: io.NopCloser(strings.NewReader(
+						`{"id":"resp_persist_failure","status":"completed","model":"gpt-native-http","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`,
+					))}, nil
+			})
+			privateDetail := "private finalize " + test.name + " storage detail"
+			failed := registerAppExecutionDBFault(
+				t, f.db, test.operation, test.table, test.occurrence, errors.New(privateDetail),
+			)
+
+			_, err := f.execution.ExecuteAppResponse(t.Context(), subject, raw)
+
+			require.True(t, failed.Load(), "the intended finalize boundary must be exercised")
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), privateDetail)
+			assert.Equal(t, int32(1), sends.Load())
+			var execution model.AppTaskExecution
+			require.NoError(t, f.db.Where("grant_id = ?", issued.GrantID).First(&execution).Error)
+			assert.Equal(t, "acceptance_unknown", execution.Status)
+			assert.Equal(t, "reserved", execution.BillingState)
+			var resultCount int64
+			require.NoError(t, f.db.Model(&model.AppResponseResult{}).Count(&resultCount).Error)
+			assert.Zero(t, resultCount)
+		})
+	}
+}
+
+func TestExecuteAppResponseFinalizeCommitFailureReturnsServiceUnavailable(t *testing.T) {
 	f, issued, _ := issueNativeAppResponseGrant(t)
 	raw := []byte(`{"model":"registered-native-http","input":"hello","max_output_tokens":32}`)
 	subject := selectedNativeAppResponseSubject(t, f, issued, raw)
-	f.execution.ResponseRoundTripper = appResponseRoundTripFunc(func(*http.Request) (*http.Response, error) {
-		sends.Add(1)
+	faultDB := appExecutionDBWithTransactionFaultAt(
+		t, f.db, nil, errors.New("private finalize commit detail"), 2,
+	)
+	executionService := NewAppExecutionService(faultDB, f.options)
+	executionService.ResponseRoundTripper = appResponseRoundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK,
 			Header: http.Header{"Content-Type": {"application/json"}},
 			Body: io.NopCloser(strings.NewReader(
-				`{"id":"resp_persist_failure","status":"completed","model":"gpt-native-http","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`,
+				`{"id":"resp_commit_failure","status":"completed","model":"gpt-native-http","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`,
 			))}, nil
 	})
-	injected := errors.New("response outbox failed")
-	require.NoError(t, f.db.Callback().Create().Before("gorm:create").
-		Register("app-response-outbox-failure", func(tx *gorm.DB) {
-			if tx.Statement.Table == "app_task_outboxes" {
-				tx.AddError(injected)
-			}
-		}))
-	t.Cleanup(func() { _ = f.db.Callback().Create().Remove("app-response-outbox-failure") })
 
-	_, err := f.execution.ExecuteAppResponse(t.Context(), subject, raw)
-	require.ErrorContains(t, err, "execution_outcome_unknown")
-	_, err = f.execution.ExecuteAppResponse(t.Context(), subject, raw)
-	require.ErrorContains(t, err, "execution_outcome_unknown")
-	assert.Equal(t, int32(1), sends.Load())
+	_, err := executionService.ExecuteAppResponse(t.Context(), subject, raw)
+
+	var authErr *AppPluginAuthError
+	require.ErrorAs(t, err, &authErr)
+	assert.Equal(t, "service_unavailable", authErr.Code)
+	assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+	assert.NotContains(t, err.Error(), "private")
 	var execution model.AppTaskExecution
 	require.NoError(t, f.db.Where("grant_id = ?", issued.GrantID).First(&execution).Error)
 	assert.Equal(t, "acceptance_unknown", execution.Status)
-	assert.Equal(t, "reserved", execution.BillingState)
-	var resultCount int64
-	require.NoError(t, f.db.Model(&model.AppResponseResult{}).Count(&resultCount).Error)
-	assert.Zero(t, resultCount)
-	var payer model.User
-	require.NoError(t, f.db.First(&payer, subject.UserID).Error)
-	assert.Equal(t, 990000, payer.Quota)
+}
+
+func TestMarkAppResponseUnknownRequiresSuccessfulPersistence(t *testing.T) {
+	t.Run("write failure", func(t *testing.T) {
+		f, issued, _ := issueNativeAppResponseGrant(t)
+		raw := []byte(`{"model":"registered-native-http","input":"hello","max_output_tokens":32}`)
+		subject := selectedNativeAppResponseSubject(t, f, issued, raw)
+		f.execution.ResponseRoundTripper = appResponseRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("provider outcome unknown")
+		})
+		failed := registerAppExecutionDBFault(
+			t, f.db, "update", "app_task_executions", 1,
+			errors.New("private unknown write storage detail"),
+		)
+
+		_, err := f.execution.ExecuteAppResponse(t.Context(), subject, raw)
+
+		require.True(t, failed.Load())
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "service_unavailable", authErr.Code)
+		assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+		assert.NotContains(t, err.Error(), "private")
+		var execution model.AppTaskExecution
+		require.NoError(t, f.db.Where("grant_id = ?", issued.GrantID).First(&execution).Error)
+		assert.Equal(t, "dispatching", execution.Status)
+	})
+
+	t.Run("commit failure", func(t *testing.T) {
+		f, issued, _ := issueNativeAppResponseGrant(t)
+		raw := []byte(`{"model":"registered-native-http","input":"hello","max_output_tokens":32}`)
+		subject := selectedNativeAppResponseSubject(t, f, issued, raw)
+		faultDB := appExecutionDBWithTransactionFaultAt(
+			t, f.db, nil, errors.New("private unknown commit detail"), 2,
+		)
+		executionService := NewAppExecutionService(faultDB, f.options)
+		executionService.ResponseRoundTripper = appResponseRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("provider outcome unknown")
+		})
+
+		_, err := executionService.ExecuteAppResponse(t.Context(), subject, raw)
+
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "service_unavailable", authErr.Code)
+		assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+		assert.NotContains(t, err.Error(), "private")
+		var execution model.AppTaskExecution
+		require.NoError(t, f.db.Where("grant_id = ?", issued.GrantID).First(&execution).Error)
+		assert.Equal(t, "dispatching", execution.Status)
+	})
 }
 
 func TestExecuteAppResponseIgnoresClientCancellationAfterClaim(t *testing.T) {

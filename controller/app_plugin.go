@@ -21,7 +21,6 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -870,7 +869,7 @@ func appPluginEndpoint(baseURL, manifestPath string) (string, error) {
 }
 
 func appPluginFeatureEnabled(c *gin.Context) bool {
-	if operation_setting.AppPluginV1Enabled {
+	if model.AppPluginRolloutAllowsCached("", "") {
 		return true
 	}
 	writeAppPluginError(c, http.StatusForbidden, "app_plugin_disabled", "")
@@ -880,9 +879,7 @@ func appPluginFeatureEnabled(c *gin.Context) bool {
 // Entry gates stop new work without changing existing Task/session records.
 // Installation, user and surface authorization remain separate service checks.
 func appPluginEntryAllowed(appKey, surface string) bool {
-	return operation_setting.AppPluginV1Enabled &&
-		(appKey != "seedance-repro" || operation_setting.AppPluginSeedanceEnabled) &&
-		(surface != "embedded" || operation_setting.AppPluginEmbeddedSurfaceEnabled)
+	return model.AppPluginRolloutAllowsCached(appKey, surface)
 }
 
 func writeAppPluginRequestError(c *gin.Context, err error) {
@@ -969,6 +966,7 @@ func writeAppPluginError(c *gin.Context, status int, code, fieldPath string) {
 		"pkce_verification_failed":        "Launch verification failed",
 		"approval_required":               "Fresh operation verification required",
 		"app_plugin_disabled":             "App plugin API is disabled",
+		"app_execution_disabled":          "App execution is disabled",
 		"invalid_request":                 "Invalid app plugin request",
 		"forbidden":                       "App plugin request is forbidden",
 		"not_found":                       "App plugin not found",
@@ -1004,7 +1002,16 @@ var appPluginEnableNetworkProbe = service.ProbeAppPluginNetwork
 func validateAppPluginEnable(c *gin.Context, tx *gorm.DB, installation model.AppInstallation) error {
 	missing := &appPluginAPIError{status: http.StatusConflict, code: "app_enable_prerequisite_missing", path: "/changes/status"}
 	manifest, _, err := service.ValidateAppPluginRegistration(tx, installation)
-	if err != nil || len(installation.EnabledSurfaces) == 0 {
+	if err != nil {
+		var authErr *service.AppPluginAuthError
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.As(err, &authErr) &&
+			(authErr.Code == "forbidden" || authErr.Code == "not_found" ||
+				authErr.Code == "app_enable_prerequisite_missing") {
+			return missing
+		}
+		return err
+	}
+	if len(installation.EnabledSurfaces) == 0 {
 		return missing
 	}
 	for _, surface := range installation.EnabledSurfaces {
@@ -1024,7 +1031,10 @@ func validateAppPluginEnable(c *gin.Context, tx *gorm.DB, installation model.App
 		}
 	}
 	scopes, err := model.AppPluginApprovedScopes(tx, installation, time.Now())
-	if err != nil || !slices.Contains(scopes, "identity.read") {
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(scopes, "identity.read") {
 		return missing
 	}
 	for _, scope := range manifest.RequestedScopes {
@@ -1044,7 +1054,7 @@ func appPluginAuthStatus(code string) int {
 		return http.StatusBadRequest
 	case "unauthenticated", "service_identity_invalid", "launch_code_expired", "launch_code_replayed":
 		return http.StatusUnauthorized
-	case "identity_inactive", "app_plugin_disabled", "scope_denied", "forbidden", "approval_required":
+	case "identity_inactive", "app_plugin_disabled", "app_execution_disabled", "scope_denied", "forbidden", "approval_required":
 		return http.StatusForbidden
 	case "not_found":
 		return http.StatusNotFound
@@ -1211,8 +1221,8 @@ func IntrospectAppPluginSession(c *gin.Context) {
 		writeAppPluginServiceError(c, err)
 		return
 	}
-	if result.Active && result.ModelPolicyVersion > 0 && operation_setting.AppExecutionGrantsEnabled &&
-		appPluginEntryAllowed(request.AppKey, "") {
+	if result.Active && result.ModelPolicyVersion > 0 &&
+		model.AppExecutionRolloutAllowsCached(request.AppKey) {
 		c.Header("X-App-Model-Policy-Version", strconv.FormatInt(result.ModelPolicyVersion, 10))
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})

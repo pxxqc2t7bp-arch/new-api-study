@@ -78,6 +78,10 @@ func (s *AppExecutionService) ExecuteAppResponse(ctx context.Context, subject ho
 				candidate, channel = current, selected
 				break
 			}
+			var authErr *AppPluginAuthError
+			if !errors.As(validationErr, &authErr) || authErr.Code == "service_unavailable" {
+				return appExecutionBoundaryError(validationErr)
+			}
 		}
 		if candidate.ChannelID == 0 {
 			return appAuthError("model_not_supported")
@@ -226,9 +230,12 @@ func (s *AppExecutionService) ExecuteAppResponse(ctx context.Context, subject ho
 		return finalizeErr
 	})
 	if err != nil {
-		return AppResponseExecutionResult{}, s.markAppResponseUnknown(
-			ctx, dispatch.execution.ID, err,
-		)
+		markErr := s.markAppResponseUnknown(ctx, dispatch.execution.ID, err)
+		var authErr *AppPluginAuthError
+		if errors.As(markErr, &authErr) && authErr.Code == "service_unavailable" {
+			return AppResponseExecutionResult{}, markErr
+		}
+		return AppResponseExecutionResult{}, appAuthError("service_unavailable")
 	}
 	return AppResponseExecutionResult{
 		Execution: dispatch.execution, Result: committed,
@@ -280,7 +287,7 @@ func appResponseExecutionError(err error) error {
 		"pricing_not_supported":
 		return appAuthError(err.Error())
 	default:
-		return err
+		return appExecutionBoundaryError(err)
 	}
 }
 
@@ -364,8 +371,11 @@ func (s *AppExecutionService) markAppResponseUnknown(ctx context.Context,
 	executionID int64, _ error) error {
 	persistContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	_ = model.RunAppPluginTransaction(s.db.WithContext(persistContext), func(tx *gorm.DB) error {
+	err := model.RunAppPluginTransaction(s.db.WithContext(persistContext), func(tx *gorm.DB) error {
 		return model.MarkAppResponseOutcomeUnknownTx(tx, executionID, s.options.Now())
 	})
+	if err != nil {
+		return appExecutionBoundaryError(err)
+	}
 	return appAuthError("execution_outcome_unknown")
 }

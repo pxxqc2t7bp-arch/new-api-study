@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -37,6 +38,22 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func setControllerAppPluginFlag(key string, enabled bool) {
+	common.OptionMapRWMutex.Lock()
+	defer common.OptionMapRWMutex.Unlock()
+	common.OptionMap[key] = fmt.Sprintf("%t", enabled)
+	switch key {
+	case operation_setting.AppPluginV1EnabledOptionKey:
+		operation_setting.AppPluginV1Enabled = enabled
+	case operation_setting.AppPluginSeedanceEnabledOptionKey:
+		operation_setting.AppPluginSeedanceEnabled = enabled
+	case operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey:
+		operation_setting.AppPluginEmbeddedSurfaceEnabled = enabled
+	case operation_setting.AppExecutionGrantsEnabledOptionKey:
+		operation_setting.AppExecutionGrantsEnabled = enabled
+	}
+}
 
 func TestAuthorizeReturnsRegisteredOneTimeLaunchURL(t *testing.T) {
 	setupAppPluginControllerTest(t)
@@ -347,7 +364,7 @@ func appPluginCredentialControllerRegression(t *testing.T) {
 	stale := call(http.MethodPost, path+"/rotate", staleProof)
 	assert.Equal(t, http.StatusForbidden, stale.Code, stale.Body.String())
 	require.NoError(t, model.DB.Model(&model.UserSession{}).Where("sid = ?", identity.SessionID).Update("version", 1).Error)
-	operation_setting.AppPluginV1Enabled = false
+	setControllerAppPluginFlag(operation_setting.AppPluginV1EnabledOptionKey, false)
 	revoked := call(http.MethodDelete, path+"/"+rotated.Data.CredentialID, "")
 	require.Equal(t, http.StatusOK, revoked.Code, revoked.Body.String())
 	_, err = model.AuthenticateAppServiceCredential(t.Context(), model.DB, rotated.Data.Credential, time.Now())
@@ -893,18 +910,36 @@ func setupAppPluginControllerTest(t *testing.T) {
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
 	previousRedis := common.RedisEnabled
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
 	previousFlag := operation_setting.AppPluginV1Enabled
 	previousSeedance, previousEmbedded, previousGrants := operation_setting.AppPluginSeedanceEnabled,
 		operation_setting.AppPluginEmbeddedSurfaceEnabled, operation_setting.AppExecutionGrantsEnabled
+	common.OptionMap = maps.Clone(common.OptionMap)
+	if common.OptionMap == nil {
+		common.OptionMap = map[string]string{}
+	}
+	operation_setting.AppPluginV1Enabled = true
+	operation_setting.AppPluginSeedanceEnabled = true
+	operation_setting.AppPluginEmbeddedSurfaceEnabled = true
+	operation_setting.AppExecutionGrantsEnabled = true
+	common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] = "true"
+	common.OptionMap[operation_setting.AppPluginSeedanceEnabledOptionKey] = "true"
+	common.OptionMap[operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey] = "true"
+	common.OptionMap[operation_setting.AppExecutionGrantsEnabledOptionKey] = "true"
+	common.OptionMapRWMutex.Unlock()
 
 	db := openAppPluginControllerDB(t)
 	t.Cleanup(func() {
 		model.DB, model.LOG_DB = previousDB, previousLogDB
 		common.SetDatabaseTypes(previousMain, previousLog)
 		common.RedisEnabled = previousRedis
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
 		operation_setting.AppPluginV1Enabled = previousFlag
 		operation_setting.AppPluginSeedanceEnabled, operation_setting.AppPluginEmbeddedSurfaceEnabled = previousSeedance, previousEmbedded
 		operation_setting.AppExecutionGrantsEnabled = previousGrants
+		common.OptionMapRWMutex.Unlock()
 	})
 	dbType := map[string]common.DatabaseType{
 		"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL,
@@ -914,9 +949,6 @@ func setupAppPluginControllerTest(t *testing.T) {
 	require.NoError(t, model.MigrateAppPluginTables(db))
 	model.DB, model.LOG_DB = db, db
 	common.RedisEnabled = false
-	operation_setting.AppPluginV1Enabled = true
-	operation_setting.AppPluginSeedanceEnabled, operation_setting.AppPluginEmbeddedSurfaceEnabled = true, true
-	operation_setting.AppExecutionGrantsEnabled = true
 	require.NoError(t, db.Create(&model.TaskPlugin{
 		Key:        "doubao",
 		APIVersion: 1,

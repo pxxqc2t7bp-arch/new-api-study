@@ -42,11 +42,11 @@ func CaptureAppTaskBillingInputs(c *gin.Context, info *relaycommon.RelayInfo, us
 	}
 	var grant model.AppExecutionGrant
 	if err := model.DB.WithContext(c.Request.Context()).Where("grant_id = ?", info.AppSubject.GrantID).First(&grant).Error; err != nil {
-		return inputs, err
+		return inputs, classifyDBLookup(err, "invalid_grant")
 	}
 	var candidates []model.AppExecutionModel
 	if common.UnmarshalJsonStr(grant.ModelsJSON, &candidates) != nil {
-		return inputs, errors.New("invalid_grant")
+		return inputs, appAuthError("invalid_grant")
 	}
 	for _, candidate := range candidates {
 		if candidate.ChannelID != info.AppSubject.ChannelID || candidate.Group != info.AppSubject.Group ||
@@ -59,28 +59,28 @@ func CaptureAppTaskBillingInputs(c *gin.Context, info *relaycommon.RelayInfo, us
 		expression, _ := candidate.Price["billing_setting.billing_expr"].(string)
 		program, err := billingexpr.CompileFromCache(expression)
 		if err != nil {
-			return inputs, err
+			return inputs, appAuthError("invalid_price_inputs")
 		}
 		probes := &appPriceProbes{}
 		node := program.Node()
 		ast.Walk(&node, probes)
 		if probes.invalid {
-			return inputs, errors.New("unsupported_price_probe")
+			return inputs, appAuthError("invalid_price_inputs")
 		}
 		protocol, ok := c.MustGet(jsplugin.ContextKeyProtocolRequest).(jsplugin.ProtocolRequestContext)
 		if !ok {
-			return inputs, errors.New("invalid_protocol")
+			return inputs, appAuthError("invalid_price_inputs")
 		}
 		raw, err := common.Marshal(protocol.Body)
 		if err != nil {
-			return inputs, err
+			return inputs, appAuthError("invalid_price_inputs")
 		}
 		body := gjson.GetBytes(raw, "value")
 		for _, path := range probes.params {
 			for _, segment := range strings.Split(path, ".") {
 				if !appPassthroughSegment.MatchString(segment) ||
 					!slicesContainsAppPriceField(segment) {
-					return inputs, errors.New("unsupported_price_probe")
+					return inputs, appAuthError("invalid_price_inputs")
 				}
 			}
 			value := body.Get(path)
@@ -88,11 +88,11 @@ func CaptureAppTaskBillingInputs(c *gin.Context, info *relaycommon.RelayInfo, us
 				continue
 			}
 			if value.IsObject() || value.IsArray() || (value.Type == gjson.String && len(value.Str) > 64) {
-				return inputs, errors.New("unsupported_price_probe")
+				return inputs, appAuthError("invalid_price_inputs")
 			}
 			inputs.Body, err = sjson.SetRawBytes(inputs.Body, path, []byte(value.Raw))
 			if err != nil {
-				return inputs, err
+				return inputs, appAuthError("invalid_price_inputs")
 			}
 		}
 		for _, header := range probes.headers {
@@ -100,16 +100,16 @@ func CaptureAppTaskBillingInputs(c *gin.Context, info *relaycommon.RelayInfo, us
 			switch name {
 			case "Content-Type", "Anthropic-Beta", "X-Service-Tier":
 			default:
-				return inputs, errors.New("unsupported_price_probe")
+				return inputs, appAuthError("invalid_price_inputs")
 			}
 			if len(c.Request.Header.Values(name)) > 1 || len(c.GetHeader(name)) > 128 {
-				return inputs, errors.New("invalid_price_input")
+				return inputs, appAuthError("invalid_price_inputs")
 			}
 			inputs.Headers[name] = c.GetHeader(name)
 		}
 		return inputs, nil
 	}
-	return inputs, errors.New("invalid_grant")
+	return inputs, appAuthError("invalid_grant")
 }
 
 func slicesContainsAppPriceField(field string) bool {

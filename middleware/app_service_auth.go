@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"errors"
 	"net/http"
 	"slices"
 	"strings"
@@ -8,7 +9,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 )
 
@@ -49,7 +49,7 @@ func AppServiceAuth() gin.HandlerFunc {
 		retained := c.Request.URL.Path == "/internal/apps/v1/tasks/lookup" ||
 			c.Request.URL.Path == "/internal/apps/v1/sessions/introspect" ||
 			c.Request.URL.Path == "/internal/apps/v1/sessions/revoke"
-		if !operation_setting.AppPluginV1Enabled && !retained {
+		if !model.AppPluginRolloutAllowsCached("", "") && !retained {
 			writeAppServiceAuthError(c, http.StatusForbidden, "app_plugin_disabled")
 			return
 		}
@@ -65,7 +65,11 @@ func AppServiceAuth() gin.HandlerFunc {
 		}
 		identity, err := model.AuthenticateAppServiceCredential(c.Request.Context(), model.DB, raw, time.Now())
 		if err != nil {
-			writeAppServiceAuthError(c, http.StatusUnauthorized, "service_identity_invalid")
+			if errors.Is(err, model.ErrAppServiceIdentityInvalid) {
+				writeAppServiceAuthError(c, http.StatusUnauthorized, "service_identity_invalid")
+			} else {
+				writeAppServiceAuthError(c, http.StatusServiceUnavailable, "service_unavailable")
+			}
 			return
 		}
 		for _, scope := range required {
@@ -88,6 +92,6 @@ func writeAppServiceAuthError(c *gin.Context, status int, code string) {
 	}
 	c.AbortWithStatusJSON(status, gin.H{"error": gin.H{
 		"code": code, "message": "App service request denied", "field_errors": []any{},
-		"retryable": false, "request_id": requestID,
+		"retryable": status >= http.StatusInternalServerError, "request_id": requestID,
 	}})
 }

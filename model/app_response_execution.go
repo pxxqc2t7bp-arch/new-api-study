@@ -138,7 +138,10 @@ func lookupAppResponseExecutionTx(tx *gorm.DB, grant AppExecutionGrant, submissi
 	case "captured", "rejected":
 		var result AppResponseResult
 		if err := tx.Where("execution_id = ?", existing.ID).First(&result).Error; err != nil {
-			return existing, nil, true, errors.New("execution_outcome_unknown")
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return existing, nil, true, errors.New("execution_outcome_unknown")
+			}
+			return existing, nil, true, err
 		}
 		return existing, &result, true, nil
 	default:

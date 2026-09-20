@@ -76,6 +76,416 @@ func TestTaskLookupAllowsAcceptedReconciliationAfterLogout(t *testing.T) {
 	}
 }
 
+func TestTaskLookupMapsCredentialQueryFailureToServiceUnavailable(t *testing.T) {
+	f := newAppExecutionFixture(t)
+	task := f.acceptedTask(t)
+	request := AppTaskLookupRequest{RequestID: uuid.NewString(), AppKey: f.request.AppKey,
+		AppSessionID: f.request.AppSessionID, Subject: f.request.Subject, TaskID: &task.TaskID}
+	injected := errors.New("injected credential query failure")
+	var failed atomic.Bool
+	const callbackName = "test:task-authority-credential-query-failure"
+	require.NoError(t, f.db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "app_service_credentials" && failed.CompareAndSwap(false, true) {
+			tx.AddError(injected)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, f.db.Callback().Query().Remove(callbackName))
+	})
+
+	_, err := f.execution.LookupScopedTask(t.Context(), f.serviceID, request)
+
+	var authErr *AppPluginAuthError
+	require.ErrorAs(t, err, &authErr)
+	assert.Equal(t, "service_unavailable", authErr.Code)
+	assert.NotContains(t, err.Error(), injected.Error())
+}
+
+func TestAppTaskControlMapsStorageQueryFailuresToServiceUnavailable(t *testing.T) {
+	queries := []struct {
+		name           string
+		table          string
+		lookup, cancel bool
+		prepare        func(*testing.T, *appExecutionFixture, model.AppTaskExecution)
+	}{
+		{name: "installation", table: "app_installations", lookup: true, cancel: true},
+		{name: "app session", table: "app_plugin_sessions", lookup: true, cancel: true},
+		{name: "dashboard user", table: "users", lookup: true, cancel: true},
+		{name: "dashboard session", table: "user_sessions", lookup: true, cancel: true},
+		{name: "registration", table: "app_versions", lookup: true, cancel: true},
+		{name: "task", table: "app_task_executions", lookup: true, cancel: true},
+		{name: "grant", table: "app_execution_grants", lookup: true, cancel: true},
+		{
+			name: "artifact projection", table: "tasks", lookup: true,
+			prepare: func(t *testing.T, f *appExecutionFixture, task model.AppTaskExecution) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppTaskExecution{}).Where("id = ?", task.ID).
+					Updates(map[string]any{
+						"provider_state": "succeeded",
+						"artifacts_json": `[{"key":"result"}]`,
+					}).Error)
+			},
+		},
+		{name: "cancel replay", table: "app_task_cancel_replays", cancel: true},
+	}
+	operations := []struct {
+		name string
+		call func(*testing.T, *appExecutionFixture, model.AppTaskExecution) error
+	}{
+		{
+			name: "lookup",
+			call: func(t *testing.T, f *appExecutionFixture, task model.AppTaskExecution) error {
+				t.Helper()
+				request := AppTaskLookupRequest{RequestID: uuid.NewString(), AppKey: task.AppKey,
+					AppSessionID: task.AppSessionID, Subject: task.Subject, TaskID: &task.TaskID}
+				_, err := f.execution.LookupScopedTask(t.Context(), f.serviceID, request)
+				return err
+			},
+		},
+		{
+			name: "cancel",
+			call: func(t *testing.T, f *appExecutionFixture, task model.AppTaskExecution) error {
+				t.Helper()
+				request := AppTaskCancelRequest{RequestID: uuid.NewString(), AppKey: task.AppKey,
+					AppSessionID: task.AppSessionID, Subject: task.Subject, TaskID: task.TaskID,
+					Reason: "user_requested"}
+				_, err := f.execution.CancelTask(t.Context(), f.serviceID, uuid.NewString(), request)
+				return err
+			},
+		},
+	}
+	for _, operation := range operations {
+		for _, query := range queries {
+			if operation.name == "lookup" && !query.lookup || operation.name == "cancel" && !query.cancel {
+				continue
+			}
+			t.Run(operation.name+"/"+query.name, func(t *testing.T) {
+				f := newAppExecutionFixture(t)
+				task := f.acceptedTask(t)
+				if query.prepare != nil {
+					query.prepare(t, f, task)
+				}
+				privateDetail := "private " + query.name + " storage detail"
+				injected := errors.New(privateDetail)
+				var failed atomic.Bool
+				callbackName := "test:app-task-query-failure:" + uuid.NewString()
+				require.NoError(t, f.db.Callback().Query().Before("gorm:query").
+					Register(callbackName, func(tx *gorm.DB) {
+						if tx.Statement.Table == query.table && failed.CompareAndSwap(false, true) {
+							tx.AddError(injected)
+						}
+					}))
+				t.Cleanup(func() {
+					require.NoError(t, f.db.Callback().Query().Remove(callbackName))
+				})
+
+				err := operation.call(t, f, task)
+
+				require.True(t, failed.Load(), "the intended storage query must be exercised")
+				var authErr *AppPluginAuthError
+				require.ErrorAs(t, err, &authErr)
+				assert.Equal(t, "service_unavailable", authErr.Code)
+				assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+				assert.NotContains(t, err.Error(), privateDetail)
+			})
+		}
+	}
+}
+
+func TestAppTaskControlMapsTransactionBoundaryFailuresToServiceUnavailable(t *testing.T) {
+	operations := []struct {
+		name string
+		call func(*testing.T, *AppExecutionService, *appExecutionFixture, model.AppTaskExecution) error
+	}{
+		{
+			name: "lookup",
+			call: func(
+				t *testing.T,
+				execution *AppExecutionService,
+				f *appExecutionFixture,
+				task model.AppTaskExecution,
+			) error {
+				t.Helper()
+				request := AppTaskLookupRequest{
+					RequestID: uuid.NewString(), AppKey: task.AppKey,
+					AppSessionID: task.AppSessionID, Subject: task.Subject,
+					TaskID: &task.TaskID,
+				}
+				_, err := execution.LookupScopedTask(t.Context(), f.serviceID, request)
+				return err
+			},
+		},
+		{
+			name: "cancel",
+			call: func(
+				t *testing.T,
+				execution *AppExecutionService,
+				f *appExecutionFixture,
+				task model.AppTaskExecution,
+			) error {
+				t.Helper()
+				request := AppTaskCancelRequest{
+					RequestID: uuid.NewString(), AppKey: task.AppKey,
+					AppSessionID: task.AppSessionID, Subject: task.Subject,
+					TaskID: task.TaskID, Reason: "user_requested",
+				}
+				_, err := execution.CancelTask(
+					t.Context(), f.serviceID, uuid.NewString(), request,
+				)
+				return err
+			},
+		},
+	}
+	boundaries := []struct {
+		name      string
+		beginErr  error
+		commitErr error
+	}{
+		{name: "begin", beginErr: errors.New("private task control begin detail")},
+		{name: "commit", commitErr: errors.New("private task control commit detail")},
+	}
+	for _, operation := range operations {
+		for _, boundary := range boundaries {
+			t.Run(operation.name+"/"+boundary.name, func(t *testing.T) {
+				f := newAppExecutionFixture(t)
+				task := f.acceptedTask(t)
+				faultDB := appExecutionDBWithTransactionFault(
+					t, f.db, boundary.beginErr, boundary.commitErr,
+				)
+				execution := NewAppExecutionService(faultDB, f.options)
+
+				err := operation.call(t, execution, f, task)
+
+				privateDetail := boundary.beginErr
+				if privateDetail == nil {
+					privateDetail = boundary.commitErr
+				}
+				var authErr *AppPluginAuthError
+				require.ErrorAs(t, err, &authErr)
+				assert.Equal(t, "service_unavailable", authErr.Code)
+				assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+				assert.NotContains(t, err.Error(), privateDetail.Error())
+				var replays int64
+				require.NoError(t, f.db.Model(&model.AppTaskCancelReplay{}).Count(&replays).Error)
+				assert.Zero(t, replays)
+			})
+		}
+	}
+}
+
+func TestAppTaskControlKeepsBusinessDenialsNonRetryable(t *testing.T) {
+	tests := []struct {
+		name       string
+		invalidate func(*testing.T, *appExecutionFixture, model.AppTaskExecution)
+		wantCode   string
+		wantStatus int
+	}{
+		{
+			name: "installation not found",
+			invalidate: func(_ *testing.T, f *appExecutionFixture, _ model.AppTaskExecution) {
+				f.serviceID.InstallationID = "missing-installation"
+			},
+			wantCode:   "not_found",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "installation inactive",
+			invalidate: func(t *testing.T, f *appExecutionFixture, _ model.AppTaskExecution) {
+				require.NoError(t, f.db.Model(&model.AppInstallation{}).
+					Where("installation_id = ?", f.installation.InstallationID).
+					Update("status", model.AppInstallationStatusDisabled).Error)
+			},
+			wantCode:   "identity_inactive",
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "session expired",
+			invalidate: func(t *testing.T, f *appExecutionFixture, task model.AppTaskExecution) {
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).
+					Where("app_session_id = ?", task.AppSessionID).
+					Update("upstream_expires_at", f.options.Now().Unix()).Error)
+			},
+			wantCode:   "unauthenticated",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "session revoked",
+			invalidate: func(t *testing.T, f *appExecutionFixture, task model.AppTaskExecution) {
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).
+					Where("app_session_id = ?", task.AppSessionID).
+					Update("revoked_at", f.options.Now().Unix()).Error)
+			},
+			wantCode:   "unauthenticated",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "session scope denied",
+			invalidate: func(t *testing.T, f *appExecutionFixture, task model.AppTaskExecution) {
+				require.NoError(t, f.db.Model(&model.AppPluginSession{}).
+					Where("app_session_id = ?", task.AppSessionID).
+					Update("granted_scopes", `["identity.read"]`).Error)
+			},
+			wantCode:   "scope_denied",
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "registration denied",
+			invalidate: func(t *testing.T, f *appExecutionFixture, _ model.AppTaskExecution) {
+				require.NoError(t, f.db.Model(&model.AppVersion{}).
+					Where("id = ?", f.installation.AppVersionID).
+					Update("manifest_sha256", strings.Repeat("0", 64)).Error)
+			},
+			wantCode:   "scope_denied",
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "grant not found",
+			invalidate: func(t *testing.T, f *appExecutionFixture, task model.AppTaskExecution) {
+				require.NoError(t, f.db.Where("grant_id = ?", task.GrantID).
+					Delete(&model.AppExecutionGrant{}).Error)
+			},
+			wantCode:   "not_found",
+			wantStatus: http.StatusNotFound,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newAppExecutionFixture(t)
+			task := f.acceptedTask(t)
+			test.invalidate(t, f, task)
+			request := AppTaskLookupRequest{RequestID: uuid.NewString(), AppKey: task.AppKey,
+				AppSessionID: task.AppSessionID, Subject: task.Subject, TaskID: &task.TaskID}
+
+			_, err := f.execution.LookupScopedTask(t.Context(), f.serviceID, request)
+
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, test.wantCode, authErr.Code)
+			status := AppRelayErrorStatus(err)
+			assert.Equal(t, test.wantStatus, status)
+			assert.Less(t, status, http.StatusInternalServerError)
+		})
+	}
+}
+
+func TestAppTaskArtifactContentPreservesStorageFailures(t *testing.T) {
+	for _, query := range []struct {
+		name    string
+		table   string
+		prepare func(*testing.T, *appExecutionFixture, model.AppTaskExecution)
+	}{
+		{name: "installation", table: "app_installations"},
+		{name: "task", table: "app_task_executions"},
+		{
+			name: "projection", table: "tasks",
+			prepare: func(t *testing.T, f *appExecutionFixture, task model.AppTaskExecution) {
+				t.Helper()
+				require.NoError(t, f.db.Model(&model.AppTaskExecution{}).Where("id = ?", task.ID).
+					Updates(map[string]any{
+						"provider_state": "succeeded",
+						"artifacts_json": `[{"key":"result"}]`,
+					}).Error)
+			},
+		},
+	} {
+		t.Run(query.name, func(t *testing.T) {
+			f := newAppExecutionFixture(t)
+			task := f.acceptedTask(t)
+			if query.prepare != nil {
+				query.prepare(t, f, task)
+			}
+			access := AppTaskArtifactAccess{
+				TaskID: task.TaskID, ArtifactKey: "result", AppKey: task.AppKey,
+				InstallationID: task.InstallationID, GrantID: task.GrantID,
+				AppSessionID: task.AppSessionID, CredentialID: f.serviceID.CredentialID,
+				CredentialVersion: f.serviceID.Version, Subject: task.Subject,
+				UserID: task.UserID, ExpiresAt: f.options.Now().Add(time.Minute).Unix(),
+			}
+			privateDetail := "private artifact " + query.name + " storage detail"
+			var failed atomic.Bool
+			callbackName := "test:app-task-artifact-query-failure:" + uuid.NewString()
+			require.NoError(t, f.db.Callback().Query().Before("gorm:query").
+				Register(callbackName, func(tx *gorm.DB) {
+					if tx.Statement.Table == query.table && failed.CompareAndSwap(false, true) {
+						tx.AddError(errors.New(privateDetail))
+					}
+				}))
+			t.Cleanup(func() {
+				require.NoError(t, f.db.Callback().Query().Remove(callbackName))
+			})
+
+			_, _, err := f.execution.ResolveAppTaskArtifactContent(t.Context(), access, http.MethodGet)
+
+			require.True(t, failed.Load(), "the intended storage query must be exercised")
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), privateDetail)
+		})
+	}
+}
+
+func TestAppTaskArtifactContentMapsTransactionBoundaryFailuresToServiceUnavailable(t *testing.T) {
+	for _, boundary := range []struct {
+		name      string
+		beginErr  error
+		commitErr error
+	}{
+		{name: "begin", beginErr: errors.New("private artifact begin detail")},
+		{name: "commit", commitErr: errors.New("private artifact commit detail")},
+	} {
+		t.Run(boundary.name, func(t *testing.T) {
+			f := newAppExecutionFixture(t)
+			task := f.acceptedTask(t)
+			require.NoError(t, f.db.Model(&model.AppTaskExecution{}).Where("id = ?", task.ID).
+				Updates(map[string]any{
+					"provider_state": "succeeded",
+					"artifacts_json": `[{"key":"result"}]`,
+				}).Error)
+			require.NoError(t, f.db.Create(&model.Task{
+				TaskID: task.TaskID, UserId: task.UserID, Status: model.TaskStatusSuccess,
+				ExecutionMode: model.TaskExecutionModeAppManaged,
+				PrivateData: model.TaskPrivateData{
+					UpstreamTaskID:  "cgt-artifact-boundary",
+					AppArtifactURLs: map[string]string{"result": "https://media.example.com/result.mp4"},
+				},
+			}).Error)
+			access := AppTaskArtifactAccess{
+				TaskID: task.TaskID, ArtifactKey: "result", AppKey: task.AppKey,
+				InstallationID: task.InstallationID, GrantID: task.GrantID,
+				AppSessionID: task.AppSessionID, CredentialID: f.serviceID.CredentialID,
+				CredentialVersion: f.serviceID.Version, Subject: task.Subject,
+				UserID: task.UserID, ExpiresAt: f.options.Now().Add(time.Minute).Unix(),
+			}
+			_, source, err := f.execution.ResolveAppTaskArtifactContent(
+				t.Context(), access, http.MethodGet,
+			)
+			require.NoError(t, err)
+			require.Equal(t, "https://media.example.com/result.mp4", source)
+			faultDB := appExecutionDBWithTransactionFault(
+				t, f.db, boundary.beginErr, boundary.commitErr,
+			)
+			execution := NewAppExecutionService(faultDB, f.options)
+
+			_, _, err = execution.ResolveAppTaskArtifactContent(
+				t.Context(), access, http.MethodGet,
+			)
+
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			if boundary.beginErr != nil {
+				assert.NotContains(t, err.Error(), boundary.beginErr.Error())
+			}
+			if boundary.commitErr != nil {
+				assert.NotContains(t, err.Error(), boundary.commitErr.Error())
+			}
+		})
+	}
+}
+
 // Only the external ownership-evidence source is replaced; delegation and
 // candidate filtering remain production service and database operations.
 type appArkSourceFixture struct {
@@ -95,6 +505,122 @@ func (s *appArkSourceFixture) Lookup(_ context.Context, query AppArkTaskQuery) (
 		{TaskID: query.TaskID, AccountRef: "another-account", ProjectID: "project-one",
 			CreatedAt: query.StartAt.Add(time.Minute), RequestJSON: `{"prompt":"other-account-private"}`},
 	}, nil
+}
+
+func setupAppArkImportLookup(t *testing.T) (*appExecutionFixture, AppArkImportLookupRequest) {
+	t.Helper()
+	f := newAppExecutionFixture(t)
+	f.execution.ArkSource = &appArkSourceFixture{}
+	start, end := f.options.Now().Add(-time.Hour), f.options.Now()
+	delegations, err := common.Marshal(AppArkImportDelegations{Delegations: []AppArkImportDelegation{{
+		InstallationID: f.installation.InstallationID,
+		UserID:         f.user.Id,
+		AccountRef:     "host-account",
+		ProjectID:      "project-one",
+		StartAt:        start,
+		EndAt:          end,
+	}}})
+	require.NoError(t, err)
+	_, err = PublishAppArkImportDelegations(
+		t.Context(), f.db, f.publisher, delegations, f.options.Now(),
+	)
+	require.NoError(t, err)
+	return f, AppArkImportLookupRequest{
+		RequestID: uuid.NewString(), AppKey: f.request.AppKey,
+		AppSessionID: f.request.AppSessionID, Subject: f.request.Subject,
+		TaskID: "cgt-historical-task",
+		QueryScope: AppArkQueryScope{
+			ProjectID: "project-one", StartAt: start.Add(time.Minute), EndAt: end,
+		},
+	}
+}
+
+func TestArkImportLookupMapsPolicyAndTransactionFailuresToServiceUnavailable(t *testing.T) {
+	for _, query := range []struct {
+		name       string
+		occurrence int32
+	}{
+		{name: "initial policy read", occurrence: 1},
+		{name: "locked policy recheck", occurrence: 2},
+	} {
+		t.Run(query.name, func(t *testing.T) {
+			f, request := setupAppArkImportLookup(t)
+			privateDetail := "private Ark " + query.name + " detail"
+			failed := registerAppExecutionDBFault(
+				t, f.db, "query", "options", query.occurrence, errors.New(privateDetail),
+			)
+
+			_, err := f.execution.LookupArkImport(t.Context(), f.serviceID, request)
+
+			require.True(t, failed.Load(), "the intended policy read must be exercised")
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			assert.NotContains(t, err.Error(), privateDetail)
+		})
+	}
+
+	for _, boundary := range []struct {
+		name             string
+		beginErr         error
+		commitErr        error
+		commitOccurrence int32
+	}{
+		{name: "begin", beginErr: errors.New("private Ark begin detail"), commitOccurrence: 1},
+		{name: "initial commit", commitErr: errors.New("private Ark initial commit detail"), commitOccurrence: 1},
+		{name: "recheck commit", commitErr: errors.New("private Ark recheck commit detail"), commitOccurrence: 2},
+	} {
+		t.Run(boundary.name, func(t *testing.T) {
+			f, request := setupAppArkImportLookup(t)
+			faultDB := appExecutionDBWithTransactionFaultAt(
+				t, f.db, boundary.beginErr, boundary.commitErr, boundary.commitOccurrence,
+			)
+			execution := NewAppExecutionService(faultDB, f.options)
+			execution.ArkSource = f.execution.ArkSource
+
+			_, err := execution.LookupArkImport(t.Context(), f.serviceID, request)
+
+			var authErr *AppPluginAuthError
+			require.ErrorAs(t, err, &authErr)
+			assert.Equal(t, "service_unavailable", authErr.Code)
+			assert.Equal(t, http.StatusServiceUnavailable, AppRelayErrorStatus(err))
+			if boundary.beginErr != nil {
+				assert.NotContains(t, err.Error(), boundary.beginErr.Error())
+			}
+			if boundary.commitErr != nil {
+				assert.NotContains(t, err.Error(), boundary.commitErr.Error())
+			}
+		})
+	}
+}
+
+func TestArkImportLookupKeepsMissingPolicyAndScopeDenialNonRetryable(t *testing.T) {
+	t.Run("missing policy", func(t *testing.T) {
+		f, request := setupAppArkImportLookup(t)
+		require.NoError(t, f.db.Where(
+			"policy_key = ?", model.AppArkImportDelegationsKey,
+		).Delete(&model.AppExecutionPolicyVersion{}).Error)
+
+		_, err := f.execution.LookupArkImport(t.Context(), f.serviceID, request)
+
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "not_found", authErr.Code)
+		assert.Equal(t, http.StatusNotFound, AppRelayErrorStatus(err))
+	})
+
+	t.Run("scope denied", func(t *testing.T) {
+		f, request := setupAppArkImportLookup(t)
+		request.QueryScope.ProjectID = "other-project"
+
+		_, err := f.execution.LookupArkImport(t.Context(), f.serviceID, request)
+
+		var authErr *AppPluginAuthError
+		require.ErrorAs(t, err, &authErr)
+		assert.Equal(t, "scope_denied", authErr.Code)
+		assert.Equal(t, http.StatusForbidden, AppRelayErrorStatus(err))
+	})
 }
 
 func (f *appExecutionFixture) logout(t *testing.T, refresh bool) {

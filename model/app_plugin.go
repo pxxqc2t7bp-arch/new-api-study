@@ -36,6 +36,7 @@ var (
 	ErrAppInstallationRevoked          = errors.New("app_installation_revoked")
 	ErrAppInstallationStatusInvalid    = errors.New("app_installation_status_invalid")
 	ErrAppInstallationUpgradeForbidden = errors.New("app_installation_upgrade_forbidden")
+	ErrAppServiceIdentityInvalid       = errors.New("service_identity_invalid")
 	errAppEntitlementVersionRace       = errors.New("app_entitlement_policy_version_race")
 )
 

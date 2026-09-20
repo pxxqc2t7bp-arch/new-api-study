@@ -1,8 +1,10 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -21,7 +23,7 @@ import (
 )
 
 type Option struct {
-	Key   string `json:"key" gorm:"primaryKey"`
+	Key   string `json:"key" gorm:"primaryKey;not null"`
 	Value string `json:"value"`
 }
 
@@ -236,11 +238,6 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
-	for _, protected := range []string{AppModelInvokePolicyKey, AppArkImportDelegationsKey} {
-		if strings.EqualFold(strings.TrimRight(key, " "), protected) {
-			return fmt.Errorf("controlled option requires authenticated policy publication")
-		}
-	}
 	if key == operation_setting.ToolPriceOptionKey {
 		return operation_setting.ValidateToolPricesJSON(value)
 	}
@@ -253,27 +250,189 @@ func validateOptionValue(key string, value string) error {
 	return nil
 }
 
-func saveGenericOptionTx(tx *gorm.DB, key, value string) error {
-	option := Option{Key: key}
-	if err := lockForUpdate(tx).Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).
-		FirstOrCreate(&option).Error; err != nil {
+type optionWriteAuthority uint8
+
+const (
+	optionWriteGeneric optionWriteAuthority = iota
+	optionWritePasskey
+	optionWriteRequestPolicy
+	optionWriteAppPolicy
+)
+
+type protectedOptionGroup struct {
+	authority optionWriteAuthority
+	keys      []string
+}
+
+func protectedOptionGroups() []protectedOptionGroup {
+	requestPolicyKeys := slices.Sorted(maps.Keys(requestPolicyDefaults))
+	return []protectedOptionGroup{
+		{authority: optionWritePasskey, keys: []string{
+			"ServerAddress", "passkey.legacy_rp_ids", "passkey.origins", "passkey.rp_id",
+		}},
+		{authority: optionWriteRequestPolicy, keys: requestPolicyKeys},
+		{authority: optionWriteAppPolicy, keys: []string{
+			AppArkImportDelegationsKey, AppModelInvokePolicyKey,
+		}},
+		{authority: optionWriteGeneric, keys: []string{
+			operation_setting.AppExecutionGrantsEnabledOptionKey,
+			operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey,
+			operation_setting.AppPluginSeedanceEnabledOptionKey,
+			operation_setting.AppPluginV1EnabledOptionKey,
+		}},
+	}
+}
+
+func optionAuthorityAllows(writer, required optionWriteAuthority) bool {
+	return writer == required || writer == optionWritePasskey && required == optionWriteGeneric
+}
+
+func protectedOptionWriteError(key string) error {
+	return fmt.Errorf("protected option %q requires its controlled writer", key)
+}
+
+func validateProtectedOptionKey(key string, writer optionWriteAuthority) error {
+	normalized := strings.TrimSpace(key)
+	for _, group := range protectedOptionGroups() {
+		for _, canonical := range group.keys {
+			if key == canonical {
+				if !optionAuthorityAllows(writer, group.authority) {
+					return protectedOptionWriteError(key)
+				}
+				return nil
+			}
+			if strings.EqualFold(normalized, canonical) {
+				return protectedOptionWriteError(key)
+			}
+		}
+	}
+	return nil
+}
+
+func lockOptionForWriteTx(tx *gorm.DB, key, initialValue string, writer optionWriteAuthority) (Option, error) {
+	if err := validateProtectedOptionKey(key, writer); err != nil {
+		return Option{}, err
+	}
+	var option Option
+	err := lockForUpdate(tx).
+		Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).
+		First(&option).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		candidate := Option{Key: key, Value: initialValue}
+		if createErr := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "key"}},
+			DoNothing: true,
+		}).Create(&candidate).Error; createErr != nil {
+			return Option{}, createErr
+		}
+	} else if err != nil {
+		return Option{}, err
+	}
+	option = Option{}
+	if err := lockForUpdate(tx).
+		Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).
+		First(&option).Error; err != nil {
+		return Option{}, err
+	}
+	for _, group := range protectedOptionGroups() {
+		values := make([]any, len(group.keys))
+		for i, protectedKey := range group.keys {
+			values[i] = protectedKey
+		}
+		var protected Option
+		result := lockForUpdate(tx).
+			Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).
+			Where(clause.IN{Column: clause.Column{Name: "key"}, Values: values}).
+			Limit(1).Find(&protected)
+		if result.Error != nil {
+			return Option{}, result.Error
+		}
+		if result.RowsAffected == 0 {
+			continue
+		}
+		if option.Key != key || !slices.Contains(group.keys, key) ||
+			!optionAuthorityAllows(writer, group.authority) {
+			return Option{}, protectedOptionWriteError(key)
+		}
+		break
+	}
+	return option, nil
+}
+
+func AppExecutionRolloutAllowsTx(tx *gorm.DB, appKey string) (bool, error) {
+	keys := []string{
+		operation_setting.AppExecutionGrantsEnabledOptionKey,
+		operation_setting.AppPluginV1EnabledOptionKey,
+	}
+	if appKey == "seedance-repro" {
+		keys = append(keys, operation_setting.AppPluginSeedanceEnabledOptionKey)
+	}
+	slices.Sort(keys)
+	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+		if err := tx.Exec("UPDATE options SET value = value WHERE 0").Error; err != nil {
+			return false, err
+		}
+	}
+	values := make(map[string]string, len(keys))
+	keyValues := make([]any, len(keys))
+	for i, key := range keys {
+		keyValues[i] = key
+	}
+	var options []Option
+	if err := lockForShare(tx).
+		Where(clause.IN{Column: clause.Column{Name: "key"}, Values: keyValues}).
+		Order(clause.OrderByColumn{Column: clause.Column{Name: "key"}}).
+		Find(&options).Error; err != nil {
+		return false, err
+	}
+	for _, option := range options {
+		if slices.Contains(keys, option.Key) {
+			values[option.Key] = option.Value
+		}
+	}
+	return values[operation_setting.AppPluginV1EnabledOptionKey] == "true" &&
+		values[operation_setting.AppExecutionGrantsEnabledOptionKey] == "true" &&
+		(appKey != "seedance-repro" ||
+			values[operation_setting.AppPluginSeedanceEnabledOptionKey] == "true"), nil
+}
+
+func AppExecutionRolloutAllowsCached(appKey string) bool {
+	common.OptionMapRWMutex.RLock()
+	defer common.OptionMapRWMutex.RUnlock()
+	return common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] == "true" &&
+		common.OptionMap[operation_setting.AppExecutionGrantsEnabledOptionKey] == "true" &&
+		(appKey != "seedance-repro" ||
+			common.OptionMap[operation_setting.AppPluginSeedanceEnabledOptionKey] == "true")
+}
+
+func AppPluginRolloutAllowsCached(appKey, surface string) bool {
+	common.OptionMapRWMutex.RLock()
+	defer common.OptionMapRWMutex.RUnlock()
+	return common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] == "true" &&
+		(appKey != "seedance-repro" ||
+			common.OptionMap[operation_setting.AppPluginSeedanceEnabledOptionKey] == "true") &&
+		(surface != "embedded" ||
+			common.OptionMap[operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey] == "true")
+}
+
+func saveOptionTx(tx *gorm.DB, key, value string, writer optionWriteAuthority) error {
+	option, err := lockOptionForWriteTx(tx, key, value, writer)
+	if err != nil {
 		return err
-	}
-	// The locked (or newly inserted) row must not equal a protected key under
-	// the column's collation, including aliases predating canonical publication.
-	var protected Option
-	result := lockForUpdate(tx).Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).
-		Where(clause.IN{Column: clause.Column{Name: "key"}, Values: []any{
-			AppModelInvokePolicyKey, AppArkImportDelegationsKey,
-		}}).Limit(1).Find(&protected)
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected != 0 {
-		return fmt.Errorf("controlled option requires authenticated policy publication")
 	}
 	option.Value = value
 	return tx.Save(&option).Error
+}
+
+func saveGenericOptionTx(tx *gorm.DB, key, value string) error {
+	return saveOptionTx(tx, key, value, optionWriteGeneric)
+}
+
+// Option-owned callbacks contain database work only. Retrying the fresh outer
+// transaction is required when concurrent MySQL missing-row writers deadlock
+// while upgrading their gap locks; caller-owned transactions are never retried.
+func runOptionWriteTransaction(db *gorm.DB, transaction func(*gorm.DB) error) error {
+	return RunAppPluginTransaction(db, transaction)
 }
 
 func UpdateOption(key string, value string) error {
@@ -290,7 +449,7 @@ func UpdateOption(key string, value string) error {
 	if err := validateOptionValue(key, value); err != nil {
 		return err
 	}
-	if err := DB.Transaction(func(tx *gorm.DB) error {
+	if err := runOptionWriteTransaction(DB, func(tx *gorm.DB) error {
 		return saveGenericOptionTx(tx, key, value)
 	}); err != nil {
 		return err
@@ -339,9 +498,13 @@ func UpdateOptionsBulk(values map[string]string) error {
 		}
 	}
 
-	err := DB.Transaction(func(tx *gorm.DB) error {
-		for k, v := range values {
-			if err := saveGenericOptionTx(tx, k, v); err != nil {
+	err := runOptionWriteTransaction(DB, func(tx *gorm.DB) error {
+		for _, key := range slices.Sorted(maps.Keys(values)) {
+			writer := optionWriteGeneric
+			if IsRequestPolicyOption(key) {
+				writer = optionWriteRequestPolicy
+			}
+			if err := saveOptionTx(tx, key, values[key], writer); err != nil {
 				return err
 			}
 		}

@@ -38,14 +38,15 @@ func relayAppNativeResponse(c *gin.Context, subject *hosttypes.AppRelaySubject,
 		status, code, retryable := http.StatusServiceUnavailable, "service_unavailable", true
 		var authError *service.AppPluginAuthError
 		if errors.As(err, &authError) {
-			status, code, retryable = service.AppRelayErrorStatus(err), authError.Code, false
+			status, code = service.AppRelayErrorStatus(err), authError.Code
+			retryable = status >= http.StatusInternalServerError
 		}
 		writeAppNativeResponseError(c, status, code, retryable)
 		return
 	}
 	var headers map[string][]string
 	if common.UnmarshalJsonStr(execution.Result.SafeHeadersJSON, &headers) != nil {
-		writeAppNativeResponseError(c, http.StatusServiceUnavailable, "execution_outcome_unknown", false)
+		writeAppNativeResponseError(c, http.StatusServiceUnavailable, "service_unavailable", true)
 		return
 	}
 	for name, values := range headers {

@@ -151,11 +151,16 @@ func RecordAppTaskObservationTx(tx *gorm.DB, lease AppTaskReconcile, state, obse
 
 func HasPendingAppTaskReconciliation() bool {
 	var row AppTaskReconcile
-	return DB.Where("next_attempt_at > 0 AND EXISTS (?)",
+	query := DB.Where("next_attempt_at > 0 AND EXISTS (?)",
 		DB.Model(&AppTaskExecution{}).Select("1").
 			Where("app_task_executions.id = app_task_reconciles.execution_id AND app_task_executions.execution_kind = ?",
 				AppExecutionKindTask)).
-		Limit(1).Find(&row).RowsAffected > 0
+		Limit(1).Find(&row)
+	if query.Error != nil {
+		common.SysError("check pending app task reconciliation failed")
+		return true
+	}
+	return query.RowsAffected > 0
 }
 
 // FinalizeAppTaskTx commits provider terminal facts, primary funding, counters,

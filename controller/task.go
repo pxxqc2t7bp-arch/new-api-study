@@ -325,6 +325,11 @@ func TaskArtifactContent(c *gin.Context) {
 		task, source, err := service.NewAppExecutionService(
 			model.DB, service.ConfiguredAppPluginAuthOptions(),
 		).ResolveAppTaskArtifactContent(c.Request.Context(), access, c.Request.Method)
+		var authErr *service.AppPluginAuthError
+		if errors.As(err, &authErr) && authErr.Code == "service_unavailable" {
+			writeAppPluginError(c, http.StatusServiceUnavailable, authErr.Code, "")
+			return
+		}
 		if err != nil || task == nil {
 			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
 			return

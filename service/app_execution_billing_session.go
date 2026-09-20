@@ -177,7 +177,34 @@ func (s *AppBillingSession) Claim(c *gin.Context, inputs AppTaskBillingInputs, o
 		return err
 	})
 	s.execution = execution
-	return execution, won, err
+	return execution, won, appTaskClaimError(err)
+}
+
+func appTaskClaimError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, model.ErrAppExecutionScopeDenied):
+		return appAuthError("scope_denied")
+	case errors.Is(err, model.ErrAppExecutionIdempotencyConflict):
+		return appAuthError("idempotency_conflict")
+	case errors.Is(err, model.ErrAppExecutionGrantExpired):
+		return appAuthError("execution_grant_expired")
+	case errors.Is(err, model.ErrAppExecutionInvalidFunding):
+		return appAuthError("invalid_funding")
+	case errors.Is(err, model.ErrAppExecutionInvalidGrant):
+		return appAuthError("invalid_grant")
+	case errors.Is(err, model.ErrAppExecutionIdentityInactive):
+		return appAuthError("identity_inactive")
+	case errors.Is(err, model.ErrAppExecutionAccountingUnavailable):
+		return appAuthError("wallet_accounting_unavailable")
+	case errors.Is(err, model.ErrAppExecutionInsufficientQuota):
+		return appAuthError("insufficient_quota")
+	case errors.Is(err, model.ErrAppExecutionFundingPeriodChanged):
+		return appAuthError("funding_period_changed")
+	default:
+		return appExecutionBoundaryError(err)
+	}
 }
 
 func (s *AppBillingSession) RecordAcceptance(ctx context.Context, providerID string) error {

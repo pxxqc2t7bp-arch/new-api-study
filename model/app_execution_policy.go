@@ -51,16 +51,15 @@ func IsAppExecutionPolicyOption(key string) bool {
 }
 
 // PublishAppExecutionPolicyTx requires current root/session authorization by
-// the service in this same transaction. Generic option writes cannot call it.
+// the service in this same transaction. The owner must use
+// RunAppPluginTransaction when it owns the outer transaction; this function
+// never retries a caller-owned transaction. Generic option writes cannot call it.
 func PublishAppExecutionPolicyTx(tx *gorm.DB, key, canonical string, actor int, now time.Time) (int64, error) {
 	if !IsAppExecutionPolicyOption(key) || canonical == "" || actor <= 0 {
 		return 0, errors.New("invalid_policy")
 	}
-	head := Option{Key: key, Value: "0"}
-	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&head).Error; err != nil {
-		return 0, err
-	}
-	if err := lockForUpdate(tx).Where(clause.Eq{Column: "key", Value: key}).First(&head).Error; err != nil {
+	head, err := lockOptionForWriteTx(tx, key, "0", optionWriteAppPolicy)
+	if err != nil {
 		return 0, err
 	}
 	current, err := strconv.ParseInt(head.Value, 10, 64)
@@ -73,7 +72,7 @@ func PublishAppExecutionPolicyTx(tx *gorm.DB, key, canonical string, actor int, 
 	if err := tx.Create(&row).Error; err != nil {
 		return 0, err
 	}
-	if err := tx.Model(&Option{}).Where(clause.Eq{Column: "key", Value: key}).Update("value", strconv.FormatInt(version, 10)).Error; err != nil {
+	if err := saveOptionTx(tx, key, strconv.FormatInt(version, 10), optionWriteAppPolicy); err != nil {
 		return 0, err
 	}
 	return version, nil

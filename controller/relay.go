@@ -1066,6 +1066,15 @@ func respondTaskSubmissionError(c *gin.Context, taskErr *taskdto.TaskError) {
 
 // respondTaskError 统一输出 Task 错误响应（含 429 限流提示改写）
 func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
+	if subject, ok := common.GetContextKeyType[*hosttypes.AppRelaySubject](
+		c, hosttypes.AppRelaySubjectContextKey,
+	); ok && subject != nil {
+		c.JSON(taskErr.StatusCode, gin.H{
+			"code": taskErr.Code, "message": "App task execution failed",
+			"data": nil, "retryable": taskErr.StatusCode >= http.StatusInternalServerError,
+		})
+		return
+	}
 	if taskErr.StatusCode == http.StatusTooManyRequests {
 		taskErr.Message = "当前分组上游负载已饱和，请稍后再试"
 	}

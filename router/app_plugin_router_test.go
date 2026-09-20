@@ -3,15 +3,23 @@ package router
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -119,7 +127,7 @@ func TestAppPluginDashboardRoutesAndRedaction(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, disabledManagement.Code, disabledManagement.Body.String())
 	assert.Equal(t, "app_plugin_disabled", routerAppPluginErrorCode(t, disabledManagement))
 
-	operation_setting.AppPluginV1Enabled = true
+	setRouterAppPluginFlag(operation_setting.AppPluginV1EnabledOptionKey, true)
 	missingIdempotency := routerAppPluginRequest(
 		fixture.engine,
 		http.MethodPost,
@@ -193,10 +201,10 @@ func TestAppPluginDashboardRoutesAndRedaction(t *testing.T) {
 		t.Cleanup(func() {
 			common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = previousGlobal, previousGlobalNum, previousGlobalDuration
 			common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.CriticalRateLimitDuration = previousCritical, previousCriticalNum, previousCriticalDuration
-			operation_setting.AppPluginV1Enabled = previousFlag
+			setRouterAppPluginFlag(operation_setting.AppPluginV1EnabledOptionKey, previousFlag)
 		})
 		require.False(t, common.RedisEnabled, "rate-limit regression must use the in-memory limiter")
-		operation_setting.AppPluginV1Enabled = false
+		setRouterAppPluginFlag(operation_setting.AppPluginV1EnabledOptionKey, false)
 		common.GlobalApiRateLimitEnable = false
 		common.CriticalRateLimitEnable, common.CriticalRateLimitNum, common.CriticalRateLimitDuration = true, 1, 60
 
@@ -356,7 +364,7 @@ func TestAppPluginDashboardRoutesAndRedaction(t *testing.T) {
 
 func TestAppPluginPatchRequiresRevisionAndRootForSensitiveChanges(t *testing.T) {
 	fixture := setupRouterAppPluginTest(t)
-	operation_setting.AppPluginV1Enabled = true
+	setRouterAppPluginFlag(operation_setting.AppPluginV1EnabledOptionKey, true)
 	created := routerAppPluginRequestWithHeaders(
 		fixture.engine,
 		http.MethodPost,
@@ -647,13 +655,173 @@ func TestAppPluginPatchRequiresRevisionAndRootForSensitiveChanges(t *testing.T) 
 	})
 }
 
+func TestAppPluginEnableRouteDistinguishesStorageFaultsFromMissingPrerequisites(t *testing.T) {
+	for _, fault := range []struct {
+		name       string
+		table      string
+		occurrence int32
+	}{
+		{name: "app version", table: "app_versions", occurrence: 1},
+		{name: "callback claim", table: "app_route_claims", occurrence: 2},
+		{name: "service credentials", table: "app_service_credentials", occurrence: 1},
+		{name: "service credential binding", table: "app_service_credential_bindings", occurrence: 1},
+	} {
+		t.Run(fault.name+" storage failure", func(t *testing.T) {
+			fixture, app := setupRouterAppPluginEnableTest(t, []string{"identity.read", "task.read"})
+			var before model.AppInstallation
+			require.NoError(t, model.DB.Where("installation_id = ?", app.InstallationID).First(&before).Error)
+			privateDetail := "private app enable " + fault.name + " storage detail"
+			failed := registerRouterExecutionDBFault(t, "query", fault.table, fault.occurrence, privateDetail)
+
+			response := routerAppPluginRequest(
+				fixture.engine,
+				http.MethodPatch,
+				"/api/app_plugins/installations",
+				fixture.pluginAdminToken,
+				routerAppPluginPatchBody(t, app.InstallationID, app.Revision, map[string]any{"status": "enabled"}),
+			)
+
+			require.True(t, failed.Load(), "the enable route must exercise the intended storage query")
+			assertRouterAppPluginErrorEnvelope(
+				t, response, http.StatusServiceUnavailable,
+				"service_unavailable", "App plugin request failed", true,
+			)
+			assert.NotContains(t, response.Body.String(), privateDetail)
+			var after model.AppInstallation
+			require.NoError(t, model.DB.Where("installation_id = ?", app.InstallationID).First(&after).Error)
+			assert.Equal(t, before, after, "storage failure must leave the enable transaction mutation-free")
+		})
+	}
+
+	for _, prerequisite := range []struct {
+		name   string
+		scopes []string
+		mutate func(*testing.T, model.AppInstallResult)
+	}{
+		{
+			name:   "missing app version",
+			scopes: []string{"identity.read", "task.read"},
+			mutate: func(t *testing.T, app model.AppInstallResult) {
+				t.Helper()
+				require.NoError(t, model.DB.Where("id = ?", app.AppVersionID).Delete(&model.AppVersion{}).Error)
+			},
+		},
+		{
+			name:   "missing callback claim",
+			scopes: []string{"identity.read", "task.read"},
+			mutate: func(t *testing.T, app model.AppInstallResult) {
+				t.Helper()
+				require.NoError(t, model.DB.Where(
+					"installation_id = ? AND kind = ?", app.InstallationID, "callback",
+				).Delete(&model.AppRouteClaim{}).Error)
+			},
+		},
+		{
+			name:   "malformed registration",
+			scopes: []string{"identity.read", "task.read"},
+			mutate: func(t *testing.T, app model.AppInstallResult) {
+				t.Helper()
+				require.NoError(t, model.DB.Model(&model.AppVersion{}).Where("id = ?", app.AppVersionID).
+					Update("canonical_manifest_json", "{").Error)
+			},
+		},
+		{name: "empty approved scopes"},
+		{name: "identity read scope missing", scopes: []string{"task.read"}},
+		{name: "requested scope missing", scopes: []string{"identity.read"}},
+	} {
+		t.Run(prerequisite.name, func(t *testing.T) {
+			fixture, app := setupRouterAppPluginEnableTest(t, prerequisite.scopes)
+			if prerequisite.mutate != nil {
+				prerequisite.mutate(t, app)
+			}
+			var before model.AppInstallation
+			require.NoError(t, model.DB.Where("installation_id = ?", app.InstallationID).First(&before).Error)
+
+			response := routerAppPluginRequest(
+				fixture.engine,
+				http.MethodPatch,
+				"/api/app_plugins/installations",
+				fixture.pluginAdminToken,
+				routerAppPluginPatchBody(t, app.InstallationID, app.Revision, map[string]any{"status": "enabled"}),
+			)
+
+			assertRouterAppPluginEnablePrerequisiteError(t, response)
+			var after model.AppInstallation
+			require.NoError(t, model.DB.Where("installation_id = ?", app.InstallationID).First(&after).Error)
+			assert.Equal(t, before, after, "missing prerequisite must leave the enable transaction mutation-free")
+		})
+	}
+}
+
+func setupRouterAppPluginEnableTest(
+	t *testing.T,
+	scopes []string,
+) (routerAppPluginFixture, model.AppInstallResult) {
+	t.Helper()
+	fixture := setupRouterAppPluginTest(t)
+	setRouterAppPluginFlag(operation_setting.AppPluginV1EnabledOptionKey, true)
+	require.NoError(t, model.MigrateAppPluginLaunchTables(model.DB))
+	var installRequest map[string]any
+	require.NoError(t, common.Unmarshal(
+		routerAppPluginInstallBody(t, "enable-taxonomy", "1.0.0"),
+		&installRequest,
+	))
+	installRequest["enabled_surfaces"] = []string{"direct"}
+	created := routerAppPluginRequestWithHeaders(
+		fixture.engine,
+		http.MethodPost,
+		"/api/app_plugins/installations",
+		fixture.rootToken,
+		routerAppPluginJSON(t, installRequest),
+		map[string]string{"Idempotency-Key": "enable-taxonomy"},
+	)
+	require.Equal(t, http.StatusCreated, created.Code, created.Body.String())
+	var result routerAppPluginEnvelope
+	require.NoError(t, common.Unmarshal(created.Body.Bytes(), &result))
+	if scopes != nil {
+		now := time.Now()
+		_, err := model.IssueAppServiceCredential(
+			t.Context(), model.DB, result.Data.InstallationID, scopes, now, now.Add(time.Hour), false,
+		)
+		require.NoError(t, err)
+	}
+	return fixture, result.Data
+}
+
+func assertRouterAppPluginEnablePrerequisiteError(t *testing.T, response *httptest.ResponseRecorder) {
+	t.Helper()
+	require.Equal(t, http.StatusConflict, response.Code, response.Body.String())
+	requestID := response.Header().Get(common.RequestIdKey)
+	require.NotEmpty(t, requestID)
+	var actual map[string]any
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &actual), response.Body.String())
+	assert.Equal(t, map[string]any{
+		"error": map[string]any{
+			"code":         "app_enable_prerequisite_missing",
+			"message":      "App plugin enable prerequisites are missing",
+			"field_errors": []any{map[string]any{"path": "/changes/status", "code": "invalid"}},
+			"retryable":    false,
+			"request_id":   requestID,
+		},
+	}, actual)
+}
+
 func setupRouterAppPluginTest(t *testing.T) routerAppPluginFixture {
 	t.Helper()
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
 	previousRedis := common.RedisEnabled
 	previousMaster := common.IsMasterNode
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
 	previousFlag := operation_setting.AppPluginV1Enabled
+	common.OptionMap = maps.Clone(common.OptionMap)
+	if common.OptionMap == nil {
+		common.OptionMap = map[string]string{}
+	}
+	common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] = "false"
+	operation_setting.AppPluginV1Enabled = false
+	common.OptionMapRWMutex.Unlock()
 
 	db := openRouterAppPluginDB(t)
 	t.Cleanup(func() {
@@ -661,7 +829,10 @@ func setupRouterAppPluginTest(t *testing.T) routerAppPluginFixture {
 		common.SetDatabaseTypes(previousMain, previousLog)
 		common.RedisEnabled = previousRedis
 		common.IsMasterNode = previousMaster
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
 		operation_setting.AppPluginV1Enabled = previousFlag
+		common.OptionMapRWMutex.Unlock()
 	})
 	dbType := map[string]common.DatabaseType{
 		"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL,
@@ -678,7 +849,6 @@ func setupRouterAppPluginTest(t *testing.T) routerAppPluginFixture {
 	model.DB, model.LOG_DB = db, db
 	common.RedisEnabled = false
 	common.IsMasterNode = true
-	operation_setting.AppPluginV1Enabled = false
 	require.NoError(t, authz.Init(db))
 	require.NoError(t, db.Create(&model.TaskPlugin{
 		Key:        "doubao",
@@ -829,6 +999,25 @@ func routerAppPluginRequestWithHeaders(
 	return response
 }
 
+func setRouterAppPluginFlag(key string, enabled bool) {
+	common.OptionMapRWMutex.Lock()
+	defer common.OptionMapRWMutex.Unlock()
+	if common.OptionMap == nil {
+		common.OptionMap = map[string]string{}
+	}
+	common.OptionMap[key] = strconv.FormatBool(enabled)
+	switch key {
+	case operation_setting.AppPluginV1EnabledOptionKey:
+		operation_setting.AppPluginV1Enabled = enabled
+	case operation_setting.AppPluginSeedanceEnabledOptionKey:
+		operation_setting.AppPluginSeedanceEnabled = enabled
+	case operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey:
+		operation_setting.AppPluginEmbeddedSurfaceEnabled = enabled
+	case operation_setting.AppExecutionGrantsEnabledOptionKey:
+		operation_setting.AppExecutionGrantsEnabled = enabled
+	}
+}
+
 func routerAppPluginInstallBody(t *testing.T, key, version string) []byte {
 	t.Helper()
 	return routerAppPluginJSON(t, map[string]any{
@@ -924,6 +1113,84 @@ type routerExecutionFixture struct {
 	credential model.AppServiceCredentialIssued
 }
 
+type routerExecutionFaultConnPool struct {
+	gorm.ConnPool
+	beginErr      error
+	commitErr     error
+	commitBarrier *routerExecutionCommitBarrier
+}
+
+type routerExecutionCommitBarrier struct {
+	blocked   atomic.Bool
+	committed chan struct{}
+	release   chan struct{}
+}
+
+func (pool *routerExecutionFaultConnPool) BeginTx(
+	ctx context.Context,
+	options *sql.TxOptions,
+) (gorm.ConnPool, error) {
+	if pool.beginErr != nil {
+		return nil, pool.beginErr
+	}
+	beginner, ok := pool.ConnPool.(gorm.TxBeginner)
+	if !ok {
+		return nil, errors.New("test connection pool cannot begin transactions")
+	}
+	tx, err := beginner.BeginTx(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &routerExecutionFaultTx{
+		Tx: tx, commitErr: pool.commitErr, commitBarrier: pool.commitBarrier,
+	}, nil
+}
+
+type routerExecutionFaultTx struct {
+	*sql.Tx
+	commitErr     error
+	commitBarrier *routerExecutionCommitBarrier
+}
+
+func (tx *routerExecutionFaultTx) Commit() error {
+	if tx.commitErr != nil {
+		_ = tx.Tx.Rollback()
+		return tx.commitErr
+	}
+	if err := tx.Tx.Commit(); err != nil {
+		return err
+	}
+	if tx.commitBarrier != nil && tx.commitBarrier.blocked.CompareAndSwap(false, true) {
+		close(tx.commitBarrier.committed)
+		<-tx.commitBarrier.release
+	}
+	return nil
+}
+
+func routerExecutionDBWithTransactionFault(
+	db *gorm.DB,
+	beginErr error,
+	commitErr error,
+) *gorm.DB {
+	faultDB := db.Session(&gorm.Session{NewDB: true})
+	faultDB.Statement.ConnPool = &routerExecutionFaultConnPool{
+		ConnPool: db.Statement.ConnPool,
+		beginErr: beginErr, commitErr: commitErr,
+	}
+	return faultDB
+}
+
+func routerExecutionDBWithCommitBarrier(
+	db *gorm.DB,
+	barrier *routerExecutionCommitBarrier,
+) *gorm.DB {
+	faultDB := db.Session(&gorm.Session{NewDB: true})
+	faultDB.Statement.ConnPool = &routerExecutionFaultConnPool{
+		ConnPool: db.Statement.ConnPool, commitBarrier: barrier,
+	}
+	return faultDB
+}
+
 func setupRouterExecutionTest(t *testing.T) *routerExecutionFixture {
 	t.Helper()
 	return setupRouterExecutionAppTest(t, "http-app")
@@ -937,19 +1204,33 @@ func setupRouterExecutionAppTest(t *testing.T, appKey string) *routerExecutionFi
 	oldGrant, oldSeedance, oldEmbedded := operation_setting.AppExecutionGrantsEnabled,
 		operation_setting.AppPluginSeedanceEnabled, operation_setting.AppPluginEmbeddedSurfaceEnabled
 	oldRegistry := jsplugin.DefaultRegistry
+	common.OptionMapRWMutex.Lock()
+	oldOptions := maps.Clone(common.OptionMap)
+	if common.OptionMap == nil {
+		common.OptionMap = make(map[string]string)
+	}
+	common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] = "true"
+	common.OptionMap[operation_setting.AppPluginSeedanceEnabledOptionKey] = "true"
+	common.OptionMap[operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey] = "true"
+	common.OptionMap[operation_setting.AppExecutionGrantsEnabledOptionKey] = "true"
+	operation_setting.AppPluginV1Enabled = true
+	operation_setting.AppExecutionGrantsEnabled = true
+	operation_setting.AppPluginSeedanceEnabled = true
+	operation_setting.AppPluginEmbeddedSurfaceEnabled = true
+	common.OptionMapRWMutex.Unlock()
 	t.Cleanup(func() {
 		system_setting.ServerAddress, common.BatchUpdateEnabled = oldAddress, oldBatch
 		common.CriticalRateLimitEnable, common.GlobalApiRateLimitEnable = oldCritical, oldGlobal
+		common.OptionMapRWMutex.Lock()
 		operation_setting.AppExecutionGrantsEnabled = oldGrant
 		operation_setting.AppPluginSeedanceEnabled, operation_setting.AppPluginEmbeddedSurfaceEnabled = oldSeedance, oldEmbedded
+		common.OptionMap = oldOptions
+		common.OptionMapRWMutex.Unlock()
 		jsplugin.DefaultRegistry = oldRegistry
 	})
 	system_setting.ServerAddress = "https://console.example.com"
 	common.BatchUpdateEnabled, common.CriticalRateLimitEnable, common.GlobalApiRateLimitEnable = false, false, false
 	t.Setenv("APP_PLUGIN_LAUNCH_SECRET", strings.Repeat("offline-http-fixture-", 3))
-	operation_setting.AppPluginV1Enabled = true
-	operation_setting.AppExecutionGrantsEnabled = true
-	operation_setting.AppPluginSeedanceEnabled, operation_setting.AppPluginEmbeddedSurfaceEnabled = true, true
 	require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.Option{}, &model.Channel{}, &model.Ability{},
 		&model.UserSubscription{}, &model.SubscriptionPlan{}))
 	require.NoError(t, model.MigrateAppPluginLaunchTables(model.DB))
@@ -1013,6 +1294,10 @@ func setupRouterExecutionAppTest(t *testing.T, appKey string) *routerExecutionFi
 		{Key: "ModelPrice", Value: `{"doubao-seedance-2-5-260628":0.01}`},
 		{Key: "UserUsableGroups", Value: `{"default":"Default"}`},
 		{Key: "GroupRatio", Value: `{"default":1}`}, {Key: "AutoGroups", Value: `["default"]`},
+		{Key: operation_setting.AppPluginV1EnabledOptionKey, Value: "true"},
+		{Key: operation_setting.AppPluginSeedanceEnabledOptionKey, Value: "true"},
+		{Key: operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey, Value: "true"},
+		{Key: operation_setting.AppExecutionGrantsEnabledOptionKey, Value: "true"},
 	}).Error)
 	f.engine = gin.New()
 	f.engine.Use(middleware.RequestId())
@@ -1035,6 +1320,816 @@ func (f *routerExecutionFixture) publish(t *testing.T) int64 {
 	version, err := service.PublishAppModelInvokePolicy(t.Context(), model.DB, f.root, []byte(routerExecutionPolicy), time.Now())
 	require.NoError(t, err)
 	return version
+}
+
+func setupRouterTaskAppGrant(t *testing.T, protocol string) (*routerExecutionFixture, service.AppExecutionGrantResult) {
+	t.Helper()
+	return setupRouterTaskAppGrantWithBillingExpression(t, protocol, "")
+}
+
+func setupRouterTaskAppGrantWithBillingExpression(t *testing.T, protocol, expression string) (
+	*routerExecutionFixture, service.AppExecutionGrantResult,
+) {
+	t.Helper()
+	f := setupRouterExecutionTest(t)
+	SetTaskPluginProtocolRouter(f.engine)
+	SetTaskRouter(f.engine)
+	require.NoError(t, model.DB.AutoMigrate(&model.Task{}, &model.SystemTask{}))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"cgt-route-accepted"}`)
+	}))
+	t.Cleanup(upstream.Close)
+	require.NoError(t, model.DB.Model(&model.Channel{}).Where("name = ?", "http-offline").
+		Update("base_url", upstream.URL).Error)
+	if expression != "" {
+		require.NoError(t, model.DB.Model(&model.Option{}).
+			Where(map[string]any{"key": "ModelPrice"}).Update("value", `{}`).Error)
+		require.NoError(t, model.DB.Create(&[]model.Option{
+			{
+				Key:   "billing_setting.billing_mode",
+				Value: `{"doubao-seedance-2-5-260628":"tiered_expr"}`,
+			},
+			{
+				Key:   "billing_setting.billing_expr",
+				Value: `{"doubao-seedance-2-5-260628":` + strconv.Quote(expression) + `}`,
+			},
+		}).Error)
+	}
+	policy := strings.Replace(routerExecutionPolicy, `"protocol":"openai_video"`,
+		`"protocol":"`+protocol+`"`, 1)
+	version, err := service.PublishAppModelInvokePolicy(
+		t.Context(), model.DB, f.root, []byte(policy), time.Now(),
+	)
+	require.NoError(t, err)
+	request := service.AppExecutionGrantRequest{
+		RequestID: uuid.NewString(), AppKey: f.app.AppKey,
+		AppSessionID: f.session.AppSessionID, Subject: f.session.Subject,
+		RunID: uuid.NewString(), ExecutionRequestID: uuid.NewString(),
+		Operation: "model.generate", ModelPolicyVersion: version,
+		RequestedModels: []string{"doubao-seedance-2-5-260628"},
+		Strategy:        "stable", ConversionPolicy: "strict",
+		PassthroughSelections: []service.AppPassthroughSelection{},
+	}
+	response := f.call(t, http.MethodPost, "/internal/apps/v1/execution-grants",
+		"AppService "+f.credential.Credential, "", request)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var issued struct {
+		Data service.AppExecutionGrantResult `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &issued))
+	require.NotEmpty(t, issued.Data.GrantToken)
+	return f, issued.Data
+}
+
+func routerTaskAppGrantBody(protocol string) []byte {
+	if protocol == "openai_responses" {
+		return []byte(`{"model":"doubao-seedance-2-5-260628","input":"hello","background":true}`)
+	}
+	return []byte(`{"model":"doubao-seedance-2-5-260628","prompt":"hello"}`)
+}
+
+func assertRouterPublicStorageError(t *testing.T, response *httptest.ResponseRecorder, privateDetail string) {
+	t.Helper()
+	require.Equal(t, http.StatusServiceUnavailable, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"code":"service_unavailable"`)
+	assert.Contains(t, response.Body.String(), `"retryable":true`)
+	assert.NotContains(t, response.Body.String(), privateDetail)
+}
+
+func routerLaunchExchangeRequest(t *testing.T, f *routerExecutionFixture) service.AppPluginExchangeRequest {
+	t.Helper()
+	verifier := strings.Repeat("v", 43)
+	challenge := sha256.Sum256([]byte(verifier))
+	authorize := service.AppPluginAuthorizeRequest{
+		Surface: "direct", TransactionID: uuid.NewString(),
+		State: strings.Repeat("s", 42) + "A", Nonce: strings.Repeat("n", 42) + "A",
+		CodeChallenge: base64.RawURLEncoding.EncodeToString(challenge[:]), CodeChallengeMethod: "S256",
+	}
+	response := routerAppPluginRequestWithHeaders(
+		f.engine, http.MethodPost,
+		"https://console.example.com/api/app_plugins/"+f.app.AppKey+"/authorize", "",
+		routerAppPluginJSON(t, authorize),
+		map[string]string{
+			"Authorization":   "Bearer " + f.userJWT,
+			"Origin":          "https://console.example.com",
+			"Idempotency-Key": uuid.NewString(),
+		},
+	)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var envelope struct {
+		Data service.AppPluginAuthorizeResult `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &envelope))
+	callback, err := url.Parse(envelope.Data.LaunchURL)
+	require.NoError(t, err)
+	require.NotEmpty(t, callback.Query().Get("code"))
+	return service.AppPluginExchangeRequest{
+		ExchangeRequestID: uuid.NewString(), AppKey: f.app.AppKey,
+		Surface: authorize.Surface, TransactionID: authorize.TransactionID,
+		Code: callback.Query().Get("code"), CodeVerifier: verifier,
+		State: authorize.State, Nonce: authorize.Nonce,
+	}
+}
+
+func expireRouterLaunchCode(t *testing.T, f *routerExecutionFixture, request *service.AppPluginExchangeRequest) {
+	t.Helper()
+	var code model.AppPluginLaunchCode
+	require.NoError(t, model.DB.Where(
+		"installation_id = ?", f.app.InstallationID,
+	).First(&code).Error)
+	var binding model.AppPluginLaunchBinding
+	require.NoError(t, common.UnmarshalJsonStr(code.BindingJSON, &binding))
+	binding.ExpiresAt = time.Now().Add(-time.Minute).UnixNano()
+	raw, err := common.Marshal(binding)
+	require.NoError(t, err)
+	code.BindingJSON = string(raw)
+	code.ExpiresAt = binding.ExpiresAt
+	key := hmac.New(sha256.New, []byte(os.Getenv("APP_PLUGIN_LAUNCH_SECRET")))
+	_, _ = key.Write([]byte("new-api/app-plugin/launch-key/v1"))
+	mac := hmac.New(sha256.New, key.Sum(nil))
+	_, _ = mac.Write([]byte(code.Salt))
+	_, _ = mac.Write([]byte(code.BindingJSON))
+	request.Code = base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	code.CodeHash = fmt.Sprintf("%x", sha256.Sum256([]byte(request.Code)))
+	require.NoError(t, model.DB.Model(&code).Updates(map[string]any{
+		"binding_json": code.BindingJSON,
+		"code_hash":    code.CodeHash,
+		"expires_at":   code.ExpiresAt,
+	}).Error)
+}
+
+func registerRouterExecutionQueryFault(t *testing.T, table string, occurrence int32, privateDetail string) *atomic.Bool {
+	t.Helper()
+	return registerRouterExecutionDBFault(t, "query", table, occurrence, privateDetail)
+}
+
+func registerRouterGrantExpiryAtQuery(t *testing.T, occurrence int32) *atomic.Bool {
+	t.Helper()
+	var reads atomic.Int32
+	var expired atomic.Bool
+	callbackName := "test:router-app-execution-expiry:" + uuid.NewString()
+	require.NoError(t, model.DB.Callback().Query().After("gorm:query").
+		Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_execution_grants" || reads.Add(1) != occurrence {
+				return
+			}
+			grant, ok := tx.Statement.Dest.(*model.AppExecutionGrant)
+			if !ok {
+				return
+			}
+			grant.ExpiresAt = time.Now().Add(-time.Minute).Unix()
+			expired.Store(true)
+		}))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Callback().Query().Remove(callbackName))
+	})
+	return &expired
+}
+
+type routerGrantReadBarrier struct {
+	reached     chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+func (b *routerGrantReadBarrier) unblock() {
+	b.releaseOnce.Do(func() {
+		close(b.release)
+	})
+}
+
+func registerRouterGrantReadBarrier(t *testing.T, occurrence int32) *routerGrantReadBarrier {
+	t.Helper()
+	var reads atomic.Int32
+	barrier := &routerGrantReadBarrier{
+		reached: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	callbackName := "test:router-grant-read-barrier:" + uuid.NewString()
+	require.NoError(t, model.DB.Callback().Query().Before("gorm:query").
+		Register(callbackName, func(tx *gorm.DB) {
+			if tx.Statement.Table != "app_execution_grants" || reads.Add(1) != occurrence {
+				return
+			}
+			close(barrier.reached)
+			<-barrier.release
+		}))
+	t.Cleanup(func() {
+		barrier.unblock()
+		require.NoError(t, model.DB.Callback().Query().Remove(callbackName))
+	})
+	return barrier
+}
+
+func registerRouterExecutionDBFault(t *testing.T, operation, table string, occurrence int32,
+	privateDetail string,
+) *atomic.Bool {
+	t.Helper()
+	var reads atomic.Int32
+	var failed atomic.Bool
+	callbackName := "test:router-app-execution-storage:" + uuid.NewString()
+	inject := func(tx *gorm.DB) {
+		if tx.Statement.Table == table && reads.Add(1) == occurrence {
+			failed.Store(true)
+			tx.AddError(errors.New(privateDetail))
+		}
+	}
+	switch operation {
+	case "query":
+		require.NoError(t, model.DB.Callback().Query().Before("gorm:query").Register(callbackName, inject))
+		t.Cleanup(func() { require.NoError(t, model.DB.Callback().Query().Remove(callbackName)) })
+	case "create":
+		require.NoError(t, model.DB.Callback().Create().Before("gorm:create").Register(callbackName, inject))
+		t.Cleanup(func() { require.NoError(t, model.DB.Callback().Create().Remove(callbackName)) })
+	case "update":
+		require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callbackName, inject))
+		t.Cleanup(func() { require.NoError(t, model.DB.Callback().Update().Remove(callbackName)) })
+	default:
+		t.Fatalf("unsupported router storage fault operation %q", operation)
+	}
+	return &failed
+}
+
+func TestAppPluginLifecycleRoutesPreserveStorageFailures(t *testing.T) {
+	tests := []struct {
+		name       string
+		table      string
+		occurrence int32
+		path       string
+		key        string
+		body       func(*testing.T, *routerExecutionFixture) any
+	}{
+		{
+			name: "launch code exchange query", table: "app_plugin_launch_codes", occurrence: 1,
+			path: "/internal/apps/v1/launch-codes/exchange",
+			body: func(t *testing.T, f *routerExecutionFixture) any {
+				return routerLaunchExchangeRequest(t, f)
+			},
+		},
+		{
+			name: "session introspection query", table: "app_plugin_sessions", occurrence: 1,
+			path: "/internal/apps/v1/sessions/introspect",
+			body: func(_ *testing.T, f *routerExecutionFixture) any {
+				return service.AppPluginIntrospectRequest{
+					AppKey: f.app.AppKey, AppSessionID: f.session.AppSessionID, Subject: f.session.Subject,
+					RequiredScopes: []string{}, RequiredEntitlements: model.AppJSONMap{},
+				}
+			},
+		},
+		{
+			name: "session introspection credential query", table: "app_service_credentials", occurrence: 4,
+			path: "/internal/apps/v1/sessions/introspect",
+			body: func(_ *testing.T, f *routerExecutionFixture) any {
+				return service.AppPluginIntrospectRequest{
+					AppKey: f.app.AppKey, AppSessionID: f.session.AppSessionID, Subject: f.session.Subject,
+					RequiredScopes: []string{}, RequiredEntitlements: model.AppJSONMap{},
+				}
+			},
+		},
+		{
+			name: "session introspection credential binding query", table: "app_service_credential_bindings", occurrence: 2,
+			path: "/internal/apps/v1/sessions/introspect",
+			body: func(_ *testing.T, f *routerExecutionFixture) any {
+				return service.AppPluginIntrospectRequest{
+					AppKey: f.app.AppKey, AppSessionID: f.session.AppSessionID, Subject: f.session.Subject,
+					RequiredScopes: []string{}, RequiredEntitlements: model.AppJSONMap{},
+				}
+			},
+		},
+		{
+			name: "session revoke installation query", table: "app_installations", occurrence: 2,
+			path: "/internal/apps/v1/sessions/revoke", key: "revoke-installation-fault",
+			body: func(_ *testing.T, f *routerExecutionFixture) any {
+				return service.AppPluginSessionRevokeRequest{
+					RequestID: uuid.NewString(), AppKey: f.app.AppKey,
+					AppSessionID: f.session.AppSessionID, Subject: f.session.Subject, Reason: "user_logout",
+				}
+			},
+		},
+		{
+			name: "session revoke query", table: "app_plugin_sessions", occurrence: 1,
+			path: "/internal/apps/v1/sessions/revoke", key: "revoke-session-fault",
+			body: func(_ *testing.T, f *routerExecutionFixture) any {
+				return service.AppPluginSessionRevokeRequest{
+					RequestID: uuid.NewString(), AppKey: f.app.AppKey,
+					AppSessionID: f.session.AppSessionID, Subject: f.session.Subject, Reason: "user_logout",
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := setupRouterExecutionTest(t)
+			body := test.body(t, f)
+			privateDetail := "private " + test.name + " storage detail"
+			failed := registerRouterExecutionQueryFault(t, test.table, test.occurrence, privateDetail)
+
+			response := f.call(t, http.MethodPost, test.path,
+				"AppService "+f.credential.Credential, test.key, body)
+
+			require.True(t, failed.Load(), "the intended lifecycle query must be exercised")
+			assertRouterPublicStorageError(t, response, privateDetail)
+		})
+	}
+}
+
+func TestAppPluginLaunchContextRouteMapsRegistrationAbsenceToNotFound(t *testing.T) {
+	for _, resource := range []string{"current app version", "callback claim"} {
+		t.Run(resource, func(t *testing.T) {
+			f := setupRouterExecutionTest(t)
+			switch resource {
+			case "current app version":
+				require.NoError(t, model.DB.Where("id = ?", f.app.AppVersionID).
+					Delete(&model.AppVersion{}).Error)
+			case "callback claim":
+				require.NoError(t, model.DB.Where(
+					"installation_id = ? AND kind = ?",
+					f.app.InstallationID, "callback",
+				).Delete(&model.AppRouteClaim{}).Error)
+			}
+
+			response := routerAppPluginRequestWithHeaders(
+				f.engine, http.MethodGet,
+				"https://console.example.com/api/app_plugins/"+f.app.AppKey+"/launch-context?surface=direct",
+				"", nil, map[string]string{"Authorization": "Bearer " + f.userJWT},
+			)
+
+			assertRouterAppPluginErrorEnvelope(
+				t, response, http.StatusNotFound,
+				"not_found", "App plugin not found", false,
+			)
+			assert.NotContains(t, response.Body.String(), `"detail"`)
+			assert.NotContains(t, response.Body.String(), "service_unavailable")
+		})
+	}
+}
+
+func TestAppPluginLaunchContextRoutePreservesRegistrationStorageFailures(t *testing.T) {
+	for _, resource := range []struct {
+		name       string
+		table      string
+		occurrence int32
+	}{
+		{name: "current app version", table: "app_versions", occurrence: 1},
+		{name: "callback claim", table: "app_route_claims", occurrence: 2},
+	} {
+		t.Run(resource.name, func(t *testing.T) {
+			f := setupRouterExecutionTest(t)
+			privateDetail := "private registration " + resource.name + " route detail"
+			failed := registerRouterExecutionQueryFault(
+				t, resource.table, resource.occurrence, privateDetail,
+			)
+
+			response := routerAppPluginRequestWithHeaders(
+				f.engine, http.MethodGet,
+				"https://console.example.com/api/app_plugins/"+f.app.AppKey+"/launch-context?surface=direct",
+				"", nil, map[string]string{"Authorization": "Bearer " + f.userJWT},
+			)
+
+			require.True(t, failed.Load(), "the actual route must execute the registration query")
+			assertRouterPublicStorageError(t, response, privateDetail)
+		})
+	}
+}
+
+func TestAppPluginLifecycleRoutesKeepBusinessFailuresNonRetryable(t *testing.T) {
+	t.Run("missing session", func(t *testing.T) {
+		f := setupRouterExecutionTest(t)
+		response := f.call(t, http.MethodPost, "/internal/apps/v1/sessions/introspect",
+			"AppService "+f.credential.Credential, "", service.AppPluginIntrospectRequest{
+				AppKey: f.app.AppKey, AppSessionID: "missing-session", Subject: f.session.Subject,
+				RequiredScopes: []string{}, RequiredEntitlements: model.AppJSONMap{},
+			})
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusNotFound,
+			"not_found", "App plugin not found", false)
+	})
+
+	t.Run("expired launch code", func(t *testing.T) {
+		f := setupRouterExecutionTest(t)
+		request := routerLaunchExchangeRequest(t, f)
+		expireRouterLaunchCode(t, f, &request)
+
+		response := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+			"AppService "+f.credential.Credential, "", request)
+
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusUnauthorized,
+			"launch_code_expired", "Launch code expired", false)
+	})
+
+	t.Run("tampered launch code expiry", func(t *testing.T) {
+		f := setupRouterExecutionTest(t)
+		request := routerLaunchExchangeRequest(t, f)
+		require.NoError(t, model.DB.Model(&model.AppPluginLaunchCode{}).
+			Where("installation_id = ?", f.app.InstallationID).
+			Update("expires_at", time.Now().Add(-time.Minute).UnixNano()).Error)
+
+		response := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+			"AppService "+f.credential.Credential, "", request)
+
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusNotFound,
+			"not_found", "App plugin not found", false)
+	})
+
+	t.Run("disabled installation", func(t *testing.T) {
+		f := setupRouterExecutionTest(t)
+		request := routerLaunchExchangeRequest(t, f)
+		require.NoError(t, model.DB.Model(&model.AppInstallation{}).
+			Where("installation_id = ?", f.app.InstallationID).
+			Update("status", model.AppInstallationStatusDisabled).Error)
+
+		response := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+			"AppService "+f.credential.Credential, "", request)
+
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusForbidden,
+			"app_plugin_disabled", "App plugin API is disabled", false)
+	})
+
+	t.Run("revoked service credential", func(t *testing.T) {
+		f := setupRouterExecutionTest(t)
+		require.NoError(t, model.DB.Model(&model.AppServiceCredential{}).
+			Where("credential_id = ?", f.credential.CredentialID).
+			Update("status", "revoked").Error)
+
+		response := f.call(t, http.MethodPost, "/internal/apps/v1/sessions/introspect",
+			"AppService "+f.credential.Credential, "", service.AppPluginIntrospectRequest{
+				AppKey: f.app.AppKey, AppSessionID: f.session.AppSessionID, Subject: f.session.Subject,
+				RequiredScopes: []string{}, RequiredEntitlements: model.AppJSONMap{},
+			})
+
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusUnauthorized,
+			"service_identity_invalid", "App service request denied", false)
+	})
+}
+
+func TestAppPluginExchangeReplayRequiresCurrentRegistration(t *testing.T) {
+	for _, resource := range []string{"current app version", "callback claim", "callback claim key case"} {
+		t.Run(resource, func(t *testing.T) {
+			f := setupRouterExecutionTest(t)
+			request := routerLaunchExchangeRequest(t, f)
+			first := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+				"AppService "+f.credential.Credential, "", request)
+			require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+
+			switch resource {
+			case "current app version":
+				require.NoError(t, model.DB.Where("id = ?", f.app.AppVersionID).
+					Delete(&model.AppVersion{}).Error)
+			case "callback claim":
+				require.NoError(t, model.DB.Where(
+					"installation_id = ? AND kind = ?",
+					f.app.InstallationID, "callback",
+				).Delete(&model.AppRouteClaim{}).Error)
+			case "callback claim key case":
+				var claim model.AppRouteClaim
+				require.NoError(t, model.DB.Where(
+					"installation_id = ? AND kind = ?",
+					f.app.InstallationID, "callback",
+				).First(&claim).Error)
+				alias := strings.ToUpper(claim.ClaimKey)
+				require.NotEqual(t, claim.ClaimKey, alias)
+				require.NoError(t, model.DB.Model(&model.AppRouteClaim{}).Where("id = ?", claim.ID).
+					UpdateColumn("claim_key", alias).Error)
+			}
+
+			replay := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+				"AppService "+f.credential.Credential, "", request)
+
+			assertRouterAppPluginErrorEnvelope(t, replay, http.StatusNotFound,
+				"not_found", "App plugin not found", false)
+		})
+	}
+}
+
+func TestAppPluginExchangeDifferentRequestRejectsTamperedLaunchSession(t *testing.T) {
+	f := setupRouterExecutionTest(t)
+	request := routerLaunchExchangeRequest(t, f)
+	first := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+		"AppService "+f.credential.Credential, "", request)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	var envelope struct {
+		Data service.AppPluginExchangeResult `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(first.Body.Bytes(), &envelope))
+	require.NotEqual(t, envelope.Data.AppSessionID, f.session.AppSessionID)
+	require.NoError(t, model.DB.Model(&model.AppPluginLaunchCode{}).Where(
+		"installation_id = ?", f.app.InstallationID,
+	).Update("app_session_id", f.session.AppSessionID).Error)
+
+	second := request
+	second.ExchangeRequestID = uuid.NewString()
+	response := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+		"AppService "+f.credential.Credential, "", second)
+
+	assertRouterAppPluginErrorEnvelope(t, response, http.StatusNotFound,
+		"not_found", "App plugin not found", false)
+	for _, sessionID := range []string{envelope.Data.AppSessionID, f.session.AppSessionID} {
+		var session model.AppPluginSession
+		require.NoError(t, model.DB.Where("app_session_id = ?", sessionID).First(&session).Error)
+		assert.Zero(t, session.RevokedAt)
+	}
+}
+
+func TestAppPluginExchangeReplayRegistrationFaultIsRetryable(t *testing.T) {
+	for _, resource := range []struct {
+		name       string
+		table      string
+		occurrence int32
+	}{
+		{name: "current app version", table: "app_versions", occurrence: 1},
+		{name: "callback claim", table: "app_route_claims", occurrence: 2},
+	} {
+		t.Run(resource.name, func(t *testing.T) {
+			f := setupRouterExecutionTest(t)
+			request := routerLaunchExchangeRequest(t, f)
+			first := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+				"AppService "+f.credential.Credential, "", request)
+			require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+			privateDetail := "private exchange replay registration " + resource.name + " detail"
+			failed := registerRouterExecutionQueryFault(
+				t, resource.table, resource.occurrence, privateDetail,
+			)
+
+			replay := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+				"AppService "+f.credential.Credential, "", request)
+
+			require.True(t, failed.Load(), "replay must execute the current registration query")
+			assertRouterPublicStorageError(t, replay, privateDetail)
+		})
+	}
+}
+
+func TestAppPluginExchangeReplayRejectsValidGenerationUpgrade(t *testing.T) {
+	f := setupRouterExecutionTest(t)
+	request := routerLaunchExchangeRequest(t, f)
+	first := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+		"AppService "+f.credential.Credential, "", request)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+
+	upgrade := routerAppPluginRequestWithHeaders(
+		f.engine, http.MethodPost,
+		"https://console.example.com/api/app_plugins/installations", "",
+		routerAppPluginInstallBody(t, f.app.AppKey, "2.0.0"),
+		map[string]string{
+			"Authorization":   "Bearer " + f.rootPAT,
+			"Idempotency-Key": "http-fixture-v2",
+		},
+	)
+	require.Equal(t, http.StatusCreated, upgrade.Code, upgrade.Body.String())
+	var upgraded routerAppPluginEnvelope
+	require.NoError(t, common.Unmarshal(upgrade.Body.Bytes(), &upgraded))
+	require.Equal(t, f.app.InstallationID, upgraded.Data.InstallationID)
+	require.Equal(t, "2.0.0", upgraded.Data.ManifestVersion)
+	require.NotEqual(t, f.app.AppVersionID, upgraded.Data.AppVersionID)
+	var callback model.AppRouteClaim
+	require.NoError(t, model.DB.Where(
+		"installation_id = ? AND kind = ?", f.app.InstallationID, "callback",
+	).First(&callback).Error)
+	require.Equal(t, "https://apps.example.com/"+f.app.AppKey+"/auth/callback",
+		callback.AbsoluteEndpoint)
+	enabled, err := model.CompareAndSwapAppInstallationStatus(
+		t.Context(), model.DB, f.app.InstallationID, upgraded.Data.Revision,
+		model.AppInstallationStatusEnabled,
+	)
+	require.NoError(t, err)
+	require.Equal(t, model.AppInstallationStatusEnabled, enabled.Status)
+
+	replay := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+		"AppService "+f.credential.Credential, "", request)
+
+	assertRouterAppPluginErrorEnvelope(t, replay, http.StatusNotFound,
+		"not_found", "App plugin not found", false)
+}
+
+func TestAppPluginExchangeReplayOriginalLaunchBindingFaultIsRetryable(t *testing.T) {
+	f := setupRouterExecutionTest(t)
+	request := routerLaunchExchangeRequest(t, f)
+	first := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+		"AppService "+f.credential.Credential, "", request)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	privateDetail := "private original launch binding route detail"
+	failed := registerRouterExecutionQueryFault(
+		t, "app_plugin_launch_codes", 1, privateDetail,
+	)
+
+	replay := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+		"AppService "+f.credential.Credential, "", request)
+
+	require.True(t, failed.Load(), "replay must reload the original launch binding")
+	assertRouterPublicStorageError(t, replay, privateDetail)
+}
+
+func TestAppPluginExchangeReplayRequiresOriginalLaunchBinding(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, string)
+	}{
+		{
+			name: "missing launch code",
+			mutate: func(t *testing.T, installationID string) {
+				t.Helper()
+				require.NoError(t, model.DB.Where(
+					"installation_id = ?", installationID,
+				).Delete(&model.AppPluginLaunchCode{}).Error)
+			},
+		},
+		{
+			name: "launch code session mismatch",
+			mutate: func(t *testing.T, installationID string) {
+				t.Helper()
+				require.NoError(t, model.DB.Model(&model.AppPluginLaunchCode{}).Where(
+					"installation_id = ?", installationID,
+				).Update("app_session_id", "different-session").Error)
+			},
+		},
+		{
+			name: "malformed binding",
+			mutate: func(t *testing.T, installationID string) {
+				t.Helper()
+				require.NoError(t, model.DB.Model(&model.AppPluginLaunchCode{}).Where(
+					"installation_id = ?", installationID,
+				).Update("binding_json", "{").Error)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := setupRouterExecutionTest(t)
+			request := routerLaunchExchangeRequest(t, f)
+			first := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+				"AppService "+f.credential.Credential, "", request)
+			require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+			test.mutate(t, f.app.InstallationID)
+
+			replay := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+				"AppService "+f.credential.Credential, "", request)
+
+			assertRouterAppPluginErrorEnvelope(t, replay, http.StatusNotFound,
+				"not_found", "App plugin not found", false)
+		})
+	}
+}
+
+func TestAppPluginExchangeReplayRejectsPersistedIntegrityTampering(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *routerExecutionFixture)
+	}{
+		{
+			name: "launch binding surface",
+			mutate: func(t *testing.T, f *routerExecutionFixture) {
+				t.Helper()
+				var code model.AppPluginLaunchCode
+				require.NoError(t, model.DB.Where(
+					"installation_id = ?", f.app.InstallationID,
+				).First(&code).Error)
+				var binding model.AppPluginLaunchBinding
+				require.NoError(t, common.UnmarshalJsonStr(code.BindingJSON, &binding))
+				binding.Surface = "embedded"
+				raw, err := common.Marshal(binding)
+				require.NoError(t, err)
+				require.NoError(t, model.DB.Model(&code).
+					Update("binding_json", string(raw)).Error)
+			},
+		},
+		{
+			name: "cached entitlement version",
+			mutate: func(t *testing.T, f *routerExecutionFixture) {
+				t.Helper()
+				var replay model.AppPluginExchangeReplay
+				require.NoError(t, model.DB.Where(
+					"installation_id = ?", f.app.InstallationID,
+				).First(&replay).Error)
+				var result service.AppPluginExchangeResult
+				require.NoError(t, common.UnmarshalJsonStr(replay.ResponseJSON, &result))
+				result.EntitlementVersion = "tampered-version"
+				raw, err := common.Marshal(result)
+				require.NoError(t, err)
+				require.NoError(t, model.DB.Model(&replay).
+					Update("response_json", string(raw)).Error)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := setupRouterExecutionTest(t)
+			request := routerLaunchExchangeRequest(t, f)
+			first := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+				"AppService "+f.credential.Credential, "", request)
+			require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+			test.mutate(t, f)
+
+			replay := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+				"AppService "+f.credential.Credential, "", request)
+
+			assertRouterAppPluginErrorEnvelope(t, replay, http.StatusNotFound,
+				"not_found", "App plugin not found", false)
+		})
+	}
+}
+
+func TestAppPluginExchangeReplayStorageFaultsAreRetryable(t *testing.T) {
+	t.Run("response query", func(t *testing.T) {
+		f := setupRouterExecutionTest(t)
+		request := routerLaunchExchangeRequest(t, f)
+		first := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+			"AppService "+f.credential.Credential, "", request)
+		require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+		privateDetail := "private cached response query detail"
+		failed := registerRouterExecutionDBFault(
+			t, "query", "app_plugin_exchange_replays", 1, privateDetail,
+		)
+
+		replay := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+			"AppService "+f.credential.Credential, "", request)
+
+		require.True(t, failed.Load())
+		assertRouterPublicStorageError(t, replay, privateDetail)
+	})
+
+	for _, test := range []struct {
+		name  string
+		table string
+	}{
+		{name: "session write", table: "app_plugin_sessions"},
+		{name: "response write", table: "app_plugin_exchange_replays"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := setupRouterExecutionTest(t)
+			request := routerLaunchExchangeRequest(t, f)
+			privateDetail := "private " + test.name + " detail"
+			failed := registerRouterExecutionDBFault(
+				t, "create", test.table, 1, privateDetail,
+			)
+
+			response := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+				"AppService "+f.credential.Credential, "", request)
+
+			require.True(t, failed.Load())
+			assertRouterPublicStorageError(t, response, privateDetail)
+		})
+	}
+}
+
+func TestAppPluginExchangeReplayRequiresPersistedSession(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, service.AppPluginExchangeResult)
+	}{
+		{
+			name: "missing session",
+			mutate: func(t *testing.T, original service.AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, model.DB.Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Delete(&model.AppPluginSession{}).Error)
+			},
+		},
+		{
+			name: "mismatched session",
+			mutate: func(t *testing.T, original service.AppPluginExchangeResult) {
+				t.Helper()
+				require.NoError(t, model.DB.Model(&model.AppPluginSession{}).Where(
+					"app_session_id = ?", original.AppSessionID,
+				).Update("subject", "user_999999").Error)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := setupRouterExecutionTest(t)
+			request := routerLaunchExchangeRequest(t, f)
+			first := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+				"AppService "+f.credential.Credential, "", request)
+			require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+			var envelope struct {
+				Data service.AppPluginExchangeResult `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(first.Body.Bytes(), &envelope))
+			test.mutate(t, envelope.Data)
+
+			replay := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+				"AppService "+f.credential.Credential, "", request)
+
+			assertRouterAppPluginErrorEnvelope(t, replay, http.StatusNotFound,
+				"not_found", "App plugin not found", false)
+		})
+	}
+}
+
+func TestAppPluginExchangeReplayPersistedSessionFaultIsRetryable(t *testing.T) {
+	f := setupRouterExecutionTest(t)
+	request := routerLaunchExchangeRequest(t, f)
+	first := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+		"AppService "+f.credential.Credential, "", request)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	privateDetail := "private exchange replay persisted session detail"
+	failed := registerRouterExecutionQueryFault(
+		t, "app_plugin_sessions", 1, privateDetail,
+	)
+
+	replay := f.call(t, http.MethodPost, "/internal/apps/v1/launch-codes/exchange",
+		"AppService "+f.credential.Credential, "", request)
+
+	require.True(t, failed.Load(), "replay must reload the persisted session")
+	assertRouterPublicStorageError(t, replay, privateDetail)
 }
 
 func TestAppExecutionControlHTTPContracts(t *testing.T) {
@@ -1083,6 +2178,27 @@ func TestAppExecutionControlHTTPContracts(t *testing.T) {
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &facts))
 	assert.Len(t, facts.Data, 13)
 	assert.Equal(t, "running", facts.Data["status"])
+	t.Run("task lookup storage failure is retryable", func(t *testing.T) {
+		const privateDetail = "private task lookup storage detail"
+		var failed atomic.Bool
+		callbackName := "test:task-lookup-route-storage-failure:" + uuid.NewString()
+		require.NoError(t, model.DB.Callback().Query().Before("gorm:query").
+			Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement.Table == "app_installations" && failed.CompareAndSwap(false, true) {
+					tx.AddError(errors.New(privateDetail))
+				}
+			}))
+		defer func() {
+			require.NoError(t, model.DB.Callback().Query().Remove(callbackName))
+		}()
+
+		failedResponse := f.call(t, http.MethodPost, "/internal/apps/v1/tasks/lookup", auth, "", lookup)
+
+		require.True(t, failed.Load(), "the route must execute the installation query")
+		assertRouterAppPluginErrorEnvelope(t, failedResponse, http.StatusServiceUnavailable,
+			"service_unavailable", "App service request denied", true)
+		assert.NotContains(t, failedResponse.Body.String(), privateDetail)
+	})
 	delete(lookup, "grant_id")
 	response = f.call(t, http.MethodPost, "/internal/apps/v1/tasks/lookup", auth, "", lookup)
 	assert.Equal(t, http.StatusBadRequest, response.Code)
@@ -1149,6 +2265,213 @@ func TestAppExecutionControlHTTPContracts(t *testing.T) {
 	})
 }
 
+func TestAppTaskControlRoutesMapTransactionBoundaryFailuresToServiceUnavailable(t *testing.T) {
+	operations := []struct {
+		name string
+		path string
+		key  string
+		body func(*routerExecutionFixture, model.AppTaskExecution) any
+	}{
+		{
+			name: "lookup",
+			path: "/internal/apps/v1/tasks/lookup",
+			body: func(f *routerExecutionFixture, task model.AppTaskExecution) any {
+				return service.AppTaskLookupRequest{
+					RequestID: uuid.NewString(), AppKey: f.app.AppKey,
+					AppSessionID: f.session.AppSessionID, Subject: f.session.Subject,
+					TaskID: &task.TaskID,
+				}
+			},
+		},
+		{
+			name: "cancel",
+			path: "/internal/apps/v1/tasks/cancel",
+			key:  "task-control-boundary",
+			body: func(f *routerExecutionFixture, task model.AppTaskExecution) any {
+				return service.AppTaskCancelRequest{
+					RequestID: uuid.NewString(), AppKey: f.app.AppKey,
+					AppSessionID: f.session.AppSessionID, Subject: f.session.Subject,
+					TaskID: task.TaskID, Reason: "user_requested",
+				}
+			},
+		},
+	}
+	boundaries := []struct {
+		name      string
+		beginErr  error
+		commitErr error
+	}{
+		{name: "begin", beginErr: errors.New("private task control route begin detail")},
+		{name: "commit", commitErr: errors.New("private task control route commit detail")},
+	}
+	for _, operation := range operations {
+		for _, boundary := range boundaries {
+			t.Run(operation.name+"/"+boundary.name, func(t *testing.T) {
+				f := setupRouterExecutionTest(t)
+				version := f.publish(t)
+				grantRequest := service.AppExecutionGrantRequest{
+					RequestID: uuid.NewString(), AppKey: f.app.AppKey,
+					AppSessionID: f.session.AppSessionID, Subject: f.session.Subject,
+					RunID: uuid.NewString(), ExecutionRequestID: uuid.NewString(),
+					Operation: "model.generate", ModelPolicyVersion: version,
+					RequestedModels: []string{"doubao-seedance-2-5-260628"},
+					Strategy:        "stable", ConversionPolicy: "strict",
+					PassthroughSelections: []service.AppPassthroughSelection{},
+				}
+				auth := "AppService " + f.credential.Credential
+				grantResponse := f.call(
+					t, http.MethodPost, "/internal/apps/v1/execution-grants",
+					auth, "", grantRequest,
+				)
+				require.Equal(t, http.StatusOK, grantResponse.Code, grantResponse.Body.String())
+				var grant struct {
+					Data service.AppExecutionGrantResult `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(grantResponse.Body.Bytes(), &grant))
+				task := model.AppTaskExecution{
+					TaskID: "task-control-boundary", GrantID: grant.Data.GrantID,
+					LogicalHash: "task-control-boundary-logical", AppKey: f.app.AppKey,
+					InstallationID: f.app.InstallationID,
+					AppSessionID:   f.session.AppSessionID, Subject: f.session.Subject,
+					UserID: f.session.UserID, RunID: grantRequest.RunID,
+					ExecutionRequestID: grantRequest.ExecutionRequestID,
+					Operation:          grantRequest.Operation, ProviderAccepted: true,
+					Status: "accepted", ProviderState: "running",
+					ActualModel: grantRequest.RequestedModels[0],
+					PluginKey:   "doubao", PluginVersion: "1.2.0",
+					UpdatedAt: time.Now().Unix(),
+				}
+				require.NoError(t, model.DB.Create(&task).Error)
+				scopes := `["task.read"]`
+				if operation.name == "cancel" {
+					scopes = `["task.read","model.invoke"]`
+				}
+				require.NoError(t, model.DB.Model(&model.AppServiceCredentialBinding{}).
+					Where("credential_id = ?", f.credential.CredentialID).
+					Update("scopes", scopes).Error)
+				currentDB := model.DB
+				model.DB = routerExecutionDBWithTransactionFault(
+					model.DB, boundary.beginErr, boundary.commitErr,
+				)
+				t.Cleanup(func() { model.DB = currentDB })
+
+				response := f.call(
+					t, http.MethodPost, operation.path, auth, operation.key,
+					operation.body(f, task),
+				)
+
+				privateDetail := boundary.beginErr
+				if privateDetail == nil {
+					privateDetail = boundary.commitErr
+				}
+				assertRouterAppPluginErrorEnvelope(
+					t, response, http.StatusServiceUnavailable,
+					"service_unavailable", "App service request denied", true,
+				)
+				assert.NotContains(t, response.Body.String(), privateDetail.Error())
+			})
+		}
+	}
+}
+
+func setupRouterArkImportRequest(
+	t *testing.T,
+	project string,
+) (*routerExecutionFixture, string, service.AppArkImportLookupRequest) {
+	t.Helper()
+	f := setupRouterExecutionTest(t)
+	require.NoError(t, model.DB.Model(&model.AppServiceCredentialBinding{}).
+		Where("credential_id = ?", f.credential.CredentialID).
+		Update("scopes", `["task.import"]`).Error)
+	start, end := time.Now().Add(-time.Hour), time.Now()
+	delegations := service.AppArkImportDelegations{Delegations: []service.AppArkImportDelegation{{
+		InstallationID: f.app.InstallationID,
+		UserID:         f.session.UserID,
+		AccountRef:     "host-account",
+		ProjectID:      project,
+		StartAt:        start,
+		EndAt:          end.Add(time.Minute),
+	}}}
+	_, err := service.PublishAppArkImportDelegations(
+		t.Context(), model.DB, f.root, routerAppPluginJSON(t, delegations), time.Now(),
+	)
+	require.NoError(t, err)
+	request := service.AppArkImportLookupRequest{
+		RequestID: uuid.NewString(), AppKey: f.app.AppKey,
+		AppSessionID: f.session.AppSessionID, Subject: f.session.Subject,
+		TaskID: "cgt-route-import",
+		QueryScope: service.AppArkQueryScope{
+			ProjectID: "project", StartAt: start, EndAt: end,
+		},
+	}
+	return f, "AppService " + f.credential.Credential, request
+}
+
+func TestAppArkImportRoutePreservesStorageFailuresAndBusinessControls(t *testing.T) {
+	const path = "/internal/apps/v1/imports/ark-task-lookup"
+	t.Run("initial policy query failure", func(t *testing.T) {
+		f, auth, request := setupRouterArkImportRequest(t, "project")
+		const privateDetail = "private Ark route policy query detail"
+		failed := registerRouterExecutionQueryFault(t, "options", 1, privateDetail)
+
+		response := f.call(t, http.MethodPost, path, auth, "", request)
+
+		require.True(t, failed.Load(), "the actual route must execute the policy query")
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusServiceUnavailable,
+			"service_unavailable", "App plugin request failed", true)
+		assert.NotContains(t, response.Body.String(), privateDetail)
+	})
+
+	for _, boundary := range []struct {
+		name      string
+		beginErr  error
+		commitErr error
+	}{
+		{name: "begin failure", beginErr: errors.New("private Ark route begin detail")},
+		{name: "commit failure", commitErr: errors.New("private Ark route commit detail")},
+	} {
+		t.Run(boundary.name, func(t *testing.T) {
+			f, auth, request := setupRouterArkImportRequest(t, "project")
+			currentDB := model.DB
+			model.DB = routerExecutionDBWithTransactionFault(
+				model.DB, boundary.beginErr, boundary.commitErr,
+			)
+			t.Cleanup(func() { model.DB = currentDB })
+
+			response := f.call(t, http.MethodPost, path, auth, "", request)
+
+			privateDetail := boundary.beginErr
+			if privateDetail == nil {
+				privateDetail = boundary.commitErr
+			}
+			assertRouterAppPluginErrorEnvelope(t, response, http.StatusServiceUnavailable,
+				"service_unavailable", "App service request denied", true)
+			assert.NotContains(t, response.Body.String(), privateDetail.Error())
+		})
+	}
+
+	t.Run("missing policy", func(t *testing.T) {
+		f, auth, request := setupRouterArkImportRequest(t, "project")
+		require.NoError(t, model.DB.Where(
+			"policy_key = ?", model.AppArkImportDelegationsKey,
+		).Delete(&model.AppExecutionPolicyVersion{}).Error)
+
+		response := f.call(t, http.MethodPost, path, auth, "", request)
+
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusNotFound,
+			"not_found", "App plugin not found", false)
+	})
+
+	t.Run("scope denied", func(t *testing.T) {
+		f, auth, request := setupRouterArkImportRequest(t, "other-project")
+
+		response := f.call(t, http.MethodPost, path, auth, "", request)
+
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusForbidden,
+			"scope_denied", "App permission denied", false)
+	})
+}
+
 func TestAppExecutionHTTPRolloutGates(t *testing.T) {
 	f := setupRouterExecutionAppTest(t, "seedance-repro")
 	request := service.AppExecutionGrantRequest{RequestID: uuid.NewString(), AppKey: f.app.AppKey,
@@ -1176,21 +2499,20 @@ func TestAppExecutionHTTPRolloutGates(t *testing.T) {
 	introspect := service.AppPluginIntrospectRequest{AppKey: f.app.AppKey, AppSessionID: f.session.AppSessionID,
 		Subject: f.session.Subject, RequiredScopes: []string{}, RequiredEntitlements: model.AppJSONMap{}}
 	for _, test := range []struct {
-		name string
-		flag *bool
+		name, key, code string
 	}{
-		{"execution", &operation_setting.AppExecutionGrantsEnabled},
-		{"seedance", &operation_setting.AppPluginSeedanceEnabled},
-		{"app_plugin", &operation_setting.AppPluginV1Enabled},
+		{"execution", operation_setting.AppExecutionGrantsEnabledOptionKey, "app_execution_disabled"},
+		{"seedance", operation_setting.AppPluginSeedanceEnabledOptionKey, "app_plugin_disabled"},
+		{"app_plugin", operation_setting.AppPluginV1EnabledOptionKey, "app_plugin_disabled"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			*test.flag = false
-			defer func() { *test.flag = true }()
+			setRouterAppPluginFlag(test.key, false)
+			defer setRouterAppPluginFlag(test.key, true)
 			request.RequestID = uuid.NewString()
 			response := f.call(t, http.MethodPost, "/internal/apps/v1/execution-grants", auth, "", request)
 			assert.Equal(t, http.StatusForbidden, response.Code, "closed rollout gate must reject new grants")
 			if response.Code != http.StatusOK {
-				assert.Equal(t, "app_plugin_disabled", routerAppPluginErrorCode(t, response))
+				assert.Equal(t, test.code, routerAppPluginErrorCode(t, response))
 			}
 			assert.Equal(t, http.StatusForbidden,
 				f.call(t, http.MethodPost, "/internal/apps/v1/tasks/cancel", auth, "rollout-cancel", cancel).Code)
@@ -1205,15 +2527,15 @@ func TestAppExecutionHTTPRolloutGates(t *testing.T) {
 	}
 	for _, test := range []struct {
 		name     string
-		flag     *bool
+		key      string
 		surfaces []string
 	}{
-		{"seedance", &operation_setting.AppPluginSeedanceEnabled, []string{"direct", "embedded"}},
-		{"embedded", &operation_setting.AppPluginEmbeddedSurfaceEnabled, []string{"embedded"}},
+		{"seedance", operation_setting.AppPluginSeedanceEnabledOptionKey, []string{"direct", "embedded"}},
+		{"embedded", operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey, []string{"embedded"}},
 	} {
 		t.Run("navigation_"+test.name, func(t *testing.T) {
-			*test.flag = false
-			defer func() { *test.flag = true }()
+			setRouterAppPluginFlag(test.key, false)
+			defer setRouterAppPluginFlag(test.key, true)
 			response := f.call(t, http.MethodGet, "/api/app_plugins", "Bearer "+f.userJWT, "", nil)
 			require.Equal(t, http.StatusOK, response.Code)
 			var navigation struct {
@@ -1269,8 +2591,8 @@ func TestAppExecutionHTTPRolloutGates(t *testing.T) {
 		assert.Equal(t, test.count, count, "closed rollout gates must not create side effects")
 	}
 	t.Run("session invalidation remains available", func(t *testing.T) {
-		operation_setting.AppPluginV1Enabled = false
-		defer func() { operation_setting.AppPluginV1Enabled = true }()
+		setRouterAppPluginFlag(operation_setting.AppPluginV1EnabledOptionKey, false)
+		defer setRouterAppPluginFlag(operation_setting.AppPluginV1EnabledOptionKey, true)
 		revoke := service.AppPluginSessionRevokeRequest{RequestID: uuid.NewString(), AppKey: f.app.AppKey,
 			AppSessionID: f.session.AppSessionID, Subject: f.session.Subject, Reason: "user_logout"}
 		response := f.call(t, http.MethodPost, "/internal/apps/v1/sessions/revoke", auth, "stop-session", revoke)
@@ -1279,6 +2601,723 @@ func TestAppExecutionHTTPRolloutGates(t *testing.T) {
 		response = f.call(t, http.MethodPost, "/internal/apps/v1/tasks/lookup", auth, "", lookup)
 		assert.Equal(t, http.StatusUnauthorized, response.Code, "retained reads still require an unrevoked App session")
 	})
+}
+
+func routerResponseDuringRolloutCommitWindow(
+	t *testing.T,
+	invoke func() *httptest.ResponseRecorder,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	previousDB := model.DB
+	barrier := &routerExecutionCommitBarrier{
+		committed: make(chan struct{}),
+		release:   make(chan struct{}),
+	}
+	model.DB = routerExecutionDBWithCommitBarrier(model.DB, barrier)
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(barrier.release)
+		}
+		model.DB = previousDB
+	})
+	writerDone := make(chan error, 1)
+	go func() {
+		writerDone <- model.UpdateOption(
+			operation_setting.AppExecutionGrantsEnabledOptionKey, "false",
+		)
+	}()
+	select {
+	case <-barrier.committed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollout writer did not commit before cache publication")
+	}
+
+	response := invoke()
+
+	close(barrier.release)
+	released = true
+	require.NoError(t, <-writerDone)
+	model.DB = previousDB
+	return response
+}
+
+func TestAppExecutionRoutesUseDatabaseTruthDuringRolloutCachePublication(t *testing.T) {
+	t.Run("internal grant", func(t *testing.T) {
+		f := setupRouterExecutionTest(t)
+		request := service.AppExecutionGrantRequest{
+			RequestID: uuid.NewString(), AppKey: f.app.AppKey,
+			AppSessionID: f.session.AppSessionID, Subject: f.session.Subject,
+			RunID: uuid.NewString(), ExecutionRequestID: uuid.NewString(),
+			Operation: "model.generate", ModelPolicyVersion: f.publish(t),
+			RequestedModels: []string{"doubao-seedance-2-5-260628"},
+			Strategy:        "stable", ConversionPolicy: "strict",
+			PassthroughSelections: []service.AppPassthroughSelection{},
+		}
+
+		response := routerResponseDuringRolloutCommitWindow(t, func() *httptest.ResponseRecorder {
+			return f.call(
+				t, http.MethodPost, "/internal/apps/v1/execution-grants",
+				"AppService "+f.credential.Credential, "", request,
+			)
+		})
+
+		assertRouterAppPluginErrorEnvelope(
+			t, response, http.StatusForbidden,
+			"app_execution_disabled", "App execution is disabled", false,
+		)
+	})
+
+	for _, protocol := range []string{"openai_responses", "openai_video"} {
+		t.Run("public "+protocol, func(t *testing.T) {
+			f, issued := setupRouterTaskAppGrant(t, protocol)
+			path := "/v1/videos"
+			if protocol == "openai_responses" {
+				path = "/v1/responses"
+			}
+
+			response := routerResponseDuringRolloutCommitWindow(t, func() *httptest.ResponseRecorder {
+				return routerAppPluginRequestWithHeaders(
+					f.engine, http.MethodPost, "https://console.example.com"+path, "",
+					routerTaskAppGrantBody(protocol),
+					map[string]string{"Authorization": "AppGrant " + issued.GrantToken},
+				)
+			})
+
+			assertRouterAppPluginErrorEnvelope(
+				t, response, http.StatusForbidden,
+				"app_execution_disabled", "App service request denied", false,
+			)
+		})
+	}
+}
+
+func TestAppPluginRolloutCachePublicationIsRaceFree(t *testing.T) {
+	f := setupRouterExecutionAppTest(t, "seedance-repro")
+	common.OptionMapRWMutex.Lock()
+	previousOptions := maps.Clone(common.OptionMap)
+	previousFlags := [4]bool{
+		operation_setting.AppPluginV1Enabled,
+		operation_setting.AppPluginSeedanceEnabled,
+		operation_setting.AppPluginEmbeddedSurfaceEnabled,
+		operation_setting.AppExecutionGrantsEnabled,
+	}
+	common.OptionMap = maps.Clone(common.OptionMap)
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		operation_setting.AppPluginV1Enabled = previousFlags[0]
+		operation_setting.AppPluginSeedanceEnabled = previousFlags[1]
+		operation_setting.AppPluginEmbeddedSurfaceEnabled = previousFlags[2]
+		operation_setting.AppExecutionGrantsEnabled = previousFlags[3]
+		common.OptionMapRWMutex.Unlock()
+	})
+
+	start := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		<-start
+		for i := range 200 {
+			enabled := i%2 == 0
+			value := strconv.FormatBool(enabled)
+			common.OptionMapRWMutex.Lock()
+			operation_setting.AppPluginV1Enabled = enabled
+			operation_setting.AppPluginSeedanceEnabled = enabled
+			operation_setting.AppPluginEmbeddedSurfaceEnabled = enabled
+			operation_setting.AppExecutionGrantsEnabled = enabled
+			common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] = value
+			common.OptionMap[operation_setting.AppPluginSeedanceEnabledOptionKey] = value
+			common.OptionMap[operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey] = value
+			common.OptionMap[operation_setting.AppExecutionGrantsEnabledOptionKey] = value
+			common.OptionMapRWMutex.Unlock()
+		}
+	}()
+
+	close(start)
+	for range 200 {
+		_ = f.call(t, http.MethodGet, "/api/app_plugins", "Bearer "+f.userJWT, "", nil)
+		_ = f.call(
+			t, http.MethodPost, "/internal/apps/v1/execution-grants",
+			"AppService "+f.credential.Credential, "", map[string]any{},
+		)
+	}
+	<-writerDone
+}
+
+func TestAppGrantTaskBackedRoutesPreserveStorageErrorTaxonomy(t *testing.T) {
+	for _, protocol := range []string{"openai_responses", "openai_video"} {
+		path := "/v1/videos"
+		if protocol == "openai_responses" {
+			path = "/v1/responses"
+		}
+		for _, failure := range []struct {
+			name       string
+			operation  string
+			table      string
+			occurrence int32
+		}{
+			{name: "passthrough", operation: "query", table: "app_execution_grants", occurrence: 5},
+			{name: "billing inputs", operation: "query", table: "app_execution_grants", occurrence: 6},
+			{name: "claim grant", operation: "query", table: "app_execution_grants", occurrence: 9},
+			{name: "claim", operation: "query", table: "app_task_executions", occurrence: 1},
+			{name: "funding read", operation: "query", table: "users", occurrence: 4},
+			{name: "funding write", operation: "update", table: "users", occurrence: 1},
+			{name: "claim create", operation: "create", table: "app_task_executions", occurrence: 1},
+			{name: "acceptance", operation: "query", table: "app_task_executions", occurrence: 2},
+			{name: "projection", operation: "query", table: "tasks", occurrence: 1},
+		} {
+			t.Run(protocol+"/"+failure.name, func(t *testing.T) {
+				f, issued := setupRouterTaskAppGrant(t, protocol)
+				privateDetail := "private " + protocol + " " + failure.name + " storage detail"
+				failed := registerRouterExecutionDBFault(
+					t, failure.operation, failure.table, failure.occurrence, privateDetail,
+				)
+
+				response := routerAppPluginRequestWithHeaders(
+					f.engine, http.MethodPost, "https://console.example.com"+path, "",
+					routerTaskAppGrantBody(protocol),
+					map[string]string{"Authorization": "AppGrant " + issued.GrantToken},
+				)
+
+				require.True(t, failed.Load(), "the intended public route boundary must be exercised")
+				assertRouterPublicStorageError(t, response, privateDetail)
+			})
+		}
+	}
+}
+
+func TestAppGrantTaskBackedRoutesTreatBillingGrantDisappearanceAsInvalidGrant(t *testing.T) {
+	for _, protocol := range []string{"openai_responses", "openai_video"} {
+		t.Run(protocol, func(t *testing.T) {
+			f, issued := setupRouterTaskAppGrant(t, protocol)
+			path := "/v1/videos"
+			if protocol == "openai_responses" {
+				path = "/v1/responses"
+			}
+			barrier := registerRouterGrantReadBarrier(t, 6)
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"https://console.example.com"+path,
+				bytes.NewReader(routerTaskAppGrantBody(protocol)),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "AppGrant "+issued.GrantToken)
+			response := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				f.engine.ServeHTTP(response, request)
+			}()
+			select {
+			case <-barrier.reached:
+			case <-time.After(5 * time.Second):
+				t.Fatal("request did not reach the billing grant reread")
+			}
+			require.NoError(t, model.DB.Where("grant_id = ?", issued.GrantID).
+				Delete(&model.AppExecutionGrant{}).Error)
+			barrier.unblock()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("request did not finish after deleting the billing grant")
+			}
+
+			require.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), `"code":"invalid_grant"`)
+			assert.Contains(t, response.Body.String(), `"retryable":false`)
+			assert.NotContains(t, response.Body.String(), `"detail"`)
+			assert.NotContains(t, response.Body.String(), "service_unavailable")
+		})
+	}
+}
+
+func TestAppGrantTaskBackedRoutesPreserveClaimBusinessErrors(t *testing.T) {
+	for _, protocol := range []string{"openai_responses", "openai_video"} {
+		path := "/v1/videos"
+		if protocol == "openai_responses" {
+			path = "/v1/responses"
+		}
+		t.Run(protocol+"/insufficient quota", func(t *testing.T) {
+			f, issued := setupRouterTaskAppGrant(t, protocol)
+			require.NoError(t, model.DB.Model(&model.User{}).
+				Where("id = ?", f.session.UserID).Update("quota", 0).Error)
+
+			response := routerAppPluginRequestWithHeaders(
+				f.engine, http.MethodPost, "https://console.example.com"+path, "",
+				routerTaskAppGrantBody(protocol),
+				map[string]string{"Authorization": "AppGrant " + issued.GrantToken},
+			)
+
+			require.Equal(t, http.StatusPaymentRequired, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), `"code":"insufficient_quota"`)
+			assert.Contains(t, response.Body.String(), `"retryable":false`)
+		})
+
+		t.Run(protocol+"/expired at claim", func(t *testing.T) {
+			f, issued := setupRouterTaskAppGrant(t, protocol)
+			expired := registerRouterGrantExpiryAtQuery(t, 9)
+
+			response := routerAppPluginRequestWithHeaders(
+				f.engine, http.MethodPost, "https://console.example.com"+path, "",
+				routerTaskAppGrantBody(protocol),
+				map[string]string{"Authorization": "AppGrant " + issued.GrantToken},
+			)
+
+			require.True(t, expired.Load(), "grant must expire at the durable claim read")
+			require.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), `"code":"execution_grant_expired"`)
+			assert.Contains(t, response.Body.String(), `"retryable":false`)
+		})
+	}
+}
+
+func TestAppGrantTaskBackedRoutesKeepInvalidPriceInputsNonretryable(t *testing.T) {
+	const expression = `v1:tier("base", u("tokens") * 9.8 / 1000000) * ` +
+		`(header("x-service-tier") == "fast" ? 2 : 1)`
+	for _, protocol := range []string{"openai_responses", "openai_video"} {
+		t.Run(protocol, func(t *testing.T) {
+			f, issued := setupRouterTaskAppGrantWithBillingExpression(t, protocol, expression)
+			path := "/v1/videos"
+			wantCode := "invalid_price_inputs"
+			if protocol == "openai_responses" {
+				path = "/v1/responses"
+				wantCode = "invalid_request_error"
+			}
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"https://console.example.com"+path,
+				bytes.NewReader(routerTaskAppGrantBody(protocol)),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "AppGrant "+issued.GrantToken)
+			request.Header["X-Service-Tier"] = []string{"fast", "slow"}
+			response := httptest.NewRecorder()
+
+			f.engine.ServeHTTP(response, request)
+
+			require.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+			assert.Contains(t, response.Body.String(), `"code":"`+wantCode+`"`)
+			assert.Contains(t, response.Body.String(), `"retryable":false`)
+		})
+	}
+}
+
+func setupRouterTaskRetrieval(t *testing.T, protocol string) (*routerExecutionFixture,
+	service.AppExecutionGrantResult, model.AppTaskExecution,
+) {
+	t.Helper()
+	f, issued := setupRouterTaskAppGrant(t, protocol)
+	var grant model.AppExecutionGrant
+	require.NoError(t, model.DB.Where("grant_id = ?", issued.GrantID).First(&grant).Error)
+	var candidates []model.AppExecutionModel
+	require.NoError(t, common.UnmarshalJsonStr(grant.ModelsJSON, &candidates))
+	require.NotEmpty(t, candidates)
+	candidate := candidates[0]
+	execution := model.AppTaskExecution{
+		ExecutionKind: model.AppExecutionKindTask,
+		LogicalHash:   fmt.Sprintf("retrieval-logical-%s", protocol),
+		TaskID:        "task_route_retrieval",
+		GrantID:       grant.GrantID,
+		AppKey:        grant.AppKey, InstallationID: grant.InstallationID,
+		AppSessionID: grant.AppSessionID, Subject: grant.Subject, UserID: grant.UserID,
+		RunID: grant.RunID, ExecutionRequestID: grant.ExecutionRequestID, Operation: grant.Operation,
+		SubmissionHash: "retrieval-submission",
+		PublicModel:    candidate.PublicModel, ActualModel: candidate.ActualModel,
+		ActualGroup: candidate.Group, ChannelID: candidate.ChannelID,
+		PluginKey: candidate.PluginKey, PluginVersion: candidate.PluginVersion,
+		PluginSHA256: candidate.PluginSHA256, Protocol: candidate.Protocol,
+		ProviderTaskID: "cgt-route-retrieval", ProviderAccepted: true,
+		Status: "accepted", ProviderState: "queued", BillingState: "reserved",
+		FundingSource: grant.FundingSource, FundingRef: grant.FundingRef,
+		CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix(),
+	}
+	require.NoError(t, model.DB.Create(&execution).Error)
+	projection := model.Task{
+		TaskID: execution.TaskID, Platform: constant.TaskPlatform(execution.PluginKey),
+		UserId: execution.UserID, Group: execution.ActualGroup, ChannelId: execution.ChannelID,
+		Status: model.TaskStatusQueued, ExecutionMode: model.TaskExecutionModeAppManaged,
+		Properties: model.Properties{
+			OriginModelName: execution.PublicModel, UpstreamModelName: execution.ActualModel,
+		},
+		PrivateData: model.TaskPrivateData{
+			UpstreamTaskID:      execution.ProviderTaskID,
+			ResponsesBackground: protocol == "openai_responses",
+		},
+	}
+	require.NoError(t, model.DB.Create(&projection).Error)
+	return f, issued, execution
+}
+
+func TestAppGrantTaskRetrievalRoutesDistinguishStorageFailureFromMissing(t *testing.T) {
+	for _, route := range []struct {
+		name     string
+		protocol string
+		path     func(model.AppTaskExecution) string
+	}{
+		{name: "responses", protocol: "openai_responses", path: func(execution model.AppTaskExecution) string {
+			return "/v1/responses/resp_" + strings.TrimPrefix(execution.TaskID, "task_")
+		}},
+		{name: "video", protocol: "openai_video", path: func(execution model.AppTaskExecution) string {
+			return "/v1/videos/" + execution.TaskID
+		}},
+		{name: "task", protocol: "openai_video", path: func(execution model.AppTaskExecution) string {
+			return "/v1/tasks/" + execution.TaskID
+		}},
+	} {
+		for _, failure := range []struct {
+			name  string
+			table string
+		}{
+			{name: "execution", table: "app_task_executions"},
+			{name: "projection", table: "tasks"},
+		} {
+			t.Run(route.name+"/"+failure.name+" storage failure", func(t *testing.T) {
+				f, issued, execution := setupRouterTaskRetrieval(t, route.protocol)
+				privateDetail := "private " + route.name + " " + failure.name + " lookup detail"
+				failed := registerRouterExecutionQueryFault(t, failure.table, 1, privateDetail)
+
+				response := routerAppPluginRequestWithHeaders(
+					f.engine, http.MethodGet,
+					"https://console.example.com"+route.path(execution), "", nil,
+					map[string]string{"Authorization": "AppGrant " + issued.GrantToken},
+				)
+
+				require.True(t, failed.Load())
+				assertRouterAppPluginErrorEnvelope(t, response, http.StatusServiceUnavailable,
+					"service_unavailable", "App service request denied", true)
+				assert.NotContains(t, response.Body.String(), privateDetail)
+			})
+		}
+
+		t.Run(route.name+"/missing", func(t *testing.T) {
+			f, issued, execution := setupRouterTaskRetrieval(t, route.protocol)
+			missingPath := strings.Replace(route.path(execution), execution.TaskID, "task_missing", 1)
+			if route.protocol == "openai_responses" {
+				missingPath = "/v1/responses/resp_missing"
+			}
+			response := routerAppPluginRequestWithHeaders(
+				f.engine, http.MethodGet, "https://console.example.com"+missingPath, "", nil,
+				map[string]string{"Authorization": "AppGrant " + issued.GrantToken},
+			)
+			assertRouterAppPluginErrorEnvelope(t, response, http.StatusNotFound,
+				"not_found", "App service request denied", false)
+		})
+	}
+}
+
+func setupRouterAppTaskArtifactCapability(t *testing.T) (*routerExecutionFixture, model.AppTaskExecution, string) {
+	t.Helper()
+	f, _, execution := setupRouterTaskRetrieval(t, "openai_video")
+	require.NoError(t, model.DB.Model(&model.AppTaskExecution{}).
+		Where("id = ?", execution.ID).
+		Updates(map[string]any{
+			"provider_state": "succeeded",
+			"artifacts_json": `[{"key":"video","type":"video","mime_type":"video/mp4"}]`,
+			"updated_at":     time.Now().Unix(),
+		}).Error)
+	var projection model.Task
+	require.NoError(t, model.DB.Where("task_id = ?", execution.TaskID).First(&projection).Error)
+	projection.Status = model.TaskStatusSuccess
+	projection.PrivateData.AppArtifactURLs = map[string]string{
+		"video": "https://media.example.com/private-video.mp4",
+	}
+	require.NoError(t, model.DB.Save(&projection).Error)
+	taskID := execution.TaskID
+	response := f.call(t, http.MethodPost, "/internal/apps/v1/tasks/lookup",
+		"AppService "+f.credential.Credential, "", service.AppTaskLookupRequest{
+			RequestID: uuid.NewString(), AppKey: f.app.AppKey,
+			AppSessionID: f.session.AppSessionID, Subject: f.session.Subject, TaskID: &taskID,
+		})
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var envelope struct {
+		Data struct {
+			Artifacts []struct {
+				ContentURL string `json:"content_url"`
+			} `json:"artifacts"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &envelope))
+	require.Len(t, envelope.Data.Artifacts, 1)
+	require.NotEmpty(t, envelope.Data.Artifacts[0].ContentURL)
+	return f, execution, envelope.Data.Artifacts[0].ContentURL
+}
+
+func TestAppTaskArtifactContentRoutePreservesStorageFailure(t *testing.T) {
+	f, _, contentURL := setupRouterAppTaskArtifactCapability(t)
+	const privateDetail = "private app task artifact execution query detail"
+	failed := registerRouterExecutionQueryFault(t, "app_task_executions", 1, privateDetail)
+
+	response := routerAppPluginRequestWithHeaders(
+		f.engine, http.MethodGet, contentURL, "", nil, nil,
+	)
+
+	require.True(t, failed.Load(), "the capability route must execute the App task query")
+	assertRouterPublicStorageError(t, response, privateDetail)
+	assert.NotContains(t, response.Body.String(), "artifact_not_found")
+}
+
+func TestAppTaskArtifactContentRouteMapsTransactionBoundaryFailuresToServiceUnavailable(t *testing.T) {
+	for _, boundary := range []struct {
+		name      string
+		beginErr  error
+		commitErr error
+	}{
+		{name: "begin", beginErr: errors.New("private artifact route begin detail")},
+		{name: "commit", commitErr: errors.New("private artifact route commit detail")},
+	} {
+		t.Run(boundary.name, func(t *testing.T) {
+			f, _, contentURL := setupRouterAppTaskArtifactCapability(t)
+			currentDB := model.DB
+			model.DB = routerExecutionDBWithTransactionFault(
+				model.DB, boundary.beginErr, boundary.commitErr,
+			)
+			t.Cleanup(func() { model.DB = currentDB })
+
+			response := routerAppPluginRequestWithHeaders(
+				f.engine, http.MethodGet, contentURL, "", nil, nil,
+			)
+
+			privateDetail := boundary.beginErr
+			if privateDetail == nil {
+				privateDetail = boundary.commitErr
+			}
+			assertRouterPublicStorageError(t, response, privateDetail.Error())
+			assert.NotContains(t, response.Body.String(), "artifact_not_found")
+		})
+	}
+}
+
+func TestAppTaskArtifactContentRouteKeepsMissingControlsNonRetryable(t *testing.T) {
+	t.Run("missing task", func(t *testing.T) {
+		f, execution, contentURL := setupRouterAppTaskArtifactCapability(t)
+		require.NoError(t, model.DB.Delete(&model.AppTaskExecution{}, execution.ID).Error)
+
+		response := routerAppPluginRequestWithHeaders(
+			f.engine, http.MethodGet, contentURL, "", nil, nil,
+		)
+
+		require.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"code":"artifact_not_found"`)
+		assert.NotContains(t, response.Body.String(), `"retryable":true`)
+	})
+
+	t.Run("missing artifact", func(t *testing.T) {
+		f, execution, contentURL := setupRouterAppTaskArtifactCapability(t)
+		require.NoError(t, model.DB.Model(&model.AppTaskExecution{}).
+			Where("id = ?", execution.ID).Update("artifacts_json", "[]").Error)
+
+		response := routerAppPluginRequestWithHeaders(
+			f.engine, http.MethodGet, contentURL, "", nil, nil,
+		)
+
+		require.Equal(t, http.StatusNotFound, response.Code, response.Body.String())
+		assert.Contains(t, response.Body.String(), `"code":"artifact_not_found"`)
+		assert.NotContains(t, response.Body.String(), `"retryable":true`)
+	})
+}
+
+func TestAppGrantResponsesWebSocketIsExplicitlyRejected(t *testing.T) {
+	f := setupRouterExecutionTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Token{}))
+	SetRelayRouter(f.engine)
+	request := httptest.NewRequest(http.MethodGet, "https://console.example.com/v1/responses", nil)
+	request.Header.Set("Authorization", "AppGrant "+strings.Repeat("a", 43))
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	request.Header.Set("Sec-WebSocket-Version", "13")
+	request.Header.Set("Sec-WebSocket-Protocol", "responses")
+	response := httptest.NewRecorder()
+
+	f.engine.ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusUnauthorized, response.Code)
+	assert.NotEqual(t, http.StatusSwitchingProtocols, response.Code)
+	assert.NotContains(t, response.Body.String(), "service_unavailable")
+}
+
+func setupRouterNativeAppGrant(t *testing.T, upstreamHandler http.Handler) (
+	*routerExecutionFixture, service.AppExecutionGrantResult, []byte,
+) {
+	t.Helper()
+	upstream := httptest.NewServer(upstreamHandler)
+	t.Cleanup(upstream.Close)
+	f := setupRouterExecutionTest(t)
+	SetTaskPluginProtocolRouter(f.engine)
+	require.NoError(t, model.DB.AutoMigrate(&model.Task{}, &model.SystemTask{}))
+	previousQuotaUnit := common.QuotaPerUnit
+	common.QuotaPerUnit = 500000
+	t.Cleanup(func() { common.QuotaPerUnit = previousQuotaUnit })
+	const publicModel = "registered-native-router"
+	mapping := `{"` + publicModel + `":"gpt-native-router"}`
+	channel := model.Channel{
+		Type: constant.ChannelTypeOpenAI, Name: "native-router", Key: "native-router-secret",
+		BaseURL: common.GetPointer(upstream.URL + "/v1"), ModelMapping: &mapping,
+		Status: common.ChannelStatusEnabled, Group: "default", Models: publicModel,
+	}
+	require.NoError(t, model.DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(model.DB))
+	require.NoError(t, model.DB.Model(&model.Option{}).Where(map[string]any{"key": "ModelPrice"}).
+		Update("value", `{"doubao-seedance-2-5-260628":0.01,"`+publicModel+`":0.02}`).Error)
+	policy := service.AppModelInvokePolicy{Operations: map[string]service.AppModelOperationPolicy{
+		"model.generate": {
+			Models: []service.AppModelAdmission{{
+				PublicModel: publicModel, ActualModel: "gpt-native-router",
+				Protocol: "openai_responses", ExecutionKind: model.AppExecutionModelKindNativeResponse,
+				ChannelTypes: []int{constant.ChannelTypeOpenAI}, RequestProfile: "responses.text.v1",
+			}},
+			Strategies: []string{"stable"}, ConversionPolicies: []string{"strict"},
+			PassthroughRules: []service.AppPassthroughRule{},
+		},
+	}}
+	policyRaw, err := common.Marshal(policy)
+	require.NoError(t, err)
+	policyVersion, err := service.PublishAppModelInvokePolicy(
+		t.Context(), model.DB, f.root, policyRaw, time.Now(),
+	)
+	require.NoError(t, err)
+	request := service.AppExecutionGrantRequest{
+		RequestID: uuid.NewString(), AppKey: f.app.AppKey,
+		AppSessionID: f.session.AppSessionID, Subject: f.session.Subject,
+		RunID: uuid.NewString(), ExecutionRequestID: uuid.NewString(),
+		Operation: "model.generate", ModelPolicyVersion: policyVersion,
+		RequestedModels: []string{publicModel}, Strategy: "stable",
+		ConversionPolicy: "strict", PassthroughSelections: []service.AppPassthroughSelection{},
+	}
+	issuedResponse := f.call(t, http.MethodPost, "/internal/apps/v1/execution-grants",
+		"AppService "+f.credential.Credential, "", request)
+	require.Equal(t, http.StatusOK, issuedResponse.Code, issuedResponse.Body.String())
+	var issued struct {
+		Data service.AppExecutionGrantResult `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(issuedResponse.Body.Bytes(), &issued))
+	require.NotEmpty(t, issued.Data.GrantToken)
+	return f, issued.Data,
+		[]byte(`{"model":"registered-native-router","input":"hello","max_output_tokens":32}`)
+}
+
+func callRouterNativeAppGrant(f *routerExecutionFixture, issued service.AppExecutionGrantResult,
+	body []byte,
+) *httptest.ResponseRecorder {
+	return routerAppPluginRequestWithHeaders(
+		f.engine, http.MethodPost, "https://console.example.com/v1/responses", "", body,
+		map[string]string{"Authorization": "AppGrant " + issued.GrantToken},
+	)
+}
+
+func completedRouterNativeResponse() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w,
+			`{"id":"resp_router","status":"completed","model":"gpt-native-router","error":null,`+
+				`"incomplete_details":null,"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`)
+	})
+}
+
+func TestAppGrantNativeResponseRoutePreservesEveryPreDispatchStorageFailure(t *testing.T) {
+	f, issued, body := setupRouterNativeAppGrant(t, completedRouterNativeResponse())
+	for _, failure := range []struct {
+		name       string
+		operation  string
+		table      string
+		occurrence int32
+	}{
+		{name: "middleware initial grant", operation: "query", table: "app_execution_grants", occurrence: 1},
+		{name: "middleware current grant", operation: "query", table: "app_execution_grants", occurrence: 2},
+		{name: "installation ownership", operation: "query", table: "app_route_claims", occurrence: 1},
+		{name: "installation", operation: "query", table: "app_installations", occurrence: 1},
+		{name: "current service credential", operation: "query", table: "app_service_credentials", occurrence: 1},
+		{name: "app session", operation: "query", table: "app_plugin_sessions", occurrence: 1},
+		{name: "dashboard user", operation: "query", table: "users", occurrence: 1},
+		{name: "dashboard session", operation: "query", table: "user_sessions", occurrence: 1},
+		{name: "registration version", operation: "query", table: "app_versions", occurrence: 1},
+		{name: "registration callback", operation: "query", table: "app_route_claims", occurrence: 2},
+		{name: "execution initial grant", operation: "query", table: "app_execution_grants", occurrence: 3},
+		{name: "execution current grant", operation: "query", table: "app_execution_grants", occurrence: 4},
+		{name: "candidate policy", operation: "query", table: "options", occurrence: 3},
+		{name: "candidate groups", operation: "query", table: "options", occurrence: 4},
+		{name: "candidate channel", operation: "query", table: "channels", occurrence: 1},
+		{name: "candidate ability", operation: "query", table: "abilities", occurrence: 1},
+		{name: "execution lookup", operation: "query", table: "app_task_executions", occurrence: 1},
+		{name: "funding lookup", operation: "query", table: "users", occurrence: 3},
+		{name: "claim write", operation: "create", table: "app_task_executions", occurrence: 1},
+	} {
+		t.Run(failure.name, func(t *testing.T) {
+			privateDetail := "private native route " + failure.name + " storage detail"
+			failed := registerRouterExecutionDBFault(
+				t, failure.operation, failure.table, failure.occurrence, privateDetail,
+			)
+
+			response := callRouterNativeAppGrant(f, issued, body)
+
+			require.True(t, failed.Load(), "the intended native route boundary must be exercised")
+			assertRouterPublicStorageError(t, response, privateDetail)
+		})
+	}
+}
+
+func TestAppGrantNativeResponseRoutePreservesReplayResultStorageFailure(t *testing.T) {
+	f, issued, body := setupRouterNativeAppGrant(t, completedRouterNativeResponse())
+	first := callRouterNativeAppGrant(f, issued, body)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	const privateDetail = "private native route replay result storage detail"
+	failed := registerRouterExecutionDBFault(
+		t, "query", "app_response_results", 1, privateDetail,
+	)
+
+	response := callRouterNativeAppGrant(f, issued, body)
+
+	require.True(t, failed.Load(), "the replay result lookup must be exercised")
+	assertRouterPublicStorageError(t, response, privateDetail)
+}
+
+func TestAppGrantNativeResponseRouteTreatsCorruptPersistedHeadersAsStorageFailure(t *testing.T) {
+	f, issued, body := setupRouterNativeAppGrant(t, completedRouterNativeResponse())
+	first := callRouterNativeAppGrant(f, issued, body)
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	require.NoError(t, model.DB.Model(&model.AppResponseResult{}).
+		Where("execution_id > ?", 0).
+		Update("safe_headers_json", "{").Error)
+
+	response := callRouterNativeAppGrant(f, issued, body)
+
+	assertRouterPublicStorageError(t, response, "private")
+	assert.NotContains(t, response.Body.String(), "execution_outcome_unknown")
+}
+
+func TestAppGrantNativeResponseRoutePreservesFinalizeStorageFailure(t *testing.T) {
+	f, issued, body := setupRouterNativeAppGrant(t, completedRouterNativeResponse())
+	const privateDetail = "private native route finalize storage detail"
+	failed := registerRouterExecutionDBFault(
+		t, "create", "app_response_results", 1, privateDetail,
+	)
+
+	response := callRouterNativeAppGrant(f, issued, body)
+
+	require.True(t, failed.Load(), "the final response persistence must be exercised")
+	assertRouterPublicStorageError(t, response, privateDetail)
+}
+
+func TestAppGrantNativeResponseRouteRequiresUnknownOutcomePersistence(t *testing.T) {
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		require.True(t, ok)
+		connection, _, err := hijacker.Hijack()
+		require.NoError(t, err)
+		require.NoError(t, connection.Close())
+	})
+	f, issued, body := setupRouterNativeAppGrant(t, upstream)
+	const privateDetail = "private native route mark unknown storage detail"
+	failed := registerRouterExecutionDBFault(
+		t, "update", "app_task_executions", 1, privateDetail,
+	)
+
+	response := callRouterNativeAppGrant(f, issued, body)
+
+	require.True(t, failed.Load(), "the unknown-outcome persistence must be exercised")
+	assertRouterPublicStorageError(t, response, privateDetail)
 }
 
 func TestAppGrantNativeResponseHTTPPersistsAndReplays(t *testing.T) {
@@ -1354,6 +3393,53 @@ func TestAppGrantNativeResponseHTTPPersistsAndReplays(t *testing.T) {
 		)
 	}
 
+	t.Run("middleware preserves grant storage failure", func(t *testing.T) {
+		const privateDetail = "private route grant storage detail"
+		var failed atomic.Bool
+		callbackName := "test:responses-route-grant-storage-failure:" + uuid.NewString()
+		require.NoError(t, model.DB.Callback().Query().Before("gorm:query").
+			Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement.Table == "app_execution_grants" && failed.CompareAndSwap(false, true) {
+					tx.AddError(errors.New(privateDetail))
+				}
+			}))
+		defer func() {
+			require.NoError(t, model.DB.Callback().Query().Remove(callbackName))
+		}()
+
+		response := call()
+
+		require.True(t, failed.Load(), "the route must execute AppGrant storage authentication")
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusServiceUnavailable,
+			"service_unavailable", "App service request denied", true)
+		assert.NotContains(t, response.Body.String(), privateDetail)
+	})
+
+	t.Run("middleware preserves missing grant", func(t *testing.T) {
+		response := routerAppPluginRequestWithHeaders(
+			f.engine, http.MethodPost, "https://console.example.com/v1/responses", "", body,
+			map[string]string{"Authorization": "AppGrant " + strings.Repeat("m", 43)},
+		)
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusUnauthorized,
+			"invalid_grant", "App service request denied", false)
+	})
+
+	t.Run("middleware keeps malformed grant and route denial nonretryable", func(t *testing.T) {
+		invalid := routerAppPluginRequestWithHeaders(
+			f.engine, http.MethodPost, "https://console.example.com/v1/responses", "", body,
+			map[string]string{"Authorization": "AppGrant malformed"},
+		)
+		assertRouterAppPluginErrorEnvelope(t, invalid, http.StatusUnauthorized,
+			"invalid_grant", "App service request denied", false)
+
+		denied := routerAppPluginRequestWithHeaders(
+			f.engine, http.MethodPost, "https://console.example.com/v1/responses?trace=1", "", body,
+			map[string]string{"Authorization": "AppGrant " + issued.Data.GrantToken},
+		)
+		assertRouterAppPluginErrorEnvelope(t, denied, http.StatusForbidden,
+			"scope_denied", "App service request denied", false)
+	})
+
 	first := call()
 	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
 	assert.Equal(t, "provider-native-router", first.Header().Get("X-Request-ID"))
@@ -1378,6 +3464,15 @@ func TestAppGrantNativeResponseHTTPPersistsAndReplays(t *testing.T) {
 		require.NoError(t, model.DB.Model(table).Count(&count).Error)
 		assert.Zero(t, count)
 	}
+
+	t.Run("middleware preserves revoked session", func(t *testing.T) {
+		require.NoError(t, model.DB.Model(&model.AppPluginSession{}).
+			Where("app_session_id = ?", f.session.AppSessionID).
+			Update("revoked_at", time.Now().Unix()).Error)
+		response := call()
+		assertRouterAppPluginErrorEnvelope(t, response, http.StatusUnauthorized,
+			"unauthenticated", "App service request denied", false)
+	})
 }
 
 func TestAppExecutionPolicyHTTPPublication(t *testing.T) {
@@ -1645,8 +3740,14 @@ func routerAppWorkerExecution(t *testing.T, upstream, expression string, querySo
 	require.NoError(t, model.DB.Model(&model.Channel{}).Where("id = ?", selected.ChannelID).Update("status", common.ChannelStatusManuallyDisabled).Error)
 	require.NoError(t, model.DB.Model(&model.Option{}).Where(map[string]any{"key": "ModelPrice"}).
 		Update("value", `{"doubao-seedance-2-5-260628":999}`).Error)
-	operation_setting.AppPluginV1Enabled, operation_setting.AppExecutionGrantsEnabled = false, false
-	operation_setting.AppPluginSeedanceEnabled, operation_setting.AppPluginEmbeddedSurfaceEnabled = false, false
+	for _, key := range []string{
+		operation_setting.AppPluginV1EnabledOptionKey,
+		operation_setting.AppExecutionGrantsEnabledOptionKey,
+		operation_setting.AppPluginSeedanceEnabledOptionKey,
+		operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey,
+	} {
+		setRouterAppPluginFlag(key, false)
+	}
 	require.NoError(t, model.DB.First(&execution, execution.ID).Error)
 	return execution, at.Add(2 * time.Hour)
 }

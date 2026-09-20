@@ -165,6 +165,17 @@ type appTaskAuthority struct {
 	reconciliationOnly bool
 }
 
+func appTaskQueryError(err error, notFoundCode string) error {
+	if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, model.ErrAppTaskNotFound) {
+		return appAuthError(notFoundCode)
+	}
+	var authErr *AppPluginAuthError
+	if errors.As(err, &authErr) {
+		return err
+	}
+	return appAuthError("service_unavailable")
+}
+
 // Caller holds this transaction through its object read or frozen replay.
 // Introspection's identity.read requirement is intentionally not used here.
 func (s *AppExecutionService) taskAuthorityTx(tx *gorm.DB, identity model.AppServiceIdentity,
@@ -178,19 +189,22 @@ func (s *AppExecutionService) taskAuthorityTx(tx *gorm.DB, identity model.AppSer
 	}
 	now := s.options.Now().UTC()
 	installation, err := model.LockAppPluginInstallation(tx, identity.AppKey, identity.InstallationID)
-	if err != nil || installation.AppKey != identity.AppKey || installation.InstallationID != identity.InstallationID {
+	if err != nil {
+		return authority, appTaskQueryError(err, "not_found")
+	}
+	if installation.AppKey != identity.AppKey || installation.InstallationID != identity.InstallationID {
 		return authority, appAuthError("not_found")
 	}
 	current, err := model.ValidateAppServiceIdentity(tx, identity, now)
 	if err != nil {
-		return authority, appAuthError("service_identity_invalid")
+		return authority, appServiceIdentityRevalidationError(err)
 	}
 	if installation.Status != model.AppInstallationStatusEnabled {
 		return authority, appAuthError("identity_inactive")
 	}
 	if err := model.AppPluginCurrentRead(tx).Where("app_session_id = ? AND installation_id = ? AND app_key = ? AND subject = ?",
 		sessionID, installation.InstallationID, appKey, subject).First(&authority.session).Error; err != nil {
-		return authority, appAuthError("not_found")
+		return authority, appTaskQueryError(err, "not_found")
 	}
 	session := authority.session
 	if session.AppSessionID != sessionID || session.AppKey != appKey ||
@@ -201,6 +215,7 @@ func (s *AppExecutionService) taskAuthorityTx(tx *gorm.DB, identity model.AppSer
 		SessionID: session.DashboardSessionID, UserAuthVersion: session.AuthVersion, SessionVersion: session.SessionVersion}, now)
 	authority.user = user
 	if identityErr != nil {
+		identityErr = appTaskQueryError(identityErr, "unauthenticated")
 		var authErr *AppPluginAuthError
 		// Logout does not advance either version. Any version mismatch, expiry,
 		// deletion, disable or different revocation reason remains a hard deny.
@@ -227,6 +242,10 @@ func (s *AppExecutionService) taskAuthorityTx(tx *gorm.DB, identity model.AppSer
 	}
 	manifest, _, err := ValidateAppPluginRegistration(tx, installation)
 	if err != nil {
+		var authErr *AppPluginAuthError
+		if !errors.As(err, &authErr) && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return authority, appAuthError("service_unavailable")
+		}
 		return authority, appAuthError("scope_denied")
 	}
 	for _, scope := range required {
@@ -244,11 +263,11 @@ func ownedAppTaskTx(ctx context.Context, tx *gorm.DB, authority appTaskAuthority
 		AppKey: session.AppKey, InstallationID: session.InstallationID, Subject: session.Subject, UserID: authority.user.Id,
 	}, taskID, grantID)
 	if err != nil {
-		return model.AppTaskExecution{}, appAuthError("not_found")
+		return model.AppTaskExecution{}, appTaskQueryError(err, "not_found")
 	}
 	var grant model.AppExecutionGrant
 	if err := model.AppPluginCurrentRead(tx).Where("grant_id = ?", task.GrantID).First(&grant).Error; err != nil {
-		return model.AppTaskExecution{}, appAuthError("not_found")
+		return model.AppTaskExecution{}, appTaskQueryError(err, "not_found")
 	}
 	if task.GrantID != grant.GrantID || task.AppKey != grant.AppKey || task.InstallationID != grant.InstallationID ||
 		task.Subject != grant.Subject || task.UserID != grant.UserID || task.AppSessionID != grant.AppSessionID ||
@@ -317,7 +336,7 @@ func (s *AppExecutionService) LookupScopedTask(ctx context.Context, identity mod
 		return nil
 	})
 	if err != nil {
-		return AppTaskLookupResult{}, err
+		return AppTaskLookupResult{}, appExecutionBoundaryError(err)
 	}
 	return result, nil
 }
@@ -355,7 +374,7 @@ func (s *AppExecutionService) CancelTask(ctx context.Context, identity model.App
 		var replay model.AppTaskCancelReplay
 		q := model.AppPluginCurrentRead(tx).Where("scope_hash = ?", scope).Limit(1).Find(&replay)
 		if q.Error != nil {
-			return q.Error
+			return appAuthError("service_unavailable")
 		}
 		if q.RowsAffected != 0 {
 			if replay.RequestHash != hash {
@@ -388,7 +407,7 @@ func (s *AppExecutionService) CancelTask(ctx context.Context, identity model.App
 			InstallationID: identity.InstallationID, ResponseJSON: string(raw)}).Error
 	})
 	if err != nil {
-		return AppTaskCancelResult{}, err
+		return AppTaskCancelResult{}, appExecutionBoundaryError(err)
 	}
 	return result, nil
 }

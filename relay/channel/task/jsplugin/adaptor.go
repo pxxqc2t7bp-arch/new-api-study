@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -125,7 +126,15 @@ func (a *TaskAdaptor) ValidateRequestAndSetAction(c *gin.Context, info *relaycom
 	}
 	if info.AppSubject != nil {
 		if err := service.PrepareAppTaskPassthrough(c, info); err != nil {
-			return service.TaskErrorWrapperLocal(fmt.Errorf("App passthrough validation failed"), "app_passthrough_invalid", http.StatusBadRequest)
+			var authErr *service.AppPluginAuthError
+			if errors.As(err, &authErr) {
+				return service.TaskErrorWrapperLocal(
+					errors.New(authErr.Code), authErr.Code, service.AppRelayErrorStatus(err),
+				)
+			}
+			return service.TaskErrorWrapperLocal(
+				errors.New("service_unavailable"), "service_unavailable", http.StatusServiceUnavailable,
+			)
 		}
 	}
 	request, hasRequest := c.Get("task_request")

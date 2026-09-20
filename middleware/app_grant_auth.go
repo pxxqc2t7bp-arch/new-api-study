@@ -73,7 +73,7 @@ func AppGrantOrTokenAuth() gin.HandlerFunc {
 		subject, user, err := service.NewAppExecutionService(model.DB, service.ConfiguredAppPluginAuthOptions()).
 			AuthenticateAppRelay(c.Request.Context(), strings.TrimPrefix(headers[0], "AppGrant "), protocol, raw)
 		if err != nil {
-			writeAppServiceAuthError(c, service.AppRelayErrorStatus(err), "app_execution_denied")
+			writeAppServiceAuthError(c, service.AppRelayErrorStatus(err), appGrantAuthErrorCode(err))
 			return
 		}
 		c.Request.Body = io.NopCloser(strings.NewReader(string(raw)))
@@ -143,13 +143,7 @@ func authenticateAppGrantTaskRetrieval(c *gin.Context, protocol, resourceID stri
 		model.DB, service.ConfiguredAppPluginAuthOptions(),
 	).AuthenticateAppTaskRetrieval(c.Request.Context(), raw, protocol, resourceID)
 	if err != nil {
-		status := service.AppRelayErrorStatus(err)
-		code := "app_execution_denied"
-		var authErr *service.AppPluginAuthError
-		if errors.As(err, &authErr) {
-			code = authErr.Code
-		}
-		writeAppServiceAuthError(c, status, code)
+		writeAppServiceAuthError(c, service.AppRelayErrorStatus(err), appGrantAuthErrorCode(err))
 		return
 	}
 	c.Request.Header.Del("Authorization")
@@ -193,7 +187,7 @@ func distributeAppRelay(c *gin.Context, subject *types.AppRelaySubject) {
 	channel, selected, err := service.NewAppExecutionService(model.DB, service.ConfiguredAppPluginAuthOptions()).
 		SelectAppRelayChannel(c.Request.Context(), *subject, constraints)
 	if err != nil {
-		writeAppServiceAuthError(c, service.AppRelayErrorStatus(err), "app_execution_denied")
+		writeAppServiceAuthError(c, service.AppRelayErrorStatus(err), appGrantAuthErrorCode(err))
 		return
 	}
 	subject.ChannelID, subject.Group = selected.ChannelID, selected.Group
@@ -205,4 +199,12 @@ func distributeAppRelay(c *gin.Context, subject *types.AppRelaySubject) {
 		return
 	}
 	c.Next()
+}
+
+func appGrantAuthErrorCode(err error) string {
+	var authErr *service.AppPluginAuthError
+	if errors.As(err, &authErr) {
+		return authErr.Code
+	}
+	return "service_unavailable"
 }

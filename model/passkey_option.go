@@ -11,7 +11,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 var passkeyOptionMutex sync.Mutex
@@ -60,14 +59,12 @@ func lockPasskeyDomainSettings(tx *gorm.DB) (system_setting.PasskeySettings, str
 		{Key: "passkey.origins", Value: settings.Origins},
 		{Key: "passkey.rp_id", Value: settings.RPID},
 	}
-	// The first write also acquires SQLite's writer lock before any reads.
-	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&rows).Error; err != nil {
-		return settings, serverAddress, err
-	}
 	for i := range rows {
-		if err := lockForUpdate(tx).Where(&Option{Key: rows[i].Key}).First(&rows[i]).Error; err != nil {
+		row, err := lockOptionForWriteTx(tx, rows[i].Key, rows[i].Value, optionWritePasskey)
+		if err != nil {
 			return settings, serverAddress, err
 		}
+		rows[i] = row
 	}
 	serverAddress = rows[0].Value
 	settings.LegacyRPIDs, settings.Origins, settings.RPID = rows[1].Value, rows[2].Value, rows[3].Value
@@ -96,24 +93,27 @@ func validatePasskeyRPIDWithTx(tx *gorm.DB, rpID string) error {
 func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirmation string) (*PasskeyDomainChange, error) {
 	passkeyOptionMutex.Lock()
 	defer passkeyOptionMutex.Unlock()
-	values = maps.Clone(values)
-	for key, value := range values {
+	requested := maps.Clone(values)
+	for key, value := range requested {
 		if err := validateOptionValue(key, value); err != nil {
 			return nil, err
 		}
 	}
 	var change *PasskeyDomainChange
-	err := DB.Transaction(func(tx *gorm.DB) error {
+	var pendingChange *PasskeyDomainChange
+	var committedValues map[string]string
+	err := runOptionWriteTransaction(DB, func(tx *gorm.DB) error {
+		attemptValues := maps.Clone(requested)
 		settings, serverAddress, err := lockPasskeyDomainSettings(tx)
 		if err != nil {
 			return err
 		}
 		previous := settings.WithDefaults(serverAddress)
 		before := [4]string{serverAddress, settings.RPID, settings.LegacyRPIDs, settings.Origins}
-		if value, changed := values["ServerAddress"]; changed {
+		if value, changed := attemptValues["ServerAddress"]; changed {
 			serverAddress = value
 		}
-		if value, changed := values["passkey.origins"]; changed {
+		if value, changed := attemptValues["passkey.origins"]; changed {
 			origins := []string{}
 			for _, origin := range strings.FieldsFunc(value, func(c rune) bool { return c == ',' || c == '\n' || c == '\r' }) {
 				origin = strings.TrimSpace(origin)
@@ -133,7 +133,7 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 			}
 			settings.Origins = strings.Join(origins, ",")
 		}
-		if value, changed := values["passkey.rp_id"]; changed {
+		if value, changed := attemptValues["passkey.rp_id"]; changed {
 			settings.RPID = strings.TrimSpace(value)
 			if settings.RPID != "" {
 				settings.RPID, err = system_setting.NormalizePasskeyRPID(settings.RPID, settings.WithDefaults(serverAddress).Origins)
@@ -142,7 +142,7 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 				}
 			}
 		}
-		if value, changed := values["passkey.legacy_rp_ids"]; changed {
+		if value, changed := attemptValues["passkey.legacy_rp_ids"]; changed {
 			settings.LegacyRPIDs = value
 		}
 		effective := settings.WithDefaults(serverAddress)
@@ -168,21 +168,21 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 				return err
 			}
 		}
-		change = &PasskeyDomainChange{
+		attemptChange := &PasskeyDomainChange{
 			RPID: settings.RPID, LegacyRPIDs: settings.LegacyRPIDs, Origins: settings.Origins,
 			PreviousRPID: oldRPID, EffectiveRPID: nextRPID, RemovedRPIDs: []string{},
 		}
 		nextIDs := settings.WithDefaults(serverAddress).RelyingPartyIDs()
 		for _, id := range previous.RelyingPartyIDs() {
 			if !slices.Contains(nextIDs, id) {
-				change.RemovedRPIDs = append(change.RemovedRPIDs, id)
+				attemptChange.RemovedRPIDs = append(attemptChange.RemovedRPIDs, id)
 			}
 		}
-		if len(change.RemovedRPIDs) > 0 {
+		if len(attemptChange.RemovedRPIDs) > 0 {
 			// MySQL may compare/group text case-insensitively. Select only
 			// candidate RP values, then count exact bytes without credential IDs.
 			rows, err := tx.Model(&PasskeyCredential{}).Select("rp_id").
-				Where("rp_id IS NULL OR rp_id = ? OR rp_id IN ?", "", change.RemovedRPIDs).Rows()
+				Where("rp_id IS NULL OR rp_id = ? OR rp_id IN ?", "", attemptChange.RemovedRPIDs).Rows()
 			if err != nil {
 				return err
 			}
@@ -193,9 +193,9 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 					return err
 				}
 				if rpID == nil || *rpID == "" {
-					change.UnknownCredentials++
-				} else if slices.Contains(change.RemovedRPIDs, *rpID) {
-					change.AffectedCredentials++
+					attemptChange.UnknownCredentials++
+				} else if slices.Contains(attemptChange.RemovedRPIDs, *rpID) {
+					attemptChange.AffectedCredentials++
 				}
 			}
 			if err := rows.Err(); err != nil {
@@ -205,7 +205,8 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 				return err
 			}
 		}
-		change.ConfirmationRequired = change.AffectedCredentials > 0 || change.UnknownCredentials > 0
+		attemptChange.ConfirmationRequired =
+			attemptChange.AffectedCredentials > 0 || attemptChange.UnknownCredentials > 0
 		// This is an intent/freshness binding, not an authentication credential.
 		// Root authorization remains mandatory. No map iteration affects its hash.
 		payload, err := common.Marshal(struct {
@@ -213,25 +214,40 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 			After          [4]string
 			Removed        []string
 			Known, Unknown int64
-		}{before, [4]string{serverAddress, settings.RPID, settings.LegacyRPIDs, settings.Origins}, change.RemovedRPIDs, change.AffectedCredentials, change.UnknownCredentials})
+		}{
+			before,
+			[4]string{serverAddress, settings.RPID, settings.LegacyRPIDs, settings.Origins},
+			attemptChange.RemovedRPIDs,
+			attemptChange.AffectedCredentials,
+			attemptChange.UnknownCredentials,
+		})
 		if err != nil {
 			return err
 		}
-		change.RemovalConfirmation = common.GenerateHMACWithKey([]byte("passkey-domains-v1:"+common.SessionSecret), string(payload))
+		attemptChange.RemovalConfirmation = common.GenerateHMACWithKey(
+			[]byte("passkey-domains-v1:"+common.SessionSecret),
+			string(payload),
+		)
 		if preview {
+			change = attemptChange
 			return errPasskeyDomainPreview
 		}
-		if (change.ConfirmationRequired || confirmation != "") && !hmac.Equal([]byte(confirmation), []byte(change.RemovalConfirmation)) {
-			return &PasskeyDomainRemovalError{Change: change}
+		if (attemptChange.ConfirmationRequired || confirmation != "") &&
+			!hmac.Equal([]byte(confirmation), []byte(attemptChange.RemovalConfirmation)) {
+			change = attemptChange
+			return &PasskeyDomainRemovalError{Change: attemptChange}
 		}
-		values["passkey.rp_id"], values["passkey.legacy_rp_ids"], values["passkey.origins"] = settings.RPID, settings.LegacyRPIDs, settings.Origins
-		values["ServerAddress"] = serverAddress
-		keys := slices.Sorted(maps.Keys(values))
+		attemptValues["passkey.rp_id"], attemptValues["passkey.legacy_rp_ids"], attemptValues["passkey.origins"] =
+			settings.RPID, settings.LegacyRPIDs, settings.Origins
+		attemptValues["ServerAddress"] = serverAddress
+		keys := slices.Sorted(maps.Keys(attemptValues))
 		for _, key := range keys {
-			if err := tx.Save(&Option{Key: key, Value: values[key]}).Error; err != nil {
+			if err := saveOptionTx(tx, key, attemptValues[key], optionWritePasskey); err != nil {
 				return err
 			}
 		}
+		pendingChange = attemptChange
+		committedValues = attemptValues
 		return nil
 	})
 	if errors.Is(err, errPasskeyDomainPreview) {
@@ -240,8 +256,9 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 	if err != nil {
 		return change, err
 	}
-	applyPasskeyDomainOptions(values)
-	for key, value := range values {
+	change = pendingChange
+	applyPasskeyDomainOptions(committedValues)
+	for key, value := range committedValues {
 		if !IsPasskeyDomainOption(key) {
 			if err := updateOptionMap(key, value); err != nil {
 				return change, err

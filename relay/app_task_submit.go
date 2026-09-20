@@ -45,7 +45,19 @@ func submitAppTask(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.
 	}
 	inputs, err := service.CaptureAppTaskBillingInputs(c, info, facts)
 	if err != nil {
-		return nil, service.TaskErrorWrapperLocal(errors.New("invalid_price_inputs"), "invalid_price_inputs", http.StatusBadRequest)
+		var authErr *service.AppPluginAuthError
+		if errors.As(err, &authErr) {
+			status := service.AppRelayErrorStatus(err)
+			if authErr.Code == "invalid_price_inputs" {
+				status = http.StatusBadRequest
+			}
+			return nil, service.TaskErrorWrapperLocal(
+				errors.New(authErr.Code), authErr.Code, status,
+			)
+		}
+		return nil, service.TaskErrorWrapperLocal(
+			errors.New("service_unavailable"), "service_unavailable", http.StatusServiceUnavailable,
+		)
 	}
 	if apiErr := service.PreConsumeBilling(c, 0, info); apiErr != nil {
 		return nil, service.TaskErrorFromAPIError(apiErr)
@@ -56,7 +68,12 @@ func submitAppTask(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.
 	}
 	execution, won, err := session.Claim(c, inputs, outbound)
 	if err != nil {
-		return nil, service.TaskErrorWrapperLocal(errors.New("app_execution_denied"), "app_execution_denied", service.AppRelayErrorStatus(err))
+		code := "service_unavailable"
+		var authErr *service.AppPluginAuthError
+		if errors.As(err, &authErr) {
+			code = authErr.Code
+		}
+		return nil, service.TaskErrorWrapperLocal(errors.New(code), code, service.AppRelayErrorStatus(err))
 	}
 	info.PublicTaskID = execution.TaskID
 	if !won {
@@ -82,7 +99,7 @@ func submitAppTask(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.
 		}
 	}
 	if err := session.RecordAcceptance(c.Request.Context(), providerID); err != nil {
-		return nil, service.TaskErrorWrapperLocal(errors.New("submission_unknown"), "submission_unknown", http.StatusServiceUnavailable)
+		return nil, service.TaskErrorWrapperLocal(errors.New("service_unavailable"), "service_unavailable", http.StatusServiceUnavailable)
 	}
 	if providerID == "" {
 		return nil, service.TaskErrorWrapperLocal(errors.New("submission_unknown"), "submission_unknown", http.StatusBadGateway)

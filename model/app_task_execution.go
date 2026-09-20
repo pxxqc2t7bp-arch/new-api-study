@@ -17,6 +17,19 @@ const (
 	AppExecutionKindResponse = "response"
 )
 
+var (
+	ErrAppTaskNotFound                   = errors.New("not_found")
+	ErrAppExecutionScopeDenied           = errors.New("scope_denied")
+	ErrAppExecutionIdempotencyConflict   = errors.New("idempotency_conflict")
+	ErrAppExecutionGrantExpired          = errors.New("execution_grant_expired")
+	ErrAppExecutionInvalidFunding        = errors.New("invalid_funding")
+	ErrAppExecutionInvalidGrant          = errors.New("invalid_grant")
+	ErrAppExecutionIdentityInactive      = errors.New("identity_inactive")
+	ErrAppExecutionAccountingUnavailable = errors.New("wallet_accounting_unavailable")
+	ErrAppExecutionInsufficientQuota     = errors.New("insufficient_quota")
+	ErrAppExecutionFundingPeriodChanged  = errors.New("funding_period_changed")
+)
+
 type AppTaskExecution struct {
 	ID                   int64  `gorm:"primaryKey"`
 	ExecutionKind        string `gorm:"size:16;not null;default:task;index"`
@@ -78,7 +91,7 @@ func GetScopedAppTask(ctx context.Context, db *gorm.DB, scope AppTaskScope, task
 	var row AppTaskExecution
 	if (taskID == "") == (grantID == "") || scope.UserID <= 0 || scope.AppKey == "" ||
 		scope.InstallationID == "" || scope.Subject == "" {
-		return row, errors.New("not_found")
+		return row, ErrAppTaskNotFound
 	}
 	query := db.WithContext(ctx).Where("app_key = ? AND installation_id = ? AND subject = ? AND user_id = ?",
 		scope.AppKey, scope.InstallationID, scope.Subject, scope.UserID).
@@ -90,7 +103,7 @@ func GetScopedAppTask(ctx context.Context, db *gorm.DB, scope AppTaskScope, task
 	}
 	if err := query.First(&row).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return AppTaskExecution{}, errors.New("not_found")
+			return AppTaskExecution{}, ErrAppTaskNotFound
 		}
 		return AppTaskExecution{}, err
 	}
@@ -99,7 +112,7 @@ func GetScopedAppTask(ctx context.Context, db *gorm.DB, scope AppTaskScope, task
 	if row.AppKey != scope.AppKey || row.InstallationID != scope.InstallationID ||
 		row.Subject != scope.Subject || row.UserID != scope.UserID || row.ExecutionKind != AppExecutionKindTask ||
 		(taskID != "" && row.TaskID != taskID) || (grantID != "" && row.GrantID != grantID) {
-		return AppTaskExecution{}, errors.New("not_found")
+		return AppTaskExecution{}, ErrAppTaskNotFound
 	}
 	return row, nil
 }
@@ -116,7 +129,7 @@ func ClaimAppTaskExecutionTx(tx *gorm.DB, grantID string, request AppTaskExecuti
 		grant.AppSessionID != request.AppSessionID || grant.Subject != request.Subject || grant.UserID != request.UserID ||
 		grant.RunID != request.RunID || grant.ExecutionRequestID != request.ExecutionRequestID || grant.Operation != request.Operation ||
 		request.SubmissionHash == "" {
-		return AppTaskExecution{}, false, errors.New("scope_denied")
+		return AppTaskExecution{}, false, ErrAppExecutionScopeDenied
 	}
 	logical := appPluginStableID("app-task-logical/v1", grant.InstallationID, grant.Subject,
 		grant.RunID, grant.ExecutionRequestID, grant.Operation)
@@ -128,19 +141,19 @@ func ClaimAppTaskExecutionTx(tx *gorm.DB, grantID string, request AppTaskExecuti
 	if q.RowsAffected != 0 {
 		if existing.ExecutionKind != AppExecutionKindTask ||
 			existing.SubmissionHash != request.SubmissionHash || existing.GrantID != grantID {
-			return AppTaskExecution{}, false, errors.New("idempotency_conflict")
+			return AppTaskExecution{}, false, ErrAppExecutionIdempotencyConflict
 		}
 		return existing, false, nil
 	}
 	if grant.ExpiresAt <= now.Unix() {
-		return AppTaskExecution{}, false, errors.New("execution_grant_expired")
+		return AppTaskExecution{}, false, ErrAppExecutionGrantExpired
 	}
 	if request.ReservedQuota < 0 || request.ReservedQuota > 2147483647 || request.FundingSource != grant.FundingSource {
-		return AppTaskExecution{}, false, errors.New("invalid_funding")
+		return AppTaskExecution{}, false, ErrAppExecutionInvalidFunding
 	}
 	var models []AppExecutionModel
 	if common.UnmarshalJsonStr(grant.ModelsJSON, &models) != nil {
-		return AppTaskExecution{}, false, errors.New("invalid_grant")
+		return AppTaskExecution{}, false, ErrAppExecutionInvalidGrant
 	}
 	selected := slices.IndexFunc(models, func(m AppExecutionModel) bool {
 		return isTaskBackedExecutionModel(m) &&
@@ -149,7 +162,7 @@ func ClaimAppTaskExecutionTx(tx *gorm.DB, grantID string, request AppTaskExecuti
 			m.PluginVersion == request.PluginVersion && m.PluginSHA256 == request.PluginSHA256 && m.Protocol == request.Protocol
 	})
 	if selected < 0 {
-		return AppTaskExecution{}, false, errors.New("scope_denied")
+		return AppTaskExecution{}, false, ErrAppExecutionScopeDenied
 	}
 	funding, err := ReserveAppExecutionFundingTx(tx, grant, request.ReservedQuota, now)
 	if err != nil {

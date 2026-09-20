@@ -251,6 +251,9 @@ func appExecutionModelsWithoutNativeAssetBindings(candidates []model.AppExecutio
 
 func (s *AppExecutionService) IssueExecutionGrant(ctx context.Context, identity model.AppServiceIdentity, request AppExecutionGrantRequest) (AppExecutionGrantResult, error) {
 	normalizeAppRegisteredAssetInputs(&request)
+	if !model.AppExecutionRolloutAllowsCached(identity.AppKey) {
+		return AppExecutionGrantResult{}, appAuthError("app_execution_disabled")
+	}
 	for _, value := range []string{request.RequestID, request.RunID, request.ExecutionRequestID} {
 		id, err := uuid.Parse(value)
 		if err != nil || id == uuid.Nil || id.String() != value {
@@ -286,11 +289,11 @@ func (s *AppExecutionService) IssueExecutionGrant(ctx context.Context, identity 
 		now := s.options.Now().UTC()
 		installation, err := model.LockAppPluginInstallation(tx, identity.AppKey, identity.InstallationID)
 		if err != nil {
-			return err
+			return classifyDBLookup(err, "not_found")
 		}
 		currentService, err := model.ValidateAppServiceIdentity(tx, identity, now)
 		if err != nil {
-			return err
+			return appServiceIdentityRevalidationError(err)
 		}
 		if installation.Status != model.AppInstallationStatusEnabled {
 			return appAuthError("identity_inactive")
@@ -301,7 +304,7 @@ func (s *AppExecutionService) IssueExecutionGrant(ctx context.Context, identity 
 		var session model.AppPluginSession
 		if err := model.AppPluginCurrentRead(tx).Where("app_session_id = ? AND installation_id = ? AND app_key = ? AND subject = ?",
 			request.AppSessionID, installation.InstallationID, request.AppKey, request.Subject).First(&session).Error; err != nil {
-			return appAuthError("not_found")
+			return classifyDBLookup(err, "not_found")
 		}
 		user, dashboard, err := AppPluginDashboardIdentity(tx, AuthIdentity{UserID: session.UserID,
 			SessionID: session.DashboardSessionID, UserAuthVersion: session.AuthVersion, SessionVersion: session.SessionVersion}, now)
@@ -317,7 +320,7 @@ func (s *AppExecutionService) IssueExecutionGrant(ctx context.Context, identity 
 		}
 		manifest, _, err := ValidateAppPluginRegistration(tx, installation)
 		if err != nil {
-			return err
+			return classifyDBLookup(err, "not_found")
 		}
 		if !slices.Contains(session.GrantedScopes, "model.invoke") || !slices.Contains(manifest.RequestedScopes, "model.invoke") {
 			return appAuthError("scope_denied")
@@ -350,10 +353,17 @@ func (s *AppExecutionService) IssueExecutionGrant(ctx context.Context, identity 
 				InstallationID: stored.InstallationID, CredentialID: binding.IssuingCredentialID,
 				Version: binding.IssuingCredentialVersion}, now)
 			if err != nil {
-				return err
+				return appServiceIdentityRevalidationError(err)
 			}
 			if common.UnmarshalJsonStr(stored.ResponseJSON, &result) != nil || result.GrantToken != "" {
 				return appAuthError("invalid_grant")
+			}
+			rolloutAllowed, rolloutErr := model.AppExecutionRolloutAllowsTx(tx, identity.AppKey)
+			if rolloutErr != nil {
+				return appAuthError("service_unavailable")
+			}
+			if !rolloutAllowed {
+				return appAuthError("app_execution_disabled")
 			}
 			result.GrantToken = token
 			return nil
@@ -489,10 +499,20 @@ func (s *AppExecutionService) IssueExecutionGrant(ctx context.Context, identity 
 		stored.BindingJSON = string(rawBinding)
 		result.GrantToken = s.executionGrantToken(stored)
 		stored.TokenHash = serviceDigestBytes([]byte(result.GrantToken))
+		rolloutAllowed, rolloutErr := model.AppExecutionRolloutAllowsTx(tx, identity.AppKey)
+		if rolloutErr != nil {
+			return appAuthError("service_unavailable")
+		}
+		if !rolloutAllowed {
+			return appAuthError("app_execution_disabled")
+		}
+		if published.Version != request.ModelPolicyVersion {
+			return appAuthError("model_policy_version_conflict")
+		}
 		return tx.Create(&stored).Error
 	})
 	if err != nil {
-		return AppExecutionGrantResult{}, err
+		return AppExecutionGrantResult{}, appExecutionBoundaryError(err)
 	}
 	return result, nil
 }

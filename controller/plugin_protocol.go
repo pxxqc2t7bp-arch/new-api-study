@@ -1285,6 +1285,22 @@ func respondPluginProtocolSubmissionError(c *gin.Context, taskErr *dto.TaskError
 	if taskErr != nil && taskErr.StatusCode >= 400 && taskErr.StatusCode <= 599 {
 		status = taskErr.StatusCode
 	}
+	if taskErr != nil && taskErr.Code == "service_unavailable" &&
+		status >= http.StatusInternalServerError {
+		respondPluginProtocolError(c, status, "service_unavailable", "Task protocol is unavailable")
+		return
+	}
+	if subject, ok := common.GetContextKeyType[*hosttypes.AppRelaySubject](
+		c, hosttypes.AppRelaySubjectContextKey,
+	); ok && subject != nil && taskErr != nil {
+		switch taskErr.Code {
+		case "app_execution_disabled", "execution_grant_expired", "funding_period_changed",
+			"idempotency_conflict", "identity_inactive", "insufficient_quota",
+			"invalid_funding", "invalid_grant", "scope_denied", "wallet_accounting_unavailable":
+			respondPluginProtocolError(c, status, taskErr.Code, "App task execution failed")
+			return
+		}
+	}
 	switch status {
 	case http.StatusBadRequest:
 		message := "Invalid task protocol request"
@@ -1306,9 +1322,10 @@ func respondPluginProtocolSubmissionError(c *gin.Context, taskErr *dto.TaskError
 func respondPluginProtocolError(c *gin.Context, status int, code, message string) {
 	c.JSON(status, gin.H{
 		"error": gin.H{
-			"message": message,
-			"type":    "new_api_error",
-			"code":    code,
+			"message":   message,
+			"type":      "new_api_error",
+			"code":      code,
+			"retryable": status >= http.StatusInternalServerError,
 		},
 	})
 }

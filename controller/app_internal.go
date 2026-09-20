@@ -10,7 +10,6 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -92,8 +91,12 @@ func appExecutionWriteEnabled(c *gin.Context) bool {
 		writeAppPluginError(c, http.StatusUnauthorized, "service_identity_invalid", "")
 		return false
 	}
-	if !operation_setting.AppExecutionGrantsEnabled || !appPluginEntryAllowed(identity.AppKey, "") {
+	if !model.AppPluginRolloutAllowsCached(identity.AppKey, "") {
 		writeAppPluginError(c, http.StatusForbidden, "app_plugin_disabled", "")
+		return false
+	}
+	if !model.AppExecutionRolloutAllowsCached(identity.AppKey) {
+		writeAppPluginError(c, http.StatusForbidden, "app_execution_disabled", "")
 		return false
 	}
 	return true

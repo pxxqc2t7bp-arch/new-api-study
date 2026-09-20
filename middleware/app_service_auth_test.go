@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +34,78 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+func TestWriteAppServiceAuthErrorMarksServiceUnavailableRetryable(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+
+	writeAppServiceAuthError(c, http.StatusServiceUnavailable, "app_execution_denied")
+
+	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+	var response struct {
+		Error struct {
+			Code      string `json:"code"`
+			Retryable bool   `json:"retryable"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.Equal(t, "app_execution_denied", response.Error.Code)
+	assert.True(t, response.Error.Retryable)
+}
+
+func TestAppGrantAuthUnknownErrorDefaultsToServiceUnavailable(t *testing.T) {
+	assert.Equal(t, "service_unavailable", appGrantAuthErrorCode(errors.New("private database detail")))
+	assert.Equal(t, "service_unavailable",
+		appGrantAuthErrorCode(&service.AppPluginAuthError{Code: "service_unavailable"}))
+	assert.Equal(t, "scope_denied",
+		appGrantAuthErrorCode(&service.AppPluginAuthError{Code: "scope_denied"}))
+}
+
+func TestAppServiceAuthReturnsRetryableServiceUnavailableOnCredentialQueryFailure(t *testing.T) {
+	db, _, credential := setupAppServiceMiddlewareTest(t)
+	injected := errors.New("injected credential query failure")
+	var failed atomic.Bool
+	const callbackName = "test:app-service-credential-query-failure"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == "app_service_credentials" && failed.CompareAndSwap(false, true) {
+			tx.AddError(injected)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Query().Remove(callbackName))
+	})
+
+	router := gin.New()
+	router.POST("/internal/apps/v1/sessions/introspect", AppServiceAuth(), func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"https://host.example.com/internal/apps/v1/sessions/introspect",
+		bytes.NewBufferString(`{"app_key":"middleware-app"}`),
+	)
+	request.TLS = &tls.ConnectionState{}
+	request.Header.Set("Authorization", "AppService "+credential.Credential)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+	var envelope struct {
+		Error struct {
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			Retryable bool   `json:"retryable"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &envelope))
+	assert.Equal(t, "service_unavailable", envelope.Error.Code)
+	assert.Equal(t, "App service request denied", envelope.Error.Message)
+	assert.True(t, envelope.Error.Retryable)
+	assert.NotContains(t, response.Body.String(), credential.Credential)
+	assert.NotContains(t, response.Body.String(), credential.CredentialID)
+	assert.NotContains(t, response.Body.String(), fmt.Sprintf("%x", sha256.Sum256([]byte(credential.Credential))))
+}
 
 func TestServiceCredentialVersionIsEnforced(t *testing.T) {
 	db, installation, credential := setupAppServiceMiddlewareTest(t)
@@ -56,24 +132,40 @@ func TestServiceCredentialVersionIsEnforced(t *testing.T) {
 		router.ServeHTTP(recorder, req)
 		return recorder
 	}
+	assertInvalid := func(response *httptest.ResponseRecorder) {
+		t.Helper()
+		assert.Equal(t, http.StatusUnauthorized, response.Code)
+		var envelope struct {
+			Error struct {
+				Code      string `json:"code"`
+				Retryable bool   `json:"retryable"`
+			} `json:"error"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &envelope))
+		assert.Equal(t, "service_identity_invalid", envelope.Error.Code)
+		assert.False(t, envelope.Error.Retryable)
+		assert.NotContains(t, response.Body.String(), credential.Credential)
+		assert.NotContains(t, response.Body.String(), credential.CredentialID)
+	}
 	require.Equal(t, http.StatusNoContent, request("AppService "+credential.Credential, true).Code)
 	for _, header := range []string{"", "Bearer " + credential.Credential, credential.Credential, "AppService invalid"} {
 		response := request(header, true)
-		assert.Equal(t, http.StatusUnauthorized, response.Code)
-		assert.Contains(t, response.Body.String(), `"code":"service_identity_invalid"`)
+		assertInvalid(response)
 		assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
 	}
-	assert.Equal(t, http.StatusUnauthorized, request("AppService "+credential.Credential, false).Code,
-		"an untrusted forwarded header must not replace TLS")
+	insecure := request("AppService "+credential.Credential, false)
+	assertInvalid(insecure)
+	assert.Equal(t, http.StatusUnauthorized, insecure.Code, "an untrusted forwarded header must not replace TLS")
 	require.NoError(t, db.Model(&model.AppServiceCredential{}).Where("credential_id = ?", credential.CredentialID).
 		Update("credential_version", "forged-version").Error)
-	assert.Equal(t, http.StatusUnauthorized, request("AppService "+credential.Credential, true).Code)
+	assertInvalid(request("AppService "+credential.Credential, true))
 	require.NoError(t, db.Model(&model.AppServiceCredential{}).Where("credential_id = ?", credential.CredentialID).
 		Update("credential_version", credential.Version).Error)
 	require.Equal(t, http.StatusNoContent, request("AppService "+credential.Credential, true).Code)
 	require.NoError(t, model.RevokeAppServiceCredential(t.Context(), db, installation.InstallationID, credential.CredentialID, time.Now()))
-	assert.Equal(t, http.StatusUnauthorized, request("AppService "+credential.Credential, true).Code,
-		"every request must reread revocation, with no positive credential cache")
+	revoked := request("AppService "+credential.Credential, true)
+	assertInvalid(revoked)
+	assert.Equal(t, http.StatusUnauthorized, revoked.Code, "every request must reread revocation, with no positive credential cache")
 }
 
 func TestServiceIdentityCannotReachDashboardOrAdmin(t *testing.T) {
@@ -176,14 +268,25 @@ func setupAppServiceMiddlewareTest(t *testing.T) (*gorm.DB, model.AppInstallResu
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, conn.Close()) })
 	previousDB, previousLog, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
 	previousFlag, previousType := operation_setting.AppPluginV1Enabled, common.MainDatabaseType()
+	common.OptionMap = maps.Clone(common.OptionMap)
+	if common.OptionMap == nil {
+		common.OptionMap = map[string]string{}
+	}
+	operation_setting.AppPluginV1Enabled = true
+	common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] = "true"
+	common.OptionMapRWMutex.Unlock()
 	t.Cleanup(func() {
 		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLog, previousRedis
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
 		operation_setting.AppPluginV1Enabled = previousFlag
+		common.OptionMapRWMutex.Unlock()
 		common.SetMainDatabaseType(previousType)
 	})
 	model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
-	operation_setting.AppPluginV1Enabled = true
 	common.SetMainDatabaseType(map[string]common.DatabaseType{
 		"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL,
 	}[db.Dialector.Name()])
