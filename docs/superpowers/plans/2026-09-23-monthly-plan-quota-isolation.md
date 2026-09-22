@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Automatically isolate every Plan channel sharing a credential when an upstream monthly quota is exhausted, then recover through the existing reset-time workflow.
+**Goal:** Automatically isolate single-key Plan channels sharing an exact credential when an upstream monthly quota is exhausted, then recover only that credential domain.
 
-**Architecture:** Extend the existing Plan quota classifier instead of treating all 429 responses as fatal. Add a model query for exact credential matches, filter the result to Plan channels in the service layer, and preserve tag-based passive recovery metadata.
+**Architecture:** Extend the existing Plan quota classifier instead of treating all 429 responses as fatal. Load channels with `model.GetAllChannels(..., selectAll=true)`, compare `Channel.GetKeys()` values case-sensitively in Go, and persist a SHA-256 credential-domain marker for scoped recovery. Empty credentials use a non-secret `channel:<id>` marker and fail closed on the known channel; multi-key Plan channels retain the generic per-key status flow. Rows written before the marker was introduced recover by tag only when the marker is absent.
 
 **Tech Stack:** Go, GORM, SQLite-backed unit tests, testify
 
@@ -82,33 +82,28 @@ go test ./service -run 'TestParsePlanQuotaResetMonthly|TestShouldDisableChannelR
 
 Expected: PASS.
 
-### Task 2: Isolate the Shared Plan Credential Domain
+### Task 2: Isolate Exact Single-Key Plan Credential Domains
 
 **Files:**
-- Modify: `model/channel.go`
+
 - Modify: `service/channel.go`
 - Modify: `service/channel_quota_test.go`
 
-- [ ] **Step 1: Write the failing credential-domain test**
+- [ ] **Step 1: Extend the credential-domain test and verify RED**
 
-Create Plan channels that cover these cases:
+Cover exact `Channel.GetKeys()` matching, case sensitivity, and exclusions:
 
 ```go
 channels := []model.Channel{
-	{Id: 11, Name: "messages", Key: "shared", Status: common.ChannelStatusEnabled, Tag: planTag, AutoBan: &autoBan},
-	{Id: 12, Name: "responses", Key: "shared", Status: common.ChannelStatusEnabled, Tag: planTag, AutoBan: &autoBan},
-	{Id: 13, Name: "native", Key: "shared", Status: common.ChannelStatusEnabled, Tag: nativeTag, AutoBan: &autoBan},
-	{Id: 14, Name: "other-account", Key: "other", Status: common.ChannelStatusEnabled, Tag: planTag, AutoBan: &autoBan},
-	{Id: 15, Name: "ordinary", Key: "shared", Status: common.ChannelStatusEnabled, Tag: ordinaryTag, AutoBan: &autoBan},
+    {Id: 11, Name: "messages", Key: "shared", Status: common.ChannelStatusEnabled, Tag: planTag, AutoBan: &autoBan},
+    {Id: 12, Name: "responses", Key: "shared\n", Status: common.ChannelStatusEnabled, Tag: planTag, AutoBan: &autoBan},
+    {Id: 13, Name: "native", Key: "shared", Status: common.ChannelStatusEnabled, Tag: nativeTag, AutoBan: &autoBan},
+    {Id: 14, Name: "other-account", Key: "other", Status: common.ChannelStatusEnabled, Tag: planTag, AutoBan: &autoBan},
+    {Id: 15, Name: "case-different", Key: "SHARED", Status: common.ChannelStatusEnabled, Tag: planTag, AutoBan: &autoBan},
+    {Id: 16, Name: "ordinary", Key: "shared", Status: common.ChannelStatusEnabled, Tag: ordinaryTag, AutoBan: &autoBan},
+    {Id: 17, Name: "multi-key", Key: "shared", Status: common.ChannelStatusEnabled, Tag: planTag, AutoBan: &autoBan, ChannelInfo: model.ChannelInfo{IsMultiKey: true}},
 }
 ```
-
-Call the credential-domain disable path using channel 11. Assert that channels
-11, 12, and 13 are auto-disabled while 14 and 15 remain enabled. Assert the
-disabled channels have disabled abilities and preserve their own tag in
-`quota_domain`.
-
-- [ ] **Step 2: Run the credential-domain test and verify RED**
 
 Run:
 
@@ -116,31 +111,186 @@ Run:
 go test ./service -run TestDisablePlanQuotaCredentialDomain -count=1
 ```
 
-Expected: FAIL because the existing implementation selects only one tag.
+Expected: FAIL because the database equality query does not apply
+`Channel.GetKeys()` semantics and does not exclude a one-entry multi-key
+channel.
 
-- [ ] **Step 3: Add the exact-key model query**
+- [ ] **Step 2: Implement in-memory exact matching and verify GREEN**
 
-Add:
+Remove `model.GetChannelsByKey`. Load all credentials and select only matching
+single-key Plan channels:
 
 ```go
-func GetChannelsByKey(key string, selectAll bool) ([]*Channel, error) {
-	var channels []*Channel
-	query := DB.Where(commonKeyCol+" = ?", key)
-	if !selectAll {
-		query = query.Omit("key")
-	}
-	err := query.Find(&channels).Error
-	return channels, err
+channels, err := model.GetAllChannels(0, 0, true, false)
+matchedChannels := make([]*model.Channel, 0)
+for _, channel := range channels {
+    keys := channel.GetKeys()
+    if !isNonMultiKeyPlanChannel(channel) || len(keys) != 1 || keys[0] != credential {
+        continue
+    }
+    matchedChannels = append(matchedChannels, channel)
 }
 ```
 
-- [ ] **Step 4: Implement Plan-only credential filtering**
+Run:
 
-Pass the failing `*model.Channel` into the disable function, load exact-key
-matches, retain only `plan:` channels, and store each selected channel's own
-tag in `quota_domain`. Keep `disabled_until=resetAt+60`.
+```bash
+go test ./service -run TestDisablePlanQuotaCredentialDomain -count=1
+```
 
-- [ ] **Step 5: Run service and model tests**
+Expected: PASS.
+
+### Task 3: Scope Recovery to the Persisted Domain Marker
+
+**Files:**
+
+- Modify: `service/channel.go`
+- Modify: `service/channel_quota_test.go`
+
+- [ ] **Step 1: Write marker-scoped recovery tests and verify RED**
+
+Create two auto-disabled credential domains that share a tag, a
+shared-credential channel with another tag, and a manually disabled channel in
+the shared tag. Recover one channel through `EnableChannel` and assert:
+
+```go
+assert.Equal(t, common.ChannelStatusEnabled, recovered.Status)
+assert.Equal(t, common.ChannelStatusAutoDisabled, otherDomain.Status)
+assert.Equal(t, common.ChannelStatusManuallyDisabled, manuallyDisabled.Status)
+assert.NotContains(t, recovered.GetOtherInfo(), "quota_domain_id")
+assert.Contains(t, otherDomain.GetOtherInfo(), "quota_domain_id")
+```
+
+Add a legacy fixture whose auto-disabled rows have `quota_domain` but no
+`quota_domain_id`; assert same-tag auto-disabled rows recover while manually
+disabled rows do not.
+
+Run:
+
+```bash
+go test ./service -run 'TestEnablePlanQuotaDomain|TestLegacyPlanQuotaDomain' -count=1
+```
+
+Expected: FAIL because recovery currently selects every row by tag.
+
+- [ ] **Step 2: Persist and recover by a non-secret marker**
+
+Compute the marker as follows:
+
+```go
+sum := sha256.Sum256([]byte(credential))
+domainID := hex.EncodeToString(sum[:])
+```
+
+Store `domainID` as `quota_domain_id`; use `channel:<id>` when the credential
+is empty. Change
+`enablePlanQuotaDomain` to accept the recovering channel, load fresh channel
+rows, and update only auto-disabled rows with the same marker. When the
+recovering row has no marker, recover only auto-disabled, markerless rows with
+the same tag. Clear quota metadata only after a selected row is recovered.
+
+- [ ] **Step 3: Run recovery tests and verify GREEN**
+
+Run:
+
+```bash
+go test ./service -run 'TestEnablePlanQuotaDomain|TestLegacyPlanQuotaDomain' -count=1
+```
+
+Expected: PASS.
+
+### Task 4: Fail Closed for Missing Credentials
+
+**Files:**
+
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/channel.go`
+
+- [ ] **Step 1: Update the missing-credential test and verify RED**
+
+Keep the nil-channel case unchanged. For an empty credential, assert the known
+channel becomes auto-disabled, its ability is disabled, reset metadata is
+stored, and `quota_domain_id` equals `channel:<id>`.
+
+Run:
+
+```bash
+go test ./service -run TestDisablePlanQuotaCredentialDomainHandlesMissingCredential -count=1
+```
+
+Expected: FAIL because the current function returns without disabling the
+known channel.
+
+- [ ] **Step 2: Implement the empty-credential fallback and verify GREEN**
+
+Select only the known failing channel when `GetKeys()` returns no credential,
+then use the normal status and metadata update path.
+
+Run the same focused command. Expected: PASS.
+
+### Task 5: Preserve Multi-Key Per-Key Disable Behavior
+
+**Files:**
+
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/channel.go`
+
+- [ ] **Step 1: Write the public-path regression test and verify RED**
+
+Create a two-key Plan channel, call `DisableChannel` with
+`UsingKey: "key-a"` and a recognized quota reason, then assert:
+
+```go
+assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+assert.True(t, ability.Enabled)
+```
+
+Run:
+
+```bash
+go test ./service -run TestDisableChannelPreservesPlanMultiKeyIsolation -count=1
+```
+
+Expected: FAIL because the shared-domain path currently disables the whole
+channel.
+
+- [ ] **Step 2: Gate shared-domain isolation and verify GREEN**
+
+Enter `disablePlanQuotaDomain` only for non-multi-key Plan channels. Let
+multi-key Plan errors reach the existing `model.UpdateChannelStatus` call with
+`channelError.UsingKey`.
+
+Run the same focused command. Expected: PASS.
+
+### Task 6: Documentation and Quality Gates
+
+**Files:**
+
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-monthly-plan-quota-isolation.md`
+- Verify: `model/channel.go`
+- Verify: `service/channel.go`
+- Verify: `service/channel_quota_test.go`
+
+- [ ] **Step 1: Correct design and plan documentation**
+
+Document that shared-domain isolation applies only to single-key Plan channels,
+matching is case-sensitive in Go, recovery uses `quota_domain_id`, and legacy
+markerless rows recover by tag without enabling manually disabled channels.
+
+- [ ] **Step 2: Format and inspect the diff**
+
+Run:
+
+```bash
+gofmt -w service/channel.go service/channel_quota_test.go
+git diff --check
+```
+
+Expected: no formatting or whitespace errors.
+
+- [ ] **Step 3: Run required tests**
 
 Run:
 
@@ -150,81 +300,13 @@ go test ./service ./model -count=1
 
 Expected: PASS.
 
-### Task 3: Regression and Quality Gates
-
-**Files:**
-- Verify: `service/channel.go`
-- Verify: `service/channel_quota_test.go`
-- Verify: `model/channel.go`
-
-- [ ] **Step 1: Format and inspect the diff**
+- [ ] **Step 4: Commit the correction**
 
 Run:
 
 ```bash
-gofmt -w service/channel.go service/channel_quota_test.go model/channel.go
-git diff --check
-git diff -- service/channel.go service/channel_quota_test.go model/channel.go
-```
-
-Expected: no formatting or whitespace errors; diff contains only quota
-classification and credential-domain isolation.
-
-- [ ] **Step 2: Run the complete backend suite**
-
-Run:
-
-```bash
-go test ./...
-```
-
-Expected: PASS.
-
-- [ ] **Step 3: Run three uncached focused regression rounds**
-
-Run the following command three times:
-
-```bash
-go test ./service ./model -run 'PlanQuota|ChannelsByKey' -count=1
-```
-
-Expected: all three rounds PASS.
-
-- [ ] **Step 4: Commit the implementation**
-
-Run:
-
-```bash
-git add model/channel.go service/channel.go service/channel_quota_test.go
-git commit -m "fix(channel): isolate monthly plan quota domains"
-```
-
-### Task 4: Production Audit Evidence
-
-**Files:**
-- Create: `reports/monthly-plan-quota-isolation-20260923/audit.md`
-- Create: `reports/monthly-plan-quota-isolation-20260923/SHA256SUMS`
-
-- [ ] **Step 1: Record the operational mutation**
-
-Document the production revision, affected channel IDs, reset timestamps,
-pre-change backup location, transaction preconditions, post-change statuses,
-ability counts, and cache synchronization evidence. Do not include credentials,
-cookies, session secrets, or database passwords.
-
-- [ ] **Step 2: Hash local and remote evidence**
-
-Hash the Compose snapshot, extension ZIP, database dump, pre/post channel
-snapshots, audit report, and implementation commit diff.
-
-- [ ] **Step 3: Verify production remains healthy**
-
-Confirm:
-
-```text
-new-api health=healthy
-restart count=0
-channels 4,66,96 status=3
-enabled abilities for channels 4,66,96 = 0
-no post-mutation requests use channels 4,66,96
+git add model/channel.go service/channel.go service/channel_quota_test.go \
+  docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md \
+  docs/superpowers/plans/2026-09-23-monthly-plan-quota-isolation.md
+git commit -m "fix(channel): scope plan quota recovery domains"
 ```

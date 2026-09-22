@@ -1,6 +1,8 @@
 package service
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
@@ -38,7 +40,7 @@ func DisableChannel(channelError types.ChannelError, reason string) {
 
 	channel, _ := model.CacheGetChannel(channelError.ChannelId)
 	resetAt, quotaLimited := ParsePlanQuotaReset(reason)
-	if channel != nil && quotaLimited && strings.HasPrefix(channel.GetTag(), "plan:") {
+	if !channelError.IsMultiKey && isNonMultiKeyPlanChannel(channel) && quotaLimited {
 		disablePlanQuotaDomain(channel, reason, resetAt)
 		return
 	}
@@ -69,32 +71,66 @@ func ParsePlanQuotaReset(reason string) (int64, bool) {
 	return resetAt.Unix(), true
 }
 
+func isNonMultiKeyPlanChannel(channel *model.Channel) bool {
+	return channel != nil &&
+		!channel.ChannelInfo.IsMultiKey &&
+		strings.HasPrefix(channel.GetTag(), "plan:")
+}
+
+func planQuotaDomainID(channelID int, credential string) string {
+	if credential == "" {
+		return fmt.Sprintf("channel:%d", channelID)
+	}
+	sum := sha256.Sum256([]byte(credential))
+	return hex.EncodeToString(sum[:])
+}
+
 func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetAt int64) {
 	if failingChannel == nil {
 		common.SysError("failed to disable Plan quota domain: channel is nil")
 		return
 	}
-	if failingChannel.Key == "" {
-		common.SysError(fmt.Sprintf("failed to disable Plan quota domain: channel_id=%d credential is empty", failingChannel.Id))
+	failingKeys := failingChannel.GetKeys()
+	if len(failingKeys) > 1 {
+		common.SysError(fmt.Sprintf("failed to disable Plan quota domain: channel_id=%d has multiple credentials", failingChannel.Id))
 		return
 	}
-	channels, err := model.GetChannelsByKey(failingChannel.Key, true)
-	if err != nil {
-		common.SysError(fmt.Sprintf("failed to load Plan quota credential domain: channel_id=%d error=%v", failingChannel.Id, err))
-		return
+
+	credential := ""
+	channels := []*model.Channel{failingChannel}
+	if len(failingKeys) == 1 {
+		credential = failingKeys[0]
+		allChannels, err := model.GetAllChannels(0, 0, true, false)
+		if err != nil {
+			common.SysError(fmt.Sprintf("failed to load Plan quota credential domain: channel_id=%d error=%v", failingChannel.Id, err))
+			return
+		}
+		channels = allChannels
 	}
+	domainID := planQuotaDomainID(failingChannel.Id, credential)
+
 	disabled := 0
 	for _, channel := range channels {
 		tag := channel.GetTag()
-		if !strings.HasPrefix(tag, "plan:") {
-			continue
+		keys := channel.GetKeys()
+		if credential == "" {
+			if channel.Id != failingChannel.Id {
+				continue
+			}
+		} else {
+			if !isNonMultiKeyPlanChannel(channel) ||
+				len(keys) != 1 ||
+				keys[0] != credential {
+				continue
+			}
 		}
 		if model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusAutoDisabled, reason) {
 			disabled++
 		}
 		metadata := map[string]interface{}{
-			"quota_domain": tag,
-			"quota_type":   "plan",
+			"quota_domain":    tag,
+			"quota_domain_id": domainID,
+			"quota_type":      "plan",
 		}
 		if resetAt > 0 {
 			metadata["quota_reset_at"] = resetAt
@@ -117,8 +153,8 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 
 func EnableChannel(channelId int, usingKey string, channelName string) {
 	channel, _ := model.CacheGetChannel(channelId)
-	if channel != nil && strings.HasPrefix(channel.GetTag(), "plan:") {
-		enablePlanQuotaDomain(channel.GetTag())
+	if isNonMultiKeyPlanChannel(channel) {
+		enablePlanQuotaDomain(channel)
 		return
 	}
 	success := model.UpdateChannelStatus(channelId, usingKey, common.ChannelStatusEnabled, "")
@@ -129,22 +165,61 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
 	}
 }
 
-func enablePlanQuotaDomain(tag string) {
-	channels, err := model.GetChannelsByTag(tag, false, true)
-	if err != nil {
-		common.SysError(fmt.Sprintf("failed to load Plan quota domain %s: %v", tag, err))
+func enablePlanQuotaDomain(recoveringChannel *model.Channel) {
+	if recoveringChannel == nil {
+		common.SysError("failed to enable Plan quota domain: channel is nil")
 		return
 	}
+	channels, err := model.GetAllChannels(0, 0, true, false)
+	if err != nil {
+		common.SysError(fmt.Sprintf("failed to load Plan quota domain: channel_id=%d error=%v", recoveringChannel.Id, err))
+		return
+	}
+
+	var current *model.Channel
+	for _, channel := range channels {
+		if channel.Id == recoveringChannel.Id {
+			current = channel
+			break
+		}
+	}
+	if current == nil {
+		common.SysError(fmt.Sprintf("failed to enable Plan quota domain: channel_id=%d not found", recoveringChannel.Id))
+		return
+	}
+
+	tag := current.GetTag()
+	domainValue, hasDomainID := current.GetOtherInfo()["quota_domain_id"]
+	domainID, domainIDValid := domainValue.(string)
+	if hasDomainID && (!domainIDValid || domainID == "") {
+		common.SysError(fmt.Sprintf("failed to enable Plan quota domain: channel_id=%d has invalid quota_domain_id", current.Id))
+		return
+	}
+
 	enabled := 0
 	for _, channel := range channels {
-		if model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusEnabled, "") {
-			enabled++
+		if channel.Status != common.ChannelStatusAutoDisabled {
+			continue
 		}
+		candidateValue, candidateHasDomainID := channel.GetOtherInfo()["quota_domain_id"]
+		if hasDomainID {
+			candidateDomainID, ok := candidateValue.(string)
+			if !ok || candidateDomainID != domainID {
+				continue
+			}
+		} else if candidateHasDomainID || channel.GetTag() != tag {
+			continue
+		}
+		if !model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusEnabled, "") {
+			continue
+		}
+		enabled++
 		if err := model.MergeChannelStatusMetadata(channel.Id, map[string]interface{}{
-			"disabled_until": nil,
-			"quota_reset_at": nil,
-			"quota_domain":   nil,
-			"quota_type":     nil,
+			"disabled_until":  nil,
+			"quota_reset_at":  nil,
+			"quota_domain":    nil,
+			"quota_domain_id": nil,
+			"quota_type":      nil,
 		}); err != nil {
 			common.SysError(fmt.Sprintf("failed to clear Plan quota metadata: channel_id=%d error=%v", channel.Id, err))
 		}
