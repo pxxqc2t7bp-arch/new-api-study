@@ -472,6 +472,50 @@ func TestEnablePlanQuotaDomainAfterCredentialRotation(t *testing.T) {
 	assert.False(t, abilities[1].Enabled)
 }
 
+func TestDisablePlanQuotaDomainPreservesConcurrentOwnership(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+
+	autoBan := 1
+	tag := "plan:support:stale"
+	channel := model.Channel{
+		Id:      43,
+		Name:    "stale-snapshot",
+		Status:  common.ChannelStatusEnabled,
+		Tag:     &tag,
+		AutoBan: &autoBan,
+		Models:  "gpt-3.5-turbo",
+		Group:   "default",
+	}
+	channel.SetOtherInfo(map[string]any{"owner": "snapshot"})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	var stale model.Channel
+	require.NoError(t, db.First(&stale, "id = ?", channel.Id).Error)
+	concurrent := stale
+	concurrent.SetOtherInfo(map[string]any{
+		"owner":         "operator",
+		"status_reason": "manual operation",
+	})
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{
+		"status":     common.ChannelStatusManuallyDisabled,
+		"other_info": concurrent.OtherInfo,
+	}).Error)
+	require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", channel.Id).
+		Update("enabled", false).Error)
+
+	disablePlanQuotaDomain(&stale, "quota exhausted", 2_000_000_000)
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, "id = ?", channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.Status)
+	assert.Equal(t, concurrent.OtherInfo, stored.OtherInfo)
+
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+}
+
 func TestDisablePlanQuotaCredentialDomainHandlesMissingCredential(t *testing.T) {
 	for _, testCase := range []struct {
 		name             string

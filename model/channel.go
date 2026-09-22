@@ -826,6 +826,58 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 	return true
 }
 
+// UpdateSingleKeyChannelStatusIfUnchanged atomically updates status-owned
+// channel state only while the locked row still matches the caller's snapshot.
+func UpdateSingleKeyChannelStatusIfUnchanged(
+	channelId int,
+	expectedStatus int,
+	expectedOtherInfo string,
+	status int,
+	otherInfo string,
+) (bool, error) {
+	if common.MemoryCacheEnabled {
+		channelStatusLock.Lock()
+		defer channelStatusLock.Unlock()
+	}
+
+	pollingLock := GetChannelPollingLock(channelId)
+	pollingLock.Lock()
+	defer pollingLock.Unlock()
+
+	changed := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var current Channel
+		if err := lockForUpdate(tx).Where("id = ?", channelId).First(&current).Error; err != nil {
+			return err
+		}
+		if current.ChannelInfo.IsMultiKey ||
+			current.Status != expectedStatus ||
+			current.OtherInfo != expectedOtherInfo {
+			return nil
+		}
+
+		if err := tx.Model(&Channel{}).Where("id = ?", channelId).Updates(map[string]any{
+			"status":     status,
+			"other_info": otherInfo,
+		}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&Ability{}).Where("channel_id = ?", channelId).
+			Select("enabled").Update("enabled", status == common.ChannelStatusEnabled).Error; err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if changed {
+		CacheUpdateChannelStatus(channelId, status)
+	}
+	return changed, nil
+}
+
 func MergeChannelStatusMetadata(channelId int, updates map[string]interface{}) error {
 	channel, err := GetChannelById(channelId, true)
 	if err != nil {

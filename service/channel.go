@@ -158,23 +158,39 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 				continue
 			}
 		}
-		if model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusAutoDisabled, reason) {
-			disabled++
+
+		expectedStatus := channel.Status
+		expectedOtherInfo := channel.OtherInfo
+		metadata := channel.GetOtherInfo()
+		if expectedStatus != common.ChannelStatusAutoDisabled {
+			metadata["status_reason"] = reason
+			metadata["status_time"] = common.GetTimestamp()
 		}
-		metadata := map[string]interface{}{
-			"quota_domain":    tag,
-			"quota_domain_id": domainID,
-			"quota_type":      "plan",
-		}
+		metadata["quota_domain"] = tag
+		metadata["quota_domain_id"] = domainID
+		metadata["quota_type"] = "plan"
 		if resetAt > 0 {
 			metadata["quota_reset_at"] = resetAt
 			metadata["disabled_until"] = resetAt + 60
 		} else {
-			metadata["quota_reset_at"] = nil
-			metadata["disabled_until"] = nil
+			delete(metadata, "quota_reset_at")
+			delete(metadata, "disabled_until")
 		}
-		if err := model.MergeChannelStatusMetadata(channel.Id, metadata); err != nil {
-			common.SysError(fmt.Sprintf("failed to persist Plan quota metadata: channel_id=%d error=%v", channel.Id, err))
+		channel.SetOtherInfo(metadata)
+
+		changed, err := model.UpdateSingleKeyChannelStatusIfUnchanged(
+			channel.Id,
+			expectedStatus,
+			expectedOtherInfo,
+			common.ChannelStatusAutoDisabled,
+			channel.OtherInfo,
+		)
+		if err != nil {
+			common.SysError(fmt.Sprintf("failed to disable Plan quota channel: channel_id=%d error=%v", channel.Id, err))
+			continue
+		}
+		if changed && expectedStatus == common.ChannelStatusEnabled {
+			disabled++
 		}
 	}
 	if disabled > 0 {
@@ -249,19 +265,33 @@ func enablePlanQuotaDomain(recoveringChannel *model.Channel) bool {
 		if channel.Status != common.ChannelStatusAutoDisabled {
 			continue
 		}
-		if !model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusEnabled, "") {
+
+		expectedOtherInfo := channel.OtherInfo
+		metadata := channel.GetOtherInfo()
+		metadata["status_reason"] = ""
+		metadata["status_time"] = common.GetTimestamp()
+		delete(metadata, "disabled_until")
+		delete(metadata, "quota_reset_at")
+		delete(metadata, "quota_domain")
+		delete(metadata, "quota_domain_id")
+		delete(metadata, "quota_type")
+		channel.SetOtherInfo(metadata)
+
+		changed, err := model.UpdateSingleKeyChannelStatusIfUnchanged(
+			channel.Id,
+			channel.Status,
+			expectedOtherInfo,
+			common.ChannelStatusEnabled,
+			channel.OtherInfo,
+		)
+		if err != nil {
+			common.SysError(fmt.Sprintf("failed to recover Plan quota channel: channel_id=%d error=%v", channel.Id, err))
+			continue
+		}
+		if !changed {
 			continue
 		}
 		enabled++
-		if err := model.MergeChannelStatusMetadata(channel.Id, map[string]interface{}{
-			"disabled_until":  nil,
-			"quota_reset_at":  nil,
-			"quota_domain":    nil,
-			"quota_domain_id": nil,
-			"quota_type":      nil,
-		}); err != nil {
-			common.SysError(fmt.Sprintf("failed to clear Plan quota metadata: channel_id=%d error=%v", channel.Id, err))
-		}
 	}
 	if enabled > 0 {
 		NotifyRootUser("channel_plan_quota_recovered_"+tag,

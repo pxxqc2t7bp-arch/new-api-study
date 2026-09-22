@@ -57,9 +57,9 @@ this path and use the existing `model.UpdateChannelStatus` call with
 `ChannelError.UsingKey`.
 
 The selected channels are auto-disabled and have their abilities disabled
-through `model.UpdateChannelStatus`. Existing reset metadata remains in place,
-and `quota_domain_id` stores the lowercase hexadecimal SHA-256 digest of the
-credential. The digest is deterministic across tags without exposing the
+through a model compare-and-swap operation. Existing reset metadata remains in
+place, and `quota_domain_id` stores the lowercase hexadecimal SHA-256 digest of
+the credential. The digest is deterministic across tags without exposing the
 credential. If the failing channel has an empty credential, no broad lookup is
 performed: only that known channel is disabled and marked with
 `quota_domain_id=channel:<id>`. A nil channel remains a no-op. The sweep may
@@ -67,6 +67,33 @@ write only an enabled channel or an auto-disabled channel that already carries
 the same `quota_domain_id`. It leaves manually disabled rows and auto-disabled
 rows owned by another marker unchanged, including their metadata and ability
 state.
+
+### Atomic Ownership Transition
+
+The service builds the complete desired `other_info` from each selected
+channel snapshot. It passes the snapshot's exact status and raw `other_info`
+string to a focused model API for single-key channels. The model API holds the
+same process-local status and per-channel polling locks used by
+`UpdateChannelStatus`, starts `DB.Transaction`, and reads the current channel
+through `lockForUpdate(tx)`. MySQL and PostgreSQL therefore hold a row lock;
+SQLite skips unsupported `FOR UPDATE` syntax and relies on its single-writer
+transaction behavior.
+
+The transaction proceeds only when the locked row is still single-key and its
+status and raw `other_info` exactly match the expected snapshot. It updates
+`channels.status`, `channels.other_info`, and all corresponding
+`abilities.enabled` rows in that transaction. A stale status or metadata
+snapshot returns `changed=false` without writing either table. Any channel or
+ability update error rolls the transaction back, so their enabled states
+cannot diverge. The in-memory channel status cache is updated only after a
+successful commit.
+
+Plan disable and recovery no longer call `UpdateChannelStatus` followed by
+`MergeChannelStatusMetadata`. A concurrent manual disable, unrelated
+auto-disable marker, or metadata edit invalidates the snapshot and makes the
+attempt a no-op. Existing credential-rotation behavior remains fail-closed:
+recovery still compares the current credential-derived marker before selecting
+peers, while the atomic write preserves any concurrent ownership metadata.
 
 Recovery accepts the recovering channel and reloads all channel rows so it
 does not depend on potentially stale cached metadata. If the recovering row
@@ -104,13 +131,15 @@ rather than partially updating an unknown set.
 3. `DisableChannel` loads the failing channel and parses its reset timestamp.
 4. Multi-key Plan channels fall through to per-key status handling.
 5. For other Plan channels, exact single-key matches are selected in Go.
-6. Eligible enabled or same-marker auto-disabled channels are disabled and
-   receive non-secret domain and reset metadata.
-7. Existing retry logic sends the current request to the next eligible tier.
-8. Passive recovery skips channels until `reset_at + 60 seconds`, then selects
+6. Eligible enabled or same-marker auto-disabled snapshots build their complete
+   desired status metadata and enter the transactional row-lock CAS.
+7. The CAS updates channel status, metadata, and ability enabled state only
+   while the locked row still matches the snapshot.
+8. Existing retry logic sends the current request to the next eligible tier.
+9. Passive recovery skips channels until `reset_at + 60 seconds`, then selects
    one row per marked or validated legacy domain and each unrelated row
    independently.
-9. A successful recovery probe enables only auto-disabled rows in the same
+10. A successful recovery probe enables only auto-disabled rows in the same
    owned domain. Credential rotation restricts that recovery to the probed row.
 
 ## Tests
@@ -136,6 +165,16 @@ rather than partially updating an unknown set.
   rows by domain/tag while selecting unrelated failures per channel.
 - Credential rotation recovers only the rotated channel and leaves peers under
   the old marker disabled.
+- A successful model CAS updates status, raw metadata, and ability enabled
+  state together.
+- A stale expected status or stale expected `other_info` returns no change and
+  preserves both channel and ability rows.
+- A forced ability update failure rolls the transaction back without changing
+  channel status or metadata.
+- A stale service snapshot cannot overwrite a concurrent owner or status
+  change.
+- Optional `TEST_MYSQL_DSN` and `TEST_POSTGRES_DSN` coverage exercises the same
+  CAS against temporary migrated real-dialect channel and ability tables.
 - Public `DisableChannel` preserves per-key isolation for multi-key Plan
   channels.
 - Existing disable/enable lifecycle and no-reset behavior continue to pass.
