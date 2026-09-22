@@ -408,6 +408,19 @@ func GetChannelsByTag(tag string, idSort bool, selectAll bool, sortOptions ...Ch
 	return channels, err
 }
 
+func GetChannelsByKey(key string, selectAll bool) ([]*Channel, error) {
+	var channels []*Channel
+	if commonKeyCol == "" {
+		initCol()
+	}
+	query := DB.Where(commonKeyCol+" = ?", key)
+	if !selectAll {
+		query = query.Omit("key")
+	}
+	err := query.Find(&channels).Error
+	return channels, err
+}
+
 func SearchChannels(keyword string, group string, model string, idSort bool, sortOptions ...ChannelSortOptions) ([]*Channel, error) {
 	var channels []*Channel
 	modelsCol := "`models`"

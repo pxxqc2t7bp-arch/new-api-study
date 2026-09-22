@@ -106,7 +106,7 @@ func TestDisableAndEnablePlanQuotaDomainLifecycle(t *testing.T) {
 	channels := []model.Channel{
 		{Id: 11, Name: "messages", Key: "shared", Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan},
 		{Id: 12, Name: "responses", Key: "shared", Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan},
-		{Id: 13, Name: "other-plan", Key: "shared", Status: common.ChannelStatusEnabled, Tag: &otherPlanTag, AutoBan: &autoBan},
+		{Id: 13, Name: "other-plan", Key: "other", Status: common.ChannelStatusEnabled, Tag: &otherPlanTag, AutoBan: &autoBan},
 		{Id: 14, Name: "ordinary", Key: "shared", Status: common.ChannelStatusEnabled, Tag: &ordinaryTag, AutoBan: &autoBan},
 	}
 	channels[0].Models = "gpt-3.5-turbo"
@@ -119,7 +119,7 @@ func TestDisableAndEnablePlanQuotaDomainLifecycle(t *testing.T) {
 	require.NoError(t, channels[1].AddAbilities(nil))
 
 	resetAt := time.Now().Add(time.Hour).Unix()
-	disablePlanQuotaDomain(tag, "quota exhausted", resetAt)
+	disablePlanQuotaDomain(&channels[0], "quota exhausted", resetAt)
 
 	var stored []model.Channel
 	require.NoError(t, db.Order("id").Find(&stored).Error)
@@ -163,6 +163,101 @@ func TestDisableAndEnablePlanQuotaDomainLifecycle(t *testing.T) {
 	assert.True(t, disabledAbilities[1].Enabled)
 }
 
+func TestDisablePlanQuotaCredentialDomain(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+
+	autoBan := 1
+	planTag := "plan:support:coding"
+	nativeTag := "plan:support:native"
+	ordinaryTag := "ark-ordinary:support"
+	channels := []model.Channel{
+		{Id: 11, Name: "messages", Key: "shared", Status: common.ChannelStatusEnabled, Tag: &planTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
+		{Id: 12, Name: "responses", Key: "shared", Status: common.ChannelStatusEnabled, Tag: &planTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
+		{Id: 13, Name: "native", Key: "shared", Status: common.ChannelStatusEnabled, Tag: &nativeTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
+		{Id: 14, Name: "other-account", Key: "other", Status: common.ChannelStatusEnabled, Tag: &planTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
+		{Id: 15, Name: "ordinary", Key: "shared", Status: common.ChannelStatusEnabled, Tag: &ordinaryTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+
+	resetAt := time.Now().Add(time.Hour).Unix()
+	disablePlanQuotaDomain(&channels[0], "quota exhausted", resetAt)
+
+	var stored []model.Channel
+	require.NoError(t, db.Order("id").Find(&stored).Error)
+	require.Len(t, stored, 5)
+	for i, channel := range stored {
+		if channel.Id >= 11 && channel.Id <= 13 {
+			assert.Equal(t, common.ChannelStatusAutoDisabled, channel.Status)
+			assert.Equal(t, resetAt+60, channel.GetDisabledUntil())
+			assert.Equal(t, channels[i].GetTag(), channel.GetOtherInfo()["quota_domain"])
+			continue
+		}
+		assert.Equal(t, common.ChannelStatusEnabled, channel.Status)
+		assert.Zero(t, channel.GetDisabledUntil())
+		assert.NotContains(t, channel.GetOtherInfo(), "quota_domain")
+	}
+
+	var abilities []model.Ability
+	require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
+	require.Len(t, abilities, 5)
+	for _, ability := range abilities {
+		if ability.ChannelId >= 11 && ability.ChannelId <= 13 {
+			assert.False(t, ability.Enabled)
+			continue
+		}
+		assert.True(t, ability.Enabled)
+	}
+}
+
+func TestDisablePlanQuotaCredentialDomainRejectsMissingCredential(t *testing.T) {
+	for _, testCase := range []struct {
+		name           string
+		useNilChannel  bool
+		channelID      int
+		channelKey     string
+		channelTagName string
+	}{
+		{name: "nil channel", useNilChannel: true, channelID: 21, channelTagName: "plan:support:nil"},
+		{name: "empty credential", channelID: 22, channelTagName: "plan:support:empty"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupPlanQuotaDomainTest(t)
+			autoBan := 1
+			channel := model.Channel{
+				Id:      testCase.channelID,
+				Name:    testCase.name,
+				Key:     testCase.channelKey,
+				Status:  common.ChannelStatusEnabled,
+				Tag:     &testCase.channelTagName,
+				AutoBan: &autoBan,
+				Models:  "gpt-3.5-turbo",
+				Group:   "default",
+			}
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+
+			var failingChannel *model.Channel
+			if !testCase.useNilChannel {
+				failingChannel = &channel
+			}
+			disablePlanQuotaDomain(failingChannel, "quota exhausted", time.Now().Add(time.Hour).Unix())
+
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, "id = ?", channel.Id).Error)
+			assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+			assert.Zero(t, stored.GetDisabledUntil())
+			assert.NotContains(t, stored.GetOtherInfo(), "quota_domain")
+
+			var ability model.Ability
+			require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+			assert.True(t, ability.Enabled)
+		})
+	}
+}
+
 func TestDisablePlanQuotaDomainWithoutResetStillDisables(t *testing.T) {
 	db := setupPlanQuotaDomainTest(t)
 	autoBan := 1
@@ -178,7 +273,7 @@ func TestDisablePlanQuotaDomainWithoutResetStillDisables(t *testing.T) {
 	)
 	require.True(t, matched)
 	require.Zero(t, resetAt)
-	disablePlanQuotaDomain(tag, "quota reset unknown", resetAt)
+	disablePlanQuotaDomain(&channels[0], "quota reset unknown", resetAt)
 
 	var stored []model.Channel
 	require.NoError(t, db.Order("id").Find(&stored).Error)

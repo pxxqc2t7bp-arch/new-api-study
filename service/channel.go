@@ -39,7 +39,7 @@ func DisableChannel(channelError types.ChannelError, reason string) {
 	channel, _ := model.CacheGetChannel(channelError.ChannelId)
 	resetAt, quotaLimited := ParsePlanQuotaReset(reason)
 	if channel != nil && quotaLimited && strings.HasPrefix(channel.GetTag(), "plan:") {
-		disablePlanQuotaDomain(channel.GetTag(), reason, resetAt)
+		disablePlanQuotaDomain(channel, reason, resetAt)
 		return
 	}
 
@@ -69,14 +69,26 @@ func ParsePlanQuotaReset(reason string) (int64, bool) {
 	return resetAt.Unix(), true
 }
 
-func disablePlanQuotaDomain(tag string, reason string, resetAt int64) {
-	channels, err := model.GetChannelsByTag(tag, false, true)
+func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetAt int64) {
+	if failingChannel == nil {
+		common.SysError("failed to disable Plan quota domain: channel is nil")
+		return
+	}
+	if failingChannel.Key == "" {
+		common.SysError(fmt.Sprintf("failed to disable Plan quota domain: channel_id=%d credential is empty", failingChannel.Id))
+		return
+	}
+	channels, err := model.GetChannelsByKey(failingChannel.Key, true)
 	if err != nil {
-		common.SysError(fmt.Sprintf("failed to load Plan quota domain %s: %v", tag, err))
+		common.SysError(fmt.Sprintf("failed to load Plan quota credential domain: channel_id=%d error=%v", failingChannel.Id, err))
 		return
 	}
 	disabled := 0
 	for _, channel := range channels {
+		tag := channel.GetTag()
+		if !strings.HasPrefix(tag, "plan:") {
+			continue
+		}
 		if model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusAutoDisabled, reason) {
 			disabled++
 		}
@@ -96,6 +108,7 @@ func disablePlanQuotaDomain(tag string, reason string, resetAt int64) {
 		}
 	}
 	if disabled > 0 {
+		tag := failingChannel.GetTag()
 		subject := fmt.Sprintf("Plan 配额域「%s」已临时禁用", tag)
 		content := fmt.Sprintf("%s，共禁用 %d 个协议渠道", reason, disabled)
 		NotifyRootUser("channel_plan_quota_"+tag, subject, content)
