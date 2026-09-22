@@ -4,7 +4,7 @@
 
 **Goal:** Automatically isolate single-key Plan channels sharing an exact credential when an upstream monthly quota is exhausted, then recover only that credential domain.
 
-**Architecture:** Extend the existing Plan quota classifier instead of treating all 429 responses as fatal. Load channels with `model.GetAllChannels(..., selectAll=true)`, compare `Channel.GetKeys()` values case-sensitively in Go, and persist a SHA-256 credential-domain marker for scoped recovery. Empty credentials use a non-secret `channel:<id>` marker and fail closed on the known channel; multi-key Plan channels retain the generic per-key status flow. Rows written before the marker was introduced recover by tag only when the marker is absent.
+**Architecture:** Extend the existing Plan quota classifier instead of treating all 429 responses as fatal. Load channels with `model.GetAllChannels(..., selectAll=true)`, compare `Channel.GetKeys()` values case-sensitively in Go, and persist a SHA-256 credential-domain marker for scoped recovery. Empty credentials use a non-secret `channel:<id>` marker and fail closed on the known channel; multi-key Plan channels retain the generic per-key status flow. Disable sweeps preserve manual and unrelated auto-disable ownership. A reusable service classifier validates legacy metadata and supplies domain keys for recovery and passive-test dedup. Credential rotation recovers only the tested channel.
 
 **Tech Stack:** Go, GORM, SQLite-backed unit tests, testify
 
@@ -118,7 +118,10 @@ channel.
 - [ ] **Step 2: Implement in-memory exact matching and verify GREEN**
 
 Remove `model.GetChannelsByKey`. Load all credentials and select only matching
-single-key Plan channels:
+single-key Plan channels. An eligible match must be currently enabled or
+already auto-disabled with the same `quota_domain_id`; manually disabled rows
+and auto-disabled rows carrying another marker must retain their status,
+metadata, and abilities:
 
 ```go
 channels, err := model.GetAllChannels(0, 0, true, false)
@@ -186,8 +189,10 @@ Store `domainID` as `quota_domain_id`; use `channel:<id>` when the credential
 is empty. Change
 `enablePlanQuotaDomain` to accept the recovering channel, load fresh channel
 rows, and update only auto-disabled rows with the same marker. When the
-recovering row has no marker, recover only auto-disabled, markerless rows with
-the same tag. Clear quota metadata only after a selected row is recovered.
+recovering row has no marker, recover only auto-disabled rows whose metadata
+explicitly contains `quota_type="plan"` and `quota_domain` equal to the
+recovering tag. Generic markerless failures remain disabled. Clear quota
+metadata only after a selected row is recovered.
 
 - [ ] **Step 3: Run recovery tests and verify GREEN**
 
@@ -263,7 +268,76 @@ multi-key Plan errors reach the existing `model.UpdateChannelStatus` call with
 
 Run the same focused command. Expected: PASS.
 
-### Task 6: Documentation and Quality Gates
+### Task 6: Preserve Passive Recovery Domains and Credential Rotation
+
+**Files:**
+
+- Modify: `service/channel.go`
+- Modify: `service/channel_quota_test.go`
+- Modify: `controller/channel-test.go`
+- Modify: `controller/channel_test_internal_test.go`
+
+- [ ] **Step 1: Write failing ownership and rotation tests**
+
+Extend the shared-credential fixture with a manually disabled row and an
+auto-disabled row carrying another `quota_domain_id`. Assert that status,
+metadata, and abilities are unchanged. Add a recovery test that disables two
+`credential-a` peers, rotates the recovering row to `credential-b`, and
+asserts only the rotated row is enabled and cleared.
+
+Run:
+
+```bash
+go test ./service -run '^(TestDisablePlanQuotaCredentialDomain|TestEnablePlanQuotaDomainAfterCredentialRotation)$' -count=1
+```
+
+Expected: FAIL because the sweep overwrites existing ownership and recovery
+trusts the stale persisted marker.
+
+- [ ] **Step 2: Write the failing passive-dedup test with isolated DB setup**
+
+Initialize `model.DB` explicitly in the controller test fixture. Cover two
+rows sharing a `quota_domain_id` across tags, a distinct marked domain in the
+same tag, two validated legacy rows, and two generic markerless failures.
+
+Run:
+
+```bash
+go test ./controller -run '^TestSelectChannelsForAutomaticTestDeduplicatesDuePlanDomain$' -count=1
+```
+
+Expected: FAIL because selection deduplicates all Plan rows by tag.
+
+- [ ] **Step 3: Add the reusable recovery-domain classifier**
+
+Export a service helper that returns a stable dedup key for:
+
+- auto-disabled rows with a non-empty string `quota_domain_id`;
+- markerless auto-disabled rows with `quota_type="plan"` and
+  `quota_domain == channel.GetTag()`.
+
+Return no shared key for all other rows so controller selection treats them as
+unique channels. Reuse the same classifier in service recovery.
+
+- [ ] **Step 4: Enforce ownership and rotation behavior**
+
+Restrict the disable sweep to enabled rows and same-marker auto-disabled rows.
+During marked recovery, compare the persisted marker with the marker computed
+from the recovering row's current single credential. On mismatch, enable and
+clear only the recovering row.
+
+- [ ] **Step 5: Verify focused GREEN**
+
+Run:
+
+```bash
+go test ./service -run '^(TestDisablePlanQuotaCredentialDomain|TestLegacyPlanQuotaDomainRecoveryByTag|TestEnablePlanQuotaDomainAfterCredentialRotation)$' -count=1
+go test ./controller -run '^TestSelectChannelsForAutomaticTestDeduplicatesDuePlanDomain$' -count=1
+```
+
+Expected: PASS.
+
+### Task 7: Documentation and Quality Gates
 
 **Files:**
 
@@ -276,8 +350,10 @@ Run the same focused command. Expected: PASS.
 - [ ] **Step 1: Correct design and plan documentation**
 
 Document that shared-domain isolation applies only to single-key Plan channels,
-matching is case-sensitive in Go, recovery uses `quota_domain_id`, and legacy
-markerless rows recover by tag without enabling manually disabled channels.
+matching is case-sensitive in Go, disable ownership is preserved, recovery
+uses `quota_domain_id`, legacy fallback requires explicit Plan quota metadata,
+passive tests deduplicate by recovery domain, and credential rotation cannot
+recover peers under the old marker.
 
 - [ ] **Step 2: Format and inspect the diff**
 
@@ -295,7 +371,8 @@ Expected: no formatting or whitespace errors.
 Run:
 
 ```bash
-go test ./service ./model -count=1
+go test ./service ./controller ./model -count=1
+go test ./controller -run '^TestSelectChannelsForAutomaticTestDeduplicatesDuePlanDomain$' -count=1
 ```
 
 Expected: PASS.

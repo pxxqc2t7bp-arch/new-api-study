@@ -23,10 +23,14 @@ different tags can therefore continue receiving traffic.
 - Auto-disable every non-multi-key Plan channel that uses the same exact
   credential as the failing channel, even when those channels use different
   Plan tags or protocols.
+- Preserve manually disabled channels and auto-disabled channels owned by
+  another failure when sweeping a shared credential.
 - Leave non-Plan channels and Plan channels with other credentials unchanged.
 - Keep multi-key Plan errors on the existing per-key status path.
 - Recover only auto-disabled channels from the same credential domain after
   `disabled_until`.
+- Schedule one passive recovery probe per quota domain while leaving unrelated
+  auto-disabled channels independently eligible.
 
 ## Non-Goals
 
@@ -58,7 +62,11 @@ and `quota_domain_id` stores the lowercase hexadecimal SHA-256 digest of the
 credential. The digest is deterministic across tags without exposing the
 credential. If the failing channel has an empty credential, no broad lookup is
 performed: only that known channel is disabled and marked with
-`quota_domain_id=channel:<id>`. A nil channel remains a no-op.
+`quota_domain_id=channel:<id>`. A nil channel remains a no-op. The sweep may
+write only an enabled channel or an auto-disabled channel that already carries
+the same `quota_domain_id`. It leaves manually disabled rows and auto-disabled
+rows owned by another marker unchanged, including their metadata and ability
+state.
 
 Recovery accepts the recovering channel and reloads all channel rows so it
 does not depend on potentially stale cached metadata. If the recovering row
@@ -68,9 +76,22 @@ tags. Rows from another marked domain and manually disabled rows are left
 unchanged. Metadata is cleared only after a selected row is actually enabled.
 
 For rows written before `quota_domain_id` existed, recovery falls back to the
-recovering channel's tag. That fallback selects only auto-disabled rows with
-the same tag whose marker key is absent; it never selects a manually disabled
-row or a row carrying any marker.
+recovering channel's tag. A markerless row qualifies for this fallback only
+when it is auto-disabled and its metadata explicitly contains
+`quota_type="plan"` plus `quota_domain` equal to its current tag. Generic
+markerless failures, malformed legacy metadata, manually disabled rows, and
+rows carrying another marker are not part of that recovery domain.
+
+The same recovery-domain classifier is reused by passive test selection.
+Marked rows deduplicate by `quota_domain_id`, validated legacy rows deduplicate
+by their `quota_domain`/tag, and every other auto-disabled row receives an
+independent probe opportunity even when several such rows share a Plan tag.
+
+Before marker-scoped recovery, the service computes a marker from the
+recovering channel's current single credential and compares it with the
+persisted `quota_domain_id`. If credential rotation changed the marker, only
+the recovering channel is enabled and has its quota metadata cleared. Peers
+that still carry the old marker remain auto-disabled.
 
 If loading the shared credential domain fails, the operation remains
 fail-closed by logging the error and leaving the affected channels unchanged
@@ -83,12 +104,14 @@ rather than partially updating an unknown set.
 3. `DisableChannel` loads the failing channel and parses its reset timestamp.
 4. Multi-key Plan channels fall through to per-key status handling.
 5. For other Plan channels, exact single-key matches are selected in Go.
-6. Each selected channel is auto-disabled and receives non-secret domain and
-   reset metadata.
+6. Eligible enabled or same-marker auto-disabled channels are disabled and
+   receive non-secret domain and reset metadata.
 7. Existing retry logic sends the current request to the next eligible tier.
-8. Passive recovery skips the channels until `reset_at + 60 seconds`.
+8. Passive recovery skips channels until `reset_at + 60 seconds`, then selects
+   one row per marked or validated legacy domain and each unrelated row
+   independently.
 9. A successful recovery probe enables only auto-disabled rows in the same
-   marked domain, or eligible markerless rows in the legacy tag fallback.
+   owned domain. Credential rotation restricts that recovery to the probed row.
 
 ## Tests
 
@@ -103,9 +126,16 @@ rather than partially updating an unknown set.
 - Non-Plan channels with the exhausted credential remain enabled.
 - Empty credentials disable only the known failing channel with a
   channel-specific marker; nil channels remain unchanged.
+- Matching manually disabled rows and auto-disabled rows carrying another
+  marker preserve status, metadata, and abilities during a disable sweep.
 - Marker-scoped recovery leaves another credential domain and manually
   disabled rows unchanged.
-- Legacy markerless recovery enables only same-tag auto-disabled rows.
+- Legacy markerless recovery enables only rows with explicit matching Plan
+  quota metadata; generic markerless failures remain disabled.
+- Passive selection deduplicates marked rows by marker and validated legacy
+  rows by domain/tag while selecting unrelated failures per channel.
+- Credential rotation recovers only the rotated channel and leaves peers under
+  the old marker disabled.
 - Public `DisableChannel` preserves per-key isolation for multi-key Plan
   channels.
 - Existing disable/enable lifecycle and no-reset behavior continue to pass.

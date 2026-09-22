@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,8 +23,10 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestValidateChannelProxy(t *testing.T) {
@@ -313,7 +316,30 @@ func TestResolveChannelTestUserIDUsesRequestUser(t *testing.T) {
 	require.Equal(t, 2, userID)
 }
 
+func setupAutomaticChannelSelectionTestDB(t *testing.T) {
+	t.Helper()
+
+	originalDB := model.DB
+	db, err := gorm.Open(sqlite.Open(fmt.Sprintf(
+		"file:%s?mode=memory&cache=shared",
+		strings.ReplaceAll(t.Name(), "/", "_"),
+	)), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.UpstreamManagedRoute{}))
+	model.DB = db
+
+	t.Cleanup(func() {
+		model.DB = originalDB
+		sqlDB, dbErr := db.DB()
+		if dbErr == nil {
+			require.NoError(t, sqlDB.Close())
+		}
+	})
+}
+
 func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
 	future := time.Now().Add(time.Hour).Unix()
 	planTag := "plan:support:coding"
 	deferred := &model.Channel{Id: 4, Status: common.ChannelStatusAutoDisabled, Tag: &planTag}
@@ -332,31 +358,61 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *te
 }
 
 func TestSelectChannelsForAutomaticTestDeduplicatesDuePlanDomain(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
 	past := time.Now().Add(-time.Minute).Unix()
 	codingTag := "plan:support:coding"
 	analysisTag := "plan:support:analysis"
 	ordinaryTag := "provider:support"
 	first := &model.Channel{Id: 11, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
-	first.SetOtherInfo(map[string]any{"disabled_until": past})
-	second := &model.Channel{Id: 12, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
-	second.SetOtherInfo(map[string]any{"disabled_until": past})
-	otherPlan := &model.Channel{Id: 13, Status: common.ChannelStatusAutoDisabled, Tag: &analysisTag}
-	otherPlan.SetOtherInfo(map[string]any{"disabled_until": past})
-	ordinary := &model.Channel{Id: 14, Status: common.ChannelStatusAutoDisabled, Tag: &ordinaryTag}
+	first.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-a"})
+	sameMarkedDomain := &model.Channel{Id: 12, Status: common.ChannelStatusAutoDisabled, Tag: &analysisTag}
+	sameMarkedDomain.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-a"})
+	differentMarkedDomain := &model.Channel{Id: 13, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
+	differentMarkedDomain.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-b"})
+	legacyFirst := &model.Channel{Id: 14, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
+	legacyFirst.SetOtherInfo(map[string]any{
+		"disabled_until": past,
+		"quota_domain":   codingTag,
+		"quota_type":     "plan",
+	})
+	legacySecond := &model.Channel{Id: 15, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
+	legacySecond.SetOtherInfo(map[string]any{
+		"disabled_until": past,
+		"quota_domain":   codingTag,
+		"quota_type":     "plan",
+	})
+	genericFirst := &model.Channel{Id: 16, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
+	genericFirst.SetOtherInfo(map[string]any{"disabled_until": past, "status_reason": "authentication failed"})
+	genericSecond := &model.Channel{Id: 17, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
+	genericSecond.SetOtherInfo(map[string]any{"disabled_until": past, "status_reason": "transport failed"})
+	ordinary := &model.Channel{Id: 18, Status: common.ChannelStatusAutoDisabled, Tag: &ordinaryTag}
 	ordinary.SetOtherInfo(map[string]any{"disabled_until": past})
 
 	selected := selectChannelsForAutomaticTest(
-		[]*model.Channel{first, second, otherPlan, ordinary},
+		[]*model.Channel{
+			first,
+			sameMarkedDomain,
+			differentMarkedDomain,
+			legacyFirst,
+			legacySecond,
+			genericFirst,
+			genericSecond,
+			ordinary,
+		},
 		operation_setting.ChannelTestModePassiveRecovery,
 	)
 
-	require.Len(t, selected, 3)
-	assert.Equal(t, 11, selected[0].Id)
-	assert.Equal(t, 13, selected[1].Id)
-	assert.Equal(t, 14, selected[2].Id)
+	selectedIDs := make([]int, len(selected))
+	for i, channel := range selected {
+		selectedIDs[i] = channel.Id
+	}
+	assert.Equal(t, []int{11, 13, 14, 16, 17, 18}, selectedIDs)
 }
 
 func TestSelectChannelsForAutomaticTestAlwaysSkipsManualDisabled(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
 	autoBanEnabled := 1
 	manual := &model.Channel{
 		Id:      21,

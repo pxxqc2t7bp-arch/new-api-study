@@ -247,8 +247,11 @@ func TestLegacyPlanQuotaDomainRecoveryByTag(t *testing.T) {
 		{Id: 32, Name: "legacy-b", Key: "credential-b", Status: common.ChannelStatusAutoDisabled, Tag: &legacyTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
 		{Id: 33, Name: "legacy-manual", Key: "credential-c", Status: common.ChannelStatusManuallyDisabled, Tag: &legacyTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
 		{Id: 34, Name: "legacy-other-tag", Key: "credential-d", Status: common.ChannelStatusAutoDisabled, Tag: &otherTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
+		{Id: 35, Name: "generic-failure", Key: "credential-e", Status: common.ChannelStatusAutoDisabled, Tag: &legacyTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
+		{Id: 36, Name: "wrong-quota-type", Key: "credential-f", Status: common.ChannelStatusAutoDisabled, Tag: &legacyTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
+		{Id: 37, Name: "wrong-quota-domain", Key: "credential-g", Status: common.ChannelStatusAutoDisabled, Tag: &legacyTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
 	}
-	for i := range channels {
+	for i := range channels[:4] {
 		channels[i].SetOtherInfo(map[string]any{
 			"disabled_until":  int64(1234),
 			"quota_domain":    channels[i].GetTag(),
@@ -257,6 +260,23 @@ func TestLegacyPlanQuotaDomainRecoveryByTag(t *testing.T) {
 			"preserved_owner": channels[i].Name,
 		})
 	}
+	channels[4].SetOtherInfo(map[string]any{
+		"disabled_until":  int64(1234),
+		"status_reason":   "generic upstream failure",
+		"preserved_owner": channels[4].Name,
+	})
+	channels[5].SetOtherInfo(map[string]any{
+		"disabled_until":  int64(1234),
+		"quota_domain":    legacyTag,
+		"quota_type":      "provider",
+		"preserved_owner": channels[5].Name,
+	})
+	channels[6].SetOtherInfo(map[string]any{
+		"disabled_until":  int64(1234),
+		"quota_domain":    otherTag,
+		"quota_type":      "plan",
+		"preserved_owner": channels[6].Name,
+	})
 	require.NoError(t, db.Create(&channels).Error)
 	for i := range channels {
 		require.NoError(t, channels[i].AddAbilities(nil))
@@ -266,11 +286,14 @@ func TestLegacyPlanQuotaDomainRecoveryByTag(t *testing.T) {
 
 	var stored []model.Channel
 	require.NoError(t, db.Order("id").Find(&stored).Error)
-	require.Len(t, stored, 4)
+	require.Len(t, stored, 7)
 	assert.Equal(t, common.ChannelStatusEnabled, stored[0].Status)
 	assert.Equal(t, common.ChannelStatusEnabled, stored[1].Status)
 	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored[2].Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[3].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[4].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[5].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[6].Status)
 	for _, channel := range stored[:2] {
 		info := channel.GetOtherInfo()
 		assert.NotContains(t, info, "disabled_until")
@@ -283,14 +306,26 @@ func TestLegacyPlanQuotaDomainRecoveryByTag(t *testing.T) {
 	assert.Equal(t, "plan", stored[2].GetOtherInfo()["quota_type"])
 	assert.Equal(t, float64(1234), stored[3].GetOtherInfo()["disabled_until"])
 	assert.Equal(t, "plan", stored[3].GetOtherInfo()["quota_type"])
+	assert.Equal(t, map[string]any{
+		"disabled_until":  float64(1234),
+		"status_reason":   "generic upstream failure",
+		"preserved_owner": "generic-failure",
+	}, stored[4].GetOtherInfo())
+	assert.Equal(t, "provider", stored[5].GetOtherInfo()["quota_type"])
+	assert.Equal(t, legacyTag, stored[5].GetOtherInfo()["quota_domain"])
+	assert.Equal(t, "plan", stored[6].GetOtherInfo()["quota_type"])
+	assert.Equal(t, otherTag, stored[6].GetOtherInfo()["quota_domain"])
 
 	var abilities []model.Ability
 	require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
-	require.Len(t, abilities, 4)
+	require.Len(t, abilities, 7)
 	assert.True(t, abilities[0].Enabled)
 	assert.True(t, abilities[1].Enabled)
 	assert.False(t, abilities[2].Enabled)
 	assert.False(t, abilities[3].Enabled)
+	assert.False(t, abilities[4].Enabled)
+	assert.False(t, abilities[5].Enabled)
+	assert.False(t, abilities[6].Enabled)
 }
 
 func TestDisablePlanQuotaCredentialDomain(t *testing.T) {
@@ -300,6 +335,8 @@ func TestDisablePlanQuotaCredentialDomain(t *testing.T) {
 	planTag := "plan:support:coding"
 	nativeTag := "plan:support:native"
 	ordinaryTag := "ark-ordinary:support"
+	sharedDomainID := fmt.Sprintf("%x", sha256.Sum256([]byte("shared")))
+	unrelatedDomainID := fmt.Sprintf("%x", sha256.Sum256([]byte("unrelated")))
 	channels := []model.Channel{
 		{Id: 11, Name: "messages", Key: "shared", Status: common.ChannelStatusEnabled, Tag: &planTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
 		{Id: 12, Name: "responses", Key: "shared\n", Status: common.ChannelStatusEnabled, Tag: &planTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
@@ -321,23 +358,61 @@ func TestDisablePlanQuotaCredentialDomain(t *testing.T) {
 				MultiKeySize: 1,
 			},
 		},
+		{Id: 18, Name: "manual", Key: "shared", Status: common.ChannelStatusManuallyDisabled, Tag: &planTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
+		{Id: 19, Name: "unrelated-auto-disabled", Key: "shared", Status: common.ChannelStatusAutoDisabled, Tag: &planTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
+		{Id: 20, Name: "same-domain-auto-disabled", Key: "shared", Status: common.ChannelStatusAutoDisabled, Tag: &nativeTag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
 	}
+	channels[7].SetOtherInfo(map[string]any{
+		"owner":         "manual",
+		"status_reason": "operator disabled",
+	})
+	channels[8].SetOtherInfo(map[string]any{
+		"owner":           "other failure",
+		"quota_domain_id": unrelatedDomainID,
+		"status_reason":   "upstream authentication failed",
+	})
+	channels[9].SetOtherInfo(map[string]any{
+		"owner":           "same quota domain",
+		"quota_domain_id": sharedDomainID,
+		"quota_type":      "plan",
+	})
 	require.NoError(t, db.Create(&channels).Error)
 	for i := range channels {
 		require.NoError(t, channels[i].AddAbilities(nil))
 	}
+	require.NoError(t, db.Model(&model.Ability{}).
+		Where("channel_id IN ?", []int{18, 19}).
+		Update("enabled", true).Error)
 
 	resetAt := time.Now().Add(time.Hour).Unix()
 	disablePlanQuotaDomain(&channels[0], "quota exhausted", resetAt)
 
 	var stored []model.Channel
 	require.NoError(t, db.Order("id").Find(&stored).Error)
-	require.Len(t, stored, 7)
+	require.Len(t, stored, 10)
 	for i, channel := range stored {
-		if channel.Id >= 11 && channel.Id <= 13 {
+		if channel.Id >= 11 && channel.Id <= 13 || channel.Id == 20 {
 			assert.Equal(t, common.ChannelStatusAutoDisabled, channel.Status)
 			assert.Equal(t, resetAt+60, channel.GetDisabledUntil())
 			assert.Equal(t, channels[i].GetTag(), channel.GetOtherInfo()["quota_domain"])
+			assert.Equal(t, sharedDomainID, channel.GetOtherInfo()["quota_domain_id"])
+			continue
+		}
+		if channel.Id == 18 {
+			assert.Equal(t, common.ChannelStatusManuallyDisabled, channel.Status)
+			assert.Equal(t, map[string]any{
+				"owner":         "manual",
+				"status_reason": "operator disabled",
+			}, channel.GetOtherInfo())
+			continue
+		}
+		if channel.Id == 19 {
+			assert.Equal(t, common.ChannelStatusAutoDisabled, channel.Status)
+			assert.Equal(t, map[string]any{
+				"owner":           "other failure",
+				"quota_domain_id": unrelatedDomainID,
+				"status_reason":   "upstream authentication failed",
+			}, channel.GetOtherInfo())
 			continue
 		}
 		assert.Equal(t, common.ChannelStatusEnabled, channel.Status)
@@ -347,14 +422,54 @@ func TestDisablePlanQuotaCredentialDomain(t *testing.T) {
 
 	var abilities []model.Ability
 	require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
-	require.Len(t, abilities, 7)
+	require.Len(t, abilities, 10)
 	for _, ability := range abilities {
-		if ability.ChannelId >= 11 && ability.ChannelId <= 13 {
+		if ability.ChannelId >= 11 && ability.ChannelId <= 13 || ability.ChannelId == 20 {
 			assert.False(t, ability.Enabled)
 			continue
 		}
 		assert.True(t, ability.Enabled)
 	}
+}
+
+func TestEnablePlanQuotaDomainAfterCredentialRotation(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+
+	autoBan := 1
+	tag := "plan:support:rotation"
+	channels := []model.Channel{
+		{Id: 41, Name: "rotated", Key: "credential-a", Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
+		{Id: 42, Name: "old-peer", Key: "credential-a", Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan, Models: "gpt-3.5-turbo", Group: "default"},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+
+	resetAt := time.Now().Add(time.Hour).Unix()
+	disablePlanQuotaDomain(&channels[0], "credential-a exhausted", resetAt)
+	require.NoError(t, db.Model(&model.Channel{}).
+		Where("id = ?", channels[0].Id).
+		Update("key", "credential-b").Error)
+
+	EnableChannel(channels[0].Id, "", channels[0].Name)
+
+	var stored []model.Channel
+	require.NoError(t, db.Order("id").Find(&stored).Error)
+	require.Len(t, stored, 2)
+	assert.Equal(t, common.ChannelStatusEnabled, stored[0].Status)
+	assert.Equal(t, "credential-b", stored[0].Key)
+	assert.NotContains(t, stored[0].GetOtherInfo(), "quota_domain_id")
+	assert.NotContains(t, stored[0].GetOtherInfo(), "quota_type")
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[1].Status)
+	assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte("credential-a"))), stored[1].GetOtherInfo()["quota_domain_id"])
+	assert.Equal(t, "plan", stored[1].GetOtherInfo()["quota_type"])
+
+	var abilities []model.Ability
+	require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
+	require.Len(t, abilities, 2)
+	assert.True(t, abilities[0].Enabled)
+	assert.False(t, abilities[1].Enabled)
 }
 
 func TestDisablePlanQuotaCredentialDomainHandlesMissingCredential(t *testing.T) {

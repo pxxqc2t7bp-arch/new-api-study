@@ -85,6 +85,32 @@ func planQuotaDomainID(channelID int, credential string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// PlanQuotaRecoveryDomainKey returns the shared recovery owner for a marked or
+// validated legacy Plan quota failure.
+func PlanQuotaRecoveryDomainKey(channel *model.Channel) (string, bool) {
+	if channel == nil || channel.Status != common.ChannelStatusAutoDisabled {
+		return "", false
+	}
+
+	info := channel.GetOtherInfo()
+	if value, exists := info["quota_domain_id"]; exists {
+		domainID, ok := value.(string)
+		if !ok || domainID == "" {
+			return "", false
+		}
+		return "marker:" + domainID, true
+	}
+
+	quotaType, quotaTypeValid := info["quota_type"].(string)
+	quotaDomain, quotaDomainValid := info["quota_domain"].(string)
+	if !quotaTypeValid || quotaType != "plan" ||
+		!quotaDomainValid || quotaDomain == "" ||
+		quotaDomain != channel.GetTag() {
+		return "", false
+	}
+	return "legacy:" + quotaDomain, true
+}
+
 func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetAt int64) {
 	if failingChannel == nil {
 		common.SysError("failed to disable Plan quota domain: channel is nil")
@@ -124,6 +150,14 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 				continue
 			}
 		}
+		if channel.Status != common.ChannelStatusEnabled {
+			candidateDomainID, ok := channel.GetOtherInfo()["quota_domain_id"].(string)
+			if channel.Status != common.ChannelStatusAutoDisabled ||
+				!ok ||
+				candidateDomainID != domainID {
+				continue
+			}
+		}
 		if model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusAutoDisabled, reason) {
 			disabled++
 		}
@@ -153,8 +187,7 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 
 func EnableChannel(channelId int, usingKey string, channelName string) {
 	channel, _ := model.CacheGetChannel(channelId)
-	if isNonMultiKeyPlanChannel(channel) {
-		enablePlanQuotaDomain(channel)
+	if isNonMultiKeyPlanChannel(channel) && enablePlanQuotaDomain(channel) {
 		return
 	}
 	success := model.UpdateChannelStatus(channelId, usingKey, common.ChannelStatusEnabled, "")
@@ -165,15 +198,15 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
 	}
 }
 
-func enablePlanQuotaDomain(recoveringChannel *model.Channel) {
+func enablePlanQuotaDomain(recoveringChannel *model.Channel) bool {
 	if recoveringChannel == nil {
 		common.SysError("failed to enable Plan quota domain: channel is nil")
-		return
+		return true
 	}
 	channels, err := model.GetAllChannels(0, 0, true, false)
 	if err != nil {
 		common.SysError(fmt.Sprintf("failed to load Plan quota domain: channel_id=%d error=%v", recoveringChannel.Id, err))
-		return
+		return true
 	}
 
 	var current *model.Channel
@@ -185,29 +218,35 @@ func enablePlanQuotaDomain(recoveringChannel *model.Channel) {
 	}
 	if current == nil {
 		common.SysError(fmt.Sprintf("failed to enable Plan quota domain: channel_id=%d not found", recoveringChannel.Id))
-		return
+		return true
 	}
 
 	tag := current.GetTag()
-	domainValue, hasDomainID := current.GetOtherInfo()["quota_domain_id"]
-	domainID, domainIDValid := domainValue.(string)
-	if hasDomainID && (!domainIDValid || domainID == "") {
-		common.SysError(fmt.Sprintf("failed to enable Plan quota domain: channel_id=%d has invalid quota_domain_id", current.Id))
-		return
+	recoveryKey, owned := PlanQuotaRecoveryDomainKey(current)
+	if !owned {
+		return false
+	}
+
+	recoverOnlyCurrent := false
+	if domainID, marked := current.GetOtherInfo()["quota_domain_id"].(string); marked {
+		currentKeys := current.GetKeys()
+		recoverOnlyCurrent = len(currentKeys) != 1 ||
+			planQuotaDomainID(current.Id, currentKeys[0]) != domainID
 	}
 
 	enabled := 0
 	for _, channel := range channels {
-		if channel.Status != common.ChannelStatusAutoDisabled {
-			continue
-		}
-		candidateValue, candidateHasDomainID := channel.GetOtherInfo()["quota_domain_id"]
-		if hasDomainID {
-			candidateDomainID, ok := candidateValue.(string)
-			if !ok || candidateDomainID != domainID {
+		if recoverOnlyCurrent {
+			if channel.Id != current.Id {
 				continue
 			}
-		} else if candidateHasDomainID || channel.GetTag() != tag {
+		} else {
+			candidateKey, candidateOwned := PlanQuotaRecoveryDomainKey(channel)
+			if !candidateOwned || candidateKey != recoveryKey {
+				continue
+			}
+		}
+		if channel.Status != common.ChannelStatusAutoDisabled {
 			continue
 		}
 		if !model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusEnabled, "") {
@@ -229,6 +268,7 @@ func enablePlanQuotaDomain(recoveringChannel *model.Channel) {
 			fmt.Sprintf("Plan 配额域「%s」已恢复", tag),
 			fmt.Sprintf("已恢复 %d 个协议渠道", enabled))
 	}
+	return true
 }
 
 func ShouldDisableChannel(err *types.NewAPIError) bool {
