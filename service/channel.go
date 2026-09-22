@@ -54,7 +54,8 @@ func DisableChannel(channelError types.ChannelError, reason string) {
 func ParsePlanQuotaReset(reason string) (int64, bool) {
 	lowerReason := strings.ToLower(reason)
 	if !strings.Contains(lowerReason, "exceeded the 5-hour usage quota") &&
-		!strings.Contains(lowerReason, "exceeded the weekly usage quota") {
+		!strings.Contains(lowerReason, "exceeded the weekly usage quota") &&
+		!strings.Contains(lowerReason, "exceeded the monthly usage quota") {
 		return 0, false
 	}
 	match := planQuotaResetPattern.FindStringSubmatch(reason)
@@ -154,6 +155,9 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 	}
 	if types.IsSkipRetryError(err) {
 		return false
+	}
+	if _, quotaLimited := ParsePlanQuotaReset(err.Error()); quotaLimited {
+		return true
 	}
 	if operation_setting.ShouldDisableByStatusCode(err.StatusCode) {
 		return true

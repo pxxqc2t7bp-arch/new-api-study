@@ -1,13 +1,17 @@
 package service
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,6 +28,16 @@ func TestParsePlanQuotaReset(t *testing.T) {
 	assert.Equal(t, time.Date(2026, 8, 31, 0, 0, 0, 0, time.FixedZone("CST", 8*60*60)).Unix(), resetAt)
 }
 
+func TestParsePlanQuotaResetMonthly(t *testing.T) {
+	resetAt, matched := ParsePlanQuotaReset(
+		"status_code=429, You have exceeded the monthly usage quota. " +
+			"It will reset at 2026-09-30 23:59:59 +0800 CST.",
+	)
+
+	assert.True(t, matched)
+	assert.Equal(t, time.Date(2026, 9, 30, 23, 59, 59, 0, time.FixedZone("CST", 8*60*60)).Unix(), resetAt)
+}
+
 func TestParsePlanQuotaResetRejectsOrdinaryRateLimit(t *testing.T) {
 	resetAt, matched := ParsePlanQuotaReset("status_code=429, too many requests")
 
@@ -38,6 +52,25 @@ func TestParsePlanQuotaResetKeepsQuotaMatchWhenResetTimeIsInvalid(t *testing.T) 
 
 	assert.True(t, matched)
 	assert.Zero(t, resetAt)
+}
+
+func TestShouldDisableChannelRecognizesMonthlyPlanQuota(t *testing.T) {
+	originalEnabled := common.AutomaticDisableChannelEnabled
+	originalKeywords := operation_setting.AutomaticDisableKeywords
+	common.AutomaticDisableChannelEnabled = true
+	operation_setting.AutomaticDisableKeywords = []string{"unrelated"}
+	t.Cleanup(func() {
+		common.AutomaticDisableChannelEnabled = originalEnabled
+		operation_setting.AutomaticDisableKeywords = originalKeywords
+	})
+
+	err := types.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota. It will reset at 2026-09-30 23:59:59 +0800 CST."),
+		types.ErrorCode("AccountQuotaExceeded"),
+		http.StatusTooManyRequests,
+	)
+
+	assert.True(t, ShouldDisableChannel(err))
 }
 
 func setupPlanQuotaDomainTest(t *testing.T) *gorm.DB {
