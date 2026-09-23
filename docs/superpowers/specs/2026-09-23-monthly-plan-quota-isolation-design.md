@@ -62,6 +62,8 @@ different tags can therefore continue receiving traffic.
   membership, and multi-key mode rotation.
 - Automatically probe an auto-disabled multi-key channel after its final
   enabled key is disabled without exposing that key to normal routing.
+- Admit each due managed all-disabled multi-key channel to passive recovery as
+  its own candidate even though per-key isolation has no quota-domain marker.
 - Restore or remove memory-cache routing membership for every production
   status transition, including legacy and snapshot-CAS enable paths.
 - Use route-before-channel row-lock ordering for managed reconciliation and
@@ -225,13 +227,17 @@ by their `quota_domain`/tag, and every other auto-disabled row receives an
 independent probe opportunity even when several such rows share a Plan tag.
 Within each shared recovery domain, the eligible row with the oldest
 `TestTime` is selected; equal timestamps choose the lower channel ID.
-Ordinary managed channels remain excluded from passive channel tests. A
-managed channel that the classifier recognizes as a marked or validated
-legacy Plan quota owner is included once `disabled_until` has elapsed. This
-allows an all-managed quota domain to recover without depending on the managed
-route's `next_probe_at`. Selection returns an error if the managed-route ID
-query fails; the system task propagates that error and starts no probes rather
-than treating the managed set as empty.
+Ordinary managed channels remain excluded from passive channel tests. A due
+managed channel is included when the classifier recognizes a marked or
+validated legacy Plan quota owner. A due auto-disabled managed multi-key
+channel with no enabled key is also included even without a quota marker,
+using its channel ID as the recovery key so same-credential channels are not
+deduplicated. Managed multi-key rows with an enabled key remain excluded. This
+allows both all-managed quota domains and per-key final-key isolation to
+recover without depending on the managed route's `next_probe_at`. Selection
+returns an error if the managed-route ID query fails; the system task
+propagates that error and starts no probes rather than treating the managed set
+as empty.
 
 Before marker-scoped health-check recovery, the service computes a marker from
 the recovering snapshot's single credential and compares it with the
@@ -329,7 +335,9 @@ atomicity are identical on MySQL and PostgreSQL; SQLite omits unsupported
    channels until `reset_at + 60 seconds`, then selects
    the oldest-tested row per marked or validated legacy domain and each
    unrelated unmanaged row independently. Validated managed Plan quota rows
-   participate; ordinary managed rows do not.
+   participate. Due managed all-disabled multi-key rows participate per channel
+   without shared-domain deduplication; ordinary managed rows and multi-key
+   rows with an enabled key do not.
 10. A health-check recovery first rejects a not-yet-due source snapshot. Once
     due, an all-disabled multi-key source is probed through a deep-copied
     snapshot containing one deterministically selected temporary enabled key.
@@ -433,6 +441,9 @@ atomicity are identical on MySQL and PostgreSQL; SQLite omits unsupported
   channel ID as its deterministic tie-break.
 - Passive recovery includes managed marked and validated legacy Plan quota
   rows after reset while excluding ordinary managed rows.
+- Passive recovery selects each due managed all-disabled multi-key row through
+  the system task exactly once, without a quota marker or credential-domain
+  deduplication, while excluding not-yet-due rows and rows with an enabled key.
 - Managed single-key Plan quota failures isolate shared credential peers before
   managed route failure thresholds are evaluated.
 - Active managed-route reconciliation preserves valid Plan quota ownership in

@@ -1210,7 +1210,12 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) ([]*
 			recoveryKey := fmt.Sprintf("channel:%d", channel.Id)
 			sharedRecoveryKey, owned := service.PlanQuotaRecoveryDomainKey(channel)
 			if _, managed := managedChannels[channel.Id]; managed && !owned {
-				continue
+				isIsolatedMultiKeyRecovery := channel.Status == common.ChannelStatusAutoDisabled &&
+					channel.ChannelInfo.IsMultiKey &&
+					!channel.HasEnabledKey()
+				if !isIsolatedMultiKeyRecovery {
+					continue
+				}
 			}
 			if owned {
 				recoveryKey = sharedRecoveryKey

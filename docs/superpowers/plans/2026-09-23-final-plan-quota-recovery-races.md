@@ -1005,3 +1005,60 @@ Observed: `gofmt` produced no remaining diff; focused model, service, and
 controller tests passed; `go test ./model ./service ./controller -count=1`
 passed; all three focused race suites passed; `go vet ./model ./service
 ./controller` and `git diff --check` exited cleanly.
+
+### Task 19: Schedule Managed Final-Key Passive Recovery
+
+**Files:**
+
+- Modify: `controller/channel-test.go`
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: Extend the full lifecycle with passive-task RED**
+
+Keep the managed final-key fixture not due and assert passive mode performs no
+probe. Move its `disabled_until` into the past, invoke `runChannelTestTask`
+instead of calling `testChannelForHealthCheck` directly, and assert progress,
+summary, and upstream requests show exactly one selected recovery candidate.
+
+Run:
+
+```bash
+go test ./controller -run \
+  '^TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedProbe$' \
+  -count=1 -v
+```
+
+Observed RED: the due run reported progress `0/0`, tested zero channels, and
+sent no request because the managed row had no quota-domain marker.
+
+- [x] **Step 2: Cover the passive-selection boundary**
+
+Extend managed passive-selection coverage with two due all-disabled multi-key
+rows sharing the same Plan tag and credential, one future all-disabled row,
+and one due multi-key row with an enabled key. Require both due all-disabled
+rows independently, while the future and enabled-key rows remain excluded
+along with the existing ordinary managed row.
+
+Observed RED: only the marked and validated legacy rows were returned.
+
+- [x] **Step 3: Admit only channel-specific final-key recovery**
+
+After the existing due check, allow an unowned managed row only when it is
+auto-disabled, multi-key, and `!HasEnabledKey()`. Leave its default
+`channel:<id>` recovery key unchanged. Marked and validated legacy rows retain
+their shared-domain key.
+
+Observed GREEN: both focused controller regressions passed.
+
+- [x] **Step 4: Verify and commit**
+
+Run focused controller/model/service tests, their relevant race suites,
+`go vet`, `gofmt`, and `git diff --check`. Review the final diff, mark the local
+handoff complete, and create one focused commit without deployment changes.
+
+Observed: focused controller/model/service tests and matching race suites
+passed; `go vet ./controller ./model ./service`, `gofmt -d`, and
+`git diff --check` exited cleanly. Review found only the registered controller
+implementation, regression coverage, and design/plan updates.

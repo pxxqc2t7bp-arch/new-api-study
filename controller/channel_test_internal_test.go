@@ -455,9 +455,11 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesManagedPlanQuota(t
 	setupAutomaticChannelSelectionTestDB(t)
 
 	past := time.Now().Add(-time.Minute).Unix()
+	future := time.Now().Add(time.Hour).Unix()
 	markedTag := "plan:managed:marked"
 	legacyTag := "plan:managed:legacy"
 	ordinaryTag := "provider:managed"
+	multiKeyTag := "plan:managed:multi-key"
 	marked := &model.Channel{Id: 31, Status: common.ChannelStatusAutoDisabled, Tag: &markedTag}
 	marked.SetOtherInfo(map[string]any{
 		"disabled_until":  past,
@@ -474,7 +476,59 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesManagedPlanQuota(t
 		"disabled_until": past,
 		"status_reason":  "ordinary managed failure",
 	})
-	for i, channel := range []*model.Channel{marked, legacy, ordinary} {
+	allDisabledFirst := &model.Channel{
+		Id:     34,
+		Key:    "shared-key-a\nshared-key-b",
+		Status: common.ChannelStatusAutoDisabled,
+		Tag:    &multiKeyTag,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+			},
+		},
+	}
+	allDisabledFirst.SetOtherInfo(map[string]any{"disabled_until": past})
+	allDisabledSecond := &model.Channel{
+		Id:          35,
+		Key:         allDisabledFirst.Key,
+		Status:      common.ChannelStatusAutoDisabled,
+		Tag:         &multiKeyTag,
+		ChannelInfo: allDisabledFirst.ChannelInfo,
+	}
+	allDisabledSecond.SetOtherInfo(map[string]any{"disabled_until": past})
+	notDue := &model.Channel{
+		Id:          36,
+		Key:         allDisabledFirst.Key,
+		Status:      common.ChannelStatusAutoDisabled,
+		Tag:         &multiKeyTag,
+		ChannelInfo: allDisabledFirst.ChannelInfo,
+	}
+	notDue.SetOtherInfo(map[string]any{"disabled_until": future})
+	hasEnabledKey := &model.Channel{
+		Id:     37,
+		Key:    allDisabledFirst.Key,
+		Status: common.ChannelStatusAutoDisabled,
+		Tag:    &multiKeyTag,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+			},
+		},
+	}
+	hasEnabledKey.SetOtherInfo(map[string]any{"disabled_until": past})
+	managed := []*model.Channel{
+		marked,
+		legacy,
+		ordinary,
+		allDisabledFirst,
+		allDisabledSecond,
+		notDue,
+		hasEnabledKey,
+	}
+	for i, channel := range managed {
 		require.NoError(t, model.DB.Create(&model.UpstreamManagedRoute{
 			SourceID:        int64(i + 1),
 			ExternalGroupID: fmt.Sprintf("managed-%d", channel.Id),
@@ -486,7 +540,7 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesManagedPlanQuota(t
 	}
 
 	selected, err := selectChannelsForAutomaticTest(
-		[]*model.Channel{marked, legacy, ordinary},
+		managed,
 		operation_setting.ChannelTestModePassiveRecovery,
 	)
 
@@ -495,7 +549,7 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesManagedPlanQuota(t
 	for i, channel := range selected {
 		selectedIDs[i] = channel.Id
 	}
-	assert.Equal(t, []int{31, 32}, selectedIDs)
+	assert.Equal(t, []int{31, 32, 34, 35}, selectedIDs)
 }
 
 func TestSelectChannelsForAutomaticTestAlwaysSkipsManualDisabled(t *testing.T) {
@@ -1022,6 +1076,9 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 			},
 		},
 	}
+	channel.SetOtherInfo(map[string]any{
+		"disabled_until": now.Add(time.Hour).Unix(),
+	})
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, channel.AddAbilities(nil))
 	route := model.UpstreamManagedRoute{
@@ -1070,16 +1127,40 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 	require.NoError(t, err)
 	assert.Nil(t, selected)
 
-	probeSummary := testChannelForHealthCheck(
+	_, sharedOwner := service.PlanQuotaRecoveryDomainKey(&reconciled)
+	assert.False(t, sharedOwner)
+
+	notDueSummary, err := runChannelTestTask(
 		context.Background(),
-		&reconciled,
-		user.Id,
+		operation_setting.ChannelTestModePassiveRecovery,
 		false,
-		10_000_000,
+		nil,
 	)
+	require.NoError(t, err)
+	assert.Zero(t, notDueSummary.Tested)
+	assert.Empty(t, requestKeys)
+
+	dueInfo := reconciled.GetOtherInfo()
+	dueInfo["disabled_until"] = now.Add(-time.Minute).Unix()
+	reconciled.SetOtherInfo(dueInfo)
+	require.NoError(t, db.Model(&model.Channel{}).
+		Where("id = ?", channel.Id).
+		Update("other_info", reconciled.OtherInfo).Error)
+
+	var progress []string
+	probeSummary, err := runChannelTestTask(
+		context.Background(),
+		operation_setting.ChannelTestModePassiveRecovery,
+		false,
+		func(processed, total int) {
+			progress = append(progress, fmt.Sprintf("%d/%d", processed, total))
+		},
+	)
+	require.NoError(t, err)
 	assert.Equal(t, 1, probeSummary.Tested)
 	assert.Equal(t, 1, probeSummary.Succeeded)
 	assert.Equal(t, 1, probeSummary.Enabled)
+	assert.Equal(t, []string{"0/1", "1/1"}, progress)
 	require.Len(t, requestKeys, 1)
 	assert.Equal(t, "key-a", <-requestKeys)
 
