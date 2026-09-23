@@ -1395,14 +1395,37 @@ func TestBuildHealthCheckProbeChannelSelectsOldestAutoDisabledKey(t *testing.T) 
 	assert.Equal(t, "key-b", wrappedKey)
 }
 
-func TestIsUpstreamProbeFailureRejectsCancellation(t *testing.T) {
+func TestIsUpstreamProbeFailureUsesParentContextState(t *testing.T) {
+	assert.False(t, isUpstreamProbeFailure(context.Background(), nil))
 	assert.True(t, isUpstreamProbeFailure(context.Background(), errors.New("upstream rejected request")))
-	assert.False(t, isUpstreamProbeFailure(context.Background(), context.Canceled))
-	assert.False(t, isUpstreamProbeFailure(context.Background(), context.DeadlineExceeded))
+	assert.True(t, isUpstreamProbeFailure(context.Background(), context.Canceled))
+	assert.True(t, isUpstreamProbeFailure(context.Background(), context.DeadlineExceeded))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	assert.False(t, isUpstreamProbeFailure(ctx, errors.New("transport returned after cancellation")))
+
+	ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	assert.False(t, isUpstreamProbeFailure(ctx, context.DeadlineExceeded))
+}
+
+func TestIsUpstreamProbeFailureClassifiesHTTPClientTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+
+	parent := context.Background()
+	request, err := http.NewRequestWithContext(parent, http.MethodGet, server.URL, nil)
+	require.NoError(t, err)
+	client := &http.Client{Timeout: 20 * time.Millisecond}
+
+	_, err = client.Do(request)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.NoError(t, parent.Err())
+	assert.True(t, isUpstreamProbeFailure(parent, err))
 }
 
 func TestChannelForHealthCheckProbesFinalAutoDisabledMultiKey(t *testing.T) {

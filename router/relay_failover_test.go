@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -277,6 +278,17 @@ func requireEventually(t *testing.T, assertion func() bool) {
 	require.Eventually(t, assertion, 2*time.Second, 10*time.Millisecond)
 }
 
+func relayGoPoolDrain(t *testing.T) func() {
+	t.Helper()
+	baselineWorkers := gopool.WorkerCount()
+	return func() {
+		t.Helper()
+		require.Eventually(t, func() bool {
+			return gopool.WorkerCount() <= baselineWorkers
+		}, 2*time.Second, 10*time.Millisecond)
+	}
+}
+
 type failoverAdminInfo struct {
 	AttemptCount      int      `json:"attempt_count"`
 	AttemptedChannels []string `json:"attempted_channels"`
@@ -463,6 +475,7 @@ func TestRelayChannelFailoverCapsAttemptsAtFivePriorities(t *testing.T) {
 
 func TestRelayChannelFailoverFromSlow429StartsBudgetAtFailover(t *testing.T) {
 	engine, _ := setupRelayFailoverTest(t, false)
+	defer relayGoPoolDrain(t)()
 	common.AutomaticDisableChannelEnabled = false
 	enableManagedOrchestrationForFailoverTest(t, 1)
 	trace := &failoverCallTrace{}
@@ -484,6 +497,7 @@ func TestRelayChannelFailoverFromSlow429StartsBudgetAtFailover(t *testing.T) {
 
 func TestRelayChannelFailoverStopsWhenBudgetExpires(t *testing.T) {
 	engine, user := setupRelayFailoverTest(t, false)
+	defer relayGoPoolDrain(t)()
 	enableManagedOrchestrationForFailoverTest(t, 1)
 	trace := &failoverCallTrace{}
 	primary := newFailoverUpstream(t, "primary", http.StatusInternalServerError, trace)

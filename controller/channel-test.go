@@ -44,7 +44,7 @@ type testResult struct {
 }
 
 func isUpstreamProbeFailure(ctx context.Context, err error) bool {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if err == nil {
 		return false
 	}
 	return ctx == nil || ctx.Err() == nil
