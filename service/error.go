@@ -236,6 +236,12 @@ func TaskErrorFromAPIError(apiErr *types.NewAPIError) *taskdto.TaskError {
 			code = strings.TrimSpace(fmt.Sprint(openAIError.Code))
 		}
 	}
+	if errType != "" {
+		switch code {
+		case "", "unknown", "unknown_error":
+			code = errType
+		}
+	}
 	message := apiErr.Error()
 	underlyingErr := apiErr.Err
 	if underlyingErr == nil {

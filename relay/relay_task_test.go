@@ -134,7 +134,7 @@ func TestSubmitTaskUpstreamPreservesStructuredQuotaTypeWithoutCode(t *testing.T)
 	)
 
 	assert.Equal(t, http.StatusTooManyRequests, taskErr.StatusCode)
-	assert.Equal(t, "unknown_error", taskErr.Code)
+	assert.Equal(t, "AccountQuotaExceeded", taskErr.Code)
 	assert.Equal(t, "AccountQuotaExceeded", taskErr.Type)
 	assert.Equal(t, quotaMessage, taskErr.Message)
 	assert.False(t, taskErr.LocalError)

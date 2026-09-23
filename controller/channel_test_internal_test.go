@@ -1011,6 +1011,18 @@ func TestExecuteTaskSubmissionDoesNotClassifyOrdinary429AsPlanQuota(t *testing.T
 }
 
 func TestLockedTaskRetryStopsAfterSingleKeyPlanQuotaDisable(t *testing.T) {
+	for _, memoryCacheEnabled := range []bool{false, true} {
+		name := "without memory cache"
+		if memoryCacheEnabled {
+			name = "with memory cache"
+		}
+		t.Run(name, func(t *testing.T) {
+			testLockedTaskRetryStopsAfterSingleKeyPlanQuotaDisable(t, memoryCacheEnabled)
+		})
+	}
+}
+
+func testLockedTaskRetryStopsAfterSingleKeyPlanQuotaDisable(t *testing.T, memoryCacheEnabled bool) {
 	db := setupModelListControllerTestDB(t)
 
 	originalRetryTimes := common.RetryTimes
@@ -1018,7 +1030,7 @@ func TestLockedTaskRetryStopsAfterSingleKeyPlanQuotaDisable(t *testing.T) {
 	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
 	originalErrorLogEnabled := constant.ErrorLogEnabled
 	common.RetryTimes = 1
-	common.MemoryCacheEnabled = false
+	common.MemoryCacheEnabled = memoryCacheEnabled
 	common.AutomaticDisableChannelEnabled = true
 	constant.ErrorLogEnabled = false
 	t.Cleanup(func() {
@@ -1037,6 +1049,9 @@ func TestLockedTaskRetryStopsAfterSingleKeyPlanQuotaDisable(t *testing.T) {
 	}
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, channel.AddAbilities(nil))
+	if memoryCacheEnabled {
+		model.InitChannelCache()
+	}
 
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
@@ -1071,6 +1086,11 @@ func TestLockedTaskRetryStopsAfterSingleKeyPlanQuotaDisable(t *testing.T) {
 	assert.Contains(t, taskErr.Message, "disabled")
 	refreshed, ok := relayInfo.LockedChannel.(*model.Channel)
 	require.True(t, ok)
+	if memoryCacheEnabled {
+		cachedChannel, err := model.CacheGetChannel(channel.Id)
+		require.NoError(t, err)
+		assert.NotSame(t, cachedChannel, refreshed)
+	}
 	assert.Equal(t, common.ChannelStatusAutoDisabled, refreshed.Status)
 	var stored model.Channel
 	require.NoError(t, db.First(&stored, channel.Id).Error)
@@ -1078,6 +1098,18 @@ func TestLockedTaskRetryStopsAfterSingleKeyPlanQuotaDisable(t *testing.T) {
 }
 
 func TestLockedTaskRetryRefreshesMultiKeyAndUsesRemainingKey(t *testing.T) {
+	for _, memoryCacheEnabled := range []bool{false, true} {
+		name := "without memory cache"
+		if memoryCacheEnabled {
+			name = "with memory cache"
+		}
+		t.Run(name, func(t *testing.T) {
+			testLockedTaskRetryRefreshesMultiKeyAndUsesRemainingKey(t, memoryCacheEnabled)
+		})
+	}
+}
+
+func testLockedTaskRetryRefreshesMultiKeyAndUsesRemainingKey(t *testing.T, memoryCacheEnabled bool) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.Task{}))
 
@@ -1087,7 +1119,7 @@ func TestLockedTaskRetryRefreshesMultiKeyAndUsesRemainingKey(t *testing.T) {
 	originalErrorLogEnabled := constant.ErrorLogEnabled
 	originalLogConsumeEnabled := common.LogConsumeEnabled
 	common.RetryTimes = 1
-	common.MemoryCacheEnabled = false
+	common.MemoryCacheEnabled = memoryCacheEnabled
 	common.AutomaticDisableChannelEnabled = true
 	constant.ErrorLogEnabled = false
 	common.LogConsumeEnabled = false
@@ -1112,6 +1144,9 @@ func TestLockedTaskRetryRefreshesMultiKeyAndUsesRemainingKey(t *testing.T) {
 	}
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, channel.AddAbilities(nil))
+	if memoryCacheEnabled {
+		model.InitChannelCache()
+	}
 
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
@@ -1152,6 +1187,11 @@ func TestLockedTaskRetryRefreshesMultiKeyAndUsesRemainingKey(t *testing.T) {
 	assert.Equal(t, []string{"key-a", "key-b"}, usedKeys)
 	refreshed, ok := relayInfo.LockedChannel.(*model.Channel)
 	require.True(t, ok)
+	if memoryCacheEnabled {
+		cachedChannel, err := model.CacheGetChannel(channel.Id)
+		require.NoError(t, err)
+		assert.NotSame(t, cachedChannel, refreshed)
+	}
 	assert.NotSame(t, &channel, refreshed)
 	assert.Equal(t, common.ChannelStatusEnabled, refreshed.Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, refreshed.ChannelInfo.MultiKeyStatusList[0])

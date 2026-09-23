@@ -771,7 +771,7 @@ func executeTaskSubmissionWith(
 		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
 			channel = lockedCh
 			if retryParam.GetRetry() > 0 {
-				refreshed, refreshErr := model.CacheGetChannel(lockedCh.Id)
+				refreshed, refreshErr := model.GetChannelById(lockedCh.Id, true)
 				if refreshErr != nil {
 					taskErr = service.TaskErrorWrapperLocal(
 						fmt.Errorf("failed to refresh locked channel #%d: %w", lockedCh.Id, refreshErr),
