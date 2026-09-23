@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -547,6 +548,129 @@ func TestCacheUpdateChannelStatusRebuildsOrderedRoutingMembership(t *testing.T) 
 	routingIDs := append([]int(nil), group2model2channels["default"]["gpt-cache-status"]...)
 	channelSyncLock.RUnlock()
 	assert.Equal(t, []int{channels[0].Id, channels[1].Id}, routingIDs)
+}
+
+func TestCacheUpdateChannelsPublishesRoutingDomainAtomically(t *testing.T) {
+	setupChannelStatusTest(t)
+	const (
+		channelCount = 64
+		readerCount  = 16
+		modelName    = "gpt-cache-batch-atomic"
+	)
+
+	channels := make([]Channel, channelCount)
+	for index := range channels {
+		channels[index] = Channel{
+			Name:   fmt.Sprintf("batch-atomic-%d", index),
+			Key:    "shared-credential",
+			Status: common.ChannelStatusEnabled,
+			Models: modelName,
+			Group:  "default",
+		}
+	}
+	require.NoError(t, DB.Create(&channels).Error)
+	for index := range channels {
+		require.NoError(t, channels[index].AddAbilities(nil))
+	}
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+
+	oldChannels := make(map[int]*Channel, channelCount)
+	updatedChannels := make([]*Channel, channelCount)
+	updatedChannelsByID := make(map[int]*Channel, channelCount)
+	channelSyncLock.RLock()
+	for index := range channels {
+		oldChannels[channels[index].Id] = channelsIDM[channels[index].Id]
+		updated := *channelsIDM[channels[index].Id]
+		updated.Status = common.ChannelStatusAutoDisabled
+		updatedChannels[index] = &updated
+		updatedChannelsByID[updated.Id] = &updated
+	}
+	channelSyncLock.RUnlock()
+
+	start := make(chan struct{})
+	ready := make(chan struct{}, readerCount)
+	observed := make(chan struct{}, readerCount)
+	stop := make(chan struct{})
+	partial := make(chan string, 1)
+	var readers sync.WaitGroup
+	for range readerCount {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			ready <- struct{}{}
+			<-start
+			firstObservation := true
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+
+				channelSyncLock.RLock()
+				oldCount := 0
+				newCount := 0
+				enabledCount := 0
+				for _, channel := range channels {
+					cached := channelsIDM[channel.Id]
+					if cached == oldChannels[channel.Id] {
+						oldCount++
+					}
+					if cached == updatedChannelsByID[channel.Id] {
+						newCount++
+					}
+					if cached.Status == common.ChannelStatusEnabled {
+						enabledCount++
+					}
+				}
+				routingCount := len(group2model2channels["default"][modelName])
+				channelSyncLock.RUnlock()
+
+				if firstObservation {
+					observed <- struct{}{}
+					firstObservation = false
+				}
+				oldState := oldCount == channelCount && newCount == 0 &&
+					enabledCount == channelCount && routingCount == channelCount
+				newState := oldCount == 0 && newCount == channelCount &&
+					enabledCount == 0 && routingCount == 0
+				if !oldState && !newState {
+					select {
+					case partial <- fmt.Sprintf(
+						"old=%d new=%d enabled=%d routed=%d",
+						oldCount, newCount, enabledCount, routingCount,
+					):
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	for range readerCount {
+		<-ready
+	}
+	close(start)
+	for range readerCount {
+		<-observed
+	}
+
+	CacheUpdateChannels(updatedChannels)
+	close(stop)
+	readers.Wait()
+
+	select {
+	case snapshot := <-partial:
+		t.Fatalf("observed partially published cache state: %s", snapshot)
+	default:
+	}
+	channelSyncLock.RLock()
+	defer channelSyncLock.RUnlock()
+	for index, channel := range channels {
+		assert.Same(t, updatedChannels[index], channelsIDM[channel.Id])
+	}
+	assert.Empty(t, group2model2channels["default"][modelName])
 }
 
 func TestUpdateManagedChannelIfUnchangedPreservesConcurrentStatusOwner(t *testing.T) {

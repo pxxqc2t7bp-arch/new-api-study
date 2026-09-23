@@ -1040,9 +1040,11 @@ func UpdateSingleKeyChannelStatusesIfUnchanged(updates []SingleKeyChannelStatusU
 		if err != nil {
 			return false, err
 		}
+		cacheUpdates := make([]*Channel, len(updatedChannels))
 		for index := range updatedChannels {
-			CacheUpdateChannel(&updatedChannels[index])
+			cacheUpdates[index] = &updatedChannels[index]
 		}
+		CacheUpdateChannels(cacheUpdates)
 		return true, nil
 	})
 }

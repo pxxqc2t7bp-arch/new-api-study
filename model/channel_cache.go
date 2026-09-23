@@ -348,16 +348,7 @@ func syncChannelRoutingIndexLocked(channel *Channel) {
 	}
 }
 
-func CacheUpdateChannel(channel *Channel) {
-	if !common.MemoryCacheEnabled {
-		return
-	}
-	channelSyncLock.Lock()
-	if channel == nil {
-		channelSyncLock.Unlock()
-		return
-	}
-
+func cacheUpdateChannelLocked(channel *Channel) {
 	if channelsIDM == nil {
 		channelsIDM = make(map[int]*Channel)
 	}
@@ -383,10 +374,32 @@ func CacheUpdateChannel(channel *Channel) {
 		}
 	}
 	logger.LogDebug(nil, "CacheUpdateChannel after: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, channel.ChannelInfo.MultiKeyPollingIndex)
+}
+
+func CacheUpdateChannels(channels []*Channel) {
+	if !common.MemoryCacheEnabled {
+		return
+	}
+
+	updated := false
+	channelSyncLock.Lock()
+	for _, channel := range channels {
+		if channel == nil {
+			continue
+		}
+		cacheUpdateChannelLocked(channel)
+		updated = true
+	}
 	// Lock ordering: do NOT hold channelSyncLock while calling
 	// InvalidatePricingCache. GetPricing acquires updatePricingLock first and then
 	// channelSyncLock.RLock (via loadPricingAdvancedCustomConfigs); acquiring
 	// updatePricingLock while holding channelSyncLock would be an AB-BA deadlock.
 	channelSyncLock.Unlock()
-	InvalidatePricingCache()
+	if updated {
+		InvalidatePricingCache()
+	}
+}
+
+func CacheUpdateChannel(channel *Channel) {
+	CacheUpdateChannels([]*Channel{channel})
 }
