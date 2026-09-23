@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Close the remaining credential-rotation, stale-recovery, legacy-writer, passive-fairness, and managed-route races in Plan quota isolation without a schema change.
+**Goal:** Close the remaining credential-rotation, stale-recovery, legacy-writer, passive-fairness, managed-route, and pre-probe snapshot races in Plan quota isolation without a schema change.
 
-**Architecture:** Extend the existing row-locked single-key CAS to compare the snapshot's credential and tag in addition to status and raw metadata. Reuse an internal lock-aware transaction primitive from both quota ownership writes and the legacy single-key status API, stamp every Plan disable event with a string generation, select the oldest passive recovery candidate per shared domain, and route recognized managed single-key Plan quota errors through domain isolation before managed failure accounting.
+**Architecture:** Extend the existing row-locked single-key CAS to compare the snapshot's credential and tag in addition to status and raw metadata. Reuse an internal lock-aware transaction primitive from quota ownership writes, legacy single-key status updates, and health-check recovery; stamp every Plan disable event with a string generation; select the oldest passive recovery candidate per shared domain; and admit validated managed Plan quota owners to passive recovery without changing ordinary managed handling.
 
 **Tech Stack:** Go, GORM transactions and row locking, SQLite deterministic regression tests, optional MySQL/PostgreSQL integration tests, testify
 
@@ -244,11 +244,95 @@ TEST_MYSQL_DSN='...' TEST_POSTGRES_DSN='...' \
 
 Record skips when the DSNs are unavailable.
 
-- [ ] **Step 4: Review and commit**
+- [x] **Step 4: Review and commit**
 
 Review the cumulative diff for scope, credential disclosure, and schema
 changes, then commit all final-review changes:
 
 ```bash
 git commit -m "fix(channel): close plan quota recovery races"
+```
+
+### Task 7: Bind Recovery to the Pre-Probe Snapshot
+
+**Files:**
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/channel.go`
+- Modify: `controller/channel-test.go`
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: Add production service-path stale-probe regressions**
+
+Call a wished-for exported health-check recovery API with a Plan quota source
+snapshot captured before a second disable generation and before a concurrent
+manual disable. Assert source and peers remain disabled, their ability rows
+remain disabled, and the newer owner metadata is unchanged.
+
+- [x] **Step 2: Verify focused RED**
+
+Run:
+
+```bash
+go test ./service -run '^TestEnableChannelForHealthCheckRejects(StalePlanQuotaGeneration|ConcurrentManualDisable)$' -count=1
+```
+
+Observed: build failure because `EnableChannelForHealthCheck` did not exist.
+
+- [x] **Step 3: Add snapshot-aware recovery and wire the controller**
+
+Add `EnableChannelForHealthCheck(snapshot, usingKey)`. For a non-multi-key Plan
+quota owner, derive the domain from the pre-probe snapshot and CAS the source
+using its exact key, tag, status, and raw `other_info`. Abort without generic
+enablement when the source CAS does not commit. After it commits, load current
+same-domain peers and recover each through its own CAS. If the source
+snapshot's credential does not match its marker, recover only the source.
+Keep `EnableChannel` unchanged for manual and internal callers. Pass the
+original channel snapshot from `testChannelForHealthCheck`.
+
+- [x] **Step 4: Verify snapshot recovery GREEN**
+
+Run the focused stale-probe tests and the broader `PlanQuota|MonthlyPlanQuota`
+service subset. Expected and observed: PASS.
+
+- [x] **Step 5: Add managed passive-selection RED**
+
+Create managed-route fixtures for a due marked Plan quota row, a due validated
+legacy Plan quota row, and a due ordinary auto-disabled row. Assert the two
+validated Plan rows are selected and the ordinary managed row is excluded.
+
+Run:
+
+```bash
+go test ./controller -run '^TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesManagedPlanQuota$' -count=1
+```
+
+Observed: FAIL with an empty selected set.
+
+- [x] **Step 6: Admit only validated managed Plan owners**
+
+In passive selection, classify quota ownership before applying the managed
+exclusion. Keep excluding managed rows without a valid shared Plan recovery
+key, while allowing marked or validated legacy Plan quota rows after
+`disabled_until`. Preserve existing domain deduplication and oldest-first
+selection.
+
+- [x] **Step 7: Verify managed-selection GREEN**
+
+Run the passive recovery selection tests plus managed unsupported-model,
+ordinary failure-classification, and managed Plan isolation tests. Expected
+and observed: PASS.
+
+- [x] **Step 8: Run final gates and commit**
+
+```bash
+gofmt -w service/channel.go service/channel_quota_test.go \
+  controller/channel-test.go controller/channel_test_internal_test.go
+go test ./service ./controller ./model -count=1
+go test -race ./service -run '^(TestEnableChannelForHealthCheck|TestEnablePlanQuotaDomainAfterCredentialRotation|TestDisableChannelManagedPlanQuota)' -count=1
+go test -race ./controller -run '^TestSelectChannelsForAutomaticTest.*Recovery' -count=1
+go vet ./service ./controller ./model
+git diff --check
+git commit -m "fix(channel): bind quota recovery to probe snapshot"
 ```

@@ -964,7 +964,7 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 	}
 
 	if result.localErr == nil && !isChannelEnabled && service.ShouldEnableChannel(newAPIError, channel.Status) {
-		service.EnableChannel(channel.Id, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.Name)
+		service.EnableChannelForHealthCheck(channel, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey))
 		summary.Enabled++
 	}
 
@@ -1143,14 +1143,15 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 			continue
 		}
 		if mode == operation_setting.ChannelTestModePassiveRecovery {
-			if _, managed := managedChannels[channel.Id]; managed {
-				continue
-			}
 			if disabledUntil := channel.GetDisabledUntil(); disabledUntil > now {
 				continue
 			}
 			recoveryKey := fmt.Sprintf("channel:%d", channel.Id)
-			if sharedRecoveryKey, owned := service.PlanQuotaRecoveryDomainKey(channel); owned {
+			sharedRecoveryKey, owned := service.PlanQuotaRecoveryDomainKey(channel)
+			if _, managed := managedChannels[channel.Id]; managed && !owned {
+				continue
+			}
+			if owned {
 				recoveryKey = sharedRecoveryKey
 			}
 			if selectedIndex, exists := selectedRecoveryDomains[recoveryKey]; exists {

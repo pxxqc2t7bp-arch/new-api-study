@@ -227,6 +227,119 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
 	}
 }
 
+// EnableChannelForHealthCheck recovers only the state observed before the
+// probe. Manual and internal callers that intentionally act on current state
+// should continue using EnableChannel.
+func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) {
+	if channel == nil || channel.Status != common.ChannelStatusAutoDisabled {
+		return
+	}
+	if channel.ChannelInfo.IsMultiKey {
+		EnableChannel(channel.Id, usingKey, channel.Name)
+		return
+	}
+	if isNonMultiKeyPlanChannel(channel) {
+		if recoveryKey, owned := PlanQuotaRecoveryDomainKey(channel); owned {
+			enablePlanQuotaDomainForHealthCheck(channel, recoveryKey)
+			return
+		}
+	}
+
+	changed, err := enableSingleKeyChannelSnapshot(channel, false)
+	if err != nil {
+		common.SysError(fmt.Sprintf("failed to recover channel from health-check snapshot: channel_id=%d error=%v", channel.Id, err))
+		return
+	}
+	if changed {
+		subject := fmt.Sprintf("通道「%s」（#%d）已被启用", channel.Name, channel.Id)
+		content := fmt.Sprintf("通道「%s」（#%d）已被启用", channel.Name, channel.Id)
+		NotifyRootUser(formatNotifyType(channel.Id, common.ChannelStatusEnabled), subject, content)
+	}
+}
+
+func enablePlanQuotaDomainForHealthCheck(recoveringSnapshot *model.Channel, recoveryKey string) {
+	changed, err := enableSingleKeyChannelSnapshot(recoveringSnapshot, true)
+	if err != nil {
+		common.SysError(fmt.Sprintf("failed to recover Plan quota source: channel_id=%d error=%v", recoveringSnapshot.Id, err))
+		return
+	}
+	if !changed {
+		return
+	}
+
+	enabled := 1
+	if planQuotaSnapshotMatchesCredentialMarker(recoveringSnapshot) {
+		channels, err := model.GetAllChannels(0, 0, true, false)
+		if err != nil {
+			common.SysError(fmt.Sprintf("failed to load Plan quota peers: channel_id=%d error=%v", recoveringSnapshot.Id, err))
+		} else {
+			for _, channel := range channels {
+				if channel.Id == recoveringSnapshot.Id {
+					continue
+				}
+				candidateKey, candidateOwned := PlanQuotaRecoveryDomainKey(channel)
+				if !candidateOwned || candidateKey != recoveryKey {
+					continue
+				}
+				changed, err := enableSingleKeyChannelSnapshot(channel, true)
+				if err != nil {
+					common.SysError(fmt.Sprintf("failed to recover Plan quota channel: channel_id=%d error=%v", channel.Id, err))
+					continue
+				}
+				if changed {
+					enabled++
+				}
+			}
+		}
+	}
+
+	tag := recoveringSnapshot.GetTag()
+	NotifyRootUser("channel_plan_quota_recovered_"+tag,
+		fmt.Sprintf("Plan 配额域「%s」已恢复", tag),
+		fmt.Sprintf("已恢复 %d 个协议渠道", enabled))
+}
+
+func planQuotaSnapshotMatchesCredentialMarker(channel *model.Channel) bool {
+	domainID, marked := channel.GetOtherInfo()["quota_domain_id"].(string)
+	if !marked {
+		return true
+	}
+	keys := channel.GetKeys()
+	return len(keys) == 1 && planQuotaDomainID(channel.Id, keys[0]) == domainID
+}
+
+func enableSingleKeyChannelSnapshot(channel *model.Channel, clearPlanQuota bool) (bool, error) {
+	if channel == nil || channel.ChannelInfo.IsMultiKey ||
+		channel.Status != common.ChannelStatusAutoDisabled {
+		return false, nil
+	}
+
+	expectedOtherInfo := channel.OtherInfo
+	desired := *channel
+	metadata := desired.GetOtherInfo()
+	metadata["status_reason"] = ""
+	metadata["status_time"] = common.GetTimestamp()
+	if clearPlanQuota {
+		delete(metadata, "disabled_until")
+		delete(metadata, "quota_reset_at")
+		delete(metadata, "quota_domain")
+		delete(metadata, "quota_domain_id")
+		delete(metadata, "quota_generation")
+		delete(metadata, "quota_type")
+	}
+	desired.SetOtherInfo(metadata)
+
+	return model.UpdateSingleKeyChannelStatusIfUnchanged(
+		channel.Id,
+		channel.Key,
+		channel.GetTag(),
+		channel.Status,
+		expectedOtherInfo,
+		common.ChannelStatusEnabled,
+		desired.OtherInfo,
+	)
+}
+
 func enablePlanQuotaDomain(recoveringChannel *model.Channel) bool {
 	if recoveringChannel == nil {
 		common.SysError("failed to enable Plan quota domain: channel is nil")
@@ -256,12 +369,7 @@ func enablePlanQuotaDomain(recoveringChannel *model.Channel) bool {
 		return false
 	}
 
-	recoverOnlyCurrent := false
-	if domainID, marked := current.GetOtherInfo()["quota_domain_id"].(string); marked {
-		currentKeys := current.GetKeys()
-		recoverOnlyCurrent = len(currentKeys) != 1 ||
-			planQuotaDomainID(current.Id, currentKeys[0]) != domainID
-	}
+	recoverOnlyCurrent := !planQuotaSnapshotMatchesCredentialMarker(current)
 
 	enabled := 0
 	for _, channel := range channels {
@@ -279,27 +387,7 @@ func enablePlanQuotaDomain(recoveringChannel *model.Channel) bool {
 			continue
 		}
 
-		expectedOtherInfo := channel.OtherInfo
-		metadata := channel.GetOtherInfo()
-		metadata["status_reason"] = ""
-		metadata["status_time"] = common.GetTimestamp()
-		delete(metadata, "disabled_until")
-		delete(metadata, "quota_reset_at")
-		delete(metadata, "quota_domain")
-		delete(metadata, "quota_domain_id")
-		delete(metadata, "quota_generation")
-		delete(metadata, "quota_type")
-		channel.SetOtherInfo(metadata)
-
-		changed, err := model.UpdateSingleKeyChannelStatusIfUnchanged(
-			channel.Id,
-			channel.Key,
-			channel.GetTag(),
-			channel.Status,
-			expectedOtherInfo,
-			common.ChannelStatusEnabled,
-			channel.OtherInfo,
-		)
+		changed, err := enableSingleKeyChannelSnapshot(channel, true)
 		if err != nil {
 			common.SysError(fmt.Sprintf("failed to recover Plan quota channel: channel_id=%d error=%v", channel.Id, err))
 			continue

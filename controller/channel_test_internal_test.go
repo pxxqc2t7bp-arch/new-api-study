@@ -447,6 +447,52 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryUsesOldestDomainPeer(t *te
 	assert.Equal(t, []int{12, 14, 16, 17}, selectedIDs)
 }
 
+func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesManagedPlanQuota(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
+	past := time.Now().Add(-time.Minute).Unix()
+	markedTag := "plan:managed:marked"
+	legacyTag := "plan:managed:legacy"
+	ordinaryTag := "provider:managed"
+	marked := &model.Channel{Id: 31, Status: common.ChannelStatusAutoDisabled, Tag: &markedTag}
+	marked.SetOtherInfo(map[string]any{
+		"disabled_until":  past,
+		"quota_domain_id": "managed-domain",
+	})
+	legacy := &model.Channel{Id: 32, Status: common.ChannelStatusAutoDisabled, Tag: &legacyTag}
+	legacy.SetOtherInfo(map[string]any{
+		"disabled_until": past,
+		"quota_domain":   legacyTag,
+		"quota_type":     "plan",
+	})
+	ordinary := &model.Channel{Id: 33, Status: common.ChannelStatusAutoDisabled, Tag: &ordinaryTag}
+	ordinary.SetOtherInfo(map[string]any{
+		"disabled_until": past,
+		"status_reason":  "ordinary managed failure",
+	})
+	for i, channel := range []*model.Channel{marked, legacy, ordinary} {
+		require.NoError(t, model.DB.Create(&model.UpstreamManagedRoute{
+			SourceID:        int64(i + 1),
+			ExternalGroupID: fmt.Sprintf("managed-%d", channel.Id),
+			Platform:        "plan",
+			Protocol:        "openai",
+			ChannelID:       channel.Id,
+			State:           model.UpstreamRouteStateActive,
+		}).Error)
+	}
+
+	selected := selectChannelsForAutomaticTest(
+		[]*model.Channel{marked, legacy, ordinary},
+		operation_setting.ChannelTestModePassiveRecovery,
+	)
+
+	selectedIDs := make([]int, len(selected))
+	for i, channel := range selected {
+		selectedIDs[i] = channel.Id
+	}
+	assert.Equal(t, []int{31, 32}, selectedIDs)
+}
+
 func TestSelectChannelsForAutomaticTestAlwaysSkipsManualDisabled(t *testing.T) {
 	setupAutomaticChannelSelectionTestDB(t)
 

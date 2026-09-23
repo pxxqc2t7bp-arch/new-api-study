@@ -36,6 +36,8 @@ different tags can therefore continue receiving traffic.
 - Keep legacy single-key status writes atomic with ability state.
 - Apply Plan quota isolation to managed routes before managed failure
   thresholds, without changing unsupported-model handling.
+- Let validated managed Plan quota domains participate in passive recovery
+  after their quota reset while ordinary managed channels remain excluded.
 
 ## Non-Goals
 
@@ -109,16 +111,28 @@ established path.
 Plan disable and recovery no longer call `UpdateChannelStatus` followed by
 `MergeChannelStatusMetadata`. A concurrent manual disable, unrelated
 auto-disable marker, or metadata edit invalidates the snapshot and makes the
-attempt a no-op. Existing credential-rotation behavior remains fail-closed:
-recovery still compares the current credential-derived marker before selecting
-peers, while the atomic write preserves any concurrent ownership metadata.
+attempt a no-op.
 
-Recovery accepts the recovering channel and reloads all channel rows so it
-does not depend on potentially stale cached metadata. If the recovering row
-has `quota_domain_id`, only rows with the same marker and
-`ChannelStatusAutoDisabled` are enabled, including rows with different Plan
-tags. Rows from another marked domain and manually disabled rows are left
-unchanged. Metadata is cleared only after a selected row is actually enabled.
+Automatic channel tests call `EnableChannelForHealthCheck` with the exact
+`Channel` snapshot used by the probe and its selected key. Non-multi-key Plan
+quota ownership and recovery scope are derived from that pre-probe snapshot.
+The service first attempts to enable the source with a CAS over the snapshot's
+exact key, tag, status, and raw `other_info`. If that CAS is stale or fails,
+recovery stops: peers are not loaded or enabled, and the call never falls
+through to generic ID-based enablement. This fences a successful stale probe
+from a newer quota generation, a manual disable, or an unrelated ownership
+change.
+
+Only after the source CAS commits does automatic recovery load current channel
+snapshots. If the source snapshot has `quota_domain_id`, current auto-disabled
+rows with the same marker are eligible, including rows with different Plan
+tags. Each peer is recovered through its own exact CAS, so changes made after
+the peer query remain protected. Rows from another marked domain and manually
+disabled rows are left unchanged. Metadata is cleared only in the successful
+CAS that enables a selected row. Generic single-key health-check recovery is
+also snapshot-bound; multi-key recovery retains the existing per-key path.
+`EnableChannel` remains available with its current-state behavior for manual
+and internal non-health-check callers.
 
 For rows written before `quota_domain_id` existed, recovery falls back to the
 recovering channel's tag. A markerless row qualifies for this fallback only
@@ -133,16 +147,23 @@ by their `quota_domain`/tag, and every other auto-disabled row receives an
 independent probe opportunity even when several such rows share a Plan tag.
 Within each shared recovery domain, the eligible row with the oldest
 `TestTime` is selected; equal timestamps choose the lower channel ID.
+Ordinary managed channels remain excluded from passive channel tests. A
+managed channel that the classifier recognizes as a marked or validated
+legacy Plan quota owner is included once `disabled_until` has elapsed. This
+allows an all-managed quota domain to recover without depending on the managed
+route's `next_probe_at`.
 
-Before marker-scoped recovery, the service computes a marker from the
-recovering channel's current single credential and compares it with the
-persisted `quota_domain_id`. If credential rotation changed the marker, only
-the recovering channel is enabled and has its quota metadata cleared. Peers
-that still carry the old marker remain auto-disabled.
+Before marker-scoped health-check recovery, the service computes a marker from
+the recovering snapshot's single credential and compares it with the
+snapshot's persisted `quota_domain_id`. If credential rotation changed the
+marker, only the recovering source is enabled and has its quota metadata
+cleared. Peers that still carry the old marker remain auto-disabled.
 
-If loading the shared credential domain fails, the operation remains
-fail-closed by logging the error and leaving the affected channels unchanged
-rather than partially updating an unknown set.
+If loading current peers fails after a successful source CAS, the operation
+logs the error and leaves every peer unchanged; it does not revert or conceal
+the already committed source recovery. Manual/internal `EnableChannel`
+continues to load the domain before applying its existing current-state
+recovery behavior.
 
 Managed-route error handling retains unsupported-model isolation as its first
 special case. A recognized single-key Plan quota error is then sent through
@@ -165,9 +186,12 @@ existing threshold and per-key behavior.
 8. Existing retry logic sends the current request to the next eligible tier.
 9. Passive recovery skips channels until `reset_at + 60 seconds`, then selects
    the oldest-tested row per marked or validated legacy domain and each
-   unrelated row independently.
-10. A successful recovery probe enables only auto-disabled rows in the same
-   owned domain. Credential rotation restricts that recovery to the probed row.
+   unrelated unmanaged row independently. Validated managed Plan quota rows
+   participate; ordinary managed rows do not.
+10. A successful recovery probe CAS-enables its exact pre-probe source
+    snapshot first. Only a successful source CAS permits current same-domain
+    peers to recover. Credential rotation restricts that recovery to the
+    probed row.
 
 ## Tests
 
@@ -195,6 +219,10 @@ existing threshold and per-key behavior.
 - Stale key and stale tag snapshots make the model CAS a no-op.
 - A fresh disable of an already-owned auto-disabled channel changes
   `quota_generation` and rejects a stale recovery snapshot.
+- A health-check snapshot taken before a fresh disable generation cannot
+  enable either its source or its peers.
+- A health-check snapshot superseded by a manual source disable cannot enable
+  the source or any peer.
 - A successful model CAS updates status, raw metadata, and ability enabled
   state together.
 - A stale expected status or stale expected `other_info` returns no change and
@@ -211,6 +239,8 @@ existing threshold and per-key behavior.
   channels.
 - Passive recovery chooses the oldest `TestTime` in a shared domain and uses
   channel ID as its deterministic tie-break.
+- Passive recovery includes managed marked and validated legacy Plan quota
+  rows after reset while excluding ordinary managed rows.
 - Managed single-key Plan quota failures isolate shared credential peers before
   managed route failure thresholds are evaluated.
 - Existing disable/enable lifecycle and no-reset behavior continue to pass.

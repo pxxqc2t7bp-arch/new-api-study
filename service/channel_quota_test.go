@@ -477,70 +477,113 @@ func TestEnablePlanQuotaDomainAfterCredentialRotation(t *testing.T) {
 	assert.False(t, abilities[1].Enabled)
 }
 
-func TestFreshPlanQuotaDisableFencesStaleRecoverySnapshot(t *testing.T) {
+func TestEnableChannelForHealthCheckRejectsStalePlanQuotaGeneration(t *testing.T) {
 	db := setupPlanQuotaDomainTest(t)
 
 	autoBan := 1
 	tag := "plan:support:generation"
-	channel := model.Channel{
-		Id:      43,
-		Name:    "generation",
-		Key:     "credential",
-		Status:  common.ChannelStatusEnabled,
-		Tag:     &tag,
-		AutoBan: &autoBan,
-		Models:  "gpt-3.5-turbo",
-		Group:   "default",
+	channels := []model.Channel{
+		{
+			Id: 43, Name: "generation-source", Key: "credential",
+			Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+			Models: "gpt-3.5-turbo", Group: "default",
+		},
+		{
+			Id: 44, Name: "generation-peer", Key: "credential",
+			Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+			Models: "gpt-3.5-turbo", Group: "default",
+		},
 	}
-	require.NoError(t, db.Create(&channel).Error)
-	require.NoError(t, channel.AddAbilities(nil))
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
 
 	const resetAt = int64(2_000_000_000)
-	disablePlanQuotaDomain(&channel, "quota exhausted", resetAt)
+	disablePlanQuotaDomain(&channels[0], "quota exhausted", resetAt)
 
-	var staleRecoverySnapshot model.Channel
-	require.NoError(t, db.First(&staleRecoverySnapshot, channel.Id).Error)
-	firstGeneration, firstGenerationOK := staleRecoverySnapshot.GetOtherInfo()["quota_generation"].(string)
+	var probeSnapshot model.Channel
+	require.NoError(t, db.First(&probeSnapshot, channels[0].Id).Error)
+	firstGeneration, firstGenerationOK := probeSnapshot.GetOtherInfo()["quota_generation"].(string)
 
-	disablePlanQuotaDomain(&staleRecoverySnapshot, "quota exhausted", resetAt)
+	disablePlanQuotaDomain(&probeSnapshot, "quota exhausted again", resetAt)
 
-	var freshlyDisabled model.Channel
-	require.NoError(t, db.First(&freshlyDisabled, channel.Id).Error)
-	secondGeneration, secondGenerationOK := freshlyDisabled.GetOtherInfo()["quota_generation"].(string)
+	var freshlyDisabled []model.Channel
+	require.NoError(t, db.Order("id").Find(&freshlyDisabled).Error)
+	require.Len(t, freshlyDisabled, 2)
+	secondGeneration, secondGenerationOK := freshlyDisabled[0].GetOtherInfo()["quota_generation"].(string)
 	assert.True(t, firstGenerationOK)
 	assert.True(t, secondGenerationOK)
 	assert.NotEqual(t, firstGeneration, secondGeneration)
+	assert.Equal(t, secondGeneration, freshlyDisabled[1].GetOtherInfo()["quota_generation"])
 
-	expectedOtherInfo := staleRecoverySnapshot.OtherInfo
-	recoveryMetadata := staleRecoverySnapshot.GetOtherInfo()
-	recoveryMetadata["status_reason"] = ""
-	recoveryMetadata["status_time"] = common.GetTimestamp()
-	delete(recoveryMetadata, "disabled_until")
-	delete(recoveryMetadata, "quota_reset_at")
-	delete(recoveryMetadata, "quota_domain")
-	delete(recoveryMetadata, "quota_domain_id")
-	delete(recoveryMetadata, "quota_generation")
-	delete(recoveryMetadata, "quota_type")
-	staleRecoverySnapshot.SetOtherInfo(recoveryMetadata)
+	EnableChannelForHealthCheck(&probeSnapshot, "")
 
-	changed, err := model.UpdateSingleKeyChannelStatusIfUnchanged(
-		staleRecoverySnapshot.Id,
-		staleRecoverySnapshot.Key,
-		staleRecoverySnapshot.GetTag(),
-		staleRecoverySnapshot.Status,
-		expectedOtherInfo,
-		common.ChannelStatusEnabled,
-		staleRecoverySnapshot.OtherInfo,
-	)
-	require.NoError(t, err)
-	assert.False(t, changed)
+	require.NoError(t, db.Order("id").Find(&freshlyDisabled).Error)
+	for _, channel := range freshlyDisabled {
+		assert.Equal(t, common.ChannelStatusAutoDisabled, channel.Status)
+		assert.Equal(t, secondGeneration, channel.GetOtherInfo()["quota_generation"])
+	}
+	var abilities []model.Ability
+	require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
+	require.Len(t, abilities, 2)
+	assert.False(t, abilities[0].Enabled)
+	assert.False(t, abilities[1].Enabled)
+}
 
-	var ability model.Ability
-	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
-	require.NoError(t, db.First(&freshlyDisabled, channel.Id).Error)
-	assert.Equal(t, common.ChannelStatusAutoDisabled, freshlyDisabled.Status)
-	assert.Equal(t, secondGeneration, freshlyDisabled.GetOtherInfo()["quota_generation"])
-	assert.False(t, ability.Enabled)
+func TestEnableChannelForHealthCheckRejectsConcurrentManualDisable(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+
+	autoBan := 1
+	tag := "plan:support:manual-race"
+	channels := []model.Channel{
+		{
+			Id: 45, Name: "manual-race-source", Key: "credential",
+			Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+			Models: "gpt-3.5-turbo", Group: "default",
+		},
+		{
+			Id: 46, Name: "manual-race-peer", Key: "credential",
+			Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+			Models: "gpt-3.5-turbo", Group: "default",
+		},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+
+	disablePlanQuotaDomain(&channels[0], "quota exhausted", 2_000_000_000)
+
+	var probeSnapshot model.Channel
+	require.NoError(t, db.First(&probeSnapshot, channels[0].Id).Error)
+	manual := probeSnapshot
+	manual.SetOtherInfo(map[string]any{
+		"owner":         "operator",
+		"status_reason": "manual disable during probe",
+	})
+	require.NoError(t, db.Model(&model.Channel{}).
+		Where("id = ?", probeSnapshot.Id).
+		Updates(map[string]any{
+			"status":     common.ChannelStatusManuallyDisabled,
+			"other_info": manual.OtherInfo,
+		}).Error)
+
+	EnableChannelForHealthCheck(&probeSnapshot, "")
+
+	var stored []model.Channel
+	require.NoError(t, db.Order("id").Find(&stored).Error)
+	require.Len(t, stored, 2)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored[0].Status)
+	assert.Equal(t, manual.OtherInfo, stored[0].OtherInfo)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[1].Status)
+	assert.NotEmpty(t, stored[1].GetOtherInfo()["quota_generation"])
+
+	var abilities []model.Ability
+	require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
+	require.Len(t, abilities, 2)
+	assert.False(t, abilities[0].Enabled)
+	assert.False(t, abilities[1].Enabled)
 }
 
 func TestDisableChannelRefreshesEmptyCredentialPlanQuotaGenerationWithCache(t *testing.T) {
