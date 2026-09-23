@@ -95,7 +95,37 @@ func TestSubmitTaskUpstreamPreservesStructuredQuotaErrorCode(t *testing.T) {
 	assert.True(t, classified)
 }
 
-func TestSubmitTaskUpstreamFallsBackToStructuredQuotaErrorType(t *testing.T) {
+func TestSubmitTaskUpstreamPreservesDistinctStructuredQuotaType(t *testing.T) {
+	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+	taskErr := submitTaskToErrorServer(
+		t,
+		http.StatusTooManyRequests,
+		`{"error":{"message":"`+quotaMessage+`","type":"AccountQuotaExceeded","code":"other_error"}}`,
+	)
+
+	assert.Equal(t, http.StatusTooManyRequests, taskErr.StatusCode)
+	assert.Equal(t, "other_error", taskErr.Code)
+	assert.Equal(t, quotaMessage, taskErr.Message)
+	assert.False(t, taskErr.LocalError)
+
+	encoded, err := common.Marshal(taskErr)
+	require.NoError(t, err)
+	var response map[string]any
+	require.NoError(t, common.Unmarshal(encoded, &response))
+	errType, ok := response["type"].(string)
+	require.True(t, ok)
+	assert.Equal(t, "AccountQuotaExceeded", errType)
+
+	apiErr := relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+		Message: taskErr.Message,
+		Type:    errType,
+		Code:    taskErr.Code,
+	}, taskErr.StatusCode)
+	_, classified := service.ClassifyPlanQuotaError(apiErr)
+	assert.True(t, classified)
+}
+
+func TestSubmitTaskUpstreamPreservesStructuredQuotaTypeWithoutCode(t *testing.T) {
 	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
 	taskErr := submitTaskToErrorServer(
 		t,
@@ -104,15 +134,16 @@ func TestSubmitTaskUpstreamFallsBackToStructuredQuotaErrorType(t *testing.T) {
 	)
 
 	assert.Equal(t, http.StatusTooManyRequests, taskErr.StatusCode)
-	assert.Equal(t, "AccountQuotaExceeded", taskErr.Code)
+	assert.Equal(t, "unknown_error", taskErr.Code)
+	assert.Equal(t, "AccountQuotaExceeded", taskErr.Type)
 	assert.Equal(t, quotaMessage, taskErr.Message)
 	assert.False(t, taskErr.LocalError)
 
-	apiErr := relaytypes.NewOpenAIError(
-		taskErr.Error,
-		relaytypes.ErrorCode(taskErr.Code),
-		taskErr.StatusCode,
-	)
+	apiErr := relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+		Message: taskErr.Message,
+		Type:    taskErr.Type,
+		Code:    taskErr.Code,
+	}, taskErr.StatusCode)
 	_, classified := service.ClassifyPlanQuotaError(apiErr)
 	assert.True(t, classified)
 }

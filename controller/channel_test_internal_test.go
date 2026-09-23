@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	taskdto "github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/relay"
@@ -705,6 +706,151 @@ func TestShouldPrioritizePlanQuotaDisableForManagedChannel(t *testing.T) {
 	assert.False(t, shouldPrioritizePlanQuotaDisable(nil))
 }
 
+func TestInitialSelectedChannelPlanQuotaDisablesSharedCredentialDomain(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	common.MemoryCacheEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+	})
+
+	autoBan := 1
+	sourceTag := "plan:initial:source"
+	peerTag := "plan:initial:peer"
+	channels := []model.Channel{
+		{
+			Name: "initial-source", Key: "shared-initial-credential",
+			Status: common.ChannelStatusEnabled, Tag: &sourceTag, AutoBan: &autoBan,
+			Models: "initial-model", Group: "default",
+		},
+		{
+			Name: "initial-peer", Key: "shared-initial-credential",
+			Status: common.ChannelStatusEnabled, Tag: &peerTag, AutoBan: &autoBan,
+			Models: "initial-model", Group: "default",
+		},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	require.Nil(t, middleware.SetupContextForSelectedChannel(ctx, &channels[0], "initial-model"))
+	selected, channelErr := getChannel(ctx, &relaycommon.RelayInfo{
+		OriginModelName: "initial-model",
+	}, &service.RetryParam{})
+	require.Nil(t, channelErr)
+	require.NotNil(t, selected)
+	assert.Equal(t, sourceTag, selected.GetTag())
+	assert.False(t, selected.ChannelInfo.IsMultiKey)
+
+	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+	processChannelError(
+		ctx,
+		*relaytypes.NewChannelError(
+			selected.Id,
+			selected.Type,
+			selected.Name,
+			selected.ChannelInfo.IsMultiKey,
+			common.GetContextKeyString(ctx, constant.ContextKeyChannelKey),
+			selected.GetAutoBan(),
+		),
+		selected.GetTag(),
+		relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+			Message: quotaMessage,
+			Type:    "AccountQuotaExceeded",
+			Code:    "AccountQuotaExceeded",
+		}, http.StatusTooManyRequests),
+	)
+
+	var stored []model.Channel
+	require.NoError(t, db.Order("id").Find(&stored).Error)
+	require.Len(t, stored, 2)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[0].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[1].Status)
+	assert.NotEmpty(t, stored[0].GetOtherInfo()["quota_domain_id"])
+	assert.Equal(t, stored[0].GetOtherInfo()["quota_domain_id"], stored[1].GetOtherInfo()["quota_domain_id"])
+}
+
+func TestInitialSelectedTaskMultiKeyPlanQuotaDisablesOnlyPrimaryKey(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	originalRetryTimes := common.RetryTimes
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	common.RetryTimes = 0
+	common.MemoryCacheEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	t.Cleanup(func() {
+		common.RetryTimes = originalRetryTimes
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+	})
+
+	autoBan := 1
+	tag := "plan:initial:multi-key"
+	channel := model.Channel{
+		Name: "initial-multi-key", Key: "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "initial-task-model", Group: "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
+	require.Nil(t, middleware.SetupContextForSelectedChannel(ctx, &channel, "initial-task-model"))
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "initial-task-model",
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
+	}
+	selected, channelErr := getChannel(ctx, relayInfo, &service.RetryParam{})
+	require.Nil(t, channelErr)
+	require.NotNil(t, selected)
+	assert.Equal(t, tag, selected.GetTag())
+	assert.True(t, selected.ChannelInfo.IsMultiKey)
+
+	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+	submitCount := 0
+	outcome, taskErr := executeTaskSubmissionWith(
+		ctx,
+		relayInfo,
+		func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError) {
+			submitCount++
+			return nil, &taskdto.TaskError{
+				Code:       "AccountQuotaExceeded",
+				Message:    quotaMessage,
+				StatusCode: http.StatusTooManyRequests,
+				Error:      errors.New(quotaMessage),
+			}
+		},
+	)
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, 1, submitCount)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+}
+
 func TestExecuteTaskSubmissionPreservesPlanQuotaErrorForChannelIsolation(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 
@@ -765,18 +911,22 @@ func TestExecuteTaskSubmissionPreservesPlanQuotaErrorForChannelIsolation(t *test
 		ctx,
 		relayInfo,
 		func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError) {
-			return nil, &taskdto.TaskError{
-				Code:       "AccountQuotaExceeded",
-				Message:    quotaMessage,
-				StatusCode: http.StatusTooManyRequests,
-				Error:      errors.New(quotaMessage),
-			}
+			return nil, service.TaskErrorFromAPIError(relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+				Message: quotaMessage,
+				Type:    "AccountQuotaExceeded",
+				Code:    "other_error",
+			}, http.StatusTooManyRequests))
 		},
 	)
 
 	assert.Nil(t, outcome)
 	require.NotNil(t, taskErr)
-	assert.Equal(t, "AccountQuotaExceeded", taskErr.Code)
+	assert.Equal(t, "other_error", taskErr.Code)
+	encoded, err := common.Marshal(taskErr)
+	require.NoError(t, err)
+	var response map[string]any
+	require.NoError(t, common.Unmarshal(encoded, &response))
+	assert.Equal(t, "AccountQuotaExceeded", response["type"])
 	var storedChannels []model.Channel
 	require.NoError(t, db.Order("id").Find(&storedChannels).Error)
 	require.Len(t, storedChannels, 2)
@@ -786,6 +936,231 @@ func TestExecuteTaskSubmissionPreservesPlanQuotaErrorForChannelIsolation(t *test
 	assert.Equal(t, common.ChannelStatusAutoDisabled, storedChannels[1].Status)
 	assert.NotEmpty(t, firstInfo["quota_generation"])
 	assert.Equal(t, firstInfo["quota_generation"], secondInfo["quota_generation"])
+}
+
+func TestExecuteTaskSubmissionDoesNotClassifyOrdinary429AsPlanQuota(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	originalRetryTimes := common.RetryTimes
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	originalDisableKeywords := operation_setting.AutomaticDisableKeywords
+	originalDisableStatusCodes := operation_setting.AutomaticDisableStatusCodeRanges
+	common.RetryTimes = 0
+	common.MemoryCacheEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	operation_setting.AutomaticDisableKeywords = []string{"unrelated"}
+	operation_setting.AutomaticDisableStatusCodeRanges = nil
+	t.Cleanup(func() {
+		common.RetryTimes = originalRetryTimes
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		operation_setting.AutomaticDisableKeywords = originalDisableKeywords
+		operation_setting.AutomaticDisableStatusCodeRanges = originalDisableStatusCodes
+	})
+
+	autoBan := 1
+	tag := "plan:task:ordinary-429"
+	channel := model.Channel{
+		Name: "task-ordinary-429", Key: "ordinary-credential",
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "task-model", Group: "default",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
+	common.SetContextKey(ctx, constant.ContextKeyChannelKey, channel.Key)
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "task-model",
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{
+			LockedChannel: &channel,
+		},
+	}
+	const quotaLikeMessage = "You have exceeded the monthly usage quota."
+	ordinaryTaskErr := service.TaskErrorWrapper(
+		errors.New(quotaLikeMessage),
+		"rate_limit_exceeded",
+		http.StatusTooManyRequests,
+	)
+	encoded, err := common.Marshal(ordinaryTaskErr)
+	require.NoError(t, err)
+	var response map[string]any
+	require.NoError(t, common.Unmarshal(encoded, &response))
+	assert.NotContains(t, response, "type")
+
+	outcome, taskErr := executeTaskSubmissionWith(
+		ctx,
+		relayInfo,
+		func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError) {
+			return nil, ordinaryTaskErr
+		},
+	)
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "rate_limit_exceeded", taskErr.Code)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.NotContains(t, stored.GetOtherInfo(), "quota_domain_id")
+}
+
+func TestLockedTaskRetryStopsAfterSingleKeyPlanQuotaDisable(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	originalRetryTimes := common.RetryTimes
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	common.RetryTimes = 1
+	common.MemoryCacheEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	t.Cleanup(func() {
+		common.RetryTimes = originalRetryTimes
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+	})
+
+	autoBan := 1
+	tag := "plan:locked:single"
+	channel := model.Channel{
+		Name: "locked-single", Key: "single-key",
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "locked-task-model", Group: "default",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
+	require.Nil(t, middleware.SetupContextForSelectedChannel(ctx, &channel, "locked-task-model"))
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "locked-task-model",
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{
+			LockedChannel: &channel,
+		},
+	}
+	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+	submitCount := 0
+
+	outcome, taskErr := executeTaskSubmissionWith(
+		ctx,
+		relayInfo,
+		func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError) {
+			submitCount++
+			return nil, service.TaskErrorFromAPIError(relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+				Message: quotaMessage,
+				Type:    "AccountQuotaExceeded",
+				Code:    "other_error",
+			}, http.StatusTooManyRequests))
+		},
+	)
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, 1, submitCount)
+	assert.True(t, taskErr.LocalError)
+	assert.Equal(t, "setup_locked_channel_disabled", taskErr.Code)
+	assert.Contains(t, taskErr.Message, "disabled")
+	refreshed, ok := relayInfo.LockedChannel.(*model.Channel)
+	require.True(t, ok)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, refreshed.Status)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+}
+
+func TestLockedTaskRetryRefreshesMultiKeyAndUsesRemainingKey(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Task{}))
+
+	originalRetryTimes := common.RetryTimes
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	common.RetryTimes = 1
+	common.MemoryCacheEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	common.LogConsumeEnabled = false
+	t.Cleanup(func() {
+		common.RetryTimes = originalRetryTimes
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+	})
+
+	autoBan := 1
+	tag := "plan:locked:multi"
+	channel := model.Channel{
+		Name: "locked-multi", Key: "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "locked-task-model", Group: "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
+	require.Nil(t, middleware.SetupContextForSelectedChannel(ctx, &channel, "locked-task-model"))
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "locked-task-model",
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{
+			PublicTaskID:  "task_locked_multi",
+			LockedChannel: &channel,
+		},
+	}
+	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+	usedKeys := make([]string, 0, 2)
+
+	outcome, taskErr := executeTaskSubmissionWith(
+		ctx,
+		relayInfo,
+		func(c *gin.Context, info *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError) {
+			info.InitChannelMeta(c)
+			usingKey := common.GetContextKeyString(c, constant.ContextKeyChannelKey)
+			usedKeys = append(usedKeys, usingKey)
+			if usingKey == "key-a" {
+				return nil, service.TaskErrorFromAPIError(relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+					Message: quotaMessage,
+					Type:    "AccountQuotaExceeded",
+					Code:    "other_error",
+				}, http.StatusTooManyRequests))
+			}
+			return &relay.TaskSubmitResult{
+				UpstreamTaskID: "upstream-locked-multi",
+				Platform:       constant.TaskPlatform("test"),
+			}, nil
+		},
+	)
+
+	require.Nil(t, taskErr)
+	require.NotNil(t, outcome)
+	assert.Equal(t, []string{"key-a", "key-b"}, usedKeys)
+	refreshed, ok := relayInfo.LockedChannel.(*model.Channel)
+	require.True(t, ok)
+	assert.NotSame(t, &channel, refreshed)
+	assert.Equal(t, common.ChannelStatusEnabled, refreshed.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, refreshed.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, refreshed.ChannelInfo.MultiKeyStatusList, 1)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
 }
 
 func TestProcessChannelErrorRecordsManagedFailureWhenAutomaticDisableIsOff(t *testing.T) {

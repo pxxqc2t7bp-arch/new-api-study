@@ -222,6 +222,7 @@ func TaskErrorFromAPIError(apiErr *types.NewAPIError) *taskdto.TaskError {
 		return nil
 	}
 	code := strings.TrimSpace(string(apiErr.GetErrorCode()))
+	errType := ""
 	var openAIError *types.OpenAIError
 	switch relayErr := apiErr.RelayError.(type) {
 	case types.OpenAIError:
@@ -230,17 +231,9 @@ func TaskErrorFromAPIError(apiErr *types.NewAPIError) *taskdto.TaskError {
 		openAIError = relayErr
 	}
 	if openAIError != nil {
-		structuredCode := ""
+		errType = strings.TrimSpace(openAIError.Type)
 		if openAIError.Code != nil {
-			structuredCode = strings.TrimSpace(fmt.Sprint(openAIError.Code))
-		}
-		switch strings.ToLower(structuredCode) {
-		case "", "unknown", "unknown_error":
-			if structuredType := strings.TrimSpace(openAIError.Type); structuredType != "" {
-				code = structuredType
-			}
-		default:
-			code = structuredCode
+			code = strings.TrimSpace(fmt.Sprint(openAIError.Code))
 		}
 	}
 	message := apiErr.Error()
@@ -250,6 +243,7 @@ func TaskErrorFromAPIError(apiErr *types.NewAPIError) *taskdto.TaskError {
 	}
 	return &taskdto.TaskError{
 		Code:       code,
+		Type:       errType,
 		Message:    message,
 		StatusCode: apiErr.StatusCode,
 		Error:      underlyingErr,

@@ -382,6 +382,7 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 		autoBan := c.GetBool("auto_ban")
 		autoBanInt := 1
 		priority := c.GetInt64("channel_priority")
+		tag := common.GetContextKeyString(c, constant.ContextKeyChannelTag)
 		if !autoBan {
 			autoBanInt = 0
 		}
@@ -391,6 +392,10 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 			Name:     c.GetString("channel_name"),
 			Priority: &priority,
 			AutoBan:  &autoBanInt,
+			Tag:      &tag,
+			ChannelInfo: model.ChannelInfo{
+				IsMultiKey: common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey),
+			},
 		}, nil
 	}
 	channel, selectGroup, err := service.CacheGetRandomSatisfiedChannel(retryParam)
@@ -766,6 +771,25 @@ func executeTaskSubmissionWith(
 		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
 			channel = lockedCh
 			if retryParam.GetRetry() > 0 {
+				refreshed, refreshErr := model.CacheGetChannel(lockedCh.Id)
+				if refreshErr != nil {
+					taskErr = service.TaskErrorWrapperLocal(
+						fmt.Errorf("failed to refresh locked channel #%d: %w", lockedCh.Id, refreshErr),
+						"setup_locked_channel_failed",
+						http.StatusInternalServerError,
+					)
+					break
+				}
+				relayInfo.LockedChannel = refreshed
+				channel = refreshed
+				if channel.Status != common.ChannelStatusEnabled {
+					taskErr = service.TaskErrorWrapperLocal(
+						fmt.Errorf("locked channel #%d is disabled (status %d)", channel.Id, channel.Status),
+						"setup_locked_channel_disabled",
+						http.StatusServiceUnavailable,
+					)
+					break
+				}
 				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName); setupErr != nil {
 					taskErr = service.TaskErrorWrapperLocal(setupErr.Err, "setup_locked_channel_failed", http.StatusInternalServerError)
 					break
@@ -808,15 +832,15 @@ func executeTaskSubmissionWith(
 		}
 
 		if !taskErr.LocalError {
-			errorCode := types.ErrorCode(taskErr.Code)
-			if errorCode == "" {
-				errorCode = types.ErrorCodeBadResponseStatusCode
-			}
 			processChannelError(c,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
 				channel.GetTag(),
-				types.NewOpenAIError(taskErr.Error, errorCode, taskErr.StatusCode))
+				types.WithOpenAIError(types.OpenAIError{
+					Message: taskErr.Message,
+					Type:    taskErr.Type,
+					Code:    taskErr.Code,
+				}, taskErr.StatusCode))
 		}
 
 		willRetry := shouldRetryTaskRelay(c, channel.Id, taskErr, maxTaskRetries-retryParam.GetRetry())

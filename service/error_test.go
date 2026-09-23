@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -64,42 +65,55 @@ func TestResetStatusCode(t *testing.T) {
 	}
 }
 
-func TestTaskErrorFromAPIErrorUsesStructuredCodeThenType(t *testing.T) {
+func TestTaskErrorFromAPIErrorPreservesStructuredCodeAndType(t *testing.T) {
 	const message = "structured upstream error"
 	testCases := []struct {
 		name     string
 		code     any
 		errType  string
 		wantCode string
+		wantType string
 	}{
 		{
 			name:     "explicit code takes priority",
 			code:     "rate_limit_exceeded",
 			errType:  "AccountQuotaExceeded",
 			wantCode: "rate_limit_exceeded",
+			wantType: "AccountQuotaExceeded",
 		},
 		{
-			name:     "missing code falls back to type",
+			name:     "distinct code and quota type are both preserved",
+			code:     "other_error",
 			errType:  "AccountQuotaExceeded",
-			wantCode: "AccountQuotaExceeded",
+			wantCode: "other_error",
+			wantType: "AccountQuotaExceeded",
 		},
 		{
-			name:     "empty code falls back to type",
+			name:     "missing code keeps normalized API code",
+			errType:  "AccountQuotaExceeded",
+			wantCode: "unknown_error",
+			wantType: "AccountQuotaExceeded",
+		},
+		{
+			name:     "empty code remains empty",
 			code:     "",
 			errType:  "AccountQuotaExceeded",
-			wantCode: "AccountQuotaExceeded",
+			wantCode: "",
+			wantType: "AccountQuotaExceeded",
 		},
 		{
-			name:     "unknown code falls back to type",
+			name:     "unknown code remains unknown",
 			code:     "unknown",
 			errType:  "AccountQuotaExceeded",
-			wantCode: "AccountQuotaExceeded",
+			wantCode: "unknown",
+			wantType: "AccountQuotaExceeded",
 		},
 		{
-			name:     "unknown error code falls back to type",
+			name:     "unknown error code remains unknown error",
 			code:     "unknown_error",
 			errType:  "AccountQuotaExceeded",
-			wantCode: "AccountQuotaExceeded",
+			wantCode: "unknown_error",
+			wantType: "AccountQuotaExceeded",
 		},
 	}
 
@@ -115,6 +129,11 @@ func TestTaskErrorFromAPIErrorUsesStructuredCodeThenType(t *testing.T) {
 
 			require.NotNil(t, taskErr)
 			require.Equal(t, testCase.wantCode, taskErr.Code)
+			encoded, err := json.Marshal(taskErr)
+			require.NoError(t, err)
+			var response map[string]any
+			require.NoError(t, json.Unmarshal(encoded, &response))
+			require.Equal(t, testCase.wantType, response["type"])
 			require.Equal(t, message, taskErr.Message)
 			require.Equal(t, http.StatusTooManyRequests, taskErr.StatusCode)
 			require.False(t, taskErr.LocalError)
