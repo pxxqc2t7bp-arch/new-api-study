@@ -3,6 +3,7 @@ package service
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -44,6 +45,65 @@ func setupUpstreamOrchestrationTest(t *testing.T) {
 	t.Cleanup(func() {
 		model.DB = originalDB
 	})
+}
+
+func createPartialManagedRouteFixture(
+	t *testing.T,
+	now time.Time,
+	suffix string,
+	multiplier float64,
+	health string,
+	rank int,
+) (model.UpstreamSource, model.UpstreamGroup, model.Channel, model.UpstreamManagedRoute) {
+	t.Helper()
+	source := model.UpstreamSource{
+		Key:              "source-" + suffix,
+		Name:             "Source " + suffix,
+		ConsoleURL:       "https://example.com",
+		SelectedEndpoint: "https://api.example.com/" + suffix,
+		Status:           model.UpstreamHealthOperational,
+		Enabled:          true,
+		LastSnapshotAt:   now.Unix(),
+		LastSuccessAt:    now.Unix(),
+		UpdatedAt:        now.Add(-time.Minute).Unix(),
+	}
+	require.NoError(t, model.DB.Create(&source).Error)
+	group := model.UpstreamGroup{
+		SourceID:            source.ID,
+		ExternalID:          "group-" + suffix,
+		Name:                "Group " + suffix,
+		Platform:            "openai",
+		EffectiveMultiplier: multiplier,
+		HealthStatus:        health,
+		Models:              `["gpt-4.1"]`,
+		RedSince:            now.Add(-time.Hour).Unix(),
+		ObservedAt:          now.Unix(),
+		UpdatedAt:           now.Add(-time.Minute).Unix(),
+	}
+	require.NoError(t, model.DB.Create(&group).Error)
+	priority := int64(0)
+	channel := model.Channel{
+		Name:     "Channel " + suffix,
+		Key:      "credential-" + suffix,
+		Status:   common.ChannelStatusEnabled,
+		Models:   "gpt-4.1",
+		Group:    "default",
+		Priority: &priority,
+	}
+	require.NoError(t, model.DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	route := model.UpstreamManagedRoute{
+		SourceID:        source.ID,
+		ExternalGroupID: group.ExternalID,
+		Platform:        group.Platform,
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           model.UpstreamRouteStateActive,
+		Rank:            rank,
+		UpdatedAt:       now.Add(-time.Minute).Unix(),
+	}
+	require.NoError(t, model.DB.Create(&route).Error)
+	return source, group, channel, route
 }
 
 func TestNormalizeUpstreamEndpoints(t *testing.T) {
@@ -446,6 +506,123 @@ func TestRankManagedRoutesPersistsSelectedModelSubsets(t *testing.T) {
 	assert.Equal(t, "gpt-unique", sixth.Models)
 }
 
+func TestRankManagedRoutesReturnsCommittedCountBeforeStaleError(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	now := time.Unix(1_788_320_000, 0)
+	firstSource, firstGroup, _, firstRoute := createPartialManagedRouteFixture(
+		t,
+		now,
+		"first",
+		0.1,
+		model.UpstreamHealthOperational,
+		1,
+	)
+	secondSource, secondGroup, _, _ := createPartialManagedRouteFixture(
+		t,
+		now,
+		"second",
+		0.2,
+		model.UpstreamHealthOperational,
+		2,
+	)
+
+	injected := false
+	const callbackName = "test:stale_second_rank_after_first_commit"
+	require.NoError(t, model.DB.Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if injected || tx.Statement == nil || tx.Statement.Table != "upstream_managed_routes" {
+			return
+		}
+		injected = true
+		writer := tx.Session(&gorm.Session{NewDB: true, SkipHooks: true})
+		require.NoError(t, writer.Model(&model.UpstreamGroup{}).
+			Where("id = ?", secondGroup.ID).
+			Update("updated_at", secondGroup.UpdatedAt+1).Error)
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Callback().Update().Remove(callbackName))
+	})
+
+	updated, err := rankManagedRoutes(
+		now,
+		[]model.UpstreamSource{firstSource, secondSource},
+		[]model.UpstreamGroup{firstGroup, secondGroup},
+		[]upstreamRouteCandidate{
+			{source: firstSource, group: firstGroup, models: []string{"gpt-4.1"}},
+			{source: secondSource, group: secondGroup, models: []string{"gpt-4.1"}},
+		},
+		&operation_setting.UpstreamOrchestrationSetting{SyncIntervalHours: 4},
+	)
+
+	require.Error(t, err)
+	require.True(t, injected)
+	assert.Equal(t, 1, updated)
+	var storedFirstRoute model.UpstreamManagedRoute
+	require.NoError(t, model.DB.First(&storedFirstRoute, firstRoute.ID).Error)
+	assert.Equal(t, 1, storedFirstRoute.Rank)
+}
+
+func TestReconcileManagedUpstreamsPreservesPartialRankCountOnError(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	now := time.Unix(1_788_320_000, 0)
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	originalSetting := *setting
+	setting.Enabled = true
+	setting.AutoEnroll = false
+	setting.CandidateLimit = 5
+	setting.MaxUpstreamMultiplier = 1
+	setting.SyncIntervalHours = 4
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4.1":1}`))
+	t.Cleanup(func() {
+		*setting = originalSetting
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+	})
+
+	_, _, _, firstRoute := createPartialManagedRouteFixture(
+		t,
+		now,
+		"first",
+		0.1,
+		model.UpstreamHealthOperational,
+		1,
+	)
+	_, secondGroup, _, _ := createPartialManagedRouteFixture(
+		t,
+		now,
+		"second",
+		0.2,
+		model.UpstreamHealthOperational,
+		2,
+	)
+
+	injected := false
+	const callbackName = "test:stale_second_rank_during_reconcile"
+	require.NoError(t, model.DB.Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if injected || tx.Statement == nil || tx.Statement.Table != "upstream_managed_routes" {
+			return
+		}
+		injected = true
+		writer := tx.Session(&gorm.Session{NewDB: true, SkipHooks: true})
+		require.NoError(t, writer.Model(&model.UpstreamGroup{}).
+			Where("id = ?", secondGroup.ID).
+			Update("updated_at", secondGroup.UpdatedAt+1).Error)
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Callback().Update().Remove(callbackName))
+	})
+
+	summary, err := reconcileManagedUpstreams(now, nil)
+
+	require.Error(t, err)
+	require.True(t, injected)
+	assert.Equal(t, 1, summary.PrioritiesUpdated)
+	var storedFirstRoute model.UpstreamManagedRoute
+	require.NoError(t, model.DB.First(&storedFirstRoute, firstRoute.ID).Error)
+	assert.Equal(t, 1, storedFirstRoute.Rank)
+}
+
 func TestRankManagedRoutesAppliesProtocolModelExclusions(t *testing.T) {
 	setupUpstreamOrchestrationTest(t)
 	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
@@ -636,6 +813,82 @@ func TestReconcileManagedUpstreamsPreservesPlanQuotaOwnership(t *testing.T) {
 	require.Len(t, abilities, 2)
 	assert.False(t, abilities[0].Enabled)
 	assert.False(t, abilities[1].Enabled)
+}
+
+func TestReconcileManagedUpstreamsReturnsAndNotifiesCommittedChangesBeforeStaleError(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	now := time.Unix(1_788_320_000, 0)
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	originalSetting := *setting
+	setting.Enabled = true
+	setting.AutoEnroll = false
+	setting.CandidateLimit = 5
+	setting.MaxUpstreamMultiplier = 1
+	setting.SyncIntervalHours = 4
+	setting.RedLongTermHours = 24
+	t.Cleanup(func() {
+		*setting = originalSetting
+	})
+
+	_, _, firstChannel, firstRoute := createPartialManagedRouteFixture(
+		t,
+		now,
+		"first",
+		0.1,
+		model.UpstreamHealthFailed,
+		1,
+	)
+	_, _, secondChannel, secondRoute := createPartialManagedRouteFixture(
+		t,
+		now,
+		"second",
+		0.2,
+		model.UpstreamHealthFailed,
+		2,
+	)
+
+	injected := false
+	const callbackName = "test:stale_second_reconcile_route_after_first_commit"
+	require.NoError(t, model.DB.Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if injected || tx.Statement == nil || tx.Statement.Table != "upstream_managed_routes" {
+			return
+		}
+		injected = true
+		writer := tx.Session(&gorm.Session{NewDB: true, SkipHooks: true})
+		require.NoError(t, writer.Model(&model.UpstreamManagedRoute{}).
+			Where("id = ?", secondRoute.ID).
+			Update("updated_at", secondRoute.UpdatedAt+1).Error)
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Callback().Update().Remove(callbackName))
+	})
+
+	notificationCalls := 0
+	notificationContent := ""
+	notificationErr := errors.New("forced notification failure")
+	summary, err := reconcileManagedUpstreams(
+		now,
+		func(_ string, _ string, content string) error {
+			notificationCalls++
+			notificationContent = content
+			return notificationErr
+		},
+	)
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, notificationErr)
+	require.True(t, injected)
+	assert.Equal(t, 1, summary.RoutesQuarantined)
+	assert.Equal(t, 1, notificationCalls)
+	assert.Contains(t, notificationContent, fmt.Sprintf("#%d", firstChannel.Id))
+	assert.NotContains(t, notificationContent, fmt.Sprintf("#%d", secondChannel.Id))
+	var storedFirstRoute model.UpstreamManagedRoute
+	require.NoError(t, model.DB.First(&storedFirstRoute, firstRoute.ID).Error)
+	assert.Equal(t, model.UpstreamRouteStateQuarantined, storedFirstRoute.State)
+	var storedSecondRoute model.UpstreamManagedRoute
+	require.NoError(t, model.DB.First(&storedSecondRoute, secondRoute.ID).Error)
+	assert.Equal(t, model.UpstreamRouteStateActive, storedSecondRoute.State)
 }
 
 func TestReconcileManagedUpstreamsRepairsRouteableQuarantinedChannel(t *testing.T) {

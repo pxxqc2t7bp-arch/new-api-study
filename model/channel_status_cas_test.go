@@ -1705,6 +1705,66 @@ func TestDisableDetachedManagedChannelIfUnchangedLocksRouteBeforeChannel(t *test
 	assert.EqualValues(t, 1_788_320_000, info["status_time"])
 }
 
+func TestRecoverSingleKeyChannelStatusIfUnchangedLocksRouteBeforeChannel(t *testing.T) {
+	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+		"owner": "before",
+	})
+	require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+	require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+	require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).
+		Update("status", common.ChannelStatusAutoDisabled).Error)
+	require.NoError(t, DB.Model(&Ability{}).Where("channel_id = ?", channel.Id).
+		Update("enabled", false).Error)
+	route := UpstreamManagedRoute{
+		SourceID:        95,
+		ExternalGroupID: "recovery-lock-order",
+		Platform:        "openai",
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           UpstreamRouteStateActive,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	desired := *expected
+	info := desired.GetOtherInfo()
+	info["status_reason"] = ""
+	info["status_time"] = int64(1_788_320_000)
+	desired.SetOtherInfo(info)
+
+	var transactionalReads []string
+	const callbackName = "test:capture_channel_recovery_lock_order"
+	require.NoError(t, DB.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil {
+			return
+		}
+		if _, inTransaction := tx.Statement.ConnPool.(*sql.Tx); !inTransaction {
+			return
+		}
+		switch tx.Statement.Table {
+		case "upstream_managed_routes", "channels":
+			transactionalReads = append(transactionalReads, tx.Statement.Table)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, DB.Callback().Query().Remove(callbackName))
+	})
+
+	changed, err := RecoverSingleKeyChannelStatusIfUnchanged(
+		expected,
+		common.ChannelStatusEnabled,
+		desired.OtherInfo,
+		1_788_320_000,
+	)
+
+	require.NoError(t, err)
+	require.True(t, changed)
+	assert.Equal(t, []string{"upstream_managed_routes", "channels"}, transactionalReads)
+	stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.True(t, ability.Enabled)
+}
+
 func TestUpdateManagedChannelIfUnchangedLocksDecisionSnapshotInOrder(t *testing.T) {
 	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
 		"owner": "before",
@@ -1827,9 +1887,21 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 			var version string
 			require.NoError(t, database.Raw("SELECT VERSION()").Scan(&version).Error)
 			t.Logf("%s version: %s", test.name, version)
-			require.NoError(t, database.AutoMigrate(&Channel{}, &Ability{}))
+			require.NoError(t, database.AutoMigrate(
+				&Channel{},
+				&Ability{},
+				&UpstreamSource{},
+				&UpstreamGroup{},
+				&UpstreamManagedRoute{},
+			))
 			t.Cleanup(func() {
-				require.NoError(t, database.Migrator().DropTable(&Ability{}, &Channel{}))
+				require.NoError(t, database.Migrator().DropTable(
+					&UpstreamManagedRoute{},
+					&UpstreamGroup{},
+					&UpstreamSource{},
+					&Ability{},
+					&Channel{},
+				))
 			})
 
 			previousDB := DB
@@ -1929,6 +2001,106 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 			assert.Equal(t, common.ChannelStatusAutoDisabled, storedSibling.Status)
 			assert.Equal(t, secondDesired.OtherInfo, storedSibling.OtherInfo)
 			assert.False(t, siblingAbility.Enabled)
+
+			recoveryChannel := Channel{
+				Name:   "configured-database-recovery",
+				Key:    "recovery-credential",
+				Status: common.ChannelStatusAutoDisabled,
+				Models: "gpt-a",
+				Group:  "default",
+			}
+			recoveryChannel.SetOtherInfo(map[string]any{"owner": "recovery"})
+			require.NoError(t, DB.Create(&recoveryChannel).Error)
+			require.NoError(t, recoveryChannel.AddAbilities(nil))
+			recoveryRoute := UpstreamManagedRoute{
+				SourceID:        91,
+				ExternalGroupID: "recovery",
+				Platform:        "openai",
+				Protocol:        UpstreamProtocolOpenAI,
+				ChannelID:       recoveryChannel.Id,
+				State:           UpstreamRouteStateQuarantined,
+			}
+			require.NoError(t, DB.Create(&recoveryRoute).Error)
+			recoveryExpected, err := GetChannelById(recoveryChannel.Id, true)
+			require.NoError(t, err)
+			recoveryDesired := *recoveryExpected
+			recoveryInfo := recoveryDesired.GetOtherInfo()
+			recoveryInfo["status_reason"] = ""
+			recoveryInfo["status_time"] = int64(1_788_320_000)
+			recoveryDesired.SetOtherInfo(recoveryInfo)
+
+			changed, err = RecoverSingleKeyChannelStatusIfUnchanged(
+				recoveryExpected,
+				common.ChannelStatusEnabled,
+				recoveryDesired.OtherInfo,
+				1_788_320_000,
+			)
+			require.NoError(t, err)
+			assert.False(t, changed)
+			require.NoError(t, DB.Model(&UpstreamManagedRoute{}).
+				Where("id = ?", recoveryRoute.ID).
+				Update("state", UpstreamRouteStateActive).Error)
+			changed, err = RecoverSingleKeyChannelStatusIfUnchanged(
+				recoveryExpected,
+				common.ChannelStatusEnabled,
+				recoveryDesired.OtherInfo,
+				1_788_320_000,
+			)
+			require.NoError(t, err)
+			require.True(t, changed)
+			storedRecovery, recoveryAbility := loadChannelStatusCASFixture(t, recoveryChannel.Id)
+			assert.Equal(t, common.ChannelStatusEnabled, storedRecovery.Status)
+			assert.True(t, recoveryAbility.Enabled)
+
+			source := UpstreamSource{
+				Key:        "configured-source",
+				Name:       "Configured Source",
+				ConsoleURL: "https://example.com",
+				Enabled:    true,
+			}
+			require.NoError(t, DB.Create(&source).Error)
+			group := UpstreamGroup{
+				SourceID:            source.ID,
+				ExternalID:          "configured-group",
+				Name:                "Configured Group",
+				Platform:            "openai",
+				EffectiveMultiplier: 0.1,
+				Models:              `["gpt-a","gpt-b"]`,
+			}
+			require.NoError(t, DB.Create(&group).Error)
+			isolationChannel := Channel{
+				Name:   "configured-database-isolation",
+				Key:    "isolation-credential",
+				Status: common.ChannelStatusEnabled,
+				Models: "gpt-a,gpt-b",
+				Group:  "default",
+			}
+			require.NoError(t, DB.Create(&isolationChannel).Error)
+			require.NoError(t, isolationChannel.AddAbilities(nil))
+			isolationRoute := UpstreamManagedRoute{
+				SourceID:        source.ID,
+				ExternalGroupID: group.ExternalID,
+				Platform:        group.Platform,
+				Protocol:        UpstreamProtocolOpenAI,
+				ChannelID:       isolationChannel.Id,
+				State:           UpstreamRouteStateActive,
+			}
+			require.NoError(t, DB.Create(&isolationRoute).Error)
+
+			isolated, err := IsolateManagedRouteModel(
+				&isolationRoute,
+				"gpt-a",
+				"status_code=404",
+				1_788_320_000,
+			)
+			require.NoError(t, err)
+			require.True(t, isolated)
+			var storedIsolationChannel Channel
+			require.NoError(t, DB.First(&storedIsolationChannel, isolationChannel.Id).Error)
+			assert.Equal(t, "gpt-b", storedIsolationChannel.Models)
+			var storedIsolationGroup UpstreamGroup
+			require.NoError(t, DB.First(&storedIsolationGroup, group.ID).Error)
+			assert.Equal(t, `["gpt-b"]`, storedIsolationGroup.Models)
 		})
 	}
 }

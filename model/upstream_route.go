@@ -124,6 +124,129 @@ func ListUpstreamManagedRoutes() ([]UpstreamManagedRoute, error) {
 	return routes, err
 }
 
+// IsolateManagedRouteModel removes one model from an attached managed route
+// while locking the managed decision rows in canonical order.
+func IsolateManagedRouteModel(
+	expectedRoute *UpstreamManagedRoute,
+	modelName string,
+	reason string,
+	now int64,
+) (bool, error) {
+	modelName = strings.TrimSpace(modelName)
+	if expectedRoute == nil ||
+		expectedRoute.ID == 0 ||
+		expectedRoute.SourceID == 0 ||
+		expectedRoute.ChannelID == 0 ||
+		modelName == "" {
+		return false, nil
+	}
+
+	return withChannelStatusLocks(expectedRoute.ChannelID, func() (bool, error) {
+		isolated := false
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			var source UpstreamSource
+			if err := lockForUpdate(tx).
+				Where("id = ?", expectedRoute.SourceID).
+				First(&source).Error; err != nil {
+				return err
+			}
+
+			var group UpstreamGroup
+			if err := lockForUpdate(tx).
+				Where("source_id = ? AND external_id = ?", source.ID, expectedRoute.ExternalGroupID).
+				First(&group).Error; err != nil {
+				return err
+			}
+
+			var route UpstreamManagedRoute
+			if err := lockForUpdate(tx).
+				Where("id = ? AND channel_id = ? AND detached = ?", expectedRoute.ID, expectedRoute.ChannelID, false).
+				First(&route).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil
+				}
+				return err
+			}
+			if route.SourceID != source.ID ||
+				route.ExternalGroupID != group.ExternalID ||
+				route.Platform != group.Platform {
+				return nil
+			}
+
+			var channel Channel
+			if err := lockForUpdate(tx).
+				Where("id = ?", route.ChannelID).
+				First(&channel).Error; err != nil {
+				return err
+			}
+
+			channelModels, removed := removeManagedRouteModel(channel.Models, modelName)
+			if removed {
+				channel.Models = strings.Join(channelModels, ",")
+				if err := tx.Model(&Channel{}).
+					Where("id = ?", channel.Id).
+					Update("models", channel.Models).Error; err != nil {
+					return err
+				}
+				if err := channel.UpdateAbilities(tx); err != nil {
+					return err
+				}
+			}
+
+			var groupModels []string
+			if err := common.UnmarshalJsonStr(group.Models, &groupModels); err != nil {
+				return err
+			}
+			groupModels, groupRemoved := removeManagedRouteModel(strings.Join(groupModels, ","), modelName)
+			if groupRemoved {
+				encodedModels, err := common.Marshal(groupModels)
+				if err != nil {
+					return err
+				}
+				if err := tx.Model(&UpstreamGroup{}).
+					Where("id = ?", group.ID).
+					Updates(map[string]any{
+						"models":     string(encodedModels),
+						"updated_at": now,
+					}).Error; err != nil {
+					return err
+				}
+			}
+
+			if err := tx.Model(&UpstreamManagedRoute{}).
+				Where("id = ?", route.ID).
+				Updates(map[string]any{
+					"last_failure_at": now,
+					"last_reason":     strings.TrimSpace(reason),
+					"updated_at":      now,
+				}).Error; err != nil {
+				return err
+			}
+			isolated = true
+			return nil
+		})
+		return isolated, err
+	})
+}
+
+func removeManagedRouteModel(models string, target string) ([]string, bool) {
+	items := strings.Split(models, ",")
+	result := make([]string, 0, len(items))
+	removed := false
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if item == target {
+			removed = true
+			continue
+		}
+		result = append(result, item)
+	}
+	return result, removed
+}
+
 func RecordUpstreamRouteFailure(channelID int, now int64, windowSeconds int64, threshold int, reason string) (*UpstreamManagedRoute, bool, error) {
 	var route UpstreamManagedRoute
 	quarantine := false

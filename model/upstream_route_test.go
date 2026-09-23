@@ -1,8 +1,10 @@
 package model
 
 import (
+	"database/sql"
 	"testing"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -92,4 +94,99 @@ func TestRecordUpstreamRouteFailureRestartsOutsideWindow(t *testing.T) {
 	assert.Equal(t, 1, updated.ConsecutiveFailures)
 	assert.Equal(t, int64(1301), updated.FailureWindowStart)
 	assert.Equal(t, UpstreamRouteStateActive, updated.State)
+}
+
+func TestIsolateManagedRouteModelLocksSourceGroupRouteChannel(t *testing.T) {
+	setupUpstreamRouteTest(t)
+	require.NoError(t, DB.AutoMigrate(
+		&UpstreamSource{},
+		&UpstreamGroup{},
+		&Channel{},
+		&Ability{},
+	))
+	source := UpstreamSource{
+		Key:        "source",
+		Name:       "Source",
+		ConsoleURL: "https://example.com",
+		Enabled:    true,
+	}
+	require.NoError(t, DB.Create(&source).Error)
+	group := UpstreamGroup{
+		SourceID:            source.ID,
+		ExternalID:          "group",
+		Name:                "Group",
+		Platform:            "openai",
+		EffectiveMultiplier: 0.1,
+		Models:              `["gpt-a","gpt-b"]`,
+	}
+	require.NoError(t, DB.Create(&group).Error)
+	channel := Channel{
+		Name:   "managed",
+		Key:    "credential",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-a,gpt-b",
+		Group:  "default",
+	}
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	route := UpstreamManagedRoute{
+		SourceID:        source.ID,
+		ExternalGroupID: group.ExternalID,
+		Platform:        group.Platform,
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           UpstreamRouteStateActive,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+
+	var transactionalReads []string
+	const callbackName = "test:capture_managed_model_isolation_lock_order"
+	require.NoError(t, DB.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil {
+			return
+		}
+		if _, inTransaction := tx.Statement.ConnPool.(*sql.Tx); !inTransaction {
+			return
+		}
+		switch tx.Statement.Table {
+		case "upstream_sources", "upstream_groups", "upstream_managed_routes", "channels":
+			transactionalReads = append(transactionalReads, tx.Statement.Table)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, DB.Callback().Query().Remove(callbackName))
+	})
+
+	isolated, err := IsolateManagedRouteModel(
+		&route,
+		"gpt-a",
+		"status_code=404",
+		1_788_320_000,
+	)
+
+	require.NoError(t, err)
+	require.True(t, isolated)
+	assert.Equal(t, []string{
+		"upstream_sources",
+		"upstream_groups",
+		"upstream_managed_routes",
+		"channels",
+	}, transactionalReads)
+
+	var storedChannel Channel
+	require.NoError(t, DB.First(&storedChannel, channel.Id).Error)
+	assert.Equal(t, "gpt-b", storedChannel.Models)
+	var abilities []Ability
+	require.NoError(t, DB.Where("channel_id = ?", channel.Id).Find(&abilities).Error)
+	require.Len(t, abilities, 1)
+	assert.Equal(t, "gpt-b", abilities[0].Model)
+	assert.True(t, abilities[0].Enabled)
+	var storedGroup UpstreamGroup
+	require.NoError(t, DB.First(&storedGroup, group.ID).Error)
+	assert.Equal(t, `["gpt-b"]`, storedGroup.Models)
+	var storedRoute UpstreamManagedRoute
+	require.NoError(t, DB.First(&storedRoute, route.ID).Error)
+	assert.Equal(t, int64(1_788_320_000), storedRoute.LastFailureAt)
+	assert.Equal(t, "status_code=404", storedRoute.LastReason)
+	assert.Equal(t, int64(1_788_320_000), storedRoute.UpdatedAt)
 }

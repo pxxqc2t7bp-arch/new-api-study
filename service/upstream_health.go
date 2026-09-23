@@ -14,7 +14,6 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 var upstreamRecoveryBackoff = []time.Duration{
@@ -138,76 +137,16 @@ func IsolateManagedRouteModel(channelID int, modelName string, reason string) (b
 	if err != nil {
 		return false, err
 	}
-	isolated := exclusionAdded
-	err = model.DB.Transaction(func(tx *gorm.DB) error {
-		var lockedRoute model.UpstreamManagedRoute
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("channel_id = ? AND detached = ?", channelID, false).
-			First(&lockedRoute).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil
-			}
-			return err
-		}
-		var channel model.Channel
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ?", channelID).
-			First(&channel).Error; err != nil {
-			return err
-		}
-		channelModels, removed := removeManagedModel(channel.Models, modelName)
-		if removed {
-			channel.Models = strings.Join(channelModels, ",")
-			if err := tx.Model(&model.Channel{}).Where("id = ?", channelID).
-				Update("models", channel.Models).Error; err != nil {
-				return err
-			}
-			if err := channel.UpdateAbilities(tx); err != nil {
-				return err
-			}
-			isolated = true
-		}
-
-		var group model.UpstreamGroup
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("source_id = ? AND external_id = ?", lockedRoute.SourceID, lockedRoute.ExternalGroupID).
-			First(&group).Error; err != nil {
-			return err
-		}
-		var groupModels []string
-		if err := common.UnmarshalJsonStr(group.Models, &groupModels); err != nil {
-			return err
-		}
-		groupModels, groupRemoved := removeManagedModel(strings.Join(groupModels, ","), modelName)
-		now := common.GetTimestamp()
-		if groupRemoved {
-			encodedModels, err := common.Marshal(groupModels)
-			if err != nil {
-				return err
-			}
-			if err := tx.Model(&model.UpstreamGroup{}).Where("id = ?", group.ID).
-				Updates(map[string]any{
-					"models":     string(encodedModels),
-					"updated_at": now,
-				}).Error; err != nil {
-				return err
-			}
-			isolated = true
-		}
-		if err := tx.Model(&model.UpstreamManagedRoute{}).Where("id = ?", lockedRoute.ID).
-			Updates(map[string]any{
-				"last_failure_at": now,
-				"last_reason":     strings.TrimSpace(reason),
-				"updated_at":      now,
-			}).Error; err != nil {
-			return err
-		}
-		isolated = true
-		return nil
-	})
+	routeIsolated, err := model.IsolateManagedRouteModel(
+		route,
+		modelName,
+		reason,
+		common.GetTimestamp(),
+	)
 	if err != nil {
 		return false, err
 	}
+	isolated := exclusionAdded || routeIsolated
 	if isolated {
 		model.InitChannelCache()
 		invalidateManagedRouteAdminInfo(channelID)
@@ -254,24 +193,6 @@ func persistManagedModelExclusion(
 		return false, err
 	}
 	return true, nil
-}
-
-func removeManagedModel(models string, target string) ([]string, bool) {
-	items := strings.Split(models, ",")
-	result := make([]string, 0, len(items))
-	removed := false
-	for _, item := range items {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-		if item == target {
-			removed = true
-			continue
-		}
-		result = append(result, item)
-	}
-	return result, removed
 }
 
 func RecordManagedChannelFailure(channelError types.ChannelError, reason string) (bool, bool, error) {

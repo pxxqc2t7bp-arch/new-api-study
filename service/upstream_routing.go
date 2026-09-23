@@ -66,6 +66,13 @@ func PrepareManagedUpstreamShadows(now time.Time) (UpstreamReconcileSummary, err
 }
 
 func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) {
+	return reconcileManagedUpstreams(now, NotifyRootBark)
+}
+
+func reconcileManagedUpstreams(
+	now time.Time,
+	notifyRouteChanges func(string, string, string) error,
+) (UpstreamReconcileSummary, error) {
 	var summary UpstreamReconcileSummary
 	setting := operation_setting.GetUpstreamOrchestrationSetting()
 	if !setting.Enabled {
@@ -86,6 +93,18 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 	summary.SourcesChecked = len(sources)
 	summary.GroupsChecked = len(groups)
 	var routeChanges []string
+	defer func() {
+		if len(routeChanges) == 0 || notifyRouteChanges == nil {
+			return
+		}
+		if err := notifyRouteChanges(
+			"channel_update_upstream_reconcile",
+			"New API 上游线路状态变化",
+			strings.Join(routeChanges, "\n"),
+		); err != nil {
+			common.SysLog("upstream Bark notification skipped: " + err.Error())
+		}
+	}()
 
 	sourceByID := make(map[int64]model.UpstreamSource, len(sources))
 	for index := range sources {
@@ -246,18 +265,9 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 		summary.EnrollmentQueued = queued
 	}
 	updated, err := rankManagedRoutes(now, sources, groups, candidates, setting)
+	summary.PrioritiesUpdated = updated
 	if err != nil {
 		return summary, err
-	}
-	summary.PrioritiesUpdated = updated
-	if len(routeChanges) > 0 {
-		if err := NotifyRootBark(
-			"channel_update_upstream_reconcile",
-			"New API 上游线路状态变化",
-			strings.Join(routeChanges, "\n"),
-		); err != nil {
-			common.SysLog("upstream Bark notification skipped: " + err.Error())
-		}
 	}
 	return summary, nil
 }

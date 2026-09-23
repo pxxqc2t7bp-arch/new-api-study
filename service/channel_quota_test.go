@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -1199,6 +1200,366 @@ func TestEnableChannelForHealthCheckReturnsCommittedRecoveryCount(t *testing.T) 
 
 	assert.Equal(t, 2, enabled)
 	assert.Zero(t, staleEnabled)
+}
+
+func TestEnableChannelForHealthCheckFencesManagedSingleKeyRoute(t *testing.T) {
+	tests := []struct {
+		name             string
+		managed          bool
+		routeState       string
+		detached         bool
+		manualPauseUntil int64
+		wantEnabled      int
+	}{
+		{
+			name:        "ordinary channel without route",
+			wantEnabled: 1,
+		},
+		{
+			name:        "active managed route",
+			managed:     true,
+			routeState:  model.UpstreamRouteStateActive,
+			wantEnabled: 1,
+		},
+		{
+			name:       "quarantined after probe snapshot",
+			managed:    true,
+			routeState: model.UpstreamRouteStateQuarantined,
+		},
+		{
+			name:       "paused after probe snapshot",
+			managed:    true,
+			routeState: model.UpstreamRouteStatePaused,
+		},
+		{
+			name:       "detached after probe snapshot",
+			managed:    true,
+			routeState: model.UpstreamRouteStateDetached,
+			detached:   true,
+		},
+		{
+			name:             "manual pause remains active",
+			managed:          true,
+			routeState:       model.UpstreamRouteStateActive,
+			manualPauseUntil: time.Now().Add(time.Hour).Unix(),
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupPlanQuotaDomainTest(t)
+			channel := model.Channel{
+				Name:   "single-key-recovery-fence",
+				Key:    "credential",
+				Status: common.ChannelStatusAutoDisabled,
+				Models: "gpt-3.5-turbo",
+				Group:  "default",
+			}
+			channel.SetOtherInfo(map[string]any{
+				"disabled_until": time.Now().Add(-time.Minute).Unix(),
+				"owner":          "health-check",
+			})
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+			var probeSnapshot model.Channel
+			require.NoError(t, db.First(&probeSnapshot, channel.Id).Error)
+
+			if testCase.managed {
+				route := model.UpstreamManagedRoute{
+					SourceID:        1,
+					ExternalGroupID: "single-key-recovery-fence",
+					Platform:        "openai",
+					Protocol:        model.UpstreamProtocolOpenAI,
+					ChannelID:       channel.Id,
+					State:           model.UpstreamRouteStateActive,
+				}
+				require.NoError(t, db.Create(&route).Error)
+				require.NoError(t, db.Model(&model.UpstreamManagedRoute{}).
+					Where("id = ?", route.ID).
+					Updates(map[string]any{
+						"state":              testCase.routeState,
+						"detached":           testCase.detached,
+						"manual_pause_until": testCase.manualPauseUntil,
+					}).Error)
+			}
+
+			common.MemoryCacheEnabled = true
+			model.InitChannelCache()
+			cached, err := model.CacheGetChannel(channel.Id)
+			require.NoError(t, err)
+			newerCache := *cached
+			newerCache.Name = "cache-owned-name"
+			model.CacheUpdateChannel(&newerCache)
+
+			enabled := EnableChannelForHealthCheck(&probeSnapshot, "")
+
+			assert.Equal(t, testCase.wantEnabled, enabled)
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			var ability model.Ability
+			require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+			cached, err = model.CacheGetChannel(channel.Id)
+			require.NoError(t, err)
+			assert.Equal(t, "cache-owned-name", cached.Name)
+			if testCase.wantEnabled == 0 {
+				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+				assert.Equal(t, probeSnapshot.OtherInfo, stored.OtherInfo)
+				assert.False(t, ability.Enabled)
+				assert.Equal(t, common.ChannelStatusAutoDisabled, cached.Status)
+				assert.Equal(t, probeSnapshot.OtherInfo, cached.OtherInfo)
+			} else {
+				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+				assert.Equal(t, "health-check", stored.GetOtherInfo()["owner"])
+				assert.True(t, ability.Enabled)
+				assert.Equal(t, common.ChannelStatusEnabled, cached.Status)
+			}
+		})
+	}
+}
+
+func TestEnableChannelBypassesManagedRouteRecoveryFence(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+	channel := model.Channel{
+		Name:   "explicit-managed-enable",
+		Key:    "credential",
+		Status: common.ChannelStatusAutoDisabled,
+		Models: "gpt-3.5-turbo",
+		Group:  "default",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	require.NoError(t, db.Create(&model.UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "explicit-managed-enable",
+		Platform:        "openai",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           model.UpstreamRouteStateQuarantined,
+	}).Error)
+
+	EnableChannel(channel.Id, "", channel.Name)
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+}
+
+func TestEnableChannelForHealthCheckFencesManagedMultiKeyRoute(t *testing.T) {
+	tests := []struct {
+		name        string
+		routeState  string
+		wantEnabled int
+	}{
+		{
+			name:        "active managed route",
+			routeState:  model.UpstreamRouteStateActive,
+			wantEnabled: 1,
+		},
+		{
+			name:       "inactive managed route",
+			routeState: model.UpstreamRouteStateQuarantined,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupPlanQuotaDomainTest(t)
+			channel := model.Channel{
+				Name:   "multi-key-recovery-fence",
+				Key:    "key-a\nkey-b",
+				Status: common.ChannelStatusAutoDisabled,
+				Models: "gpt-3.5-turbo",
+				Group:  "default",
+				ChannelInfo: model.ChannelInfo{
+					IsMultiKey:           true,
+					MultiKeySize:         2,
+					MultiKeyMode:         constant.MultiKeyModePolling,
+					MultiKeyPollingIndex: 0,
+					MultiKeyStatusList: map[int]int{
+						0: common.ChannelStatusAutoDisabled,
+						1: common.ChannelStatusAutoDisabled,
+					},
+					MultiKeyDisabledReason: map[int]string{
+						0: "probe target",
+						1: "peer",
+					},
+					MultiKeyDisabledTime: map[int]int64{
+						0: 100,
+						1: 200,
+					},
+				},
+			}
+			channel.SetOtherInfo(map[string]any{
+				"disabled_until": time.Now().Add(-time.Minute).Unix(),
+				"owner":          "health-check",
+			})
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+			route := model.UpstreamManagedRoute{
+				SourceID:        1,
+				ExternalGroupID: "multi-key-recovery-fence",
+				Platform:        "openai",
+				Protocol:        model.UpstreamProtocolOpenAI,
+				ChannelID:       channel.Id,
+				State:           model.UpstreamRouteStateActive,
+			}
+			require.NoError(t, db.Create(&route).Error)
+			var probeSnapshot model.Channel
+			require.NoError(t, db.First(&probeSnapshot, channel.Id).Error)
+			require.NoError(t, db.Model(&model.UpstreamManagedRoute{}).
+				Where("id = ?", route.ID).
+				Update("state", testCase.routeState).Error)
+
+			common.MemoryCacheEnabled = true
+			model.InitChannelCache()
+			cached, err := model.CacheGetChannel(channel.Id)
+			require.NoError(t, err)
+			pollingLock := model.GetChannelPollingLock(channel.Id)
+			pollingLock.Lock()
+			cached.ChannelInfo.MultiKeyPollingIndex = 1
+			pollingLock.Unlock()
+
+			enabled := EnableChannelForHealthCheck(&probeSnapshot, "key-a")
+
+			assert.Equal(t, testCase.wantEnabled, enabled)
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			var ability model.Ability
+			require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+			cached, err = model.CacheGetChannel(channel.Id)
+			require.NoError(t, err)
+			assert.Equal(t, 1, cached.ChannelInfo.MultiKeyPollingIndex)
+			if testCase.wantEnabled == 0 {
+				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+				assert.Equal(t, probeSnapshot.OtherInfo, stored.OtherInfo)
+				assert.Equal(t, probeSnapshot.ChannelInfo, stored.ChannelInfo)
+				assert.False(t, ability.Enabled)
+				assert.Equal(t, common.ChannelStatusAutoDisabled, cached.Status)
+				assert.Contains(t, cached.ChannelInfo.MultiKeyStatusList, 0)
+			} else {
+				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+				assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 0)
+				assert.Contains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+				assert.True(t, ability.Enabled)
+				assert.Equal(t, common.ChannelStatusEnabled, cached.Status)
+				assert.NotContains(t, cached.ChannelInfo.MultiKeyStatusList, 0)
+			}
+		})
+	}
+}
+
+func TestEnableChannelForHealthCheckFencesEachPlanQuotaDomainRoute(t *testing.T) {
+	t.Run("non-managed source recovers without inactive managed peer", func(t *testing.T) {
+		db := setupPlanQuotaDomainTest(t)
+		autoBan := 1
+		tag := "plan:support:route-fence"
+		domainID := fmt.Sprintf("%x", sha256.Sum256([]byte("shared-credential")))
+		channels := []model.Channel{
+			{
+				Name: "source", Key: "shared-credential",
+				Status: common.ChannelStatusAutoDisabled, Tag: &tag, AutoBan: &autoBan,
+				Models: "gpt-3.5-turbo", Group: "default",
+			},
+			{
+				Name: "managed-peer", Key: "shared-credential",
+				Status: common.ChannelStatusAutoDisabled, Tag: &tag, AutoBan: &autoBan,
+				Models: "gpt-3.5-turbo", Group: "default",
+			},
+		}
+		for index := range channels {
+			channels[index].SetOtherInfo(map[string]any{
+				"disabled_until":   time.Now().Add(-time.Minute).Unix(),
+				"quota_domain_id":  domainID,
+				"quota_generation": "generation-a",
+				"quota_type":       "plan",
+			})
+		}
+		require.NoError(t, db.Create(&channels).Error)
+		for index := range channels {
+			require.NoError(t, channels[index].AddAbilities(nil))
+		}
+		require.NoError(t, db.Create(&model.UpstreamManagedRoute{
+			SourceID:        1,
+			ExternalGroupID: "inactive-peer",
+			Platform:        "openai",
+			Protocol:        model.UpstreamProtocolOpenAI,
+			ChannelID:       channels[1].Id,
+			State:           model.UpstreamRouteStateQuarantined,
+		}).Error)
+
+		enabled := EnableChannelForHealthCheck(&channels[0], "")
+
+		assert.Equal(t, 1, enabled)
+		var stored []model.Channel
+		require.NoError(t, db.Order("id").Find(&stored).Error)
+		require.Len(t, stored, 2)
+		assert.Equal(t, common.ChannelStatusEnabled, stored[0].Status)
+		assert.Equal(t, common.ChannelStatusAutoDisabled, stored[1].Status)
+		assert.Equal(t, channels[1].OtherInfo, stored[1].OtherInfo)
+		var abilities []model.Ability
+		require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
+		require.Len(t, abilities, 2)
+		assert.True(t, abilities[0].Enabled)
+		assert.False(t, abilities[1].Enabled)
+	})
+
+	t.Run("inactive managed source prevents peer recovery", func(t *testing.T) {
+		db := setupPlanQuotaDomainTest(t)
+		autoBan := 1
+		tag := "plan:support:source-route-fence"
+		domainID := fmt.Sprintf("%x", sha256.Sum256([]byte("shared-credential")))
+		channels := []model.Channel{
+			{
+				Name: "managed-source", Key: "shared-credential",
+				Status: common.ChannelStatusAutoDisabled, Tag: &tag, AutoBan: &autoBan,
+				Models: "gpt-3.5-turbo", Group: "default",
+			},
+			{
+				Name: "ordinary-peer", Key: "shared-credential",
+				Status: common.ChannelStatusAutoDisabled, Tag: &tag, AutoBan: &autoBan,
+				Models: "gpt-3.5-turbo", Group: "default",
+			},
+		}
+		for index := range channels {
+			channels[index].SetOtherInfo(map[string]any{
+				"disabled_until":   time.Now().Add(-time.Minute).Unix(),
+				"quota_domain_id":  domainID,
+				"quota_generation": "generation-a",
+				"quota_type":       "plan",
+			})
+		}
+		require.NoError(t, db.Create(&channels).Error)
+		for index := range channels {
+			require.NoError(t, channels[index].AddAbilities(nil))
+		}
+		require.NoError(t, db.Create(&model.UpstreamManagedRoute{
+			SourceID:        1,
+			ExternalGroupID: "inactive-source",
+			Platform:        "openai",
+			Protocol:        model.UpstreamProtocolOpenAI,
+			ChannelID:       channels[0].Id,
+			State:           model.UpstreamRouteStateQuarantined,
+		}).Error)
+
+		enabled := EnableChannelForHealthCheck(&channels[0], "")
+
+		assert.Zero(t, enabled)
+		var stored []model.Channel
+		require.NoError(t, db.Order("id").Find(&stored).Error)
+		require.Len(t, stored, 2)
+		for index := range stored {
+			assert.Equal(t, common.ChannelStatusAutoDisabled, stored[index].Status)
+			assert.Equal(t, channels[index].OtherInfo, stored[index].OtherInfo)
+		}
+		var abilities []model.Ability
+		require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
+		require.Len(t, abilities, 2)
+		assert.False(t, abilities[0].Enabled)
+		assert.False(t, abilities[1].Enabled)
+	})
 }
 
 func TestEnableChannelForHealthCheckPreservesPlanQuotaDomainBeforeSourceDue(t *testing.T) {

@@ -353,11 +353,12 @@ func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) int {
 	if channel == nil || channel.Status != common.ChannelStatusAutoDisabled {
 		return 0
 	}
-	if channel.GetDisabledUntil() > time.Now().Unix() {
+	recoveryAt := time.Now().Unix()
+	if channel.GetDisabledUntil() > recoveryAt {
 		return 0
 	}
 	if channel.ChannelInfo.IsMultiKey {
-		changed, err := model.UpdateMultiKeyChannelStatusIfUnchanged(
+		changed, err := model.RecoverMultiKeyChannelStatusIfUnchanged(
 			channel,
 			channel.GetTag(),
 			usingKey,
@@ -366,6 +367,7 @@ func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) int {
 			model.MultiKeyChannelStatusUpdateOptions{
 				ClearPlanQuotaDeadline: true,
 			},
+			recoveryAt,
 		)
 		if err != nil {
 			common.SysError(fmt.Sprintf("failed to recover multi-key channel from health-check snapshot: channel_id=%d error=%v", channel.Id, err))
@@ -381,11 +383,11 @@ func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) int {
 	}
 	if isNonMultiKeyPlanChannel(channel) {
 		if recoveryKey, owned := PlanQuotaRecoveryDomainKey(channel); owned {
-			return enablePlanQuotaDomainForHealthCheck(channel, recoveryKey)
+			return enablePlanQuotaDomainForHealthCheck(channel, recoveryKey, recoveryAt)
 		}
 	}
 
-	changed, err := enableSingleKeyChannelSnapshot(channel, false)
+	changed, err := enableSingleKeyChannelSnapshot(channel, false, &recoveryAt)
 	if err != nil {
 		common.SysError(fmt.Sprintf("failed to recover channel from health-check snapshot: channel_id=%d error=%v", channel.Id, err))
 		return 0
@@ -399,8 +401,12 @@ func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) int {
 	return 0
 }
 
-func enablePlanQuotaDomainForHealthCheck(recoveringSnapshot *model.Channel, recoveryKey string) int {
-	changed, err := enableSingleKeyChannelSnapshot(recoveringSnapshot, true)
+func enablePlanQuotaDomainForHealthCheck(
+	recoveringSnapshot *model.Channel,
+	recoveryKey string,
+	recoveryAt int64,
+) int {
+	changed, err := enableSingleKeyChannelSnapshot(recoveringSnapshot, true, &recoveryAt)
 	if err != nil {
 		common.SysError(fmt.Sprintf("failed to recover Plan quota source: channel_id=%d error=%v", recoveringSnapshot.Id, err))
 		return 0
@@ -415,7 +421,6 @@ func enablePlanQuotaDomainForHealthCheck(recoveringSnapshot *model.Channel, reco
 		if err != nil {
 			common.SysError(fmt.Sprintf("failed to load Plan quota peers: channel_id=%d error=%v", recoveringSnapshot.Id, err))
 		} else {
-			now := time.Now().Unix()
 			for _, channel := range channels {
 				if channel.Id == recoveringSnapshot.Id {
 					continue
@@ -423,11 +428,11 @@ func enablePlanQuotaDomainForHealthCheck(recoveringSnapshot *model.Channel, reco
 				candidateKey, candidateOwned := PlanQuotaRecoveryDomainKey(channel)
 				if !candidateOwned ||
 					candidateKey != recoveryKey ||
-					channel.GetDisabledUntil() > now ||
+					channel.GetDisabledUntil() > recoveryAt ||
 					!planQuotaPeerGenerationMatches(recoveringSnapshot, channel) {
 					continue
 				}
-				changed, err := enableSingleKeyChannelSnapshot(channel, true)
+				changed, err := enableSingleKeyChannelSnapshot(channel, true, &recoveryAt)
 				if err != nil {
 					common.SysError(fmt.Sprintf("failed to recover Plan quota channel: channel_id=%d error=%v", channel.Id, err))
 					continue
@@ -468,7 +473,11 @@ func planQuotaPeerGenerationMatches(source *model.Channel, peer *model.Channel) 
 		sourceValue == peerValue
 }
 
-func enableSingleKeyChannelSnapshot(channel *model.Channel, clearPlanQuota bool) (bool, error) {
+func enableSingleKeyChannelSnapshot(
+	channel *model.Channel,
+	clearPlanQuota bool,
+	recoveryAt *int64,
+) (bool, error) {
 	if channel == nil || channel.ChannelInfo.IsMultiKey ||
 		channel.Status != common.ChannelStatusAutoDisabled {
 		return false, nil
@@ -489,6 +498,14 @@ func enableSingleKeyChannelSnapshot(channel *model.Channel, clearPlanQuota bool)
 	}
 	desired.SetOtherInfo(metadata)
 
+	if recoveryAt != nil {
+		return model.RecoverSingleKeyChannelStatusIfUnchanged(
+			channel,
+			common.ChannelStatusEnabled,
+			desired.OtherInfo,
+			*recoveryAt,
+		)
+	}
 	return model.UpdateSingleKeyChannelStatusIfUnchanged(
 		channel.Id,
 		channel.Key,
@@ -547,7 +564,7 @@ func enablePlanQuotaDomain(recoveringChannel *model.Channel) bool {
 			continue
 		}
 
-		changed, err := enableSingleKeyChannelSnapshot(channel, true)
+		changed, err := enableSingleKeyChannelSnapshot(channel, true, nil)
 		if err != nil {
 			common.SysError(fmt.Sprintf("failed to recover Plan quota channel: channel_id=%d error=%v", channel.Id, err))
 			continue

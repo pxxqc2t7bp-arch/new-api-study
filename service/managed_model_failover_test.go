@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -148,6 +149,13 @@ func TestIsolateManagedRouteModelOnlyRemovesFailedModel(t *testing.T) {
 		State:           model.UpstreamRouteStateActive,
 	}).Error)
 	model.InitChannelCache()
+	managedRouteAdminCache.Store(channel.Id, managedRouteAdminCacheEntry{
+		info:      map[string]any{"state": "stale"},
+		expiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	t.Cleanup(func() {
+		managedRouteAdminCache.Delete(channel.Id)
+	})
 
 	isolated, err := IsolateManagedRouteModel(
 		channel.Id,
@@ -160,6 +168,11 @@ func TestIsolateManagedRouteModelOnlyRemovesFailedModel(t *testing.T) {
 	var storedChannel model.Channel
 	require.NoError(t, db.First(&storedChannel, channel.Id).Error)
 	assert.Equal(t, "gpt-5.5", storedChannel.Models)
+	cachedChannel, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "gpt-5.5", cachedChannel.Models)
+	_, adminCacheExists := managedRouteAdminCache.Load(channel.Id)
+	assert.False(t, adminCacheExists)
 	var failedAbilityCount int64
 	require.NoError(t, db.Model(&model.Ability{}).
 		Where("channel_id = ? AND model = ?", channel.Id, "gpt-5.4").

@@ -866,6 +866,7 @@ func updateChannelStatusLocked(channelId int, usingKey string, status int, reaso
 			expectedOtherInfo,
 			status,
 			current.OtherInfo,
+			nil,
 		)
 		if err != nil || changed {
 			return changed, err
@@ -894,6 +895,33 @@ func UpdateSingleKeyChannelStatusIfUnchanged(
 			expectedOtherInfo,
 			status,
 			otherInfo,
+			nil,
+		)
+	})
+}
+
+// RecoverSingleKeyChannelStatusIfUnchanged applies a passive recovery only
+// while any managed route for the channel remains routeable.
+func RecoverSingleKeyChannelStatusIfUnchanged(
+	expected *Channel,
+	status int,
+	otherInfo string,
+	recoveryAt int64,
+) (bool, error) {
+	if expected == nil || expected.Id == 0 {
+		return false, errors.New("single-key channel recovery snapshot is missing")
+	}
+
+	return withChannelStatusLocks(expected.Id, func() (bool, error) {
+		return updateSingleKeyChannelStatusIfUnchangedLocked(
+			expected.Id,
+			expected.Key,
+			expected.GetTag(),
+			expected.Status,
+			expected.OtherInfo,
+			status,
+			otherInfo,
+			&recoveryAt,
 		)
 	})
 }
@@ -906,10 +934,18 @@ func updateSingleKeyChannelStatusIfUnchangedLocked(
 	expectedOtherInfo string,
 	status int,
 	otherInfo string,
+	managedRouteRecoveryAt *int64,
 ) (bool, error) {
 	changed := false
 	var updated Channel
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		if managedRouteRecoveryAt != nil {
+			allowed, err := lockManagedRouteRecoveryFence(tx, channelId, *managedRouteRecoveryAt)
+			if err != nil || !allowed {
+				return err
+			}
+		}
+
 		var current Channel
 		if err := lockForUpdate(tx).Where("id = ?", channelId).First(&current).Error; err != nil {
 			return err
@@ -947,6 +983,20 @@ func updateSingleKeyChannelStatusIfUnchangedLocked(
 		}})
 	}
 	return changed, nil
+}
+
+func lockManagedRouteRecoveryFence(tx *gorm.DB, channelId int, recoveryAt int64) (bool, error) {
+	var route UpstreamManagedRoute
+	err := lockForUpdate(tx).Where("channel_id = ?", channelId).First(&route).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return route.State == UpstreamRouteStateActive &&
+		!route.Detached &&
+		route.ManualPauseUntil <= recoveryAt, nil
 }
 
 type SingleKeyChannelStatusUpdate struct {
@@ -1067,6 +1117,48 @@ func UpdateMultiKeyChannelStatusIfUnchanged(
 	reason string,
 	options MultiKeyChannelStatusUpdateOptions,
 ) (bool, error) {
+	return updateMultiKeyChannelStatusIfUnchanged(
+		expected,
+		observedTag,
+		usingKey,
+		status,
+		reason,
+		options,
+		nil,
+	)
+}
+
+// RecoverMultiKeyChannelStatusIfUnchanged applies a passive key recovery only
+// while any managed route for the channel remains routeable.
+func RecoverMultiKeyChannelStatusIfUnchanged(
+	expected *Channel,
+	observedTag string,
+	usingKey string,
+	status int,
+	reason string,
+	options MultiKeyChannelStatusUpdateOptions,
+	recoveryAt int64,
+) (bool, error) {
+	return updateMultiKeyChannelStatusIfUnchanged(
+		expected,
+		observedTag,
+		usingKey,
+		status,
+		reason,
+		options,
+		&recoveryAt,
+	)
+}
+
+func updateMultiKeyChannelStatusIfUnchanged(
+	expected *Channel,
+	observedTag string,
+	usingKey string,
+	status int,
+	reason string,
+	options MultiKeyChannelStatusUpdateOptions,
+	managedRouteRecoveryAt *int64,
+) (bool, error) {
 	if expected == nil || expected.Id == 0 {
 		return false, errors.New("multi-key channel snapshot is missing")
 	}
@@ -1075,6 +1167,13 @@ func UpdateMultiKeyChannelStatusIfUnchanged(
 		changed := false
 		var updated Channel
 		err := DB.Transaction(func(tx *gorm.DB) error {
+			if managedRouteRecoveryAt != nil {
+				allowed, err := lockManagedRouteRecoveryFence(tx, expected.Id, *managedRouteRecoveryAt)
+				if err != nil || !allowed {
+					return err
+				}
+			}
+
 			var current Channel
 			if err := lockForUpdate(tx).Where("id = ?", expected.Id).First(&current).Error; err != nil {
 				return err
