@@ -42,8 +42,12 @@ different tags can therefore continue receiving traffic.
   path, while preserving configured generic disable behavior.
 - Bind isolation to the credential and Plan tag observed by the failed
   request, even if either field rotates before error handling.
+- Treat an observed empty credential as source-only only while the source
+  still has that exact empty credential and observed Plan tag.
 - Prevent managed reconciliation from enabling a channel while valid Plan
   quota ownership remains.
+- Preserve immediate per-key isolation for structured Plan quota errors on
+  managed multi-key channels, bypassing managed failure thresholds.
 - Count only health-check recoveries that actually commit, and fail passive
   selection closed when managed-route ownership cannot be queried.
 
@@ -87,13 +91,15 @@ The selected channels are auto-disabled and have their abilities disabled
 through a model compare-and-swap operation. Existing reset metadata remains in
 place, and `quota_domain_id` stores the lowercase hexadecimal SHA-256 digest of
 the credential. The digest is deterministic across tags without exposing the
-credential. If the failing channel has an empty credential, no broad lookup is
-performed: only that known channel is disabled and marked with
-`quota_domain_id=channel:<id>`. A nil channel remains a no-op. The sweep may
-write only an enabled channel or an auto-disabled channel that already carries
-the same `quota_domain_id`. It leaves manually disabled rows and auto-disabled
-rows owned by another marker unchanged, including their metadata and ability
-state.
+credential. If the request observed an empty credential, no broad lookup is
+performed. The known source is disabled with
+`quota_domain_id=channel:<id>` only when its freshly loaded row remains
+non-multi-key, has the exact empty raw key, and retains the exact observed Plan
+tag. A source whose key or tag rotated is left enabled and unmarked. A nil
+channel remains a no-op. The sweep may write only an enabled channel or an
+auto-disabled channel that already carries the same `quota_domain_id`. It
+leaves manually disabled rows and auto-disabled rows owned by another marker
+unchanged, including their metadata and ability state.
 
 ### Atomic Ownership Transition
 
@@ -136,12 +142,15 @@ attempt a no-op.
 Automatic channel tests call `EnableChannelForHealthCheck` with the exact
 `Channel` snapshot used by the probe and its selected key. Non-multi-key Plan
 quota ownership and recovery scope are derived from that pre-probe snapshot.
-The service first attempts to enable the source with a CAS over the snapshot's
-exact key, tag, status, and raw `other_info`. If that CAS is stale or fails,
-recovery stops: peers are not loaded or enabled, and the call never falls
-through to generic ID-based enablement. This fences a successful stale probe
-from a newer quota generation, a manual disable, or an unrelated ownership
-change.
+Before any status write, the service rejects a source snapshot whose
+`disabled_until` is still in the future. It returns zero without changing the
+source, peers, metadata, or abilities. Once due, the service attempts to enable
+the source with a CAS over the snapshot's exact key, tag, status, and raw
+`other_info`. If that CAS is stale or fails, recovery stops: peers are not
+loaded or enabled, and the call never falls through to generic ID-based
+enablement. This fences a successful stale probe from a newer quota generation,
+a manual disable, or an unrelated ownership change. Manual `EnableChannel`
+remains an explicit override and does not apply the due-time fence.
 
 Only after the source CAS commits does automatic recovery load current channel
 snapshots. If the source snapshot has `quota_domain_id`, current auto-disabled
@@ -199,15 +208,29 @@ special case. A recognized Plan quota error is then sent through
 `DisableChannelForAPIError` synchronously, where Plan domain isolation runs
 before retry selection and managed failure accounting. Generic disables remain
 asynchronous. Ordinary managed failures retain their existing threshold
-behavior, while multi-key Plan failures retain per-key isolation through the
-same structured entry.
+behavior. A structured Plan quota error for a managed multi-key channel calls
+the existing `UpdateChannelStatus` path immediately with the request's
+`UsingKey`, then returns without incrementing the managed failure threshold.
+Only the used key is disabled; the overall channel and abilities remain enabled
+while another key is available.
 
 Managed reconciliation treats valid Plan quota metadata as separate ownership
-of channel availability. Both the route transition to active and steady-state
-active ranking consult the same guard before writing an enabled status.
-Reconciliation continues updating route state, rank, priority, endpoint, and
-model fields, but preserves the channel's auto-disabled status, quota metadata,
-and disabled abilities until health-check or manual recovery clears ownership.
+of channel availability. A transition to active no longer performs a
+pre-ranking enable. Final rank reconciliation reads a channel snapshot,
+calculates the desired status while preserving valid Plan ownership, and calls
+a model-owned compare-and-swap. The model holds the existing channel status
+locks, starts one transaction, reads through `lockForUpdate`, and compares key,
+tag, status, and raw metadata. Its conditional channel update supplies the
+SQLite optimistic fence; MySQL and PostgreSQL also hold the row lock. A stale
+snapshot returns no change, and the service retries from fresh state.
+
+On a matching snapshot, route rank and multiplier, channel priority, endpoint,
+models and status, plus regenerated abilities commit in the same transaction.
+Thus a concurrent quota disable either wins before the locked comparison and is
+preserved, or commits after reconciliation; reconciliation cannot overwrite it.
+Reconciliation still updates route state separately and retains ordinary
+managed behavior, but valid quota ownership keeps channel status and abilities
+disabled until health-check or manual recovery clears ownership.
 
 ## Data Flow
 
@@ -216,7 +239,8 @@ and disabled abilities until health-check or manual recovery clears ownership.
    evidence; `ShouldDisableChannel` retains generic configured fallbacks.
 3. `DisableChannelForAPIError` carries the observed request tag, credential,
    and parsed reset timestamp into the Plan disable path.
-4. Multi-key Plan channels fall through to per-key status handling.
+4. Multi-key Plan channels immediately use per-key status handling, including
+   managed channels below their failure threshold.
 5. For other Plan channels, exact single-key matches are selected in Go.
 6. Eligible enabled or same-marker auto-disabled snapshots build their complete
    desired status metadata with a fresh `quota_generation` and enter the
@@ -229,12 +253,15 @@ and disabled abilities until health-check or manual recovery clears ownership.
    the oldest-tested row per marked or validated legacy domain and each
    unrelated unmanaged row independently. Validated managed Plan quota rows
    participate; ordinary managed rows do not.
-10. A successful recovery probe CAS-enables its exact pre-probe source
-    snapshot first. Only a successful source CAS permits current same-domain,
+10. A health-check recovery first rejects a not-yet-due source snapshot. Once
+    due, a successful probe CAS-enables its exact pre-probe source snapshot
+    first. Only a successful source CAS permits current same-domain,
     same-generation, due peers to recover. Credential rotation restricts that
     recovery to the probed row, and accounting uses only committed enables.
-11. Managed reconciliation may refresh routing fields but cannot enable a
-    channel while valid Plan quota ownership remains.
+11. Managed reconciliation omits the pre-rank activation enable and uses one
+    model-owned locked CAS transaction for rank, channel routing/status fields,
+    and abilities. Valid Plan ownership survives either ordering of a
+    concurrent disable.
 
 ## Tests
 
@@ -258,7 +285,9 @@ and disabled abilities until health-check or manual recovery clears ownership.
 - Same-tag Plan channels with another credential remain enabled.
 - Non-Plan channels with the exhausted credential remain enabled.
 - Empty credentials disable only the known failing channel with a
-  channel-specific marker; nil channels remain unchanged.
+  channel-specific marker when key and tag are unchanged; key-only, tag-only,
+  or combined rotation leaves the source enabled and unmarked. Nil channels
+  remain unchanged.
 - Matching manually disabled rows and auto-disabled rows carrying another
   marker preserve status, metadata, and abilities during a disable sweep.
 - Marker-scoped recovery leaves another credential domain and manually
@@ -277,8 +306,9 @@ and disabled abilities until health-check or manual recovery clears ownership.
 - A health-check snapshot superseded by a manual source disable cannot enable
   the source or any peer.
 - A source recovery cannot enable a peer with another generation or a future
-  `disabled_until`; legacy marked rows with both generations absent remain
-  compatible.
+  `disabled_until`; a source with a future `disabled_until` returns zero and
+  preserves the whole domain. Legacy marked rows with both generations absent
+  remain compatible, and manual enable remains an override.
 - Health-check summaries count committed source and peer enables, while stale
   or no-op recovery contributes zero.
 - A successful model CAS updates status, raw metadata, and ability enabled
@@ -291,10 +321,13 @@ and disabled abilities until health-check or manual recovery clears ownership.
   and cache changes together and leaves no interleaving gap.
 - A stale service snapshot cannot overwrite a concurrent owner or status
   change.
-- Optional `TEST_MYSQL_DSN` and `TEST_POSTGRES_DSN` coverage exercises the same
-  CAS against temporary migrated real-dialect channel and ability tables.
+- Optional `TEST_MYSQL_DSN` and `TEST_POSTGRES_DSN` coverage exercises both
+  status CAS paths against temporary migrated real-dialect route, channel, and
+  ability tables.
 - Public `DisableChannel` preserves per-key isolation for multi-key Plan
   channels.
+- Managed structured Plan quota handling immediately disables only the used key
+  and does not increment the managed failure counter while another key remains.
 - Passive recovery chooses the oldest `TestTime` in a shared domain and uses
   channel ID as its deterministic tie-break.
 - Passive recovery includes managed marked and validated legacy Plan quota
@@ -302,8 +335,11 @@ and disabled abilities until health-check or manual recovery clears ownership.
 - Managed single-key Plan quota failures isolate shared credential peers before
   managed route failure thresholds are evaluated.
 - Active managed-route reconciliation preserves valid Plan quota ownership in
-  both activation-transition and steady-state ranking paths while updating
-  non-status route fields.
+  deterministic activation-transition and steady-state interleavings while
+  atomically updating route rank, priority, endpoint, models, and abilities.
+- The model managed-channel CAS rejects stale status ownership without changing
+  route rank, channel routing fields, or abilities, and commits all three on a
+  fresh snapshot.
 - A managed-route query failure aborts passive selection and performs zero
   probes.
 - Existing disable/enable lifecycle and no-reset behavior continue to pass.

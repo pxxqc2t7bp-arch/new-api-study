@@ -14,8 +14,6 @@ import (
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
-
-	"gorm.io/gorm"
 )
 
 type UpstreamReconcileSummary struct {
@@ -195,15 +193,7 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 			route.State,
 			state,
 		))
-		if state == model.UpstreamRouteStateActive {
-			channel, err := model.GetChannelById(route.ChannelID, true)
-			if err != nil {
-				return summary, err
-			}
-			if !preserveManagedPlanQuotaOwnership(channel, common.ChannelStatusEnabled) {
-				model.UpdateChannelStatus(route.ChannelID, "", common.ChannelStatusEnabled, "")
-			}
-		} else {
+		if state != model.UpstreamRouteStateActive {
 			model.UpdateChannelStatus(route.ChannelID, "", common.ChannelStatusAutoDisabled, reason)
 		}
 		route.State = state
@@ -642,39 +632,40 @@ func rankManagedRoutes(
 			status = common.ChannelStatusEnabled
 		}
 		selectedEndpoint := source.SelectedEndpoint
-		result := model.DB.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Model(&model.UpstreamManagedRoute{}).Where("id = ?", route.ID).Updates(map[string]any{
-				"rank":                 rank,
-				"effective_multiplier": group.EffectiveMultiplier,
-				"updated_at":           now.Unix(),
-			}).Error; err != nil {
-				return err
+		applied := false
+		for range 3 {
+			channel, err := model.GetChannelById(route.ChannelID, true)
+			if err != nil {
+				return updated, err
 			}
-			var channel model.Channel
-			if err := tx.Where("id = ?", route.ChannelID).First(&channel).Error; err != nil {
-				return err
+			desiredStatus := status
+			if preserveManagedPlanQuotaOwnership(channel, desiredStatus) {
+				desiredStatus = channel.Status
 			}
-			if preserveManagedPlanQuotaOwnership(&channel, status) {
-				status = channel.Status
-			}
-			channel.Priority = &priority
-			channel.BaseURL = &selectedEndpoint
-			channel.Status = status
+			models := channel.Models
 			if groupSelected {
-				channel.Models = strings.Join(routeModels, ",")
+				models = strings.Join(routeModels, ",")
 			}
-			if err := tx.Model(&model.Channel{}).Where("id = ?", route.ChannelID).Updates(map[string]any{
-				"priority": priority,
-				"base_url": selectedEndpoint,
-				"models":   channel.Models,
-				"status":   status,
-			}).Error; err != nil {
-				return err
+			changed, err := model.UpdateManagedChannelIfUnchanged(channel, model.ManagedChannelUpdate{
+				RouteID:             route.ID,
+				Rank:                rank,
+				EffectiveMultiplier: group.EffectiveMultiplier,
+				UpdatedAt:           now.Unix(),
+				Priority:            priority,
+				BaseURL:             selectedEndpoint,
+				Models:              models,
+				Status:              desiredStatus,
+			})
+			if err != nil {
+				return updated, err
 			}
-			return channel.UpdateAbilities(tx)
-		})
-		if result != nil {
-			return updated, result
+			if changed {
+				applied = true
+				break
+			}
+		}
+		if !applied {
+			return updated, fmt.Errorf("managed channel changed during reconciliation: channel_id=%d", route.ChannelID)
 		}
 		if selected && route.State == model.UpstreamRouteStateActive {
 			updated++

@@ -511,3 +511,87 @@ git diff --check
 
 Review the cumulative diff for occupancy, secret disclosure, schema changes,
 multi-key behavior, and stale-write protection, then create one focused commit.
+
+### Task 14: Close Final Review Blockers
+
+**Files:**
+
+- Modify: `service/channel.go`
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/upstream_routing.go`
+- Modify: `service/upstream_orchestration_test.go`
+- Modify: `model/channel.go`
+- Modify: `model/channel_status_cas_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: Add all four blocking RED regressions**
+
+Cover empty observed key rotation by key and by tag, managed multi-key Plan
+isolation below the managed threshold, a future source `disabled_until`, and
+deterministic quota-disable interleavings in activation and steady-state rank.
+Add a model contract test for stale and fresh managed channel snapshots.
+
+Observed RED:
+
+```text
+TestDisableChannelForAPIErrorPreservesRotatedEmptyCredentialSource:
+source status became 3 and its ability became disabled after both rotations.
+
+TestDisableChannelManagedPlanMultiKeyImmediatelyIsolatesUsedKey:
+used-key status remained 0 and the managed failure counter became 1.
+
+TestEnableChannelForHealthCheckPreservesPlanQuotaDomainBeforeSourceDue:
+returned 1, enabled the source ability, and cleared source quota metadata.
+
+TestReconcileManagedUpstreamsPreservesConcurrentPlanQuotaDisable:
+activation and steady-state rank both restored channel status 1 and enabled
+the ability.
+
+TestUpdateManagedChannelIfUnchangedPreservesConcurrentStatusOwner:
+build failed because ManagedChannelUpdate and
+UpdateManagedChannelIfUnchanged did not exist.
+```
+
+- [x] **Step 2: Bind empty observed identity and managed multi-key handling**
+
+Require the freshly loaded empty-key source to remain non-multi-key with the
+exact empty raw key and observed tag. Route structured multi-key Plan errors
+directly to `UpdateChannelStatus` with `UsingKey` before managed failure
+accounting.
+
+- [x] **Step 3: Fence source recovery by due time**
+
+Return zero from `EnableChannelForHealthCheck` before any write when the source
+snapshot has `disabled_until > now`. Keep `EnableChannel` unchanged as the
+manual override.
+
+- [x] **Step 4: Make final managed reconciliation atomic**
+
+Remove activation's pre-rank enable. Add a model-owned managed update CAS that
+uses the existing status locks, `lockForUpdate`, and a conditional channel
+update, then commits route rank/multiplier, channel priority/base/models/status,
+and abilities in one transaction. Retry stale snapshots from current state.
+
+- [x] **Step 5: Verify focused GREEN**
+
+```bash
+go test ./service -run \
+  '^(TestDisableChannelForAPIErrorPreservesRotatedEmptyCredentialSource|TestDisableChannelManagedPlanMultiKeyImmediatelyIsolatesUsedKey|TestEnableChannelForHealthCheckPreservesPlanQuotaDomainBeforeSourceDue|TestReconcileManagedUpstreamsPreservesConcurrentPlanQuotaDisable)$' -count=1
+go test ./model -run \
+  '^(TestUpdateManagedChannelIfUnchangedPreservesConcurrentStatusOwner|TestUpdateSingleKeyChannelStatusIfUnchanged.*)$' -count=1
+```
+
+Observed: PASS.
+
+- [x] **Step 6: Run final formatting, package, race, vet, and diff gates**
+
+Run the full requested verification set, including the optional configured
+MySQL/PostgreSQL CAS matrix when DSNs are available, then self-review and
+commit.
+
+Observed: `gofmt`, focused race suites for model/service/controller, full
+`go test ./service ./controller ./model -count=1`, `go vet` for those packages,
+and `git diff --check` all passed. The optional configured-database test passed
+with its MySQL and PostgreSQL cases skipped because `TEST_MYSQL_DSN` and
+`TEST_POSTGRES_DSN` were unset. Cumulative review found no P0-P2 defect.

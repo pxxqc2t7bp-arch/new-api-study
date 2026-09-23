@@ -58,9 +58,8 @@ func disableChannel(channelError types.ChannelError, reason string, planQuota *p
 		return
 	}
 
-	if !channelError.IsMultiKey &&
-		planQuota != nil &&
-		strings.HasPrefix(planQuota.observedTag, "plan:") {
+	structuredPlanQuota := planQuota != nil && strings.HasPrefix(planQuota.observedTag, "plan:")
+	if structuredPlanQuota && !channelError.IsMultiKey {
 		disablePlanQuotaDomainWithCredential(
 			&model.Channel{Id: channelError.ChannelId},
 			channelError.UsingKey,
@@ -71,11 +70,13 @@ func disableChannel(channelError types.ChannelError, reason string, planQuota *p
 		return
 	}
 
-	if handled, _, err := RecordManagedChannelFailure(channelError, reason); handled {
-		if err != nil {
-			common.SysError(fmt.Sprintf("failed to record managed channel failure: channel_id=%d error=%v", channelError.ChannelId, err))
+	if !structuredPlanQuota {
+		if handled, _, err := RecordManagedChannelFailure(channelError, reason); handled {
+			if err != nil {
+				common.SysError(fmt.Sprintf("failed to record managed channel failure: channel_id=%d error=%v", channelError.ChannelId, err))
+			}
+			return
 		}
-		return
 	}
 
 	success := model.UpdateChannelStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason)
@@ -233,7 +234,10 @@ func disablePlanQuotaDomainWithCredential(
 		tag := channel.GetTag()
 		keys := channel.GetKeys()
 		if observedCredential == "" {
-			if channel.Id != failingChannel.Id {
+			if channel.Id != failingChannel.Id ||
+				channel.ChannelInfo.IsMultiKey ||
+				channel.Key != observedCredential ||
+				tag != observedTag {
 				continue
 			}
 		} else {
@@ -315,6 +319,9 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
 // should continue using EnableChannel.
 func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) int {
 	if channel == nil || channel.Status != common.ChannelStatusAutoDisabled {
+		return 0
+	}
+	if channel.GetDisabledUntil() > time.Now().Unix() {
 		return 0
 	}
 	if channel.ChannelInfo.IsMultiKey {

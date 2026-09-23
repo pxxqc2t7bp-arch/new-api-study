@@ -237,6 +237,86 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedRollsBackAbilityFailure(t *testi
 	assert.Equal(t, expectedOtherInfo, cached.OtherInfo)
 }
 
+func TestUpdateManagedChannelIfUnchangedPreservesConcurrentStatusOwner(t *testing.T) {
+	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+		"owner": "before",
+	})
+	require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+	require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+	route := UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "group",
+		Platform:        "openai",
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           UpstreamRouteStateActive,
+		Rank:            7,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	concurrent := *expected
+	concurrent.Status = common.ChannelStatusAutoDisabled
+	concurrent.SetOtherInfo(map[string]any{
+		"owner":            "plan-quota",
+		"quota_domain_id":  "domain-a",
+		"quota_generation": "generation-a",
+		"quota_type":       "plan",
+	})
+	require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{
+		"status":     concurrent.Status,
+		"other_info": concurrent.OtherInfo,
+	}).Error)
+	require.NoError(t, DB.Model(&Ability{}).Where("channel_id = ?", channel.Id).
+		Update("enabled", false).Error)
+
+	update := ManagedChannelUpdate{
+		RouteID:             route.ID,
+		Rank:                1,
+		EffectiveMultiplier: 0.1,
+		UpdatedAt:           1_788_320_000,
+		Priority:            999,
+		BaseURL:             "https://api.example.com",
+		Models:              "gpt-4.1",
+		Status:              common.ChannelStatusEnabled,
+	}
+	changed, err := UpdateManagedChannelIfUnchanged(expected, update)
+	require.NoError(t, err)
+	assert.False(t, changed)
+
+	stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	assert.Equal(t, concurrent.OtherInfo, stored.OtherInfo)
+	assert.Equal(t, "gpt-3.5-turbo", stored.Models)
+	assert.False(t, ability.Enabled)
+	var storedRoute UpstreamManagedRoute
+	require.NoError(t, DB.First(&storedRoute, route.ID).Error)
+	assert.Equal(t, 7, storedRoute.Rank)
+
+	fresh, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	update.Status = fresh.Status
+	changed, err = UpdateManagedChannelIfUnchanged(fresh, update)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	stored, ability = loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	assert.Equal(t, concurrent.OtherInfo, stored.OtherInfo)
+	assert.Equal(t, "gpt-4.1", stored.Models)
+	require.NotNil(t, stored.Priority)
+	assert.EqualValues(t, 999, *stored.Priority)
+	assert.Equal(t, "https://api.example.com", stored.GetBaseURL())
+	assert.False(t, ability.Enabled)
+	assert.Equal(t, "gpt-4.1", ability.Model)
+	require.NotNil(t, ability.Priority)
+	assert.EqualValues(t, 999, *ability.Priority)
+	require.NoError(t, DB.First(&storedRoute, route.ID).Error)
+	assert.Equal(t, 1, storedRoute.Rank)
+	assert.Equal(t, 0.1, storedRoute.EffectiveMultiplier)
+}
+
 func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -286,9 +366,9 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 			var version string
 			require.NoError(t, database.Raw("SELECT VERSION()").Scan(&version).Error)
 			t.Logf("%s version: %s", test.name, version)
-			require.NoError(t, database.AutoMigrate(&Channel{}, &Ability{}))
+			require.NoError(t, database.AutoMigrate(&Channel{}, &Ability{}, &UpstreamManagedRoute{}))
 			t.Cleanup(func() {
-				require.NoError(t, database.Migrator().DropTable(&Ability{}, &Channel{}))
+				require.NoError(t, database.Migrator().DropTable(&UpstreamManagedRoute{}, &Ability{}, &Channel{}))
 			})
 
 			previousDB := DB
@@ -337,6 +417,40 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 			assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
 			assert.Equal(t, channel.OtherInfo, stored.OtherInfo)
 			assert.False(t, ability.Enabled)
+
+			route := UpstreamManagedRoute{
+				SourceID:        1,
+				ExternalGroupID: "configured-group",
+				Platform:        "openai",
+				Protocol:        UpstreamProtocolOpenAI,
+				ChannelID:       channel.Id,
+				State:           UpstreamRouteStateActive,
+				Rank:            7,
+			}
+			require.NoError(t, DB.Create(&route).Error)
+			managedSnapshot, err := GetChannelById(channel.Id, true)
+			require.NoError(t, err)
+			changed, err = UpdateManagedChannelIfUnchanged(managedSnapshot, ManagedChannelUpdate{
+				RouteID:             route.ID,
+				Rank:                1,
+				EffectiveMultiplier: 0.1,
+				UpdatedAt:           time.Now().Unix(),
+				Priority:            999,
+				BaseURL:             "https://api.example.com",
+				Models:              "gpt-4.1",
+				Status:              common.ChannelStatusAutoDisabled,
+			})
+			require.NoError(t, err)
+			require.True(t, changed)
+
+			stored, ability = loadChannelStatusCASFixture(t, channel.Id)
+			assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+			assert.Equal(t, channel.OtherInfo, stored.OtherInfo)
+			assert.Equal(t, "gpt-4.1", stored.Models)
+			assert.False(t, ability.Enabled)
+			var storedRoute UpstreamManagedRoute
+			require.NoError(t, DB.First(&storedRoute, route.ID).Error)
+			assert.Equal(t, 1, storedRoute.Rank)
 		})
 	}
 }

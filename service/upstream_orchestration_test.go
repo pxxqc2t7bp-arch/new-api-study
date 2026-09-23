@@ -1,6 +1,7 @@
 package service
 
 import (
+	"database/sql"
 	"errors"
 	"net/http"
 	"slices"
@@ -635,6 +636,155 @@ func TestReconcileManagedUpstreamsPreservesPlanQuotaOwnership(t *testing.T) {
 	require.Len(t, abilities, 2)
 	assert.False(t, abilities[0].Enabled)
 	assert.False(t, abilities[1].Enabled)
+}
+
+func TestReconcileManagedUpstreamsPreservesConcurrentPlanQuotaDisable(t *testing.T) {
+	tests := []struct {
+		name                 string
+		initialState         string
+		consecutiveSuccesses int
+	}{
+		{
+			name:                 "activation",
+			initialState:         model.UpstreamRouteStateShadow,
+			consecutiveSuccesses: 3,
+		},
+		{
+			name:         "steady-state rank",
+			initialState: model.UpstreamRouteStateActive,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			setupUpstreamOrchestrationTest(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+
+			now := time.Unix(1_788_320_000, 0)
+			setting := operation_setting.GetUpstreamOrchestrationSetting()
+			originalSetting := *setting
+			setting.Enabled = true
+			setting.AutoEnroll = false
+			setting.CandidateLimit = 5
+			setting.MaxUpstreamMultiplier = 1
+			setting.SyncIntervalHours = 4
+			setting.ShadowSuccessesRequired = 3
+			originalModelRatios := ratio_setting.ModelRatio2JSONString()
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4.1":1}`))
+			t.Cleanup(func() {
+				*setting = originalSetting
+				require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+			})
+
+			source := model.UpstreamSource{
+				Key:              "source",
+				Name:             "Source",
+				ConsoleURL:       "https://example.com",
+				SelectedEndpoint: "https://api.example.com",
+				Status:           model.UpstreamHealthOperational,
+				Enabled:          true,
+				LastSnapshotAt:   now.Unix(),
+				LastSuccessAt:    now.Unix(),
+			}
+			require.NoError(t, model.DB.Create(&source).Error)
+			group := model.UpstreamGroup{
+				SourceID:            source.ID,
+				ExternalID:          "group",
+				Name:                "Group",
+				Platform:            "openai",
+				EffectiveMultiplier: 0.1,
+				HealthStatus:        model.UpstreamHealthOperational,
+				Models:              `["gpt-4.1"]`,
+				ObservedAt:          now.Unix(),
+			}
+			require.NoError(t, model.DB.Create(&group).Error)
+
+			autoBan := 1
+			tag := "plan:managed:concurrent"
+			priority := int64(17)
+			baseURL := "https://old.example.com"
+			channel := model.Channel{
+				Id: 73, Name: "concurrently-disabled", Key: "credential",
+				Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+				Priority: &priority, BaseURL: &baseURL,
+				Models: "gpt-old", Group: "default",
+			}
+			require.NoError(t, model.DB.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+			route := model.UpstreamManagedRoute{
+				SourceID: source.ID, ExternalGroupID: group.ExternalID,
+				Platform: group.Platform, Protocol: model.UpstreamProtocolOpenAI,
+				ChannelID: channel.Id, State: testCase.initialState,
+				ConsecutiveSuccesses: testCase.consecutiveSuccesses,
+			}
+			require.NoError(t, model.DB.Create(&route).Error)
+
+			disabled := channel
+			disabled.Status = common.ChannelStatusAutoDisabled
+			disabled.SetOtherInfo(map[string]any{
+				"disabled_until":   now.Add(time.Hour).Unix(),
+				"quota_domain_id":  planQuotaDomainID(channel.Id, channel.Key),
+				"quota_generation": "concurrent-generation",
+				"quota_type":       "plan",
+				"preserved_owner":  testCase.name,
+			})
+			injected := false
+			const callbackName = "test:inject_concurrent_plan_quota_disable"
+			require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if injected || tx.Statement == nil || tx.Statement.Table != "channels" {
+					return
+				}
+				if _, singleChannel := tx.Statement.Dest.(*model.Channel); !singleChannel {
+					return
+				}
+				injected = true
+				writer := model.DB.Session(&gorm.Session{NewDB: true, SkipHooks: true})
+				if _, inTransaction := tx.Statement.ConnPool.(*sql.Tx); inTransaction {
+					writer = tx.Session(&gorm.Session{NewDB: true, SkipHooks: true})
+				}
+				require.NoError(t, writer.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{
+					"status":     disabled.Status,
+					"other_info": disabled.OtherInfo,
+				}).Error)
+				require.NoError(t, writer.Model(&model.Ability{}).Where("channel_id = ?", channel.Id).
+					Update("enabled", false).Error)
+			}))
+			t.Cleanup(func() {
+				require.NoError(t, model.DB.Callback().Query().Remove(callbackName))
+			})
+
+			summary, err := ReconcileManagedUpstreams(now)
+
+			require.NoError(t, err)
+			require.True(t, injected)
+			if testCase.initialState == model.UpstreamRouteStateShadow {
+				assert.Equal(t, 1, summary.RoutesActivated)
+			}
+			assert.Equal(t, 1, summary.PrioritiesUpdated)
+
+			var storedRoute model.UpstreamManagedRoute
+			require.NoError(t, model.DB.First(&storedRoute, route.ID).Error)
+			assert.Equal(t, model.UpstreamRouteStateActive, storedRoute.State)
+			assert.Equal(t, 1, storedRoute.Rank)
+
+			var storedChannel model.Channel
+			require.NoError(t, model.DB.First(&storedChannel, channel.Id).Error)
+			assert.Equal(t, common.ChannelStatusAutoDisabled, storedChannel.Status)
+			assert.Equal(t, disabled.OtherInfo, storedChannel.OtherInfo)
+			require.NotNil(t, storedChannel.Priority)
+			assert.EqualValues(t, 999, *storedChannel.Priority)
+			assert.Equal(t, source.SelectedEndpoint, storedChannel.GetBaseURL())
+			assert.Equal(t, "gpt-4.1", storedChannel.Models)
+
+			var abilities []model.Ability
+			require.NoError(t, model.DB.Where("channel_id = ?", channel.Id).Find(&abilities).Error)
+			require.Len(t, abilities, 1)
+			assert.False(t, abilities[0].Enabled)
+			assert.Equal(t, "gpt-4.1", abilities[0].Model)
+			require.NotNil(t, abilities[0].Priority)
+			assert.EqualValues(t, 999, *abilities[0].Priority)
+		})
+	}
 }
 
 func TestRankManagedRoutesPreservesChannelWhenSnapshotIsStale(t *testing.T) {

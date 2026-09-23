@@ -919,6 +919,107 @@ func updateSingleKeyChannelStatusIfUnchangedLocked(
 	return changed, nil
 }
 
+type ManagedChannelUpdate struct {
+	RouteID             int64
+	Rank                int
+	EffectiveMultiplier float64
+	UpdatedAt           int64
+	Priority            int64
+	BaseURL             string
+	Models              string
+	Status              int
+}
+
+// UpdateManagedChannelIfUnchanged commits managed rank, channel, and ability
+// state only while the channel still matches the reconciliation snapshot.
+func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpdate) (bool, error) {
+	if expected == nil || expected.Id == 0 {
+		return false, errors.New("managed channel snapshot is missing")
+	}
+
+	return withChannelStatusLocks(expected.Id, func() (bool, error) {
+		changed := false
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			var current Channel
+			if err := lockForUpdate(tx).Where("id = ?", expected.Id).First(&current).Error; err != nil {
+				return err
+			}
+			tagsMatch := current.Tag == nil && expected.Tag == nil
+			if current.Tag != nil && expected.Tag != nil {
+				tagsMatch = *current.Tag == *expected.Tag
+			}
+			if current.Key != expected.Key ||
+				!tagsMatch ||
+				current.Status != expected.Status ||
+				current.OtherInfo != expected.OtherInfo {
+				return nil
+			}
+
+			channelQuery := tx.Model(&Channel{}).Where(map[string]any{
+				"id":         expected.Id,
+				"key":        expected.Key,
+				"status":     expected.Status,
+				"other_info": expected.OtherInfo,
+			})
+			if expected.Tag == nil {
+				channelQuery = channelQuery.Where("tag IS NULL")
+			} else {
+				channelQuery = channelQuery.Where(map[string]any{"tag": *expected.Tag})
+			}
+			result := channelQuery.Updates(map[string]any{
+				"priority": update.Priority,
+				"base_url": update.BaseURL,
+				"models":   update.Models,
+				"status":   update.Status,
+			})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				var latest Channel
+				if err := tx.Where("id = ?", expected.Id).First(&latest).Error; err != nil {
+					return err
+				}
+				latestTagsMatch := latest.Tag == nil && expected.Tag == nil
+				if latest.Tag != nil && expected.Tag != nil {
+					latestTagsMatch = *latest.Tag == *expected.Tag
+				}
+				if latest.Key != expected.Key ||
+					!latestTagsMatch ||
+					latest.Status != expected.Status ||
+					latest.OtherInfo != expected.OtherInfo {
+					return nil
+				}
+			}
+
+			if err := tx.Model(&UpstreamManagedRoute{}).Where("id = ?", update.RouteID).Updates(map[string]any{
+				"rank":                 update.Rank,
+				"effective_multiplier": update.EffectiveMultiplier,
+				"updated_at":           update.UpdatedAt,
+			}).Error; err != nil {
+				return err
+			}
+
+			current.Priority = &update.Priority
+			current.BaseURL = &update.BaseURL
+			current.Models = update.Models
+			current.Status = update.Status
+			if err := current.UpdateAbilities(tx); err != nil {
+				return err
+			}
+			changed = true
+			return nil
+		})
+		if err != nil {
+			return false, err
+		}
+		if changed {
+			CacheUpdateChannelStatus(expected.Id, update.Status)
+		}
+		return changed, nil
+	})
+}
+
 func MergeChannelStatusMetadata(channelId int, updates map[string]interface{}) error {
 	channel, err := GetChannelById(channelId, true)
 	if err != nil {
