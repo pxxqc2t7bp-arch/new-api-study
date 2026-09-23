@@ -203,12 +203,10 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
 	maxRetries := service.AdaptiveRetryTimes(retryParam)
-	failoverDeadline := time.Now().Add(time.Duration(operation_setting.GetUpstreamOrchestrationSetting().FailoverBudgetSeconds) * time.Second)
+	var failoverDeadline time.Time
 
 	for ; retryParam.GetRetry() <= maxRetries; retryParam.IncreaseRetry() {
-		if retryParam.GetRetry() > 0 &&
-			operation_setting.GetUpstreamOrchestrationSetting().Enabled &&
-			time.Now().After(failoverDeadline) {
+		if !failoverDeadline.IsZero() && time.Now().After(failoverDeadline) {
 			c.Set("channel_fallback_reason", "failover_budget_exhausted")
 			break
 		}
@@ -312,6 +310,9 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if !shouldRetry(c, newAPIError, maxRetries-retryParam.GetRetry()) {
 			break
+		}
+		if failoverDeadline.IsZero() && operation_setting.GetUpstreamOrchestrationSetting().Enabled {
+			failoverDeadline = time.Now().Add(time.Duration(operation_setting.GetUpstreamOrchestrationSetting().FailoverBudgetSeconds) * time.Second)
 		}
 	}
 

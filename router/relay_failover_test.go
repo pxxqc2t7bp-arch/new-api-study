@@ -461,22 +461,48 @@ func TestRelayChannelFailoverCapsAttemptsAtFivePriorities(t *testing.T) {
 	requireRelayRefunded(t, user.Id)
 }
 
+func TestRelayChannelFailoverFromSlow429StartsBudgetAtFailover(t *testing.T) {
+	engine, _ := setupRelayFailoverTest(t, false)
+	common.AutomaticDisableChannelEnabled = false
+	enableManagedOrchestrationForFailoverTest(t, 1)
+	trace := &failoverCallTrace{}
+	primary := newFailoverUpstream(t, "slow-primary", http.StatusTooManyRequests, trace)
+	primary.setDelay(1100 * time.Millisecond)
+	backup := newFailoverUpstream(t, "backup", http.StatusOK, trace)
+	addRelayFailoverChannel(t, 3641, 30, primary)
+	addRelayFailoverChannel(t, 3642, 20, backup)
+	initializeRelayFailoverChannels()
+
+	response := performRelayFailoverRequest(t, engine)
+
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "backup")
+	assert.Equal(t, []string{"slow-primary", "backup"}, trace.snapshot())
+	assert.Equal(t, 1, primary.callCount())
+	assert.Equal(t, 1, backup.callCount())
+}
+
 func TestRelayChannelFailoverStopsWhenBudgetExpires(t *testing.T) {
 	engine, user := setupRelayFailoverTest(t, false)
 	enableManagedOrchestrationForFailoverTest(t, 1)
 	trace := &failoverCallTrace{}
-	primary := newFailoverUpstream(t, "slow-primary", http.StatusInternalServerError, trace)
-	primary.setDelay(1100 * time.Millisecond)
-	backup := newFailoverUpstream(t, "backup", http.StatusOK, trace)
+	primary := newFailoverUpstream(t, "primary", http.StatusInternalServerError, trace)
+	slowFallback := newFailoverUpstream(t, "slow-fallback", http.StatusInternalServerError, trace)
+	slowFallback.setDelay(1100 * time.Millisecond)
+	third := newFailoverUpstream(t, "third", http.StatusOK, trace)
 	addRelayFailoverChannel(t, 3651, 30, primary)
-	addRelayFailoverChannel(t, 3652, 20, backup)
+	addRelayFailoverChannel(t, 3652, 20, slowFallback)
+	addRelayFailoverChannel(t, 3653, 10, third)
 	initializeRelayFailoverChannels()
 
 	response := performRelayFailoverRequest(t, engine)
 
 	assert.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
-	assert.Equal(t, []string{"slow-primary"}, trace.snapshot())
-	assert.Zero(t, backup.callCount())
+	assert.Contains(t, response.Body.String(), "slow-fallback")
+	assert.Equal(t, []string{"primary", "slow-fallback"}, trace.snapshot())
+	assert.Equal(t, 1, primary.callCount())
+	assert.Equal(t, 1, slowFallback.callCount())
+	assert.Zero(t, third.callCount())
 	requireRelayRefunded(t, user.Id)
 }
 
