@@ -42,37 +42,35 @@ func GetManagedRouteAdminInfo(channelID int) map[string]any {
 			return entry.info
 		}
 	}
-	var row struct {
-		model.UpstreamManagedRoute
-		SourceKey         string
-		SourceEndpoint    string
-		GroupName         string
-		GroupHealth       string
-		GroupObservedAt   int64
-		GroupAvailability *float64
+	var route model.UpstreamManagedRoute
+	if err := model.DB.
+		Where("channel_id = ? AND detached = ?", channelID, false).
+		First(&route).Error; err != nil {
+		return nil
 	}
-	err := model.DB.Table("upstream_managed_routes AS routes").
-		Select("routes.*, sources.key AS source_key, sources.selected_endpoint AS source_endpoint, groups.name AS group_name, groups.health_status AS group_health, groups.observed_at AS group_observed_at, groups.availability AS group_availability").
-		Joins("JOIN upstream_sources AS sources ON sources.id = routes.source_id").
-		Joins("JOIN upstream_groups AS groups ON groups.source_id = routes.source_id AND groups.external_id = routes.external_group_id").
-		Where("routes.channel_id = ? AND routes.detached = ?", channelID, false).
-		Scan(&row).Error
-	if err != nil || row.ID == 0 {
+	var source model.UpstreamSource
+	if err := model.DB.Where("id = ?", route.SourceID).First(&source).Error; err != nil {
+		return nil
+	}
+	var group model.UpstreamGroup
+	if err := model.DB.
+		Where("source_id = ? AND external_id = ?", route.SourceID, route.ExternalGroupID).
+		First(&group).Error; err != nil {
 		return nil
 	}
 	info := map[string]any{
-		"source":               row.SourceKey,
-		"group":                row.GroupName,
-		"external_group_id":    row.ExternalGroupID,
-		"protocol":             row.Protocol,
-		"state":                row.State,
-		"effective_multiplier": row.EffectiveMultiplier,
-		"selected_endpoint":    row.SourceEndpoint,
-		"health_status":        row.GroupHealth,
-		"health_sample_age":    max(int64(0), now-row.GroupObservedAt),
+		"source":               source.Key,
+		"group":                group.Name,
+		"external_group_id":    route.ExternalGroupID,
+		"protocol":             route.Protocol,
+		"state":                route.State,
+		"effective_multiplier": route.EffectiveMultiplier,
+		"selected_endpoint":    source.SelectedEndpoint,
+		"health_status":        group.HealthStatus,
+		"health_sample_age":    max(int64(0), now-group.ObservedAt),
 	}
-	if row.GroupAvailability != nil {
-		info["availability"] = *row.GroupAvailability
+	if group.Availability != nil {
+		info["availability"] = *group.Availability
 	}
 	managedRouteAdminCache.Store(channelID, managedRouteAdminCacheEntry{info: info, expiresAt: now + 60})
 	return info
