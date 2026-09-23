@@ -315,20 +315,29 @@ func TestUpdateSingleKeyChannelStatusesIfUnchangedQuotesKeyWithoutInitializedCol
 
 func TestUpdateSingleKeyChannelStatusesIfUnchangedPreservesNewerCacheFields(t *testing.T) {
 	setupChannelStatusTest(t)
+	databasePriorities := []int64{10, 20}
+	databaseBaseURLs := []string{
+		"https://database-a.example.com",
+		"https://database-b.example.com",
+	}
 	channels := []Channel{
 		{
-			Name:   "batch-cache-a",
-			Key:    "credential-a",
-			Status: common.ChannelStatusEnabled,
-			Models: "database-model-a",
-			Group:  "default",
+			Name:     "batch-cache-a",
+			Key:      "credential-a",
+			Status:   common.ChannelStatusEnabled,
+			Models:   "database-model-a",
+			Group:    "database-group",
+			Priority: &databasePriorities[0],
+			BaseURL:  &databaseBaseURLs[0],
 		},
 		{
-			Name:   "batch-cache-b",
-			Key:    "credential-b",
-			Status: common.ChannelStatusEnabled,
-			Models: "database-model-b",
-			Group:  "default",
+			Name:     "batch-cache-b",
+			Key:      "credential-b",
+			Status:   common.ChannelStatusEnabled,
+			Models:   "database-model-b",
+			Group:    "database-group",
+			Priority: &databasePriorities[1],
+			BaseURL:  &databaseBaseURLs[1],
 		},
 	}
 	for index := range channels {
@@ -348,12 +357,22 @@ func TestUpdateSingleKeyChannelStatusesIfUnchangedPreservesNewerCacheFields(t *t
 	common.MemoryCacheEnabled = true
 	InitChannelCache()
 
+	cachePriorities := []int64{100, 200}
+	cacheBaseURLs := []string{
+		"https://cache-a.example.com",
+		"https://cache-b.example.com",
+	}
 	newerCache := make([]*Channel, len(channels))
 	for index := range channels {
 		cached, err := CacheGetChannel(channels[index].Id)
 		require.NoError(t, err)
 		updated := *cached
-		updated.Models = fmt.Sprintf("cache-owned-model-%d", index)
+		updated.Key = fmt.Sprintf("cache-owned-key-%d", index)
+		updated.Models = "cache-owned-model"
+		updated.Group = "cache-owned-group"
+		updated.Priority = &cachePriorities[index]
+		updated.BaseURL = &cacheBaseURLs[index]
+		updated.Status = common.ChannelStatusAutoDisabled
 		newerCache[index] = &updated
 	}
 	CacheUpdateChannels(newerCache)
@@ -362,13 +381,13 @@ func TestUpdateSingleKeyChannelStatusesIfUnchangedPreservesNewerCacheFields(t *t
 	for index := range channels {
 		desired := *expected[index]
 		desired.SetOtherInfo(map[string]any{
-			"owner":           "snapshot",
+			"owner":           fmt.Sprintf("status-publisher-%d", index),
 			"quota_domain_id": "domain-a",
 			"quota_type":      "plan",
 		})
 		updates[index] = SingleKeyChannelStatusUpdate{
 			Expected:  expected[index],
-			Status:    common.ChannelStatusAutoDisabled,
+			Status:    common.ChannelStatusEnabled,
 			OtherInfo: desired.OtherInfo,
 		}
 	}
@@ -380,16 +399,31 @@ func TestUpdateSingleKeyChannelStatusesIfUnchangedPreservesNewerCacheFields(t *t
 	for index := range channels {
 		cached, err := CacheGetChannel(channels[index].Id)
 		require.NoError(t, err)
-		assert.Equal(t, fmt.Sprintf("cache-owned-model-%d", index), cached.Models)
-		assert.Equal(t, common.ChannelStatusAutoDisabled, cached.Status)
+		assert.Equal(t, fmt.Sprintf("cache-owned-key-%d", index), cached.Key)
+		assert.Equal(t, "cache-owned-model", cached.Models)
+		assert.Equal(t, "cache-owned-group", cached.Group)
+		assert.Equal(t, cachePriorities[index], cached.GetPriority())
+		assert.Equal(t, cacheBaseURLs[index], cached.GetBaseURL())
+		assert.Equal(t, common.ChannelStatusEnabled, cached.Status)
 		assert.Equal(t, updates[index].OtherInfo, cached.OtherInfo)
 	}
+
 	channelSyncLock.RLock()
+	routingIDs := append([]int(nil), group2model2channels["cache-owned-group"]["cache-owned-model"]...)
+	oldRoutingIDs := make([]int, 0, len(channels))
 	for index := range channels {
-		modelName := fmt.Sprintf("cache-owned-model-%d", index)
-		assert.NotContains(t, group2model2channels["default"][modelName], channels[index].Id)
+		oldRoutingIDs = append(
+			oldRoutingIDs,
+			group2model2channels["database-group"][channels[index].Models]...,
+		)
 	}
 	channelSyncLock.RUnlock()
+	assert.Equal(t, []int{channels[1].Id, channels[0].Id}, routingIDs)
+	assert.Empty(t, oldRoutingIDs)
+
+	priorities, err := ListSatisfiedChannelPriorities("cache-owned-group", "cache-owned-model", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []int64{cachePriorities[1], cachePriorities[0]}, priorities)
 }
 
 func TestUpdateMultiKeyChannelStatusIfUnchangedFencesSnapshot(t *testing.T) {
@@ -795,7 +829,7 @@ func TestCacheUpdateChannelStatusRebuildsOrderedRoutingMembership(t *testing.T) 
 	assert.Equal(t, []int{channels[0].Id, channels[1].Id}, routingIDs)
 }
 
-func TestCacheUpdateChannelsPublishesRoutingDomainAtomically(t *testing.T) {
+func TestCacheUpdateChannelStatusSnapshotsPublishesRoutingDomainAtomically(t *testing.T) {
 	setupChannelStatusTest(t)
 	const (
 		channelCount = 64
@@ -812,6 +846,7 @@ func TestCacheUpdateChannelsPublishesRoutingDomainAtomically(t *testing.T) {
 			Models: modelName,
 			Group:  "default",
 		}
+		channels[index].SetOtherInfo(map[string]any{"generation": "old"})
 	}
 	require.NoError(t, DB.Create(&channels).Error)
 	for index := range channels {
@@ -820,16 +855,13 @@ func TestCacheUpdateChannelsPublishesRoutingDomainAtomically(t *testing.T) {
 	common.MemoryCacheEnabled = true
 	InitChannelCache()
 
-	oldChannels := make(map[int]*Channel, channelCount)
-	updatedChannels := make([]*Channel, channelCount)
-	updatedChannelsByID := make(map[int]*Channel, channelCount)
+	updates := make([]ChannelStatusCacheUpdate, channelCount)
 	channelSyncLock.RLock()
 	for index := range channels {
-		oldChannels[channels[index].Id] = channelsIDM[channels[index].Id]
 		updated := *channelsIDM[channels[index].Id]
 		updated.Status = common.ChannelStatusAutoDisabled
-		updatedChannels[index] = &updated
-		updatedChannelsByID[updated.Id] = &updated
+		updated.SetOtherInfo(map[string]any{"generation": "new"})
+		updates[index].Snapshot = &updated
 	}
 	channelSyncLock.RUnlock()
 
@@ -856,17 +888,15 @@ func TestCacheUpdateChannelsPublishesRoutingDomainAtomically(t *testing.T) {
 				channelSyncLock.RLock()
 				oldCount := 0
 				newCount := 0
-				enabledCount := 0
 				for _, channel := range channels {
 					cached := channelsIDM[channel.Id]
-					if cached == oldChannels[channel.Id] {
+					switch {
+					case cached.Status == common.ChannelStatusEnabled &&
+						cached.GetOtherInfo()["generation"] == "old":
 						oldCount++
-					}
-					if cached == updatedChannelsByID[channel.Id] {
+					case cached.Status == common.ChannelStatusAutoDisabled &&
+						cached.GetOtherInfo()["generation"] == "new":
 						newCount++
-					}
-					if cached.Status == common.ChannelStatusEnabled {
-						enabledCount++
 					}
 				}
 				routingCount := len(group2model2channels["default"][modelName])
@@ -876,15 +906,13 @@ func TestCacheUpdateChannelsPublishesRoutingDomainAtomically(t *testing.T) {
 					observed <- struct{}{}
 					firstObservation = false
 				}
-				oldState := oldCount == channelCount && newCount == 0 &&
-					enabledCount == channelCount && routingCount == channelCount
-				newState := oldCount == 0 && newCount == channelCount &&
-					enabledCount == 0 && routingCount == 0
+				oldState := oldCount == channelCount && newCount == 0 && routingCount == channelCount
+				newState := oldCount == 0 && newCount == channelCount && routingCount == 0
 				if !oldState && !newState {
 					select {
 					case partial <- fmt.Sprintf(
-						"old=%d new=%d enabled=%d routed=%d",
-						oldCount, newCount, enabledCount, routingCount,
+						"old=%d new=%d routed=%d",
+						oldCount, newCount, routingCount,
 					):
 					default:
 					}
@@ -901,7 +929,7 @@ func TestCacheUpdateChannelsPublishesRoutingDomainAtomically(t *testing.T) {
 		<-observed
 	}
 
-	CacheUpdateChannels(updatedChannels)
+	CacheUpdateChannelStatusSnapshots(updates)
 	close(stop)
 	readers.Wait()
 
@@ -912,10 +940,79 @@ func TestCacheUpdateChannelsPublishesRoutingDomainAtomically(t *testing.T) {
 	}
 	channelSyncLock.RLock()
 	defer channelSyncLock.RUnlock()
-	for index, channel := range channels {
-		assert.Same(t, updatedChannels[index], channelsIDM[channel.Id])
+	for _, channel := range channels {
+		cached := channelsIDM[channel.Id]
+		assert.Equal(t, common.ChannelStatusAutoDisabled, cached.Status)
+		assert.Equal(t, "new", cached.GetOtherInfo()["generation"])
 	}
 	assert.Empty(t, group2model2channels["default"][modelName])
+}
+
+func TestCacheUpdateChannelStatusSnapshotsInitializesMissingMultiKeyEntry(t *testing.T) {
+	setupChannelStatusTest(t)
+	priority := int64(123)
+	baseURL := "https://cache-miss.example.com"
+	channel := Channel{
+		Name:     "multi-key-cache-miss",
+		Key:      "key-a\nkey-b",
+		Status:   common.ChannelStatusEnabled,
+		Models:   "gpt-cache-miss",
+		Group:    "cache-miss-group",
+		Priority: &priority,
+		BaseURL:  &baseURL,
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:             true,
+			MultiKeySize:           2,
+			MultiKeyStatusList:     map[int]int{0: common.ChannelStatusAutoDisabled},
+			MultiKeyDisabledReason: map[int]string{0: "quota exhausted"},
+			MultiKeyDisabledTime:   map[int]int64{0: 1_788_320_000},
+			MultiKeyRecoveryIndex:  1,
+		},
+	}
+	channel.SetOtherInfo(map[string]any{
+		"owner":           "committed-snapshot",
+		"quota_domain_id": "domain-a",
+	})
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	snapshot, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	require.Empty(t, snapshot.Keys)
+
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+	channelSyncLock.Lock()
+	delete(channelsIDM, channel.Id)
+	missing := *snapshot
+	missing.Status = common.ChannelStatusAutoDisabled
+	syncChannelRoutingIndexLocked(&missing)
+	channelSyncLock.Unlock()
+
+	CacheUpdateChannelStatusSnapshots([]ChannelStatusCacheUpdate{{
+		Snapshot:          snapshot,
+		UpdateChannelInfo: true,
+	}})
+
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, snapshot.Key, cached.Key)
+	assert.Equal(t, []string{"key-a", "key-b"}, cached.Keys)
+	assert.Equal(t, snapshot.Status, cached.Status)
+	assert.Equal(t, snapshot.OtherInfo, cached.OtherInfo)
+	assert.Equal(t, snapshot.ChannelInfo, cached.ChannelInfo)
+	assert.Equal(t, snapshot.Models, cached.Models)
+	assert.Equal(t, snapshot.Group, cached.Group)
+	assert.Equal(t, snapshot.GetPriority(), cached.GetPriority())
+	assert.Equal(t, snapshot.GetBaseURL(), cached.GetBaseURL())
+
+	routingIDs, err := ListSatisfiedChannelIDsAtPriority(
+		snapshot.Group,
+		snapshot.Models,
+		snapshot.GetPriority(),
+		nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, []int{snapshot.Id}, routingIDs)
 }
 
 func TestUpdateManagedChannelIfUnchangedPreservesConcurrentStatusOwner(t *testing.T) {
