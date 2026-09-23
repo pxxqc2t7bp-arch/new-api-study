@@ -543,6 +543,60 @@ func TestFreshPlanQuotaDisableFencesStaleRecoverySnapshot(t *testing.T) {
 	assert.False(t, ability.Enabled)
 }
 
+func TestDisableChannelRefreshesEmptyCredentialPlanQuotaGenerationWithCache(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+
+	autoBan := 1
+	tag := "plan:support:empty-cached-generation"
+	channel := model.Channel{
+		Id:      45,
+		Name:    "empty-cached-generation",
+		Status:  common.ChannelStatusEnabled,
+		Tag:     &tag,
+		AutoBan: &autoBan,
+		Models:  "gpt-3.5-turbo",
+		Group:   "default",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	common.MemoryCacheEnabled = true
+	model.InitChannelCache()
+
+	channelError := types.ChannelError{
+		ChannelId:   channel.Id,
+		ChannelName: channel.Name,
+		AutoBan:     true,
+	}
+	const reason = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+
+	DisableChannel(channelError, reason)
+
+	var firstDisable model.Channel
+	require.NoError(t, db.First(&firstDisable, channel.Id).Error)
+	firstGeneration, firstGenerationOK := firstDisable.GetOtherInfo()["quota_generation"].(string)
+	require.True(t, firstGenerationOK)
+	require.NotEmpty(t, firstGeneration)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, firstDisable.Status)
+
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+
+	DisableChannel(channelError, reason)
+
+	var secondDisable model.Channel
+	require.NoError(t, db.First(&secondDisable, channel.Id).Error)
+	secondGeneration, secondGenerationOK := secondDisable.GetOtherInfo()["quota_generation"].(string)
+	require.True(t, secondGenerationOK)
+	require.NotEmpty(t, secondGeneration)
+	assert.NotEqual(t, firstGeneration, secondGeneration)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, secondDisable.Status)
+
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+}
+
 func TestDisablePlanQuotaDomainPreservesConcurrentOwnership(t *testing.T) {
 	db := setupPlanQuotaDomainTest(t)
 
@@ -587,7 +641,7 @@ func TestDisablePlanQuotaDomainPreservesConcurrentOwnership(t *testing.T) {
 	assert.False(t, ability.Enabled)
 }
 
-func TestDisablePlanQuotaDomainStaleCASDoesNotMutateCachedMetadata(t *testing.T) {
+func TestDisablePlanQuotaDomainReloadsDatabaseMetadataWithoutMutatingCache(t *testing.T) {
 	db := setupPlanQuotaDomainTest(t)
 
 	autoBan := 1
@@ -621,16 +675,21 @@ func TestDisablePlanQuotaDomainStaleCASDoesNotMutateCachedMetadata(t *testing.T)
 	cachedAfter, err := model.CacheGetChannel(channel.Id)
 	require.NoError(t, err)
 	assert.Equal(t, cachedOtherInfo, cachedAfter.OtherInfo)
-	assert.Equal(t, common.ChannelStatusEnabled, cachedAfter.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, cachedAfter.Status)
 
 	var stored model.Channel
 	require.NoError(t, db.First(&stored, "id = ?", channel.Id).Error)
-	assert.Equal(t, concurrent.OtherInfo, stored.OtherInfo)
-	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	storedInfo := stored.GetOtherInfo()
+	assert.Equal(t, "concurrent-update", storedInfo["owner"])
+	assert.Equal(t, tag, storedInfo["quota_domain"])
+	assert.Equal(t, "channel:44", storedInfo["quota_domain_id"])
+	assert.NotEmpty(t, storedInfo["quota_generation"])
+	assert.Equal(t, "plan", storedInfo["quota_type"])
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
 
 	var ability model.Ability
 	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
-	assert.True(t, ability.Enabled)
+	assert.False(t, ability.Enabled)
 }
 
 func TestDisablePlanQuotaCredentialDomainHandlesMissingCredential(t *testing.T) {

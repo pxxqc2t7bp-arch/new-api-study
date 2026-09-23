@@ -117,6 +117,13 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 		common.SysError("failed to disable Plan quota domain: channel is nil")
 		return
 	}
+	currentFailingChannel, err := model.GetChannelById(failingChannel.Id, true)
+	if err != nil {
+		common.SysError(fmt.Sprintf("failed to load failing Plan quota channel: channel_id=%d error=%v", failingChannel.Id, err))
+		return
+	}
+	failingChannel = currentFailingChannel
+
 	failingKeys := failingChannel.GetKeys()
 	if len(failingKeys) > 1 {
 		common.SysError(fmt.Sprintf("failed to disable Plan quota domain: channel_id=%d has multiple credentials", failingChannel.Id))
