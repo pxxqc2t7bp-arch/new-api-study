@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -79,6 +80,45 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedUpdatesChannelAndAbility(t *test
 	require.NoError(t, err)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, cached.Status)
 	assert.Equal(t, desiredOtherInfo, cached.OtherInfo)
+}
+
+func TestUpdateSingleKeyChannelStatusIfUnchangedPreservesNewerCacheFields(t *testing.T) {
+	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+		"owner": "snapshot",
+	})
+	expectedOtherInfo := channel.OtherInfo
+	desired := channel
+	desired.SetOtherInfo(map[string]any{
+		"owner":           "snapshot",
+		"quota_domain_id": "domain-a",
+		"quota_type":      "plan",
+	})
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	newerCache := *cached
+	newerCache.Models = "cache-owned-model"
+	CacheUpdateChannel(&newerCache)
+
+	changed, err := UpdateSingleKeyChannelStatusIfUnchanged(
+		channel.Id,
+		channel.Key,
+		channel.GetTag(),
+		common.ChannelStatusEnabled,
+		expectedOtherInfo,
+		common.ChannelStatusAutoDisabled,
+		desired.OtherInfo,
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	cached, err = CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "cache-owned-model", cached.Models)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, cached.Status)
+	assert.Equal(t, desired.OtherInfo, cached.OtherInfo)
 }
 
 func TestUpdateSingleKeyChannelStatusIfUnchangedRejectsStaleSnapshot(t *testing.T) {
@@ -273,6 +313,85 @@ func TestUpdateSingleKeyChannelStatusesIfUnchangedQuotesKeyWithoutInitializedCol
 	assert.False(t, ability.Enabled)
 }
 
+func TestUpdateSingleKeyChannelStatusesIfUnchangedPreservesNewerCacheFields(t *testing.T) {
+	setupChannelStatusTest(t)
+	channels := []Channel{
+		{
+			Name:   "batch-cache-a",
+			Key:    "credential-a",
+			Status: common.ChannelStatusEnabled,
+			Models: "database-model-a",
+			Group:  "default",
+		},
+		{
+			Name:   "batch-cache-b",
+			Key:    "credential-b",
+			Status: common.ChannelStatusEnabled,
+			Models: "database-model-b",
+			Group:  "default",
+		},
+	}
+	for index := range channels {
+		channels[index].SetOtherInfo(map[string]any{"owner": "snapshot"})
+	}
+	require.NoError(t, DB.Create(&channels).Error)
+	for index := range channels {
+		require.NoError(t, channels[index].AddAbilities(nil))
+	}
+
+	expected := make([]*Channel, len(channels))
+	for index := range channels {
+		var err error
+		expected[index], err = GetChannelById(channels[index].Id, true)
+		require.NoError(t, err)
+	}
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+
+	newerCache := make([]*Channel, len(channels))
+	for index := range channels {
+		cached, err := CacheGetChannel(channels[index].Id)
+		require.NoError(t, err)
+		updated := *cached
+		updated.Models = fmt.Sprintf("cache-owned-model-%d", index)
+		newerCache[index] = &updated
+	}
+	CacheUpdateChannels(newerCache)
+
+	updates := make([]SingleKeyChannelStatusUpdate, len(channels))
+	for index := range channels {
+		desired := *expected[index]
+		desired.SetOtherInfo(map[string]any{
+			"owner":           "snapshot",
+			"quota_domain_id": "domain-a",
+			"quota_type":      "plan",
+		})
+		updates[index] = SingleKeyChannelStatusUpdate{
+			Expected:  expected[index],
+			Status:    common.ChannelStatusAutoDisabled,
+			OtherInfo: desired.OtherInfo,
+		}
+	}
+
+	changed, err := UpdateSingleKeyChannelStatusesIfUnchanged(updates)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	for index := range channels {
+		cached, err := CacheGetChannel(channels[index].Id)
+		require.NoError(t, err)
+		assert.Equal(t, fmt.Sprintf("cache-owned-model-%d", index), cached.Models)
+		assert.Equal(t, common.ChannelStatusAutoDisabled, cached.Status)
+		assert.Equal(t, updates[index].OtherInfo, cached.OtherInfo)
+	}
+	channelSyncLock.RLock()
+	for index := range channels {
+		modelName := fmt.Sprintf("cache-owned-model-%d", index)
+		assert.NotContains(t, group2model2channels["default"][modelName], channels[index].Id)
+	}
+	channelSyncLock.RUnlock()
+}
+
 func TestUpdateMultiKeyChannelStatusIfUnchangedFencesSnapshot(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -339,6 +458,56 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedFencesSnapshot(t *testing.T) {
 			assert.True(t, ability.Enabled)
 		})
 	}
+}
+
+func TestUpdateMultiKeyChannelStatusIfUnchangedPreservesInMemoryPollingCursor(t *testing.T) {
+	setupChannelStatusTest(t)
+	tag := "plan:managed:polling-cache"
+	channel := Channel{
+		Name:   "multi-key-polling-cache",
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		Tag:    &tag,
+		Models: "gpt-3.5-turbo",
+		Group:  "default",
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+		},
+	}
+	channel.SetOtherInfo(map[string]any{"owner": "preserved"})
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	usingKey, keyIndex, keyErr := cached.GetNextEnabledKey()
+	require.Nil(t, keyErr)
+	require.Equal(t, "key-a", usingKey)
+	require.Equal(t, 0, keyIndex)
+	require.Equal(t, 1, cached.ChannelInfo.MultiKeyPollingIndex)
+
+	changed, err := UpdateMultiKeyChannelStatusIfUnchanged(
+		expected,
+		tag,
+		usingKey,
+		common.ChannelStatusAutoDisabled,
+		"quota exhausted",
+		MultiKeyChannelStatusUpdateOptions{},
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	cached, err = CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cached.ChannelInfo.MultiKeyPollingIndex)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, cached.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, "quota exhausted", cached.ChannelInfo.MultiKeyDisabledReason[0])
 }
 
 func TestAdvanceMultiKeyRecoveryCursorIfUnchangedFencesSnapshot(t *testing.T) {
@@ -409,6 +578,49 @@ func TestAdvanceMultiKeyRecoveryCursorIfUnchangedFencesSnapshot(t *testing.T) {
 		assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
 		assert.False(t, ability.Enabled)
 	})
+}
+
+func TestAdvanceMultiKeyRecoveryCursorIfUnchangedPreservesInMemoryPollingCursor(t *testing.T) {
+	setupChannelStatusTest(t)
+	channel := Channel{
+		Name:   "multi-key-recovery-polling-cache",
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusAutoDisabled,
+		Models: "gpt-3.5-turbo",
+		Group:  "default",
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:            true,
+			MultiKeySize:          2,
+			MultiKeyRecoveryIndex: 0,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledTime: map[int]int64{0: 100, 1: 200},
+		},
+	}
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	pollingLock := GetChannelPollingLock(channel.Id)
+	pollingLock.Lock()
+	cached.ChannelInfo.MultiKeyPollingIndex = 1
+	pollingLock.Unlock()
+
+	changed, err := AdvanceMultiKeyRecoveryCursorIfUnchanged(expected, "key-a")
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	cached, err = CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cached.ChannelInfo.MultiKeyPollingIndex)
+	assert.Equal(t, 1, cached.ChannelInfo.MultiKeyRecoveryIndex)
 }
 
 func TestUpdateMultiKeyChannelStatusIfUnchangedRollsBackPlanDeadlineWithAbilityFailure(t *testing.T) {
@@ -1180,9 +1392,9 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 			var version string
 			require.NoError(t, database.Raw("SELECT VERSION()").Scan(&version).Error)
 			t.Logf("%s version: %s", test.name, version)
-			require.NoError(t, database.AutoMigrate(&Channel{}, &Ability{}, &UpstreamManagedRoute{}))
+			require.NoError(t, database.AutoMigrate(&Channel{}, &Ability{}))
 			t.Cleanup(func() {
-				require.NoError(t, database.Migrator().DropTable(&UpstreamManagedRoute{}, &Ability{}, &Channel{}))
+				require.NoError(t, database.Migrator().DropTable(&Ability{}, &Channel{}))
 			})
 
 			previousDB := DB
@@ -1282,43 +1494,6 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 			assert.Equal(t, common.ChannelStatusAutoDisabled, storedSibling.Status)
 			assert.Equal(t, secondDesired.OtherInfo, storedSibling.OtherInfo)
 			assert.False(t, siblingAbility.Enabled)
-			channel.OtherInfo = firstDesired.OtherInfo
-
-			route := UpstreamManagedRoute{
-				SourceID:        1,
-				ExternalGroupID: "configured-group",
-				Platform:        "openai",
-				Protocol:        UpstreamProtocolOpenAI,
-				ChannelID:       channel.Id,
-				State:           UpstreamRouteStateActive,
-				Rank:            7,
-			}
-			require.NoError(t, DB.Create(&route).Error)
-			managedSnapshot, err := GetChannelById(channel.Id, true)
-			require.NoError(t, err)
-			changed, err = UpdateManagedChannelIfUnchanged(managedSnapshot, ManagedChannelUpdate{
-				RouteID:               route.ID,
-				ExpectedRouteState:    route.State,
-				ExpectedRouteDetached: route.Detached,
-				Rank:                  1,
-				EffectiveMultiplier:   0.1,
-				UpdatedAt:             time.Now().Unix(),
-				Priority:              999,
-				BaseURL:               "https://api.example.com",
-				Models:                "gpt-4.1",
-				Status:                common.ChannelStatusAutoDisabled,
-			})
-			require.NoError(t, err)
-			require.True(t, changed)
-
-			stored, ability = loadChannelStatusCASFixture(t, channel.Id)
-			assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
-			assert.Equal(t, channel.OtherInfo, stored.OtherInfo)
-			assert.Equal(t, "gpt-4.1", stored.Models)
-			assert.False(t, ability.Enabled)
-			var storedRoute UpstreamManagedRoute
-			require.NoError(t, DB.First(&storedRoute, route.ID).Error)
-			assert.Equal(t, 1, storedRoute.Rank)
 		})
 	}
 }

@@ -942,7 +942,9 @@ func updateSingleKeyChannelStatusIfUnchangedLocked(
 		return false, err
 	}
 	if changed {
-		CacheUpdateChannel(&updated)
+		CacheUpdateChannelStatusSnapshots([]ChannelStatusCacheUpdate{{
+			Snapshot: &updated,
+		}})
 	}
 	return changed, nil
 }
@@ -1040,11 +1042,11 @@ func UpdateSingleKeyChannelStatusesIfUnchanged(updates []SingleKeyChannelStatusU
 		if err != nil {
 			return false, err
 		}
-		cacheUpdates := make([]*Channel, len(updatedChannels))
+		cacheUpdates := make([]ChannelStatusCacheUpdate, len(updatedChannels))
 		for index := range updatedChannels {
-			cacheUpdates[index] = &updatedChannels[index]
+			cacheUpdates[index].Snapshot = &updatedChannels[index]
 		}
-		CacheUpdateChannels(cacheUpdates)
+		CacheUpdateChannelStatusSnapshots(cacheUpdates)
 		return true, nil
 	})
 }
@@ -1144,7 +1146,10 @@ func UpdateMultiKeyChannelStatusIfUnchanged(
 			return false, err
 		}
 		if changed {
-			CacheUpdateChannel(&updated)
+			CacheUpdateChannelStatusSnapshots([]ChannelStatusCacheUpdate{{
+				Snapshot:          &updated,
+				UpdateChannelInfo: true,
+			}})
 		}
 		return changed, nil
 	})
@@ -1232,7 +1237,10 @@ func AdvanceMultiKeyRecoveryCursorIfUnchanged(expected *Channel, usingKey string
 			return false, err
 		}
 		if changed {
-			CacheUpdateChannel(&updated)
+			CacheUpdateChannelStatusSnapshots([]ChannelStatusCacheUpdate{{
+				Snapshot:          &updated,
+				UpdateChannelInfo: true,
+			}})
 		}
 		return changed, nil
 	})

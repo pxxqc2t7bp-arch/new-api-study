@@ -376,6 +376,52 @@ func cacheUpdateChannelLocked(channel *Channel) {
 	logger.LogDebug(nil, "CacheUpdateChannel after: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, channel.ChannelInfo.MultiKeyPollingIndex)
 }
 
+type ChannelStatusCacheUpdate struct {
+	Snapshot          *Channel
+	UpdateChannelInfo bool
+}
+
+// CacheUpdateChannelStatusSnapshots publishes only status-owned fields from
+// committed snapshots, preserving newer cache state outside that ownership.
+func CacheUpdateChannelStatusSnapshots(updates []ChannelStatusCacheUpdate) {
+	if !common.MemoryCacheEnabled {
+		return
+	}
+
+	updated := false
+	channelSyncLock.Lock()
+	for _, update := range updates {
+		if update.Snapshot == nil {
+			continue
+		}
+
+		snapshot := update.Snapshot
+		published := *snapshot
+		cached, exists := channelsIDM[snapshot.Id]
+		if exists && cached != nil {
+			published = *cached
+		}
+		published.Status = snapshot.Status
+		published.OtherInfo = snapshot.OtherInfo
+		if update.UpdateChannelInfo {
+			pollingIndex := published.ChannelInfo.MultiKeyPollingIndex
+			published.ChannelInfo = snapshot.ChannelInfo
+			if exists && cached != nil {
+				published.ChannelInfo.MultiKeyPollingIndex = pollingIndex
+			}
+		}
+		if (!exists || cached == nil) && published.ChannelInfo.IsMultiKey {
+			published.Keys = published.GetKeys()
+		}
+		cacheUpdateChannelLocked(&published)
+		updated = true
+	}
+	channelSyncLock.Unlock()
+	if updated {
+		InvalidatePricingCache()
+	}
+}
+
 func CacheUpdateChannels(channels []*Channel) {
 	if !common.MemoryCacheEnabled {
 		return
