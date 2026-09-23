@@ -130,6 +130,19 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 	for i := range routes {
 		route := &routes[i]
 		if route.Detached {
+			applied, disableErr := model.DisableDetachedManagedChannelIfUnchanged(
+				route,
+				now.Unix(),
+			)
+			if disableErr != nil {
+				return summary, disableErr
+			}
+			if !applied {
+				return summary, fmt.Errorf(
+					"detached managed route changed during reconciliation: route_id=%d",
+					route.ID,
+				)
+			}
 			continue
 		}
 		source, sourceExists := sourceByID[route.SourceID]

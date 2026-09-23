@@ -744,6 +744,102 @@ func TestReconcileManagedUpstreamsRepairsRouteableQuarantinedChannel(t *testing.
 	assert.NotContains(t, routingIDs, channel.Id)
 }
 
+func TestReconcileManagedUpstreamsRepairsRouteableDetachedChannelWithoutSourceOrGroup(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+
+	now := time.Unix(1_788_320_000, 0)
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	originalSetting := *setting
+	setting.Enabled = true
+	setting.AutoEnroll = false
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	t.Cleanup(func() {
+		*setting = originalSetting
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+	})
+
+	priority := int64(999)
+	channel := model.Channel{
+		Name:     "routeable-detached",
+		Key:      "credential",
+		Status:   common.ChannelStatusEnabled,
+		Models:   "gpt-4.1",
+		Group:    "default",
+		Priority: &priority,
+	}
+	channel.SetOtherInfo(map[string]any{"preserved_owner": "status-domain"})
+	require.NoError(t, model.DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	route := model.UpstreamManagedRoute{
+		SourceID:        91,
+		ExternalGroupID: "deleted-group",
+		Platform:        "openai",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           model.UpstreamRouteStateDetached,
+		Rank:            7,
+		LastReason:      "operator detached",
+		Detached:        true,
+		UpdatedAt:       now.Add(-time.Minute).Unix(),
+	}
+	require.NoError(t, model.DB.Create(&route).Error)
+	var expectedRoute model.UpstreamManagedRoute
+	require.NoError(t, model.DB.First(&expectedRoute, route.ID).Error)
+	common.MemoryCacheEnabled = true
+	model.InitChannelCache()
+	cachedBefore, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	newerCache := *cachedBefore
+	newerCache.SetOtherInfo(map[string]any{
+		"preserved_owner": "newer-cache-owner",
+		"cache_only":      true,
+	})
+	model.CacheUpdateChannel(&newerCache)
+	routingIDs, err := model.ListSatisfiedChannelIDsAtPriority(
+		channel.Group,
+		channel.Models,
+		priority,
+		nil,
+	)
+	require.NoError(t, err)
+	require.Contains(t, routingIDs, channel.Id)
+
+	summary, err := ReconcileManagedUpstreams(now)
+
+	require.NoError(t, err)
+	assert.Zero(t, summary.PrioritiesUpdated)
+	var storedRoute model.UpstreamManagedRoute
+	require.NoError(t, model.DB.First(&storedRoute, route.ID).Error)
+	assert.Equal(t, expectedRoute, storedRoute)
+	var storedChannel model.Channel
+	require.NoError(t, model.DB.First(&storedChannel, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, storedChannel.Status)
+	storedInfo := storedChannel.GetOtherInfo()
+	assert.Equal(t, "status-domain", storedInfo["preserved_owner"])
+	assert.Equal(t, "detached", storedInfo["status_reason"])
+	assert.EqualValues(t, now.Unix(), storedInfo["status_time"])
+	var ability model.Ability
+	require.NoError(t, model.DB.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+	cached, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, cached.Status)
+	cachedInfo := cached.GetOtherInfo()
+	assert.Equal(t, "newer-cache-owner", cachedInfo["preserved_owner"])
+	assert.Equal(t, true, cachedInfo["cache_only"])
+	assert.Equal(t, "detached", cachedInfo["status_reason"])
+	assert.EqualValues(t, now.Unix(), cachedInfo["status_time"])
+	routingIDs, err = model.ListSatisfiedChannelIDsAtPriority(
+		channel.Group,
+		channel.Models,
+		priority,
+		nil,
+	)
+	require.NoError(t, err)
+	assert.NotContains(t, routingIDs, channel.Id)
+}
+
 func TestReconcileManagedUpstreamsRollsBackRouteWhenAbilityDisableFails(t *testing.T) {
 	setupUpstreamOrchestrationTest(t)
 	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))

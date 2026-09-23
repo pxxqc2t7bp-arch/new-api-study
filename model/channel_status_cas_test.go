@@ -1527,6 +1527,184 @@ func TestUpdateManagedRouteStateIfUnchangedRollsBackAbilityFailure(t *testing.T)
 	assert.Equal(t, channel.OtherInfo, cached.OtherInfo)
 }
 
+func TestDisableDetachedManagedChannelIfUnchangedRollsBackAbilityFailure(t *testing.T) {
+	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+		"owner": "before",
+	})
+	require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+	require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+	route := UpstreamManagedRoute{
+		SourceID:             91,
+		ExternalGroupID:      "detached-rollback",
+		Platform:             "openai",
+		Protocol:             UpstreamProtocolOpenAI,
+		ChannelID:            channel.Id,
+		State:                UpstreamRouteStateDetached,
+		Rank:                 7,
+		EffectiveMultiplier:  0.25,
+		ConsecutiveFailures:  2,
+		ConsecutiveSuccesses: 3,
+		LastReason:           "operator detached",
+		Detached:             true,
+		UpdatedAt:            1_788_319_000,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+	var expectedRoute UpstreamManagedRoute
+	require.NoError(t, DB.First(&expectedRoute, route.ID).Error)
+	expectedChannel, expectedAbility := loadChannelStatusCASFixture(t, channel.Id)
+
+	forcedErr := errors.New("forced detached ability failure")
+	const callbackName = "test:fail_detached_managed_route_ability"
+	require.NoError(t, DB.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil && tx.Statement.Table == "abilities" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, DB.Callback().Update().Remove(callbackName))
+	})
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+
+	applied, err := DisableDetachedManagedChannelIfUnchanged(&expectedRoute, 1_788_320_000)
+
+	require.ErrorIs(t, err, forcedErr)
+	assert.False(t, applied)
+	var storedRoute UpstreamManagedRoute
+	require.NoError(t, DB.First(&storedRoute, route.ID).Error)
+	assert.Equal(t, expectedRoute, storedRoute)
+	storedChannel, storedAbility := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, expectedChannel, storedChannel)
+	assert.Equal(t, expectedAbility, storedAbility)
+	cached, cacheErr := CacheGetChannel(channel.Id)
+	require.NoError(t, cacheErr)
+	assert.Equal(t, expectedChannel.Status, cached.Status)
+	assert.Equal(t, expectedChannel.OtherInfo, cached.OtherInfo)
+}
+
+func TestDisableDetachedManagedChannelIfUnchangedRejectsChangedRouteSnapshot(t *testing.T) {
+	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+		"owner": "before",
+	})
+	require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+	require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+	route := UpstreamManagedRoute{
+		SourceID:        92,
+		ExternalGroupID: "detached-stale",
+		Platform:        "openai",
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           UpstreamRouteStateDetached,
+		LastReason:      "operator detached",
+		Detached:        true,
+		UpdatedAt:       1_788_319_000,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+	expectedRoute := route
+	require.NoError(t, DB.Model(&UpstreamManagedRoute{}).
+		Where("id = ?", route.ID).
+		Updates(map[string]any{
+			"last_reason": "newer operator decision",
+			"updated_at":  route.UpdatedAt + 1,
+		}).Error)
+
+	applied, err := DisableDetachedManagedChannelIfUnchanged(&expectedRoute, 1_788_320_000)
+
+	require.NoError(t, err)
+	assert.False(t, applied)
+	storedChannel, storedAbility := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusEnabled, storedChannel.Status)
+	assert.True(t, storedAbility.Enabled)
+}
+
+func TestDisableDetachedManagedChannelIfUnchangedDisablesAbilityForDisabledChannel(t *testing.T) {
+	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+		"owner": "before",
+	})
+	require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+	require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+	require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).
+		Update("status", common.ChannelStatusManuallyDisabled).Error)
+	route := UpstreamManagedRoute{
+		SourceID:        94,
+		ExternalGroupID: "detached-disabled-channel",
+		Platform:        "openai",
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           UpstreamRouteStateDetached,
+		LastReason:      "operator detached",
+		Detached:        true,
+		UpdatedAt:       1_788_319_000,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+
+	applied, err := DisableDetachedManagedChannelIfUnchanged(&route, 1_788_320_000)
+
+	require.NoError(t, err)
+	require.True(t, applied)
+	storedChannel, storedAbility := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, storedChannel.Status)
+	assert.False(t, storedAbility.Enabled)
+	info := storedChannel.GetOtherInfo()
+	assert.Equal(t, "before", info["owner"])
+	assert.Equal(t, "detached", info["status_reason"])
+	assert.EqualValues(t, 1_788_320_000, info["status_time"])
+}
+
+func TestDisableDetachedManagedChannelIfUnchangedLocksRouteBeforeChannel(t *testing.T) {
+	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+		"owner": "before",
+	})
+	require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+	require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+	route := UpstreamManagedRoute{
+		SourceID:        93,
+		ExternalGroupID: "detached-lock-order",
+		Platform:        "openai",
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           UpstreamRouteStateDetached,
+		LastReason:      "operator detached",
+		Detached:        true,
+		UpdatedAt:       1_788_319_000,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+
+	var transactionalReads []string
+	const callbackName = "test:capture_detached_managed_channel_lock_order"
+	require.NoError(t, DB.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil {
+			return
+		}
+		if _, inTransaction := tx.Statement.ConnPool.(*sql.Tx); !inTransaction {
+			return
+		}
+		switch tx.Statement.Table {
+		case "upstream_managed_routes", "channels":
+			transactionalReads = append(transactionalReads, tx.Statement.Table)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, DB.Callback().Query().Remove(callbackName))
+	})
+
+	applied, err := DisableDetachedManagedChannelIfUnchanged(&route, 1_788_320_000)
+
+	require.NoError(t, err)
+	require.True(t, applied)
+	assert.Equal(t, []string{"upstream_managed_routes", "channels"}, transactionalReads)
+	var storedRoute UpstreamManagedRoute
+	require.NoError(t, DB.First(&storedRoute, route.ID).Error)
+	assert.Equal(t, route, storedRoute)
+	storedChannel, storedAbility := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, storedChannel.Status)
+	assert.False(t, storedAbility.Enabled)
+	info := storedChannel.GetOtherInfo()
+	assert.Equal(t, "before", info["owner"])
+	assert.Equal(t, "detached", info["status_reason"])
+	assert.EqualValues(t, 1_788_320_000, info["status_time"])
+}
+
 func TestUpdateManagedChannelIfUnchangedLocksDecisionSnapshotInOrder(t *testing.T) {
 	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
 		"owner": "before",

@@ -1262,6 +1262,84 @@ type ManagedChannelUpdate struct {
 	Status                int
 }
 
+// DisableDetachedManagedChannelIfUnchanged disables channel routing only while
+// the complete route snapshot still describes a detached, non-active route.
+func DisableDetachedManagedChannelIfUnchanged(
+	expectedRoute *UpstreamManagedRoute,
+	statusTime int64,
+) (bool, error) {
+	if expectedRoute == nil || expectedRoute.ID == 0 || expectedRoute.ChannelID == 0 {
+		return false, errors.New("detached managed route snapshot is missing")
+	}
+
+	return withChannelStatusLocks(expectedRoute.ChannelID, func() (bool, error) {
+		applied := false
+		var updatedChannel Channel
+		transactionErr := DB.Transaction(func(tx *gorm.DB) error {
+			var currentRoute UpstreamManagedRoute
+			if err := lockForUpdate(tx).Where("id = ?", expectedRoute.ID).First(&currentRoute).Error; err != nil {
+				return err
+			}
+			if !reflect.DeepEqual(currentRoute, *expectedRoute) ||
+				!currentRoute.Detached ||
+				currentRoute.State == UpstreamRouteStateActive {
+				return nil
+			}
+
+			var currentChannel Channel
+			if err := lockForUpdate(tx).
+				Where("id = ?", currentRoute.ChannelID).
+				First(&currentChannel).Error; err != nil {
+				return err
+			}
+			updatedChannel = currentChannel
+			if updatedChannel.Status == common.ChannelStatusEnabled {
+				updatedChannel.Status = common.ChannelStatusAutoDisabled
+			}
+			info := updatedChannel.GetOtherInfo()
+			statusReason, reasonExists := info["status_reason"].(string)
+			_, timeExists := info["status_time"]
+			if updatedChannel.Status != currentChannel.Status ||
+				!reasonExists ||
+				statusReason != UpstreamRouteStateDetached ||
+				!timeExists {
+				info["status_reason"] = UpstreamRouteStateDetached
+				info["status_time"] = statusTime
+				updatedChannel.SetOtherInfo(info)
+			}
+			if updatedChannel.Status != currentChannel.Status ||
+				updatedChannel.OtherInfo != currentChannel.OtherInfo {
+				if err := tx.Model(&Channel{}).
+					Where("id = ?", updatedChannel.Id).
+					Updates(map[string]any{
+						"status":     updatedChannel.Status,
+						"other_info": updatedChannel.OtherInfo,
+					}).Error; err != nil {
+					return err
+				}
+			}
+			if err := tx.Model(&Ability{}).
+				Where("channel_id = ?", updatedChannel.Id).
+				Select("enabled").
+				Update("enabled", false).Error; err != nil {
+				return err
+			}
+			applied = true
+			return nil
+		})
+		if transactionErr != nil {
+			return false, transactionErr
+		}
+		if applied {
+			CacheUpdateManagedChannelSnapshots([]ManagedChannelCacheUpdate{{
+				Snapshot:           &updatedChannel,
+				UpdateStatusReason: true,
+			}})
+		}
+		return applied, nil
+	})
+}
+
 func UpdateManagedRouteStateIfUnchanged(
 	expectedSource *UpstreamSource,
 	expectedGroup *UpstreamGroup,
