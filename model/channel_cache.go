@@ -422,6 +422,58 @@ func CacheUpdateChannelStatusSnapshots(updates []ChannelStatusCacheUpdate) {
 	}
 }
 
+type ManagedChannelCacheUpdate struct {
+	Snapshot            *Channel
+	UpdateRoutingConfig bool
+	UpdateStatusReason  bool
+}
+
+// CacheUpdateManagedChannelSnapshots publishes only reconciliation-owned
+// fields while preserving newer cache state from independent writers.
+func CacheUpdateManagedChannelSnapshots(updates []ManagedChannelCacheUpdate) {
+	if !common.MemoryCacheEnabled {
+		return
+	}
+
+	updated := false
+	channelSyncLock.Lock()
+	for _, update := range updates {
+		if update.Snapshot == nil {
+			continue
+		}
+
+		snapshot := update.Snapshot
+		published := *snapshot
+		if cached, exists := channelsIDM[snapshot.Id]; exists && cached != nil {
+			published = *cached
+		}
+		published.Status = snapshot.Status
+		if update.UpdateRoutingConfig {
+			published.Priority = snapshot.Priority
+			published.BaseURL = snapshot.BaseURL
+			published.Models = snapshot.Models
+		}
+		if update.UpdateStatusReason {
+			publishedInfo := published.GetOtherInfo()
+			snapshotInfo := snapshot.GetOtherInfo()
+			for _, key := range []string{"status_reason", "status_time"} {
+				if value, exists := snapshotInfo[key]; exists {
+					publishedInfo[key] = value
+				} else {
+					delete(publishedInfo, key)
+				}
+			}
+			published.SetOtherInfo(publishedInfo)
+		}
+		cacheUpdateChannelLocked(&published)
+		updated = true
+	}
+	channelSyncLock.Unlock()
+	if updated {
+		InvalidatePricingCache()
+	}
+}
+
 func CacheUpdateChannels(channels []*Channel) {
 	if !common.MemoryCacheEnabled {
 		return

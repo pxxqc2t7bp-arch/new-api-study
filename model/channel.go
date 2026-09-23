@@ -1247,6 +1247,9 @@ func AdvanceMultiKeyRecoveryCursorIfUnchanged(expected *Channel, usingKey string
 }
 
 type ManagedChannelUpdate struct {
+	ExpectedSource        *UpstreamSource
+	ExpectedGroup         *UpstreamGroup
+	ExpectedRoute         *UpstreamManagedRoute
 	RouteID               int64
 	ExpectedRouteState    string
 	ExpectedRouteDetached bool
@@ -1257,6 +1260,157 @@ type ManagedChannelUpdate struct {
 	BaseURL               string
 	Models                string
 	Status                int
+}
+
+func UpdateManagedRouteStateIfUnchanged(
+	expectedSource *UpstreamSource,
+	expectedGroup *UpstreamGroup,
+	expectedRoute *UpstreamManagedRoute,
+	desiredRoute *UpstreamManagedRoute,
+	statusTime int64,
+) (bool, error) {
+	if expectedSource == nil || expectedSource.ID == 0 ||
+		expectedGroup == nil || expectedGroup.ID == 0 ||
+		expectedRoute == nil || expectedRoute.ID == 0 ||
+		desiredRoute == nil || desiredRoute.ID != expectedRoute.ID ||
+		desiredRoute.SourceID != expectedRoute.SourceID ||
+		desiredRoute.ExternalGroupID != expectedRoute.ExternalGroupID ||
+		desiredRoute.Platform != expectedRoute.Platform ||
+		desiredRoute.Protocol != expectedRoute.Protocol ||
+		desiredRoute.ChannelID != expectedRoute.ChannelID {
+		return false, errors.New("managed route decision snapshot is missing or inconsistent")
+	}
+
+	return withChannelStatusLocks(expectedRoute.ChannelID, func() (bool, error) {
+		applied := false
+		var updatedChannel Channel
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			currentRoute, matches, err := lockManagedDecisionSnapshot(
+				tx,
+				expectedSource,
+				expectedGroup,
+				expectedRoute,
+			)
+			if err != nil || !matches {
+				return err
+			}
+
+			var currentChannel Channel
+			if err := lockForUpdate(tx).
+				Where("id = ?", currentRoute.ChannelID).
+				First(&currentChannel).Error; err != nil {
+				return err
+			}
+
+			if err := tx.Model(&UpstreamManagedRoute{}).
+				Where("id = ?", currentRoute.ID).
+				Updates(map[string]any{
+					"state":                desiredRoute.State,
+					"rank":                 desiredRoute.Rank,
+					"consecutive_failures": desiredRoute.ConsecutiveFailures,
+					"failure_window_start": desiredRoute.FailureWindowStart,
+					"recovery_attempts":    desiredRoute.RecoveryAttempts,
+					"next_probe_at":        desiredRoute.NextProbeAt,
+					"red_since":            desiredRoute.RedSince,
+					"last_reason":          desiredRoute.LastReason,
+					"updated_at":           desiredRoute.UpdatedAt,
+				}).Error; err != nil {
+				return err
+			}
+
+			updatedChannel = currentChannel
+			if desiredRoute.State != UpstreamRouteStateActive {
+				if updatedChannel.Status == common.ChannelStatusEnabled {
+					updatedChannel.Status = common.ChannelStatusAutoDisabled
+				}
+				info := updatedChannel.GetOtherInfo()
+				statusReason, reasonExists := info["status_reason"].(string)
+				_, timeExists := info["status_time"]
+				stateChanged := expectedRoute.State != desiredRoute.State ||
+					expectedRoute.LastReason != desiredRoute.LastReason
+				if stateChanged ||
+					updatedChannel.Status != currentChannel.Status ||
+					!reasonExists ||
+					statusReason != desiredRoute.LastReason ||
+					!timeExists {
+					info["status_reason"] = desiredRoute.LastReason
+					info["status_time"] = statusTime
+					updatedChannel.SetOtherInfo(info)
+				}
+				if updatedChannel.Status != currentChannel.Status ||
+					updatedChannel.OtherInfo != currentChannel.OtherInfo {
+					if err := tx.Model(&Channel{}).
+						Where("id = ?", currentChannel.Id).
+						Updates(map[string]any{
+							"status":     updatedChannel.Status,
+							"other_info": updatedChannel.OtherInfo,
+						}).Error; err != nil {
+						return err
+					}
+				}
+				if err := tx.Model(&Ability{}).
+					Where("channel_id = ?", currentChannel.Id).
+					Select("enabled").
+					Update("enabled", false).Error; err != nil {
+					return err
+				}
+			}
+			applied = true
+			return nil
+		})
+		if err != nil {
+			return false, err
+		}
+		if applied && desiredRoute.State != UpstreamRouteStateActive {
+			CacheUpdateManagedChannelSnapshots([]ManagedChannelCacheUpdate{{
+				Snapshot:           &updatedChannel,
+				UpdateStatusReason: true,
+			}})
+		}
+		return applied, nil
+	})
+}
+
+func lockManagedDecisionSnapshot(
+	tx *gorm.DB,
+	expectedSource *UpstreamSource,
+	expectedGroup *UpstreamGroup,
+	expectedRoute *UpstreamManagedRoute,
+) (*UpstreamManagedRoute, bool, error) {
+	if expectedSource == nil || expectedSource.ID == 0 ||
+		expectedGroup == nil || expectedGroup.ID == 0 ||
+		expectedRoute == nil || expectedRoute.ID == 0 {
+		return nil, false, errors.New("managed decision snapshot is missing")
+	}
+
+	var currentSource UpstreamSource
+	if err := lockForUpdate(tx).Where("id = ?", expectedSource.ID).First(&currentSource).Error; err != nil {
+		return nil, false, err
+	}
+	if !reflect.DeepEqual(currentSource, *expectedSource) {
+		return nil, false, nil
+	}
+
+	var currentGroup UpstreamGroup
+	if err := lockForUpdate(tx).Where("id = ?", expectedGroup.ID).First(&currentGroup).Error; err != nil {
+		return nil, false, err
+	}
+	if currentGroup.SourceID != currentSource.ID ||
+		!reflect.DeepEqual(currentGroup, *expectedGroup) {
+		return nil, false, nil
+	}
+
+	var currentRoute UpstreamManagedRoute
+	if err := lockForUpdate(tx).Where("id = ?", expectedRoute.ID).First(&currentRoute).Error; err != nil {
+		return nil, false, err
+	}
+	if currentRoute.SourceID != currentSource.ID ||
+		currentRoute.ExternalGroupID != currentGroup.ExternalID ||
+		currentRoute.Platform != currentGroup.Platform ||
+		!reflect.DeepEqual(currentRoute, *expectedRoute) {
+		return nil, false, nil
+	}
+	return &currentRoute, true, nil
 }
 
 func managedChannelSnapshotMatches(current *Channel, expected *Channel) bool {
@@ -1277,27 +1431,38 @@ func managedChannelSnapshotMatches(current *Channel, expected *Channel) bool {
 }
 
 // UpdateManagedChannelIfUnchanged commits managed rank, channel, and ability
-// state only while the channel still matches the reconciliation snapshot.
+// state only while the complete decision snapshot remains unchanged.
 func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpdate) (bool, error) {
-	if expected == nil || expected.Id == 0 {
-		return false, errors.New("managed channel snapshot is missing")
+	if expected == nil || expected.Id == 0 ||
+		update.ExpectedSource == nil ||
+		update.ExpectedGroup == nil ||
+		update.ExpectedRoute == nil {
+		return false, errors.New("managed channel decision snapshot is missing")
 	}
 
 	return withChannelStatusLocks(expected.Id, func() (bool, error) {
 		changed := false
 		var updated Channel
 		err := DB.Transaction(func(tx *gorm.DB) error {
-			var currentRoute UpstreamManagedRoute
-			if err := lockForUpdate(tx).Where("id = ?", update.RouteID).First(&currentRoute).Error; err != nil {
+			currentRoute, matches, err := lockManagedDecisionSnapshot(
+				tx,
+				update.ExpectedSource,
+				update.ExpectedGroup,
+				update.ExpectedRoute,
+			)
+			if err != nil || !matches {
 				return err
 			}
 			if currentRoute.ChannelID != expected.Id ||
+				(update.RouteID != 0 && currentRoute.ID != update.RouteID) ||
 				currentRoute.State != update.ExpectedRouteState ||
 				currentRoute.Detached != update.ExpectedRouteDetached {
 				return nil
 			}
 			if update.Status == common.ChannelStatusEnabled &&
-				(currentRoute.Detached || currentRoute.State != UpstreamRouteStateActive) {
+				(currentRoute.Detached ||
+					currentRoute.State != UpstreamRouteStateActive ||
+					currentRoute.ManualPauseUntil > update.UpdatedAt) {
 				return nil
 			}
 
@@ -1373,7 +1538,10 @@ func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpd
 			return false, err
 		}
 		if changed {
-			CacheUpdateChannel(&updated)
+			CacheUpdateManagedChannelSnapshots([]ManagedChannelCacheUpdate{{
+				Snapshot:            &updated,
+				UpdateRoutingConfig: true,
+			}})
 		}
 		return changed, nil
 	})

@@ -103,9 +103,12 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 				}
 			}
 			if low != source.LowBalanceAlerted {
-				_ = model.DB.Model(&model.UpstreamSource{}).Where("id = ?", source.ID).
-					Updates(map[string]any{"low_balance_alerted": low, "updated_at": now.Unix()}).Error
+				if err := model.DB.Model(&model.UpstreamSource{}).Where("id = ?", source.ID).
+					Updates(map[string]any{"low_balance_alerted": low, "updated_at": now.Unix()}).Error; err != nil {
+					return summary, err
+				}
 				source.LowBalanceAlerted = low
+				source.UpdatedAt = now.Unix()
 				sources[index] = source
 			}
 		}
@@ -146,57 +149,80 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 				reason = "outside managed candidate limit"
 			}
 		}
-		if state == route.State {
+		stateChanged := state != route.State
+		reasonChanged := reason != route.LastReason
+		if !stateChanged && !reasonChanged && state == model.UpstreamRouteStateActive {
 			continue
 		}
-		updates := map[string]any{
-			"state":       state,
-			"last_reason": reason,
-			"updated_at":  now.Unix(),
+		desiredRoute := *route
+		desiredRoute.State = state
+		desiredRoute.LastReason = reason
+		if stateChanged || reasonChanged {
+			desiredRoute.UpdatedAt = now.Unix()
 		}
-		if state == model.UpstreamRouteStateQuarantined {
+		if stateChanged && state == model.UpstreamRouteStateQuarantined {
 			if route.RedSince == 0 {
-				updates["red_since"] = now.Unix()
+				desiredRoute.RedSince = now.Unix()
 			}
-			updates["recovery_attempts"] = 0
-			updates["next_probe_at"] = now.Unix()
-			summary.RoutesQuarantined++
+			desiredRoute.RecoveryAttempts = 0
+			desiredRoute.NextProbeAt = now.Unix()
 		}
-		if state == model.UpstreamRouteStateLongRed {
-			updates["next_probe_at"] = int64(0)
-			summary.RoutesLongRed++
+		if stateChanged && state == model.UpstreamRouteStateLongRed {
+			desiredRoute.NextProbeAt = 0
 		}
-		if state == model.UpstreamRouteStateRetained {
-			updates["rank"] = 0
-			updates["next_probe_at"] = int64(0)
-			summary.RoutesRetained++
+		if stateChanged && state == model.UpstreamRouteStateRetained {
+			desiredRoute.Rank = 0
+			desiredRoute.NextProbeAt = 0
 		}
-		if state == model.UpstreamRouteStateShadow && route.State == model.UpstreamRouteStateRetained {
-			updates["next_probe_at"] = now.Unix()
+		if stateChanged &&
+			state == model.UpstreamRouteStateShadow &&
+			route.State == model.UpstreamRouteStateRetained {
+			desiredRoute.NextProbeAt = now.Unix()
 		}
-		if state == model.UpstreamRouteStateActive {
-			updates["red_since"] = int64(0)
-			updates["recovery_attempts"] = 0
-			updates["next_probe_at"] = int64(0)
-			updates["consecutive_failures"] = 0
-			updates["failure_window_start"] = int64(0)
-			summary.RoutesActivated++
+		if stateChanged && state == model.UpstreamRouteStateActive {
+			desiredRoute.RedSince = 0
+			desiredRoute.RecoveryAttempts = 0
+			desiredRoute.NextProbeAt = 0
+			desiredRoute.ConsecutiveFailures = 0
+			desiredRoute.FailureWindowStart = 0
 		}
-		if err := model.DB.Model(route).Updates(updates).Error; err != nil {
+		applied, err := model.UpdateManagedRouteStateIfUnchanged(
+			&source,
+			&group,
+			route,
+			&desiredRoute,
+			now.Unix(),
+		)
+		if err != nil {
 			return summary, err
 		}
-		routeChanges = append(routeChanges, fmt.Sprintf(
-			"#%d %s/%s: %s -> %s",
-			route.ChannelID,
-			source.Key,
-			group.Name,
-			route.State,
-			state,
-		))
-		if state != model.UpstreamRouteStateActive {
-			model.UpdateChannelStatus(route.ChannelID, "", common.ChannelStatusAutoDisabled, reason)
+		if !applied {
+			return summary, fmt.Errorf(
+				"managed route decision changed during reconciliation: route_id=%d",
+				route.ID,
+			)
 		}
-		route.State = state
+		if stateChanged {
+			switch state {
+			case model.UpstreamRouteStateQuarantined:
+				summary.RoutesQuarantined++
+			case model.UpstreamRouteStateLongRed:
+				summary.RoutesLongRed++
+			case model.UpstreamRouteStateRetained:
+				summary.RoutesRetained++
+			case model.UpstreamRouteStateActive:
+				summary.RoutesActivated++
+			}
+			routeChanges = append(routeChanges, fmt.Sprintf(
+				"#%d %s/%s: %s -> %s",
+				route.ChannelID,
+				source.Key,
+				group.Name,
+				route.State,
+				state,
+			))
+		}
+		*route = desiredRoute
 	}
 
 	if setting.AutoEnroll {
@@ -211,9 +237,6 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 		return summary, err
 	}
 	summary.PrioritiesUpdated = updated
-	if updated > 0 {
-		model.InitChannelCache()
-	}
 	if len(routeChanges) > 0 {
 		if err := NotifyRootBark(
 			"channel_update_upstream_reconcile",
@@ -273,7 +296,11 @@ func desiredManagedRouteState(
 		return model.UpstreamRouteStateDetached, "detached"
 	}
 	if route.ManualPauseUntil > now.Unix() {
-		return model.UpstreamRouteStatePaused, "manual pause"
+		reason := strings.TrimSpace(route.LastReason)
+		if reason == "" {
+			reason = "manual pause"
+		}
+		return model.UpstreamRouteStatePaused, reason
 	}
 	if route.State == model.UpstreamRouteStatePaused {
 		route.State = model.UpstreamRouteStateShadow
@@ -647,11 +674,18 @@ func rankManagedRoutes(
 			if preserveManagedPlanQuotaOwnership(channel, desiredStatus) {
 				desiredStatus = channel.Status
 			}
+			if route.State != model.UpstreamRouteStateActive &&
+				channel.Status != common.ChannelStatusEnabled {
+				desiredStatus = channel.Status
+			}
 			models := channel.Models
 			if groupSelected {
 				models = strings.Join(routeModels, ",")
 			}
 			changed, err := model.UpdateManagedChannelIfUnchanged(channel, model.ManagedChannelUpdate{
+				ExpectedSource:        &source,
+				ExpectedGroup:         &group,
+				ExpectedRoute:         route,
 				RouteID:               route.ID,
 				ExpectedRouteState:    route.State,
 				ExpectedRouteDetached: route.Detached,
