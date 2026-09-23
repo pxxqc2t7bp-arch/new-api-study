@@ -377,6 +377,39 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedSynchronizesMemoryRouting(t *test
 	assert.Equal(t, 1, selected.ChannelInfo.MultiKeyPollingIndex)
 }
 
+func TestCacheUpdateChannelStatusRebuildsOrderedRoutingMembership(t *testing.T) {
+	setupChannelStatusTest(t)
+	highPriority := int64(200)
+	lowPriority := int64(100)
+	channels := []Channel{
+		{
+			Name: "high-priority", Key: "key-a",
+			Status: common.ChannelStatusEnabled, Models: "gpt-cache-status",
+			Group: "default", Priority: &highPriority,
+		},
+		{
+			Name: "low-priority", Key: "key-b",
+			Status: common.ChannelStatusEnabled, Models: "gpt-cache-status",
+			Group: "default", Priority: &lowPriority,
+		},
+	}
+	require.NoError(t, DB.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+
+	CacheUpdateChannelStatus(channels[0].Id, common.ChannelStatusAutoDisabled)
+	CacheUpdateChannelStatus(channels[0].Id, common.ChannelStatusEnabled)
+	CacheUpdateChannelStatus(channels[0].Id, common.ChannelStatusEnabled)
+
+	channelSyncLock.RLock()
+	routingIDs := append([]int(nil), group2model2channels["default"]["gpt-cache-status"]...)
+	channelSyncLock.RUnlock()
+	assert.Equal(t, []int{channels[0].Id, channels[1].Id}, routingIDs)
+}
+
 func TestUpdateManagedChannelIfUnchangedPreservesConcurrentStatusOwner(t *testing.T) {
 	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
 		"owner": "before",

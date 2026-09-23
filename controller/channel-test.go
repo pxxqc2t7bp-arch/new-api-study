@@ -926,11 +926,66 @@ type channelTestSummary struct {
 	Enabled   int `json:"enabled"`
 }
 
+func buildHealthCheckProbeChannel(channel *model.Channel) (*model.Channel, string, bool) {
+	if channel == nil ||
+		channel.Status != common.ChannelStatusAutoDisabled ||
+		!channel.ChannelInfo.IsMultiKey {
+		return channel, "", false
+	}
+
+	keys := channel.GetKeys()
+	selectedIndex := -1
+	var selectedDisabledTime int64
+	for index := range keys {
+		status, exists := channel.ChannelInfo.MultiKeyStatusList[index]
+		if !exists || status == common.ChannelStatusEnabled {
+			return channel, "", false
+		}
+		if status != common.ChannelStatusAutoDisabled {
+			continue
+		}
+		disabledTime := channel.ChannelInfo.MultiKeyDisabledTime[index]
+		if selectedIndex == -1 ||
+			disabledTime < selectedDisabledTime ||
+			disabledTime == selectedDisabledTime && index < selectedIndex {
+			selectedIndex = index
+			selectedDisabledTime = disabledTime
+		}
+	}
+	if selectedIndex == -1 {
+		return channel, "", false
+	}
+
+	probe := *channel
+	probe.ChannelInfo = channel.ChannelInfo
+	probe.ChannelInfo.MultiKeyStatusList = make(map[int]int, len(channel.ChannelInfo.MultiKeyStatusList))
+	for index, status := range channel.ChannelInfo.MultiKeyStatusList {
+		probe.ChannelInfo.MultiKeyStatusList[index] = status
+	}
+	probe.ChannelInfo.MultiKeyDisabledReason = make(map[int]string, len(channel.ChannelInfo.MultiKeyDisabledReason))
+	for index, reason := range channel.ChannelInfo.MultiKeyDisabledReason {
+		probe.ChannelInfo.MultiKeyDisabledReason[index] = reason
+	}
+	probe.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64, len(channel.ChannelInfo.MultiKeyDisabledTime))
+	for index, disabledTime := range channel.ChannelInfo.MultiKeyDisabledTime {
+		probe.ChannelInfo.MultiKeyDisabledTime[index] = disabledTime
+	}
+	delete(probe.ChannelInfo.MultiKeyStatusList, selectedIndex)
+	// The probe has one enabled key, so random mode selects it without persisting
+	// a polling cursor or the temporary enabled state.
+	probe.ChannelInfo.MultiKeyMode = constant.MultiKeyModeRandom
+	return &probe, keys[selectedIndex], true
+}
+
 func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, testUserID int, allowDisable bool, disableThreshold int64) channelTestSummary {
 	summary := channelTestSummary{}
 	isChannelEnabled := channel.Status == common.ChannelStatusEnabled
+	probeChannel, _, isolatedProbe := buildHealthCheckProbeChannel(channel)
+	if !isolatedProbe {
+		probeChannel = channel
+	}
 	tik := time.Now()
-	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
+	result := testChannel(ctx, probeChannel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(probeChannel))
 	milliseconds := time.Since(tik).Milliseconds()
 	if ctx.Err() != nil {
 		return summary

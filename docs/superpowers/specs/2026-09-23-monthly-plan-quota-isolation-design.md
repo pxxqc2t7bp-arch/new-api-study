@@ -57,6 +57,10 @@ different tags can therefore continue receiving traffic.
   disable sweep snapshot but before an individual disable CAS.
 - Fence managed multi-key Plan isolation against request-time tag, key
   membership, and multi-key mode rotation.
+- Automatically probe an auto-disabled multi-key channel after its final
+  enabled key is disabled without exposing that key to normal routing.
+- Restore or remove memory-cache routing membership for every production
+  status transition, including legacy and snapshot-CAS enable paths.
 - Use route-before-channel row-lock ordering for managed reconciliation and
   unsupported-model isolation.
 
@@ -157,18 +161,35 @@ Plan disable and recovery no longer call `UpdateChannelStatus` followed by
 auto-disable marker, or metadata edit invalidates the snapshot and makes the
 attempt a no-op.
 
-Automatic channel tests call `EnableChannelForHealthCheck` with the exact
-`Channel` snapshot used by the probe and its selected key. Non-multi-key Plan
-quota ownership and recovery scope are derived from that pre-probe snapshot.
-Before any status write, the service rejects a source snapshot whose
-`disabled_until` is still in the future. It returns zero without changing the
-source, peers, metadata, or abilities. Once due, the service attempts to enable
-the source with a CAS over the snapshot's exact key, tag, status, and raw
-`other_info`. If that CAS is stale or fails, recovery stops: peers are not
-loaded or enabled, and the call never falls through to generic ID-based
-enablement. This fences a successful stale probe from a newer quota generation,
-a manual disable, or an unrelated ownership change. Manual `EnableChannel`
-remains an explicit override and does not apply the due-time fence.
+Automatic channel tests retain the original pre-probe `Channel` snapshot for
+recovery. When that snapshot is an auto-disabled multi-key channel with no
+enabled keys, the controller builds a health-check-only copy with a deep copy
+of every `ChannelInfo` map. It chooses one auto-disabled key by the oldest
+`MultiKeyDisabledTime`, breaking equal timestamps by lower key index, and marks
+only that key enabled in the copy. The copy uses a non-persisting probe
+selection mode, so key status and polling state in the source snapshot,
+database, and cache remain untouched by setup and probing. A failed probe
+performs no status mutation.
+
+After a successful probe, the controller calls `EnableChannelForHealthCheck`
+with the original pre-probe snapshot and the key actually selected for the
+request. Multi-key recovery uses the same identity-fenced model CAS as
+structured Plan disable handling. It enables exactly the selected key only
+while key, tag, multi-key mode, status metadata, and complete `ChannelInfo`
+still match the original snapshot; any stale snapshot or key, tag, or mode
+rotation is a no-op.
+
+For non-multi-key channels, quota ownership and recovery scope are derived
+from that pre-probe snapshot. Before any status write, the service rejects a
+source snapshot whose `disabled_until` is still in the future. It returns zero
+without changing the source, peers, metadata, or abilities. Once due, the
+service attempts to enable the source with a CAS over the snapshot's exact key,
+tag, status, and raw `other_info`. If that CAS is stale or fails, recovery
+stops: peers are not loaded or enabled, and the call never falls through to
+generic ID-based enablement. This fences a successful stale probe from a newer
+quota generation, a manual disable, or an unrelated ownership change. Manual
+`EnableChannel` remains an explicit override and does not apply the due-time
+fence.
 
 Only after the source CAS commits does automatic recovery load current channel
 snapshots. If the source snapshot has `quota_domain_id`, current auto-disabled
@@ -236,9 +257,14 @@ It also compares the snapshot's key, status, raw status metadata, and complete
 ability transition. A tag rotation or multi-key-to-single-key rotation is a
 no-op, so a credential introduced after request selection is never disabled.
 After commit, the full updated channel replaces the memory-cache entry so the
-new per-key status remains available. When the overall channel status changes,
-that same cache update removes a disabled channel from the group/model routing
-index or restores an enabled channel without duplicate membership. The general
+new per-key status remains available. A single lock-scoped routing-index helper
+removes every occurrence of the channel ID from all group/model entries, then
+re-adds it from the cached channel's group, model, status, and priority fields
+only when the channel is enabled. Both status-only cache updates and full
+channel replacements use this symmetric helper when routing state changes.
+Legacy `UpdateChannelStatus`, manual `EnableChannel`, and snapshot-CAS health
+recovery therefore restore enabled routing membership, remove disabled
+membership, preserve priority ordering, and avoid duplicate IDs. The general
 multi-key status API remains unchanged.
 
 `DisableChannelForAPIError` rejects the structured path before classification
@@ -299,8 +325,11 @@ atomicity are identical on MySQL and PostgreSQL; SQLite omits unsupported
    unrelated unmanaged row independently. Validated managed Plan quota rows
    participate; ordinary managed rows do not.
 10. A health-check recovery first rejects a not-yet-due source snapshot. Once
-    due, a successful probe CAS-enables its exact pre-probe source snapshot
-    first. Only a successful source CAS permits current same-domain,
+    due, an all-disabled multi-key source is probed through a deep-copied
+    snapshot containing one deterministically selected temporary enabled key.
+    A successful probe CAS-enables that exact key against the original
+    snapshot. Single-key recovery CAS-enables its exact pre-probe source
+    snapshot first. Only a successful source CAS permits current same-domain,
     same-generation, due peers to recover. Credential rotation restricts that
     recovery to the probed row, and accounting uses only committed enables.
 11. Managed reconciliation omits the pre-rank activation enable and uses one
@@ -385,7 +414,14 @@ atomicity are identical on MySQL and PostgreSQL; SQLite omits unsupported
   credential.
 - With memory caching enabled, disabling the final enabled key removes the
   channel from cached selection while preserving the committed per-key state;
-  re-enabling a key restores routing membership without duplication.
+  re-enabling a key through `EnableChannelForHealthCheck` or `EnableChannel`
+  restores routing membership in priority order without duplication.
+- An all-disabled multi-key health check probes the oldest auto-disabled key,
+  breaks timestamp ties by lower index, and does not mutate the source
+  snapshot, database key status, or cache before recovery.
+- A failed final-key probe preserves every disabled key. A successful probe
+  enables only the selected key, while stale channel info and key, tag, or
+  multi-key mode rotation make recovery a no-op.
 - Passive recovery chooses the oldest `TestTime` in a shared domain and uses
   channel ID as its deterministic tie-break.
 - Passive recovery includes managed marked and validated legacy Plan quota

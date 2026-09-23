@@ -820,3 +820,115 @@ Observed: formatting was clean; full model/service package tests, focused
 model/service race subsets, `go vet ./model ./service ./controller`, and
 `git diff --check` passed. The diff contains only the cache implementation,
 its behavior regression, and the existing design/plan updates.
+
+### Task 17: Recover an All-Disabled Multi-Key Channel
+
+**Files:**
+
+- Modify: `controller/channel-test.go`
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `service/channel.go`
+- Modify: `service/channel_quota_test.go`
+- Modify: `model/channel_cache.go`
+- Modify: `model/channel_status_cas_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: RED for final-key automatic probing**
+
+Add controller regressions requiring a health-check-only deep copy of
+`ChannelInfo`, oldest-disabled-time selection with a lower-index tie-break, no
+source snapshot mutation, a failed-probe no-op, and successful recovery of
+exactly the selected key.
+
+Run:
+
+```bash
+go test ./controller -run \
+  '^(TestBuildHealthCheckProbeChannelSelectsOldestAutoDisabledKey|TestChannelForHealthCheckProbesFinalAutoDisabledMultiKey)$' -count=1
+```
+
+Observed RED: build failed because `buildHealthCheckProbeChannel` did not
+exist; without the probe copy, `SetupContextForSelectedChannel` returned
+`ChannelNoAvailableKey`.
+
+- [x] **Step 2: RED for health-check identity fencing**
+
+Call `EnableChannelForHealthCheck` with a stale multi-key source snapshot after
+channel-info, multi-key mode, tag, and key rotation. Require zero committed
+enables and unchanged channel plus ability state.
+
+Run:
+
+```bash
+go test ./service -run \
+  '^(TestEnableChannelForHealthCheckRecoversOnlySelectedFinalKey|TestEnableChannelForHealthCheckFencesMultiKeySnapshotIdentity)$' -count=1
+```
+
+Observed RED: all stale cases returned one; channel-info and tag changes
+re-enabled the selected key, mode rotation enabled the whole channel, and key
+rotation reported success despite no matching key.
+
+- [x] **Step 3: GREEN with an isolated probe and snapshot CAS**
+
+Build a shallow channel copy with independently copied `ChannelInfo` maps.
+When every key is unavailable, select the auto-disabled key with the oldest
+disable time and lower index tie-break, expose only that key in the probe copy,
+and prevent polling-state persistence. Probe the copy, but pass the original
+snapshot and request-selected key to `EnableChannelForHealthCheck`. Route
+multi-key recovery through `UpdateMultiKeyChannelStatusIfUnchanged`.
+
+Observed: both focused controller and service commands passed.
+
+- [x] **Step 4: RED for production re-enable cache membership**
+
+With memory caching enabled, disable the final key through the structured
+production service path, confirm cached random selection excludes the channel,
+then call `EnableChannel` and require cached selection to return it. Add a
+model cache contract that repeats enabled status updates and requires one
+priority-ordered routing ID.
+
+Run:
+
+```bash
+go test ./service -run '^TestEnableChannelRestoresFinalMultiKeyMemoryRouting$' -count=1
+go test ./model -run '^TestCacheUpdateChannelStatusRebuildsOrderedRoutingMembership$' -count=1
+```
+
+Observed RED: the service recovery committed but cached selection remained
+empty; the model routing index contained only the lower-priority peer.
+
+- [x] **Step 5: GREEN with one symmetric routing-index helper**
+
+Under `channelSyncLock`, remove every occurrence of the channel ID from every
+routing entry, then re-add the enabled cached channel from its group/model
+fields and stable-sort by priority. Use the helper from
+`CacheUpdateChannelStatus` and from `CacheUpdateChannel` when status, group,
+models, or priority changes.
+
+Observed: both focused cache commands passed.
+
+- [x] **Step 6: Run final verification and commit**
+
+```bash
+gofmt -w controller/channel-test.go controller/channel_test_internal_test.go \
+  model/channel_cache.go model/channel_status_cas_test.go \
+  service/channel.go service/channel_quota_test.go
+go test ./controller ./model ./service -count=1
+go test -race ./controller -run \
+  'Test(BuildHealthCheckProbeChannel|ChannelForHealthCheckProbesFinalAutoDisabledMultiKey)' -count=1
+go test -race ./model -run \
+  'Test(CacheUpdateChannelStatusRebuildsOrderedRoutingMembership|UpdateMultiKeyChannelStatusIfUnchangedSynchronizesMemoryRouting)' -count=1
+go test -race ./service -run \
+  'TestEnableChannel(ForHealthCheck.*MultiKey|RestoresFinalMultiKeyMemoryRouting)' -count=1
+go vet ./controller ./model ./service
+git diff --check
+```
+
+Review the focused diff, mark the handoff complete, and create one commit
+without deployment changes.
+
+Observed: all three package suites and focused race suites passed. `go vet`
+and `git diff --check` exited cleanly. Review found only the registered
+controller, model, service, test, and documentation changes; no deployment or
+schema files changed.

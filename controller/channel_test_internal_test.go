@@ -724,6 +724,197 @@ func TestChannelForHealthCheckCountsOnlyCommittedRecoveries(t *testing.T) {
 	assert.Zero(t, staleSummary.Enabled)
 }
 
+func TestBuildHealthCheckProbeChannelSelectsOldestAutoDisabledKey(t *testing.T) {
+	channel := &model.Channel{
+		Id:     71,
+		Key:    "key-a\nkey-b\nkey-c\nkey-d",
+		Status: common.ChannelStatusAutoDisabled,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 4,
+			MultiKeyMode: constant.MultiKeyModePolling,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+				2: common.ChannelStatusManuallyDisabled,
+				3: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledReason: map[int]string{
+				0: "newer",
+				1: "oldest lower index",
+				2: "manual",
+				3: "oldest higher index",
+			},
+			MultiKeyDisabledTime: map[int]int64{
+				0: 200,
+				1: 100,
+				2: 50,
+				3: 100,
+			},
+		},
+	}
+
+	probe, selectedKey, ok := buildHealthCheckProbeChannel(channel)
+
+	require.True(t, ok)
+	require.NotSame(t, channel, probe)
+	assert.Equal(t, "key-b", selectedKey)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, probe.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, probe.ChannelInfo.MultiKeyStatusList, 1)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, probe.ChannelInfo.MultiKeyStatusList[2])
+	assert.Equal(t, common.ChannelStatusAutoDisabled, probe.ChannelInfo.MultiKeyStatusList[3])
+
+	probe.ChannelInfo.MultiKeyStatusList[0] = common.ChannelStatusEnabled
+	probe.ChannelInfo.MultiKeyDisabledReason[0] = "probe mutation"
+	probe.ChannelInfo.MultiKeyDisabledTime[0] = 1
+	assert.Equal(t, common.ChannelStatusAutoDisabled, channel.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, "newer", channel.ChannelInfo.MultiKeyDisabledReason[0])
+	assert.EqualValues(t, 200, channel.ChannelInfo.MultiKeyDisabledTime[0])
+	assert.Equal(t, constant.MultiKeyModePolling, channel.ChannelInfo.MultiKeyMode)
+}
+
+func TestChannelForHealthCheckProbesFinalAutoDisabledMultiKey(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		upstreamOK    bool
+		wantSucceeded int
+		wantFailed    int
+		wantEnabled   int
+	}{
+		{
+			name:          "failed probe preserves every key",
+			wantFailed:    1,
+			wantEnabled:   0,
+			wantSucceeded: 0,
+		},
+		{
+			name:          "successful probe recovers selected key",
+			upstreamOK:    true,
+			wantSucceeded: 1,
+			wantEnabled:   1,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			originalMemoryCacheEnabled := common.MemoryCacheEnabled
+			originalLogConsumeEnabled := common.LogConsumeEnabled
+			originalAutomaticEnableChannelEnabled := common.AutomaticEnableChannelEnabled
+			originalModelRatios := ratio_setting.ModelRatio2JSONString()
+			originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+			common.MemoryCacheEnabled = false
+			common.LogConsumeEnabled = false
+			common.AutomaticEnableChannelEnabled = true
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-final-key-health":1}`))
+			require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = originalMemoryCacheEnabled
+				common.LogConsumeEnabled = originalLogConsumeEnabled
+				common.AutomaticEnableChannelEnabled = originalAutomaticEnableChannelEnabled
+				require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+				require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+			})
+
+			user := model.User{
+				Username: "final-key-health-root",
+				Role:     common.RoleRootUser,
+				Status:   common.UserStatusEnabled,
+				Group:    "default",
+				Quota:    1_000_000,
+			}
+			require.NoError(t, db.Create(&user).Error)
+
+			requestKeys := make(chan string, 4)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestKeys <- strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+				w.Header().Set("Content-Type", "application/json")
+				if !testCase.upstreamOK {
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = fmt.Fprint(w, `{"error":{"message":"probe failed","type":"upstream_error"}}`)
+					return
+				}
+				_, _ = fmt.Fprint(w, `{
+					"id":"chatcmpl-final-key-health",
+					"object":"chat.completion",
+					"created":1,
+					"model":"gpt-final-key-health",
+					"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+					"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+				}`)
+			}))
+			defer upstream.Close()
+
+			autoBan := 1
+			channel := model.Channel{
+				Name: "final-key-health", Type: constant.ChannelTypeOpenAI,
+				Key: "key-a\nkey-b\nkey-c", BaseURL: &upstream.URL,
+				Status: common.ChannelStatusAutoDisabled, AutoBan: &autoBan,
+				Models: "gpt-final-key-health", Group: "default",
+				ChannelInfo: model.ChannelInfo{
+					IsMultiKey:   true,
+					MultiKeySize: 3,
+					MultiKeyMode: constant.MultiKeyModePolling,
+					MultiKeyStatusList: map[int]int{
+						0: common.ChannelStatusAutoDisabled,
+						1: common.ChannelStatusAutoDisabled,
+						2: common.ChannelStatusAutoDisabled,
+					},
+					MultiKeyDisabledReason: map[int]string{
+						0: "newest",
+						1: "oldest lower index",
+						2: "oldest higher index",
+					},
+					MultiKeyDisabledTime: map[int]int64{
+						0: 300,
+						1: 100,
+						2: 100,
+					},
+				},
+			}
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+
+			summary := testChannelForHealthCheck(
+				context.Background(),
+				&channel,
+				user.Id,
+				false,
+				10_000_000,
+			)
+
+			assert.Equal(t, 1, summary.Tested)
+			assert.Equal(t, testCase.wantSucceeded, summary.Succeeded)
+			assert.Equal(t, testCase.wantFailed, summary.Failed)
+			assert.Equal(t, testCase.wantEnabled, summary.Enabled)
+			require.Len(t, requestKeys, 1)
+			assert.Equal(t, "key-b", <-requestKeys)
+
+			assert.Equal(t, common.ChannelStatusAutoDisabled, channel.Status)
+			assert.Equal(t, map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+				2: common.ChannelStatusAutoDisabled,
+			}, channel.ChannelInfo.MultiKeyStatusList)
+			assert.Equal(t, constant.MultiKeyModePolling, channel.ChannelInfo.MultiKeyMode)
+
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			var ability model.Ability
+			require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+			if testCase.upstreamOK {
+				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+				assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[2])
+				assert.True(t, ability.Enabled)
+				return
+			}
+			assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+			assert.Equal(t, channel.ChannelInfo, stored.ChannelInfo)
+			assert.False(t, ability.Enabled)
+		})
+	}
+}
+
 func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T) {
 	channels := []*model.Channel{
 		{Id: 1, Status: common.ChannelStatusEnabled},

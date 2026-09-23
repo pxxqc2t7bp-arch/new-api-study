@@ -305,19 +305,45 @@ func CacheUpdateChannelStatus(id int, status int) {
 	defer channelSyncLock.Unlock()
 	if channel, ok := channelsIDM[id]; ok {
 		channel.Status = status
+		syncChannelRoutingIndexLocked(channel)
 	}
-	if status != common.ChannelStatusEnabled {
-		// delete the channel from group2model2channels
-		for group, model2channels := range group2model2channels {
-			for model, channels := range model2channels {
-				for i, channelId := range channels {
-					if channelId == id {
-						// remove the channel from the slice
-						group2model2channels[group][model] = append(channels[:i], channels[i+1:]...)
-						break
-					}
+}
+
+func syncChannelRoutingIndexLocked(channel *Channel) {
+	for group, model2channels := range group2model2channels {
+		for model, channels := range model2channels {
+			filtered := channels[:0]
+			for _, channelID := range channels {
+				if channelID != channel.Id {
+					filtered = append(filtered, channelID)
 				}
 			}
+			group2model2channels[group][model] = filtered
+		}
+	}
+	if channel.Status != common.ChannelStatusEnabled {
+		return
+	}
+
+	if group2model2channels == nil {
+		group2model2channels = make(map[string]map[string][]int)
+	}
+	addedRoutes := make(map[string]struct{})
+	for _, group := range strings.Split(channel.Group, ",") {
+		if group2model2channels[group] == nil {
+			group2model2channels[group] = make(map[string][]int)
+		}
+		for _, model := range strings.Split(channel.Models, ",") {
+			routeKey := group + "\x00" + model
+			if _, exists := addedRoutes[routeKey]; exists {
+				continue
+			}
+			addedRoutes[routeKey] = struct{}{}
+			channels := append(group2model2channels[group][model], channel.Id)
+			sort.SliceStable(channels, func(i, j int) bool {
+				return channelsIDM[channels[i]].GetPriority() > channelsIDM[channels[j]].GetPriority()
+			})
+			group2model2channels[group][model] = channels
 		}
 	}
 }
@@ -335,40 +361,17 @@ func CacheUpdateChannel(channel *Channel) {
 	if channelsIDM == nil {
 		channelsIDM = make(map[int]*Channel)
 	}
-	statusChanged := false
+	routingChanged := true
 	if oldChannel, ok := channelsIDM[channel.Id]; ok {
 		logger.LogDebug(nil, "CacheUpdateChannel before: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, oldChannel.ChannelInfo.MultiKeyPollingIndex)
-		statusChanged = oldChannel.Status != channel.Status
+		routingChanged = oldChannel.Status != channel.Status ||
+			oldChannel.Group != channel.Group ||
+			oldChannel.Models != channel.Models ||
+			oldChannel.GetPriority() != channel.GetPriority()
 	}
 	channelsIDM[channel.Id] = channel
-	if statusChanged {
-		for group, model2channels := range group2model2channels {
-			for model, channels := range model2channels {
-				for i := len(channels) - 1; i >= 0; i-- {
-					if channels[i] == channel.Id {
-						channels = append(channels[:i], channels[i+1:]...)
-					}
-				}
-				group2model2channels[group][model] = channels
-			}
-		}
-		if channel.Status == common.ChannelStatusEnabled {
-			if group2model2channels == nil {
-				group2model2channels = make(map[string]map[string][]int)
-			}
-			for _, group := range strings.Split(channel.Group, ",") {
-				if group2model2channels[group] == nil {
-					group2model2channels[group] = make(map[string][]int)
-				}
-				for _, model := range strings.Split(channel.Models, ",") {
-					channels := append(group2model2channels[group][model], channel.Id)
-					sort.Slice(channels, func(i, j int) bool {
-						return channelsIDM[channels[i]].GetPriority() > channelsIDM[channels[j]].GetPriority()
-					})
-					group2model2channels[group][model] = channels
-				}
-			}
-		}
+	if routingChanged {
+		syncChannelRoutingIndexLocked(channel)
 	}
 	if channel2advancedCustomConfig == nil {
 		channel2advancedCustomConfig = make(map[int]*kitdto.AdvancedCustomConfig)

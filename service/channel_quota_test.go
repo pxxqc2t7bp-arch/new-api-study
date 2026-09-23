@@ -1193,6 +1193,213 @@ func TestEnableChannelForHealthCheckPreservesPlanQuotaDomainBeforeSourceDue(t *t
 	assert.False(t, abilities[1].Enabled)
 }
 
+func TestEnableChannelForHealthCheckRecoversOnlySelectedFinalKey(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+	tag := "plan:support:multi-key-health"
+	channel := model.Channel{
+		Id:     65,
+		Name:   "multi-key-health",
+		Key:    "key-a\nkey-b\nkey-c",
+		Status: common.ChannelStatusAutoDisabled,
+		Tag:    &tag,
+		Models: "gpt-3.5-turbo",
+		Group:  "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 3,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+				2: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledReason: map[int]string{
+				0: "first",
+				1: "selected",
+				2: "last",
+			},
+			MultiKeyDisabledTime: map[int]int64{
+				0: 300,
+				1: 100,
+				2: 200,
+			},
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	enabled := EnableChannelForHealthCheck(&channel, "key-b")
+
+	assert.Equal(t, 1, enabled)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, channel.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, channel.ChannelInfo.MultiKeyStatusList[1])
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[2])
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+}
+
+func TestEnableChannelForHealthCheckFencesMultiKeySnapshotIdentity(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(t *testing.T, db *gorm.DB, channel model.Channel)
+	}{
+		{
+			name: "stale channel info",
+			mutate: func(t *testing.T, db *gorm.DB, channel model.Channel) {
+				t.Helper()
+				updated := channel.ChannelInfo
+				updated.MultiKeyPollingIndex = 1
+				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).
+					Update("channel_info", updated).Error)
+			},
+		},
+		{
+			name: "multi-key mode rotation",
+			mutate: func(t *testing.T, db *gorm.DB, channel model.Channel) {
+				t.Helper()
+				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).
+					Update("channel_info", model.ChannelInfo{}).Error)
+			},
+		},
+		{
+			name: "tag rotation",
+			mutate: func(t *testing.T, db *gorm.DB, channel model.Channel) {
+				t.Helper()
+				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).
+					Update("tag", "plan:support:rotated").Error)
+			},
+		},
+		{
+			name: "key rotation",
+			mutate: func(t *testing.T, db *gorm.DB, channel model.Channel) {
+				t.Helper()
+				require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).
+					Update("key", "replacement-a\nreplacement-b").Error)
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupPlanQuotaDomainTest(t)
+			tag := "plan:support:multi-key-fence"
+			channel := model.Channel{
+				Id:     66,
+				Name:   "multi-key-fence",
+				Key:    "key-a\nkey-b",
+				Status: common.ChannelStatusAutoDisabled,
+				Tag:    &tag,
+				Models: "gpt-3.5-turbo",
+				Group:  "default",
+				ChannelInfo: model.ChannelInfo{
+					IsMultiKey:   true,
+					MultiKeySize: 2,
+					MultiKeyStatusList: map[int]int{
+						0: common.ChannelStatusAutoDisabled,
+						1: common.ChannelStatusAutoDisabled,
+					},
+					MultiKeyDisabledReason: map[int]string{
+						0: "selected",
+						1: "peer",
+					},
+					MultiKeyDisabledTime: map[int]int64{
+						0: 100,
+						1: 200,
+					},
+				},
+			}
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+			testCase.mutate(t, db, channel)
+
+			var before model.Channel
+			require.NoError(t, db.First(&before, channel.Id).Error)
+			enabled := EnableChannelForHealthCheck(&channel, "key-a")
+
+			assert.Zero(t, enabled)
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			assert.Equal(t, before.Status, stored.Status)
+			assert.Equal(t, before.Key, stored.Key)
+			assert.Equal(t, before.GetTag(), stored.GetTag())
+			assert.Equal(t, before.OtherInfo, stored.OtherInfo)
+			assert.Equal(t, before.ChannelInfo, stored.ChannelInfo)
+			var ability model.Ability
+			require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+			assert.False(t, ability.Enabled)
+		})
+	}
+}
+
+func TestEnableChannelRestoresFinalMultiKeyMemoryRouting(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+	tag := "plan:support:multi-key-cache"
+	channel := model.Channel{
+		Id:     67,
+		Name:   "multi-key-cache",
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		Tag:    &tag,
+		Models: "gpt-3.5-turbo",
+		Group:  "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledReason: map[int]string{
+				0: "previous failure",
+			},
+			MultiKeyDisabledTime: map[int]int64{
+				0: 100,
+			},
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	common.MemoryCacheEnabled = true
+	model.InitChannelCache()
+
+	selected, err := model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, channel.Id, selected.Id)
+
+	apiError := types.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota. It will reset at 2026-09-30 23:59:59 +0800 CST."),
+		types.ErrorCode("AccountQuotaExceeded"),
+		http.StatusTooManyRequests,
+	)
+	require.True(t, DisableChannelForAPIError(types.ChannelError{
+		ChannelId:   channel.Id,
+		ChannelName: channel.Name,
+		IsMultiKey:  true,
+		AutoBan:     true,
+		UsingKey:    "key-b",
+	}, tag, apiError))
+
+	selected, err = model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
+	require.NoError(t, err)
+	assert.Nil(t, selected)
+
+	EnableChannel(channel.Id, "key-b", channel.Name)
+
+	selected, err = model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, channel.Id, selected.Id)
+	assert.Equal(t, common.ChannelStatusEnabled, selected.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, selected.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, selected.ChannelInfo.MultiKeyStatusList, 1)
+}
+
 func TestDisableChannelRefreshesEmptyCredentialPlanQuotaGenerationWithCache(t *testing.T) {
 	db := setupPlanQuotaDomainTest(t)
 

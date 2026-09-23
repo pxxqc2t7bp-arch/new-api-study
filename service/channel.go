@@ -392,7 +392,18 @@ func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) int {
 		return 0
 	}
 	if channel.ChannelInfo.IsMultiKey {
-		if !model.UpdateChannelStatus(channel.Id, usingKey, common.ChannelStatusEnabled, "") {
+		changed, err := model.UpdateMultiKeyChannelStatusIfUnchanged(
+			channel,
+			channel.GetTag(),
+			usingKey,
+			common.ChannelStatusEnabled,
+			"",
+		)
+		if err != nil {
+			common.SysError(fmt.Sprintf("failed to recover multi-key channel from health-check snapshot: channel_id=%d error=%v", channel.Id, err))
+			return 0
+		}
+		if !changed {
 			return 0
 		}
 		subject := fmt.Sprintf("通道「%s」（#%d）已被启用", channel.Name, channel.Id)
