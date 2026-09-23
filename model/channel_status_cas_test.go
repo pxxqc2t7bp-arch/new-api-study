@@ -240,6 +240,39 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedRollsBackAbilityFailure(t *testi
 	assert.Equal(t, expectedOtherInfo, cached.OtherInfo)
 }
 
+func TestUpdateSingleKeyChannelStatusesIfUnchangedQuotesKeyWithoutInitializedColumns(t *testing.T) {
+	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+		"owner": "snapshot",
+	})
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	desired := *expected
+	desired.SetOtherInfo(map[string]any{
+		"owner":           "snapshot",
+		"quota_domain_id": "domain-a",
+		"quota_type":      "plan",
+	})
+
+	previousCommonKeyCol := commonKeyCol
+	commonKeyCol = ""
+	t.Cleanup(func() {
+		commonKeyCol = previousCommonKeyCol
+	})
+
+	changed, err := UpdateSingleKeyChannelStatusesIfUnchanged([]SingleKeyChannelStatusUpdate{{
+		Expected:  expected,
+		Status:    common.ChannelStatusAutoDisabled,
+		OtherInfo: desired.OtherInfo,
+	}})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	assert.Equal(t, desired.OtherInfo, stored.OtherInfo)
+	assert.False(t, ability.Enabled)
+}
+
 func TestUpdateMultiKeyChannelStatusIfUnchangedFencesSnapshot(t *testing.T) {
 	tests := []struct {
 		name   string
