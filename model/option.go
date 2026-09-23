@@ -3,6 +3,7 @@ package model
 import (
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -15,12 +16,18 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Option struct {
 	Key   string `json:"key" gorm:"primaryKey"`
 	Value string `json:"value"`
 }
+
+// optionPersistencePublishMutex serializes local option persistence with
+// publication. Callers must not enter an exported option writer while holding
+// it; locked paths use updateOptionMap directly to avoid reentrant deadlocks.
+var optionPersistencePublishMutex sync.Mutex
 
 func AllOption() ([]*Option, error) {
 	var options []*Option
@@ -198,6 +205,9 @@ func InitOptionMap() {
 }
 
 func loadOptionsFromDatabase() {
+	optionPersistencePublishMutex.Lock()
+	defer optionPersistencePublishMutex.Unlock()
+
 	options, _ := AllOption()
 	for _, option := range options {
 		err := updateOptionMap(option.Key, option.Value)
@@ -232,28 +242,36 @@ func UpdateOption(key string, value string) error {
 	if err := validateOptionValue(key, value); err != nil {
 		return err
 	}
-	// Save to database first
-	option := Option{
-		Key: key,
+	optionPersistencePublishMutex.Lock()
+	defer optionPersistencePublishMutex.Unlock()
+
+	if err := DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "key"}},
+		DoUpdates: clause.AssignmentColumns([]string{"value"}),
+	}).Create(&Option{Key: key, Value: value}).Error; err != nil {
+		return err
 	}
-	// https://gorm.io/docs/update.html#Save-All-Fields
-	DB.FirstOrCreate(&option, Option{Key: key})
-	option.Value = value
-	// Save is a combination function.
-	// If save value does not contain primary key, it will execute Create,
-	// otherwise it will execute Update (with all fields).
-	DB.Save(&option)
-	// Update OptionMap
 	return updateOptionMap(key, value)
 }
 
 // PublishOptionValue updates in-memory consumers for an option whose database
-// write has already committed.
-func PublishOptionValue(key string, value string) error {
-	if err := validateOptionValue(key, value); err != nil {
+// write has already committed. It re-reads under the option protocol so a
+// delayed publisher cannot overwrite a newer local write with a stale value.
+func PublishOptionValue(key string, _ string) error {
+	optionPersistencePublishMutex.Lock()
+	defer optionPersistencePublishMutex.Unlock()
+
+	var option Option
+	if err := DB.Where(clause.Eq{
+		Column: clause.Column{Name: "key"},
+		Value:  key,
+	}).First(&option).Error; err != nil {
 		return err
 	}
-	return updateOptionMap(key, value)
+	if err := validateOptionValue(key, option.Value); err != nil {
+		return err
+	}
+	return updateOptionMap(key, option.Value)
 }
 
 // UpdateOptionsBulk persists multiple key/value pairs in a single database
@@ -270,14 +288,15 @@ func UpdateOptionsBulk(values map[string]string) error {
 			return err
 		}
 	}
+	optionPersistencePublishMutex.Lock()
+	defer optionPersistencePublishMutex.Unlock()
+
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		for k, v := range values {
-			option := Option{Key: k}
-			if err := tx.FirstOrCreate(&option, Option{Key: k}).Error; err != nil {
-				return err
-			}
-			option.Value = v
-			if err := tx.Save(&option).Error; err != nil {
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "key"}},
+				DoUpdates: clause.AssignmentColumns([]string{"value"}),
+			}).Create(&Option{Key: k, Value: v}).Error; err != nil {
 				return err
 			}
 		}

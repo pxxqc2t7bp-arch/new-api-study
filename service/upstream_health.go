@@ -118,6 +118,20 @@ func IsManagedModelUnsupported(err *types.NewAPIError) bool {
 }
 
 func IsolateManagedRouteModel(channelID int, modelName string, reason string) (bool, error) {
+	return isolateManagedRouteModel(
+		channelID,
+		modelName,
+		reason,
+		model.PublishOptionValue,
+	)
+}
+
+func isolateManagedRouteModel(
+	channelID int,
+	modelName string,
+	reason string,
+	publishOptionValue func(string, string) error,
+) (bool, error) {
 	modelName = strings.TrimSpace(modelName)
 	if channelID <= 0 || modelName == "" {
 		return false, nil
@@ -145,12 +159,10 @@ func IsolateManagedRouteModel(channelID int, modelName string, reason string) (b
 	if !isolated {
 		return false, nil
 	}
-	if err := model.PublishOptionValue(managedModelExclusionsOption, optionValue); err != nil {
-		return true, err
-	}
+	publishErr := publishOptionValue(managedModelExclusionsOption, optionValue)
 	model.InitChannelCache()
 	invalidateManagedRouteAdminInfo(channelID)
-	return true, nil
+	return true, publishErr
 }
 
 func RecordManagedChannelFailure(channelError types.ChannelError, reason string) (bool, bool, error) {

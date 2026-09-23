@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func setupUpstreamRouteTest(t *testing.T) {
@@ -174,11 +175,11 @@ func TestIsolateManagedRouteModelLocksSourceGroupRouteChannel(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, isolated)
 	assert.Equal(t, []string{
+		"options",
 		"upstream_sources",
 		"upstream_groups",
 		"upstream_managed_routes",
 		"channels",
-		"options",
 	}, transactionalReads)
 
 	var storedChannel Channel
@@ -201,4 +202,79 @@ func TestIsolateManagedRouteModelLocksSourceGroupRouteChannel(t *testing.T) {
 	require.NoError(t, common.UnmarshalJsonStr(optionValue, &exclusions))
 	assert.Equal(t, []string{"gpt-a"}, exclusions["source:group"])
 	assert.Equal(t, []string{"gpt-existing"}, exclusions["source:other"])
+}
+
+func TestIsolateManagedRouteModelCreatesMissingOptionWithConflictSafeInsert(t *testing.T) {
+	setupUpstreamRouteTest(t)
+	require.NoError(t, DB.AutoMigrate(
+		&UpstreamSource{},
+		&UpstreamGroup{},
+		&Channel{},
+		&Ability{},
+		&Option{},
+	))
+	source := UpstreamSource{
+		Key:        "source",
+		Name:       "Source",
+		ConsoleURL: "https://example.com",
+		Enabled:    true,
+	}
+	require.NoError(t, DB.Create(&source).Error)
+	group := UpstreamGroup{
+		SourceID:            source.ID,
+		ExternalID:          "group",
+		Name:                "Group",
+		Platform:            "openai",
+		EffectiveMultiplier: 0.1,
+		Models:              `["gpt-a"]`,
+	}
+	require.NoError(t, DB.Create(&group).Error)
+	channel := Channel{
+		Name:   "managed",
+		Key:    "credential",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-a",
+		Group:  "default",
+	}
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	route := UpstreamManagedRoute{
+		SourceID:        source.ID,
+		ExternalGroupID: group.ExternalID,
+		Platform:        group.Platform,
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           UpstreamRouteStateActive,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+
+	conflictSafeInsert := false
+	const callbackName = "test:capture_managed_model_option_create"
+	require.NoError(t, DB.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil || tx.Statement.Table != "options" {
+			return
+		}
+		onConflict, ok := tx.Statement.Clauses["ON CONFLICT"]
+		if !ok {
+			return
+		}
+		expression, ok := onConflict.Expression.(clause.OnConflict)
+		conflictSafeInsert = ok && expression.DoNothing
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, DB.Callback().Create().Remove(callbackName))
+	})
+
+	isolated, optionValue, err := IsolateManagedRouteModel(
+		&route,
+		"gpt-a",
+		"status_code=404",
+		1_788_320_000,
+		"test.missing_managed_model_exclusions",
+	)
+
+	require.NoError(t, err)
+	assert.True(t, isolated)
+	assert.True(t, conflictSafeInsert)
+	assert.JSONEq(t, `{"source:group":["gpt-a"]}`, optionValue)
 }

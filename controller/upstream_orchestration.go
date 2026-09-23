@@ -445,7 +445,20 @@ type upstreamProbeSummary struct {
 }
 
 func runDueUpstreamProbeTask(ctx context.Context) (upstreamProbeSummary, error) {
+	return runDueUpstreamProbeTaskWithDependencies(
+		ctx,
+		service.ReconcileManagedUpstreams,
+		service.NotifyManagedChannelRecovered,
+	)
+}
+
+func runDueUpstreamProbeTaskWithDependencies(
+	ctx context.Context,
+	reconcileManagedUpstreams func(time.Time) (service.UpstreamReconcileSummary, error),
+	notifyManagedChannelRecovered func(*model.Channel),
+) (upstreamProbeSummary, error) {
 	summary := upstreamProbeSummary{}
+	activatedChannelIDs := make([]int, 0)
 	now := common.GetTimestamp()
 	var routes []model.UpstreamManagedRoute
 	if err := model.DB.Where(
@@ -494,7 +507,7 @@ func runDueUpstreamProbeTask(ctx context.Context) (upstreamProbeSummary, error) 
 			if transition.Applied &&
 				before != model.UpstreamRouteStateActive &&
 				transition.State == model.UpstreamRouteStateActive {
-				summary.Enabled++
+				activatedChannelIDs = append(activatedChannelIDs, route.ChannelID)
 			}
 			continue
 		}
@@ -517,9 +530,38 @@ func runDueUpstreamProbeTask(ctx context.Context) (upstreamProbeSummary, error) 
 		}
 		summary.Failed++
 	}
-	if summary.Enabled > 0 {
-		if _, err := service.ReconcileManagedUpstreams(time.Now()); err != nil {
+	if len(activatedChannelIDs) > 0 {
+		if _, err := reconcileManagedUpstreams(time.Now()); err != nil {
 			return summary, err
+		}
+		seen := make(map[int]struct{}, len(activatedChannelIDs))
+		for _, channelID := range activatedChannelIDs {
+			if _, exists := seen[channelID]; exists {
+				continue
+			}
+			seen[channelID] = struct{}{}
+
+			var channel model.Channel
+			if err := model.DB.First(&channel, channelID).Error; err != nil {
+				return summary, err
+			}
+			if channel.Status != common.ChannelStatusEnabled {
+				continue
+			}
+			var ability model.Ability
+			err := model.DB.Where(
+				"channel_id = ? AND enabled = ?",
+				channelID,
+				true,
+			).First(&ability).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				continue
+			}
+			if err != nil {
+				return summary, err
+			}
+			summary.Enabled++
+			notifyManagedChannelRecovered(&channel)
 		}
 	}
 	return summary, nil

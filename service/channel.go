@@ -346,6 +346,28 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
 	}
 }
 
+// NotifyManagedChannelRecovered sends the same recovery notification as a
+// direct channel enable after orchestration has persisted the final state.
+func NotifyManagedChannelRecovered(channel *model.Channel) {
+	notifyManagedChannelRecovered(channel, NotifyRootUser)
+}
+
+func notifyManagedChannelRecovered(
+	channel *model.Channel,
+	notifyRootUser func(string, string, string),
+) {
+	if channel == nil || channel.Id <= 0 {
+		return
+	}
+	subject := fmt.Sprintf("通道「%s」（#%d）已被启用", channel.Name, channel.Id)
+	content := fmt.Sprintf("通道「%s」（#%d）已被启用", channel.Name, channel.Id)
+	notifyRootUser(
+		formatNotifyType(channel.Id, common.ChannelStatusEnabled),
+		subject,
+		content,
+	)
+}
+
 // EnableChannelForHealthCheck recovers only the state observed before the
 // probe. Manual and internal callers that intentionally act on current state
 // should continue using EnableChannel.

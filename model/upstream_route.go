@@ -24,6 +24,8 @@ const (
 	UpstreamRouteStateRetained    = "retained"
 )
 
+var errStaleManagedRouteIsolation = errors.New("managed route isolation snapshot changed")
+
 type UpstreamManagedRoute struct {
 	ID                   int64   `json:"id" gorm:"primaryKey"`
 	SourceID             int64   `json:"source_id" gorm:"not null;uniqueIndex:idx_upstream_route_identity,priority:1;index"`
@@ -260,10 +262,29 @@ func IsolateManagedRouteModel(
 		return false, "", err
 	}
 
+	// Lock order: option protocol, channel status locks, then database rows in
+	// option/source/group/route/channel order. Do not call an exported option
+	// writer while this mutex is held.
+	optionPersistencePublishMutex.Lock()
+	defer optionPersistencePublishMutex.Unlock()
+
 	optionValue := ""
 	isolated, err := withChannelStatusLocks(expectedRoute.ChannelID, func() (bool, error) {
 		isolated := false
 		err := DB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "key"}},
+				DoNothing: true,
+			}).Create(&Option{Key: exclusionOptionKey, Value: "{}"}).Error; err != nil {
+				return err
+			}
+			var option Option
+			if err := lockForUpdate(tx).
+				Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: exclusionOptionKey}).
+				First(&option).Error; err != nil {
+				return err
+			}
+
 			var source UpstreamSource
 			if err := lockForUpdate(tx).
 				Where("id = ?", expectedRoute.SourceID).
@@ -283,7 +304,7 @@ func IsolateManagedRouteModel(
 				Where("id = ?", expectedRoute.ID).
 				First(&route).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return nil
+					return errStaleManagedRouteIsolation
 				}
 				return err
 			}
@@ -292,7 +313,7 @@ func IsolateManagedRouteModel(
 				route.Platform != group.Platform ||
 				route.Detached ||
 				!reflect.DeepEqual(route, *expectedRoute) {
-				return nil
+				return errStaleManagedRouteIsolation
 			}
 
 			var channel Channel
@@ -309,19 +330,8 @@ func IsolateManagedRouteModel(
 			}
 			groupModels, groupRemoved := removeManagedRouteModel(strings.Join(groupModels, ","), modelName)
 
-			var option Option
-			optionExists := true
-			if err := lockForUpdate(tx).
-				Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: exclusionOptionKey}).
-				First(&option).Error; err != nil {
-				if !errors.Is(err, gorm.ErrRecordNotFound) {
-					return err
-				}
-				optionExists = false
-				option.Key = exclusionOptionKey
-			}
 			exclusions := make(map[string][]string)
-			if optionExists && strings.TrimSpace(option.Value) != "" {
+			if strings.TrimSpace(option.Value) != "" {
 				if err := common.UnmarshalJsonStr(option.Value, &exclusions); err != nil {
 					return err
 				}
@@ -336,6 +346,8 @@ func IsolateManagedRouteModel(
 				}
 			}
 			if !exclusionAdded && !channelRemoved && !groupRemoved {
+				optionValue = option.Value
+				isolated = true
 				return nil
 			}
 
@@ -382,13 +394,9 @@ func IsolateManagedRouteModel(
 					return err
 				}
 				option.Value = string(encoded)
-				if optionExists {
-					if err := tx.Model(&Option{}).
-						Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: exclusionOptionKey}).
-						Update("value", option.Value).Error; err != nil {
-						return err
-					}
-				} else if err := tx.Create(&option).Error; err != nil {
+				if err := tx.Model(&Option{}).
+					Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: exclusionOptionKey}).
+					Update("value", option.Value).Error; err != nil {
 					return err
 				}
 			}
@@ -398,6 +406,9 @@ func IsolateManagedRouteModel(
 		})
 		return isolated, err
 	})
+	if errors.Is(err, errStaleManagedRouteIsolation) {
+		return false, "", nil
+	}
 	return isolated, optionValue, err
 }
 

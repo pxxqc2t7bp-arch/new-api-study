@@ -397,14 +397,20 @@ func TestIsolateManagedRouteModelRejectsStaleRouteWithoutExclusion(t *testing.T)
 				require.NoError(t, fixture.db.Callback().Query().Remove(callbackName))
 			})
 
-			isolated, err := IsolateManagedRouteModel(
+			publishCalls := 0
+			isolated, err := isolateManagedRouteModel(
 				fixture.channel.Id,
 				"gpt-remove",
 				"status_code=404",
+				func(string, string) error {
+					publishCalls++
+					return nil
+				},
 			)
 
 			require.NoError(t, err)
 			assert.False(t, isolated)
+			assert.Zero(t, publishCalls)
 			require.True(t, injected)
 			assertManagedModelIsolationUnchanged(t, fixture)
 			var storedRoute model.UpstreamManagedRoute
@@ -474,6 +480,127 @@ func TestIsolateManagedRouteModelPersistsExclusionWhenModelIsTemporarilyAbsent(t
 	require.NoError(t, fixture.db.First(&storedRoute, fixture.route.ID).Error)
 	assert.Equal(t, "status_code=404", storedRoute.LastReason)
 	assert.NotZero(t, storedRoute.LastFailureAt)
+	cached, cacheErr := model.CacheGetChannel(fixture.channel.Id)
+	require.NoError(t, cacheErr)
+	assert.Equal(t, "gpt-keep", cached.Models)
+	_, adminCacheExists := managedRouteAdminCache.Load(fixture.channel.Id)
+	assert.False(t, adminCacheExists)
+}
+
+func TestIsolateManagedRouteModelAlreadyAppliedRefreshesPublishedCaches(t *testing.T) {
+	fixture := setupManagedModelIsolationFixture(t)
+	latestOptionValue := `{
+		"source:group":["gpt-remove"],
+		"source:other":["gpt-existing"]
+	}`
+	require.NoError(t, fixture.db.Model(&model.Option{}).
+		Where("key = ?", managedModelExclusionsOption).
+		Update("value", latestOptionValue).Error)
+	require.NoError(t, fixture.db.Model(&model.Channel{}).
+		Where("id = ?", fixture.channel.Id).
+		Update("models", "gpt-keep").Error)
+	fixture.channel.Models = "gpt-keep"
+	require.NoError(t, fixture.channel.UpdateAbilities(fixture.db))
+	require.NoError(t, fixture.db.Model(&model.UpstreamGroup{}).
+		Where("id = ?", fixture.group.ID).
+		Update("models", `["gpt-keep"]`).Error)
+
+	common.OptionMapRWMutex.Lock()
+	common.OptionMap[managedModelExclusionsOption] = fixture.initialOptionValue
+	common.OptionMapRWMutex.Unlock()
+	managedRouteAdminCache.Store(fixture.channel.Id, managedRouteAdminCacheEntry{
+		info:      map[string]any{"state": "stale"},
+		expiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+
+	isolated, err := IsolateManagedRouteModel(
+		fixture.channel.Id,
+		"gpt-remove",
+		"status_code=404",
+	)
+
+	require.NoError(t, err)
+	assert.True(t, isolated)
+	common.OptionMapRWMutex.RLock()
+	inMemoryOption := common.OptionMap[managedModelExclusionsOption]
+	common.OptionMapRWMutex.RUnlock()
+	assert.JSONEq(t, latestOptionValue, inMemoryOption)
+	cached, cacheErr := model.CacheGetChannel(fixture.channel.Id)
+	require.NoError(t, cacheErr)
+	assert.Equal(t, "gpt-keep", cached.Models)
+	_, adminCacheExists := managedRouteAdminCache.Load(fixture.channel.Id)
+	assert.False(t, adminCacheExists)
+}
+
+func TestIsolateManagedRouteModelDoesNotPublishOverNewerOptionUpdate(t *testing.T) {
+	fixture := setupManagedModelIsolationFixture(t)
+	publishStarted := make(chan struct{})
+	releasePublish := make(chan struct{})
+	publish := func(key string, value string) error {
+		close(publishStarted)
+		<-releasePublish
+		return model.PublishOptionValue(key, value)
+	}
+
+	type isolationResult struct {
+		isolated bool
+		err      error
+	}
+	result := make(chan isolationResult, 1)
+	go func() {
+		isolated, err := isolateManagedRouteModel(
+			fixture.channel.Id,
+			"gpt-remove",
+			"status_code=404",
+			publish,
+		)
+		result <- isolationResult{isolated: isolated, err: err}
+	}()
+	<-publishStarted
+
+	newerOptionValue := `{
+		"source:group":["gpt-remove"],
+		"source:newer":["gpt-newer"],
+		"source:other":["gpt-existing"]
+	}`
+	require.NoError(t, model.UpdateOption(
+		managedModelExclusionsOption,
+		newerOptionValue,
+	))
+	close(releasePublish)
+
+	isolation := <-result
+	require.NoError(t, isolation.err)
+	assert.True(t, isolation.isolated)
+	var storedOption model.Option
+	require.NoError(t, fixture.db.First(
+		&storedOption,
+		"key = ?",
+		managedModelExclusionsOption,
+	).Error)
+	assert.JSONEq(t, newerOptionValue, storedOption.Value)
+	common.OptionMapRWMutex.RLock()
+	inMemoryOption := common.OptionMap[managedModelExclusionsOption]
+	common.OptionMapRWMutex.RUnlock()
+	assert.JSONEq(t, newerOptionValue, inMemoryOption)
+}
+
+func TestIsolateManagedRouteModelRefreshesCachesAfterPublishError(t *testing.T) {
+	fixture := setupManagedModelIsolationFixture(t)
+	forcedErr := errors.New("forced managed option publish failure")
+	publish := func(string, string) error {
+		return forcedErr
+	}
+
+	isolated, err := isolateManagedRouteModel(
+		fixture.channel.Id,
+		"gpt-remove",
+		"status_code=404",
+		publish,
+	)
+
+	require.ErrorIs(t, err, forcedErr)
+	assert.True(t, isolated)
 	cached, cacheErr := model.CacheGetChannel(fixture.channel.Id)
 	require.NoError(t, cacheErr)
 	assert.Equal(t, "gpt-keep", cached.Models)

@@ -632,6 +632,17 @@ func TestRunChannelTestTaskFailsClosedWhenManagedRouteQueryFails(t *testing.T) {
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, channel.AddAbilities(nil))
 
+	forcedErr := errors.New("forced managed route query failure")
+	const callbackName = "test:fail_managed_route_query"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil && tx.Statement.Table == "upstream_managed_routes" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Query().Remove(callbackName))
+	})
+
 	summary, err := runChannelTestTask(
 		context.Background(),
 		operation_setting.ChannelTestModePassiveRecovery,
@@ -639,7 +650,7 @@ func TestRunChannelTestTaskFailsClosedWhenManagedRouteQueryFails(t *testing.T) {
 		nil,
 	)
 
-	require.Error(t, err)
+	require.ErrorIs(t, err, forcedErr)
 	assert.Zero(t, summary.Tested)
 	assert.Zero(t, requests.Load())
 }
