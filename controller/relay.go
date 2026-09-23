@@ -28,7 +28,6 @@ import (
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
-	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/samber/lo"
 
 	"github.com/gin-gonic/gin"
@@ -296,7 +295,7 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 			relayInfo.LastError = nil
 			channelID := channel.Id
 			elapsed := time.Since(attemptStartedAt)
-			gopool.Go(func() {
+			service.RunRelayAsync(c, func() {
 				service.RecordManagedChannelSuccess(channelID, elapsed)
 			})
 			return
@@ -322,7 +321,7 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 		logger.LogInfo(c, retryLogStr)
 	}
 	if newAPIError != nil {
-		gopool.Go(func() {
+		service.RunRelayAsync(c, func() {
 			perfmetrics.RecordRelaySample(relayInfo, false, 0)
 		})
 	}
@@ -498,7 +497,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, observ
 	}
 	if !handledManagedUnsupported && !handledPlanQuota && isManaged && channelError.AutoBan && service.ShouldRecordManagedRouteFailure(err) {
 		reason := err.ErrorWithStatusCode()
-		gopool.Go(func() {
+		service.RunRelayAsync(c, func() {
 			if _, _, recordErr := service.RecordManagedChannelFailure(channelError, reason); recordErr != nil {
 				common.SysError(fmt.Sprintf(
 					"failed to record managed channel failure: channel_id=%d error=%v",
@@ -508,7 +507,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, observ
 			}
 		})
 	} else if !handledPlanQuota && !isManaged && service.ShouldDisableChannel(err) && channelError.AutoBan {
-		gopool.Go(func() {
+		service.RunRelayAsync(c, func() {
 			service.DisableChannel(channelError, err.ErrorWithStatusCode())
 		})
 	}

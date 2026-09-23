@@ -13,9 +13,9 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
-	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -202,6 +202,12 @@ func setupRelayFailoverTest(t *testing.T, memoryCache bool) (*gin.Engine, *model
 	}).Error)
 
 	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		service.SetRelayAsyncRunner(c, func(task func()) {
+			task()
+		})
+		c.Next()
+	})
 	SetRelayRouter(engine)
 	return engine, user
 }
@@ -276,16 +282,6 @@ func addManagedFailoverRoute(t *testing.T, channel model.Channel) model.Upstream
 func requireEventually(t *testing.T, assertion func() bool) {
 	t.Helper()
 	require.Eventually(t, assertion, 2*time.Second, 10*time.Millisecond)
-}
-
-func relayGoPoolDrain(t *testing.T) func() {
-	t.Helper()
-	return func() {
-		t.Helper()
-		require.Eventually(t, func() bool {
-			return gopool.WorkerCount() == 0
-		}, 2*time.Second, 10*time.Millisecond)
-	}
 }
 
 type failoverAdminInfo struct {
@@ -474,7 +470,6 @@ func TestRelayChannelFailoverCapsAttemptsAtFivePriorities(t *testing.T) {
 
 func TestRelayChannelFailoverFromSlow429StartsBudgetAtFailover(t *testing.T) {
 	engine, _ := setupRelayFailoverTest(t, false)
-	defer relayGoPoolDrain(t)()
 	common.AutomaticDisableChannelEnabled = false
 	enableManagedOrchestrationForFailoverTest(t, 1)
 	trace := &failoverCallTrace{}
@@ -496,7 +491,6 @@ func TestRelayChannelFailoverFromSlow429StartsBudgetAtFailover(t *testing.T) {
 
 func TestRelayChannelFailoverStopsWhenBudgetExpires(t *testing.T) {
 	engine, user := setupRelayFailoverTest(t, false)
-	defer relayGoPoolDrain(t)()
 	enableManagedOrchestrationForFailoverTest(t, 1)
 	trace := &failoverCallTrace{}
 	primary := newFailoverUpstream(t, "primary", http.StatusInternalServerError, trace)
