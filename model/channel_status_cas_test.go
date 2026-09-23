@@ -1034,10 +1034,12 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 			previousMemoryCacheEnabled := common.MemoryCacheEnabled
 			DB = database
 			common.SetDatabaseTypes(test.databaseType, previousLogType)
+			initCol()
 			common.MemoryCacheEnabled = false
 			t.Cleanup(func() {
 				DB = previousDB
 				common.SetDatabaseTypes(previousMainType, previousLogType)
+				initCol()
 				common.MemoryCacheEnabled = previousMemoryCacheEnabled
 			})
 

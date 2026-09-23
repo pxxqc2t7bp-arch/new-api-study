@@ -1007,7 +1007,7 @@ func UpdateSingleKeyChannelStatusesIfUnchanged(updates []SingleKeyChannelStatusU
 				expected := update.Expected
 				channelQuery := tx.Model(&Channel{}).
 					Where("id = ?", expected.Id).
-					Where("key = ?", expected.Key).
+					Where(commonKeyCol+" = ?", expected.Key).
 					Where("status = ?", expected.Status).
 					Where("other_info = ?", expected.OtherInfo)
 				if expected.Tag == nil {
