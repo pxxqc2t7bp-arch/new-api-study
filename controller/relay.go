@@ -807,11 +807,15 @@ func executeTaskSubmissionWith(
 		}
 
 		if !taskErr.LocalError {
+			errorCode := types.ErrorCode(taskErr.Code)
+			if errorCode == "" {
+				errorCode = types.ErrorCodeBadResponseStatusCode
+			}
 			processChannelError(c,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
 				channel.GetTag(),
-				types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode))
+				types.NewOpenAIError(taskErr.Error, errorCode, taskErr.StatusCode))
 		}
 
 		willRetry := shouldRetryTaskRelay(c, channel.Id, taskErr, maxTaskRetries-retryParam.GetRetry())

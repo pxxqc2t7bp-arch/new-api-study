@@ -652,14 +652,16 @@ func rankManagedRoutes(
 				models = strings.Join(routeModels, ",")
 			}
 			changed, err := model.UpdateManagedChannelIfUnchanged(channel, model.ManagedChannelUpdate{
-				RouteID:             route.ID,
-				Rank:                rank,
-				EffectiveMultiplier: group.EffectiveMultiplier,
-				UpdatedAt:           now.Unix(),
-				Priority:            priority,
-				BaseURL:             selectedEndpoint,
-				Models:              models,
-				Status:              desiredStatus,
+				RouteID:               route.ID,
+				ExpectedRouteState:    route.State,
+				ExpectedRouteDetached: route.Detached,
+				Rank:                  rank,
+				EffectiveMultiplier:   group.EffectiveMultiplier,
+				UpdatedAt:             now.Unix(),
+				Priority:              priority,
+				BaseURL:               selectedEndpoint,
+				Models:                models,
+				Status:                desiredStatus,
 			})
 			if err != nil {
 				return updated, err

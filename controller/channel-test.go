@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,9 +37,17 @@ import (
 )
 
 type testResult struct {
-	context     *gin.Context
-	localErr    error
-	newAPIError *types.NewAPIError
+	context         *gin.Context
+	localErr        error
+	newAPIError     *types.NewAPIError
+	upstreamFailure bool
+}
+
+func isUpstreamProbeFailure(ctx context.Context, err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return ctx == nil || ctx.Err() == nil
 }
 
 func normalizeChannelTestEndpoint(channel *model.Channel, testModel string, endpointType string) string {
@@ -445,9 +454,10 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
 		return testResult{
-			context:     c,
-			localErr:    err,
-			newAPIError: types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError),
+			context:         c,
+			localErr:        err,
+			newAPIError:     types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError),
+			upstreamFailure: isUpstreamProbeFailure(ctx, err),
 		}
 	}
 	var httpResp *http.Response
@@ -466,42 +476,47 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 				err,
 			))
 			return testResult{
-				context:     c,
-				localErr:    err,
-				newAPIError: types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
+				context:         c,
+				localErr:        err,
+				newAPIError:     types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError),
+				upstreamFailure: isUpstreamProbeFailure(ctx, err),
 			}
 		}
 	}
 	usageA, respErr := adaptor.DoResponse(c, httpResp, info)
 	if respErr != nil {
 		return testResult{
-			context:     c,
-			localErr:    respErr,
-			newAPIError: respErr,
+			context:         c,
+			localErr:        respErr,
+			newAPIError:     respErr,
+			upstreamFailure: isUpstreamProbeFailure(ctx, respErr),
 		}
 	}
 	usage, usageErr := coerceTestUsage(usageA, isStream, info.GetEstimatePromptTokens())
 	if usageErr != nil {
 		return testResult{
-			context:     c,
-			localErr:    usageErr,
-			newAPIError: types.NewOpenAIError(usageErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
+			context:         c,
+			localErr:        usageErr,
+			newAPIError:     types.NewOpenAIError(usageErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
+			upstreamFailure: isUpstreamProbeFailure(ctx, usageErr),
 		}
 	}
 	result := w.Result()
 	respBody, err := readTestResponseBody(result.Body, isStream)
 	if err != nil {
 		return testResult{
-			context:     c,
-			localErr:    err,
-			newAPIError: types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError),
+			context:         c,
+			localErr:        err,
+			newAPIError:     types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError),
+			upstreamFailure: isUpstreamProbeFailure(ctx, err),
 		}
 	}
 	if bodyErr := validateTestResponseBody(respBody, isStream); bodyErr != nil {
 		return testResult{
-			context:     c,
-			localErr:    bodyErr,
-			newAPIError: types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
+			context:         c,
+			localErr:        bodyErr,
+			newAPIError:     types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
+			upstreamFailure: isUpstreamProbeFailure(ctx, bodyErr),
 		}
 	}
 	info.SetEstimatePromptTokens(usage.PromptTokens)
@@ -934,27 +949,32 @@ func buildHealthCheckProbeChannel(channel *model.Channel) (*model.Channel, strin
 	}
 
 	keys := channel.GetKeys()
-	selectedIndex := -1
-	var selectedDisabledTime int64
+	autoDisabledIndexes := make([]int, 0, len(keys))
 	for index := range keys {
 		status, exists := channel.ChannelInfo.MultiKeyStatusList[index]
 		if !exists || status == common.ChannelStatusEnabled {
 			return channel, "", false
 		}
-		if status != common.ChannelStatusAutoDisabled {
-			continue
-		}
-		disabledTime := channel.ChannelInfo.MultiKeyDisabledTime[index]
-		if selectedIndex == -1 ||
-			disabledTime < selectedDisabledTime ||
-			disabledTime == selectedDisabledTime && index < selectedIndex {
-			selectedIndex = index
-			selectedDisabledTime = disabledTime
+		if status == common.ChannelStatusAutoDisabled {
+			autoDisabledIndexes = append(autoDisabledIndexes, index)
 		}
 	}
-	if selectedIndex == -1 {
+	if len(autoDisabledIndexes) == 0 {
 		return channel, "", false
 	}
+	sort.Slice(autoDisabledIndexes, func(i, j int) bool {
+		leftTime := channel.ChannelInfo.MultiKeyDisabledTime[autoDisabledIndexes[i]]
+		rightTime := channel.ChannelInfo.MultiKeyDisabledTime[autoDisabledIndexes[j]]
+		if leftTime != rightTime {
+			return leftTime < rightTime
+		}
+		return autoDisabledIndexes[i] < autoDisabledIndexes[j]
+	})
+	cursor := channel.ChannelInfo.MultiKeyRecoveryIndex
+	if cursor < 0 {
+		cursor = 0
+	}
+	selectedIndex := autoDisabledIndexes[cursor%len(autoDisabledIndexes)]
 
 	probe := *channel
 	probe.ChannelInfo = channel.ChannelInfo
@@ -980,7 +1000,7 @@ func buildHealthCheckProbeChannel(channel *model.Channel) (*model.Channel, strin
 func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, testUserID int, allowDisable bool, disableThreshold int64) channelTestSummary {
 	summary := channelTestSummary{}
 	isChannelEnabled := channel.Status == common.ChannelStatusEnabled
-	probeChannel, _, isolatedProbe := buildHealthCheckProbeChannel(channel)
+	probeChannel, probeKey, isolatedProbe := buildHealthCheckProbeChannel(channel)
 	if !isolatedProbe {
 		probeChannel = channel
 	}
@@ -989,6 +1009,15 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 	milliseconds := time.Since(tik).Milliseconds()
 	if ctx.Err() != nil {
 		return summary
+	}
+	if isolatedProbe && result.upstreamFailure {
+		if _, err := model.AdvanceMultiKeyRecoveryCursorIfUnchanged(channel, probeKey); err != nil {
+			common.SysError(fmt.Sprintf(
+				"failed to advance multi-key recovery cursor: channel_id=%d error=%v",
+				channel.Id,
+				err,
+			))
+		}
 	}
 
 	summary.Tested++

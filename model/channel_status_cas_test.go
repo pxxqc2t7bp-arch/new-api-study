@@ -77,6 +77,7 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedUpdatesChannelAndAbility(t *test
 	cached, err := CacheGetChannel(channel.Id)
 	require.NoError(t, err)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, cached.Status)
+	assert.Equal(t, desiredOtherInfo, cached.OtherInfo)
 }
 
 func TestUpdateSingleKeyChannelStatusIfUnchangedRejectsStaleSnapshot(t *testing.T) {
@@ -306,6 +307,76 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedFencesSnapshot(t *testing.T) {
 	}
 }
 
+func TestAdvanceMultiKeyRecoveryCursorIfUnchangedFencesSnapshot(t *testing.T) {
+	t.Run("advances only recovery cursor", func(t *testing.T) {
+		setupChannelStatusTest(t)
+		tag := "plan:recovery:cursor"
+		channel := Channel{
+			Name: "multi-key-recovery-cursor", Key: "key-a\nkey-b",
+			Status: common.ChannelStatusAutoDisabled, Tag: &tag,
+			Models: "gpt-3.5-turbo", Group: "default",
+			ChannelInfo: ChannelInfo{
+				IsMultiKey:             true,
+				MultiKeySize:           2,
+				MultiKeyPollingIndex:   1,
+				MultiKeyRecoveryIndex:  0,
+				MultiKeyStatusList:     map[int]int{0: common.ChannelStatusAutoDisabled, 1: common.ChannelStatusAutoDisabled},
+				MultiKeyDisabledTime:   map[int]int64{0: 100, 1: 200},
+				MultiKeyDisabledReason: map[int]string{0: "first", 1: "second"},
+			},
+		}
+		channel.SetOtherInfo(map[string]any{"owner": "preserved"})
+		require.NoError(t, DB.Create(&channel).Error)
+		require.NoError(t, channel.AddAbilities(nil))
+		expected, err := GetChannelById(channel.Id, true)
+		require.NoError(t, err)
+
+		changed, err := AdvanceMultiKeyRecoveryCursorIfUnchanged(expected, "key-a")
+
+		require.NoError(t, err)
+		require.True(t, changed)
+		stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+		assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+		assert.Equal(t, channel.OtherInfo, stored.OtherInfo)
+		assert.Equal(t, 1, stored.ChannelInfo.MultiKeyPollingIndex)
+		assert.Equal(t, 1, stored.ChannelInfo.MultiKeyRecoveryIndex)
+		assert.Equal(t, channel.ChannelInfo.MultiKeyStatusList, stored.ChannelInfo.MultiKeyStatusList)
+		assert.False(t, ability.Enabled)
+	})
+
+	t.Run("rejects stale channel info", func(t *testing.T) {
+		setupChannelStatusTest(t)
+		channel := Channel{
+			Name: "multi-key-recovery-stale", Key: "key-a\nkey-b",
+			Status: common.ChannelStatusAutoDisabled,
+			Models: "gpt-3.5-turbo", Group: "default",
+			ChannelInfo: ChannelInfo{
+				IsMultiKey:           true,
+				MultiKeySize:         2,
+				MultiKeyStatusList:   map[int]int{0: common.ChannelStatusAutoDisabled, 1: common.ChannelStatusAutoDisabled},
+				MultiKeyDisabledTime: map[int]int64{0: 100, 1: 200},
+			},
+		}
+		require.NoError(t, DB.Create(&channel).Error)
+		require.NoError(t, channel.AddAbilities(nil))
+		expected, err := GetChannelById(channel.Id, true)
+		require.NoError(t, err)
+		concurrentInfo := expected.ChannelInfo
+		concurrentInfo.MultiKeyRecoveryIndex = 1
+		require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).
+			Update("channel_info", concurrentInfo).Error)
+
+		changed, err := AdvanceMultiKeyRecoveryCursorIfUnchanged(expected, "key-a")
+
+		require.NoError(t, err)
+		assert.False(t, changed)
+		stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+		assert.Equal(t, 1, stored.ChannelInfo.MultiKeyRecoveryIndex)
+		assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+		assert.False(t, ability.Enabled)
+	})
+}
+
 func TestUpdateMultiKeyChannelStatusIfUnchangedRollsBackPlanDeadlineWithAbilityFailure(t *testing.T) {
 	setupChannelStatusTest(t)
 	tag := "plan:managed:deadline-rollback"
@@ -513,14 +584,16 @@ func TestUpdateManagedChannelIfUnchangedPreservesConcurrentStatusOwner(t *testin
 		Update("enabled", false).Error)
 
 	update := ManagedChannelUpdate{
-		RouteID:             route.ID,
-		Rank:                1,
-		EffectiveMultiplier: 0.1,
-		UpdatedAt:           1_788_320_000,
-		Priority:            999,
-		BaseURL:             "https://api.example.com",
-		Models:              "gpt-4.1",
-		Status:              common.ChannelStatusEnabled,
+		RouteID:               route.ID,
+		ExpectedRouteState:    route.State,
+		ExpectedRouteDetached: route.Detached,
+		Rank:                  1,
+		EffectiveMultiplier:   0.1,
+		UpdatedAt:             1_788_320_000,
+		Priority:              999,
+		BaseURL:               "https://api.example.com",
+		Models:                "gpt-4.1",
+		Status:                common.ChannelStatusEnabled,
 	}
 	changed, err := UpdateManagedChannelIfUnchanged(expected, update)
 	require.NoError(t, err)
@@ -626,14 +699,16 @@ func TestUpdateManagedChannelIfUnchangedRejectsConcurrentManagedFieldChanges(t *
 			testCase.mutate(t, channel)
 
 			changed, err := UpdateManagedChannelIfUnchanged(expected, ManagedChannelUpdate{
-				RouteID:             route.ID,
-				Rank:                1,
-				EffectiveMultiplier: 0.1,
-				UpdatedAt:           1_788_320_000,
-				Priority:            999,
-				BaseURL:             "https://desired.example.com",
-				Models:              "desired-model",
-				Status:              common.ChannelStatusEnabled,
+				RouteID:               route.ID,
+				ExpectedRouteState:    route.State,
+				ExpectedRouteDetached: route.Detached,
+				Rank:                  1,
+				EffectiveMultiplier:   0.1,
+				UpdatedAt:             1_788_320_000,
+				Priority:              999,
+				BaseURL:               "https://desired.example.com",
+				Models:                "desired-model",
+				Status:                common.ChannelStatusEnabled,
 			})
 			require.NoError(t, err)
 			assert.False(t, changed)
@@ -669,14 +744,16 @@ func TestUpdateManagedChannelIfUnchangedRefreshesManagedFieldsInCache(t *testing
 	expected, err := GetChannelById(channel.Id, true)
 	require.NoError(t, err)
 	changed, err := UpdateManagedChannelIfUnchanged(expected, ManagedChannelUpdate{
-		RouteID:             route.ID,
-		Rank:                1,
-		EffectiveMultiplier: 0.1,
-		UpdatedAt:           1_788_320_000,
-		Priority:            999,
-		BaseURL:             "https://desired.example.com",
-		Models:              "desired-model",
-		Status:              common.ChannelStatusEnabled,
+		RouteID:               route.ID,
+		ExpectedRouteState:    route.State,
+		ExpectedRouteDetached: route.Detached,
+		Rank:                  1,
+		EffectiveMultiplier:   0.1,
+		UpdatedAt:             1_788_320_000,
+		Priority:              999,
+		BaseURL:               "https://desired.example.com",
+		Models:                "desired-model",
+		Status:                common.ChannelStatusEnabled,
 	})
 	require.NoError(t, err)
 	require.True(t, changed)
@@ -731,14 +808,16 @@ func TestUpdateManagedChannelIfUnchangedRejectsEnableForInactiveRoute(t *testing
 			require.NoError(t, err)
 
 			changed, err := UpdateManagedChannelIfUnchanged(expected, ManagedChannelUpdate{
-				RouteID:             route.ID,
-				Rank:                1,
-				EffectiveMultiplier: 0.1,
-				UpdatedAt:           1_788_320_000,
-				Priority:            999,
-				BaseURL:             "https://desired.example.com",
-				Models:              "desired-model",
-				Status:              common.ChannelStatusEnabled,
+				RouteID:               route.ID,
+				ExpectedRouteState:    route.State,
+				ExpectedRouteDetached: route.Detached,
+				Rank:                  1,
+				EffectiveMultiplier:   0.1,
+				UpdatedAt:             1_788_320_000,
+				Priority:              999,
+				BaseURL:               "https://desired.example.com",
+				Models:                "desired-model",
+				Status:                common.ChannelStatusEnabled,
 			})
 			require.NoError(t, err)
 			assert.False(t, changed)
@@ -751,6 +830,82 @@ func TestUpdateManagedChannelIfUnchangedRejectsEnableForInactiveRoute(t *testing
 			assert.Equal(t, 7, storedRoute.Rank)
 			assert.Equal(t, testCase.state, storedRoute.State)
 			assert.Equal(t, testCase.detached, storedRoute.Detached)
+		})
+	}
+}
+
+func TestUpdateManagedChannelIfUnchangedRejectsChangedRouteSnapshot(t *testing.T) {
+	tests := []struct {
+		name                 string
+		initialChannelStatus int
+		updateStatus         int
+		routeUpdates         map[string]any
+	}{
+		{
+			name:                 "enable after route paused",
+			initialChannelStatus: common.ChannelStatusAutoDisabled,
+			updateStatus:         common.ChannelStatusEnabled,
+			routeUpdates:         map[string]any{"state": UpstreamRouteStatePaused},
+		},
+		{
+			name:                 "disable after route detached",
+			initialChannelStatus: common.ChannelStatusEnabled,
+			updateStatus:         common.ChannelStatusAutoDisabled,
+			routeUpdates:         map[string]any{"detached": true},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+				"owner": "managed-route-snapshot",
+			})
+			require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+			require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+			if testCase.initialChannelStatus != common.ChannelStatusEnabled {
+				require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).
+					Update("status", testCase.initialChannelStatus).Error)
+				require.NoError(t, DB.Model(&Ability{}).Where("channel_id = ?", channel.Id).
+					Update("enabled", false).Error)
+			}
+			route := UpstreamManagedRoute{
+				SourceID:        1,
+				ExternalGroupID: "changed-route-" + testCase.name,
+				Platform:        "openai",
+				Protocol:        UpstreamProtocolOpenAI,
+				ChannelID:       channel.Id,
+				State:           UpstreamRouteStateActive,
+				Rank:            7,
+			}
+			require.NoError(t, DB.Create(&route).Error)
+			expected, err := GetChannelById(channel.Id, true)
+			require.NoError(t, err)
+			require.NoError(t, DB.Model(&UpstreamManagedRoute{}).
+				Where("id = ?", route.ID).
+				Updates(testCase.routeUpdates).Error)
+
+			changed, err := UpdateManagedChannelIfUnchanged(expected, ManagedChannelUpdate{
+				RouteID:               route.ID,
+				ExpectedRouteState:    route.State,
+				ExpectedRouteDetached: route.Detached,
+				Rank:                  1,
+				EffectiveMultiplier:   0.1,
+				UpdatedAt:             1_788_320_000,
+				Priority:              999,
+				BaseURL:               "https://desired.example.com",
+				Models:                "desired-model",
+				Status:                testCase.updateStatus,
+			})
+			require.NoError(t, err)
+			assert.False(t, changed)
+
+			stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+			assert.Equal(t, testCase.initialChannelStatus, stored.Status)
+			assert.Equal(t, "gpt-3.5-turbo", stored.Models)
+			assert.Equal(t, testCase.initialChannelStatus == common.ChannelStatusEnabled, ability.Enabled)
+			var storedRoute UpstreamManagedRoute
+			require.NoError(t, DB.First(&storedRoute, route.ID).Error)
+			assert.Equal(t, 7, storedRoute.Rank)
 		})
 	}
 }
@@ -793,14 +948,16 @@ func TestUpdateManagedChannelIfUnchangedLocksRouteBeforeChannel(t *testing.T) {
 	})
 
 	changed, err := UpdateManagedChannelIfUnchanged(expected, ManagedChannelUpdate{
-		RouteID:             route.ID,
-		Rank:                1,
-		EffectiveMultiplier: 0.25,
-		UpdatedAt:           1_788_320_000,
-		Priority:            999,
-		BaseURL:             "https://api.example.com",
-		Models:              "gpt-4.1",
-		Status:              common.ChannelStatusAutoDisabled,
+		RouteID:               route.ID,
+		ExpectedRouteState:    route.State,
+		ExpectedRouteDetached: route.Detached,
+		Rank:                  1,
+		EffectiveMultiplier:   0.25,
+		UpdatedAt:             1_788_320_000,
+		Priority:              999,
+		BaseURL:               "https://api.example.com",
+		Models:                "gpt-4.1",
+		Status:                common.ChannelStatusAutoDisabled,
 	})
 	require.NoError(t, err)
 	require.True(t, changed)
@@ -918,6 +1075,56 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 			assert.Equal(t, channel.OtherInfo, stored.OtherInfo)
 			assert.False(t, ability.Enabled)
 
+			sibling := Channel{
+				Name:   "configured-database-status-cas-sibling",
+				Key:    channel.Key,
+				Status: common.ChannelStatusEnabled,
+				Models: channel.Models,
+				Group:  channel.Group,
+			}
+			require.NoError(t, DB.Create(&sibling).Error)
+			require.NoError(t, sibling.AddAbilities(nil))
+			firstExpected, err := GetChannelById(channel.Id, true)
+			require.NoError(t, err)
+			secondExpected, err := GetChannelById(sibling.Id, true)
+			require.NoError(t, err)
+			firstDesired := *firstExpected
+			firstDesired.SetOtherInfo(map[string]any{
+				"owner":            "snapshot",
+				"quota_domain_id":  "configured-domain",
+				"quota_generation": "configured-generation",
+				"quota_type":       "plan",
+			})
+			secondDesired := *secondExpected
+			secondDesired.SetOtherInfo(map[string]any{
+				"quota_domain_id":  "configured-domain",
+				"quota_generation": "configured-generation",
+				"quota_type":       "plan",
+			})
+			changed, err = UpdateSingleKeyChannelStatusesIfUnchanged([]SingleKeyChannelStatusUpdate{
+				{
+					Expected:  firstExpected,
+					Status:    common.ChannelStatusAutoDisabled,
+					OtherInfo: firstDesired.OtherInfo,
+				},
+				{
+					Expected:  secondExpected,
+					Status:    common.ChannelStatusAutoDisabled,
+					OtherInfo: secondDesired.OtherInfo,
+				},
+			})
+			require.NoError(t, err)
+			require.True(t, changed)
+
+			stored, ability = loadChannelStatusCASFixture(t, channel.Id)
+			assert.Equal(t, firstDesired.OtherInfo, stored.OtherInfo)
+			assert.False(t, ability.Enabled)
+			storedSibling, siblingAbility := loadChannelStatusCASFixture(t, sibling.Id)
+			assert.Equal(t, common.ChannelStatusAutoDisabled, storedSibling.Status)
+			assert.Equal(t, secondDesired.OtherInfo, storedSibling.OtherInfo)
+			assert.False(t, siblingAbility.Enabled)
+			channel.OtherInfo = firstDesired.OtherInfo
+
 			route := UpstreamManagedRoute{
 				SourceID:        1,
 				ExternalGroupID: "configured-group",
@@ -931,14 +1138,16 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 			managedSnapshot, err := GetChannelById(channel.Id, true)
 			require.NoError(t, err)
 			changed, err = UpdateManagedChannelIfUnchanged(managedSnapshot, ManagedChannelUpdate{
-				RouteID:             route.ID,
-				Rank:                1,
-				EffectiveMultiplier: 0.1,
-				UpdatedAt:           time.Now().Unix(),
-				Priority:            999,
-				BaseURL:             "https://api.example.com",
-				Models:              "gpt-4.1",
-				Status:              common.ChannelStatusAutoDisabled,
+				RouteID:               route.ID,
+				ExpectedRouteState:    route.State,
+				ExpectedRouteDetached: route.Detached,
+				Rank:                  1,
+				EffectiveMultiplier:   0.1,
+				UpdatedAt:             time.Now().Unix(),
+				Priority:              999,
+				BaseURL:               "https://api.example.com",
+				Models:                "gpt-4.1",
+				Status:                common.ChannelStatusAutoDisabled,
 			})
 			require.NoError(t, err)
 			require.True(t, changed)

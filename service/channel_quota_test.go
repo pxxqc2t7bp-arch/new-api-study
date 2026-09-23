@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1503,7 +1504,7 @@ func TestDisablePlanQuotaDomainPreservesConcurrentOwnership(t *testing.T) {
 	assert.False(t, ability.Enabled)
 }
 
-func TestDisablePlanQuotaDomainReloadsDatabaseMetadataWithoutMutatingCache(t *testing.T) {
+func TestDisablePlanQuotaDomainReloadsDatabaseMetadataAndPublishesCompleteCache(t *testing.T) {
 	db := setupPlanQuotaDomainTest(t)
 
 	autoBan := 1
@@ -1536,11 +1537,13 @@ func TestDisablePlanQuotaDomainReloadsDatabaseMetadataWithoutMutatingCache(t *te
 
 	cachedAfter, err := model.CacheGetChannel(channel.Id)
 	require.NoError(t, err)
-	assert.Equal(t, cachedOtherInfo, cachedAfter.OtherInfo)
+	assert.Equal(t, cachedOtherInfo, cached.OtherInfo)
+	assert.NotEqual(t, cachedOtherInfo, cachedAfter.OtherInfo)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, cachedAfter.Status)
 
 	var stored model.Channel
 	require.NoError(t, db.First(&stored, "id = ?", channel.Id).Error)
+	assert.Equal(t, stored.OtherInfo, cachedAfter.OtherInfo)
 	storedInfo := stored.GetOtherInfo()
 	assert.Equal(t, "concurrent-update", storedInfo["owner"])
 	assert.Equal(t, tag, storedInfo["quota_domain"])
@@ -1678,7 +1681,7 @@ func TestDisableChannelPreservesPlanMultiKeyIsolation(t *testing.T) {
 	assert.True(t, ability.Enabled)
 }
 
-func TestDisableChannelPlanMultiKeyFinalKeyWithoutKnownResetKeepsNoDeadline(t *testing.T) {
+func TestDisableChannelPlanMultiKeyFinalKeyWithoutKnownResetClearsStaleDeadline(t *testing.T) {
 	db := setupPlanQuotaDomainTest(t)
 
 	autoBan := 1
@@ -1704,20 +1707,39 @@ func TestDisableChannelPlanMultiKeyFinalKeyWithoutKnownResetKeepsNoDeadline(t *t
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, channel.AddAbilities(nil))
 
-	apiError := types.NewOpenAIError(
-		errors.New("You have exceeded the monthly usage quota. It will reset at unknown."),
-		types.ErrorCode("AccountQuotaExceeded"),
-		http.StatusTooManyRequests,
-	)
-	require.True(t, DisableChannelForAPIError(types.ChannelError{
+	channelError := types.ChannelError{
 		ChannelId:   channel.Id,
 		ChannelName: channel.Name,
 		IsMultiKey:  true,
 		AutoBan:     true,
 		UsingKey:    "key-b",
-	}, tag, apiError))
+	}
+	knownResetError := types.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."),
+		types.ErrorCode("AccountQuotaExceeded"),
+		http.StatusTooManyRequests,
+	)
+	require.True(t, DisableChannelForAPIError(channelError, tag, knownResetError))
 
 	var stored model.Channel
+	require.NoError(t, db.First(&stored, "id = ?", channel.Id).Error)
+	require.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	require.Contains(t, stored.GetOtherInfo(), "quota_reset_at")
+	require.Contains(t, stored.GetOtherInfo(), "disabled_until")
+
+	EnableChannel(channel.Id, "key-b", channel.Name)
+	require.NoError(t, db.First(&stored, "id = ?", channel.Id).Error)
+	require.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	require.Contains(t, stored.GetOtherInfo(), "quota_reset_at")
+	require.Contains(t, stored.GetOtherInfo(), "disabled_until")
+
+	apiError := types.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota. It will reset at unknown."),
+		types.ErrorCode("AccountQuotaExceeded"),
+		http.StatusTooManyRequests,
+	)
+	require.True(t, DisableChannelForAPIError(channelError, tag, apiError))
+
 	require.NoError(t, db.First(&stored, "id = ?", channel.Id).Error)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
@@ -1985,6 +2007,122 @@ func TestDisableChannelManagedPlanQuotaIsolatesCredentialDomain(t *testing.T) {
 	var storedRoute model.UpstreamManagedRoute
 	require.NoError(t, db.First(&storedRoute, route.ID).Error)
 	assert.Zero(t, storedRoute.ConsecutiveFailures)
+}
+
+func TestDisablePlanQuotaDomainRollsBackAllSiblingsOnAbilityFailure(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+
+	autoBan := 1
+	firstTag := "plan:support:domain-rollback-a"
+	secondTag := "plan:support:domain-rollback-b"
+	channels := []model.Channel{
+		{
+			Id: 63, Name: "domain-rollback-first", Key: "shared-credential",
+			Status: common.ChannelStatusEnabled, Tag: &firstTag, AutoBan: &autoBan,
+			Models: "gpt-3.5-turbo", Group: "default",
+		},
+		{
+			Id: 64, Name: "domain-rollback-second", Key: "shared-credential",
+			Status: common.ChannelStatusEnabled, Tag: &secondTag, AutoBan: &autoBan,
+			Models: "gpt-3.5-turbo", Group: "default",
+		},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+
+	abilityUpdates := 0
+	forcedErr := errors.New("forced sibling ability failure")
+	const callbackName = "test:fail_second_plan_domain_ability"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil || tx.Statement.Table != "abilities" {
+			return
+		}
+		abilityUpdates++
+		if abilityUpdates == 2 {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Update().Remove(callbackName))
+	})
+
+	disablePlanQuotaDomainWithCredential(
+		&channels[0],
+		channels[0].Key,
+		firstTag,
+		"quota exhausted",
+		2_000_000_000,
+	)
+
+	require.Equal(t, 2, abilityUpdates)
+	var storedChannels []model.Channel
+	require.NoError(t, db.Order("id").Find(&storedChannels).Error)
+	require.Len(t, storedChannels, 2)
+	for _, channel := range storedChannels {
+		assert.Equal(t, common.ChannelStatusEnabled, channel.Status)
+		assert.NotContains(t, channel.GetOtherInfo(), "quota_generation")
+	}
+	var abilities []model.Ability
+	require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
+	require.Len(t, abilities, 2)
+	assert.True(t, abilities[0].Enabled)
+	assert.True(t, abilities[1].Enabled)
+}
+
+func TestConcurrentPlanQuotaSweepsConvergeDomainGenerationAndDeadline(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+
+	autoBan := 1
+	firstTag := "plan:support:concurrent-domain-a"
+	secondTag := "plan:support:concurrent-domain-b"
+	channels := []model.Channel{
+		{
+			Id: 65, Name: "concurrent-domain-first", Key: "shared-credential",
+			Status: common.ChannelStatusEnabled, Tag: &firstTag, AutoBan: &autoBan,
+			Models: "gpt-3.5-turbo", Group: "default",
+		},
+		{
+			Id: 66, Name: "concurrent-domain-second", Key: "shared-credential",
+			Status: common.ChannelStatusEnabled, Tag: &secondTag, AutoBan: &autoBan,
+			Models: "gpt-3.5-turbo", Group: "default",
+		},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+
+	start := make(chan struct{})
+	var sweeps sync.WaitGroup
+	for _, resetAt := range []int64{2_000_000_000, 2_100_000_000} {
+		resetAt := resetAt
+		sweeps.Add(1)
+		go func() {
+			defer sweeps.Done()
+			<-start
+			disablePlanQuotaDomainWithCredential(
+				&channels[0],
+				channels[0].Key,
+				firstTag,
+				"quota exhausted",
+				resetAt,
+			)
+		}()
+	}
+	close(start)
+	sweeps.Wait()
+
+	var storedChannels []model.Channel
+	require.NoError(t, db.Order("id").Find(&storedChannels).Error)
+	require.Len(t, storedChannels, 2)
+	firstInfo := storedChannels[0].GetOtherInfo()
+	secondInfo := storedChannels[1].GetOtherInfo()
+	require.NotEmpty(t, firstInfo["quota_generation"])
+	assert.Equal(t, firstInfo["quota_generation"], secondInfo["quota_generation"])
+	assert.Equal(t, firstInfo["quota_reset_at"], secondInfo["quota_reset_at"])
+	assert.Equal(t, firstInfo["disabled_until"], secondInfo["disabled_until"])
 }
 
 func TestDisablePlanQuotaDomainWithoutResetStillDisables(t *testing.T) {

@@ -14,8 +14,10 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
@@ -703,6 +705,89 @@ func TestShouldPrioritizePlanQuotaDisableForManagedChannel(t *testing.T) {
 	assert.False(t, shouldPrioritizePlanQuotaDisable(nil))
 }
 
+func TestExecuteTaskSubmissionPreservesPlanQuotaErrorForChannelIsolation(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	originalRetryTimes := common.RetryTimes
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	originalDisableKeywords := operation_setting.AutomaticDisableKeywords
+	originalDisableStatusCodes := operation_setting.AutomaticDisableStatusCodeRanges
+	common.RetryTimes = 0
+	common.MemoryCacheEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	operation_setting.AutomaticDisableKeywords = []string{"unrelated"}
+	operation_setting.AutomaticDisableStatusCodeRanges = nil
+	t.Cleanup(func() {
+		common.RetryTimes = originalRetryTimes
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		operation_setting.AutomaticDisableKeywords = originalDisableKeywords
+		operation_setting.AutomaticDisableStatusCodeRanges = originalDisableStatusCodes
+	})
+
+	autoBan := 1
+	submitTag := "plan:task:submit"
+	peerTag := "plan:task:peer"
+	channels := []model.Channel{
+		{
+			Name: "task-submit-source", Key: "shared-task-credential",
+			Status: common.ChannelStatusEnabled, Tag: &submitTag, AutoBan: &autoBan,
+			Models: "task-model", Group: "default",
+		},
+		{
+			Name: "task-submit-peer", Key: "shared-task-credential",
+			Status: common.ChannelStatusEnabled, Tag: &peerTag, AutoBan: &autoBan,
+			Models: "task-model", Group: "default",
+		},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
+	common.SetContextKey(ctx, constant.ContextKeyChannelKey, channels[0].Key)
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "task-model",
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{
+			LockedChannel: &channels[0],
+		},
+	}
+	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+
+	outcome, taskErr := executeTaskSubmissionWith(
+		ctx,
+		relayInfo,
+		func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError) {
+			return nil, &taskdto.TaskError{
+				Code:       "AccountQuotaExceeded",
+				Message:    quotaMessage,
+				StatusCode: http.StatusTooManyRequests,
+				Error:      errors.New(quotaMessage),
+			}
+		},
+	)
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "AccountQuotaExceeded", taskErr.Code)
+	var storedChannels []model.Channel
+	require.NoError(t, db.Order("id").Find(&storedChannels).Error)
+	require.Len(t, storedChannels, 2)
+	firstInfo := storedChannels[0].GetOtherInfo()
+	secondInfo := storedChannels[1].GetOtherInfo()
+	assert.Equal(t, common.ChannelStatusAutoDisabled, storedChannels[0].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, storedChannels[1].Status)
+	assert.NotEmpty(t, firstInfo["quota_generation"])
+	assert.Equal(t, firstInfo["quota_generation"], secondInfo["quota_generation"])
+}
+
 func TestProcessChannelErrorRecordsManagedFailureWhenAutomaticDisableIsOff(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.UpstreamManagedRoute{}))
@@ -883,6 +968,26 @@ func TestBuildHealthCheckProbeChannelSelectsOldestAutoDisabledKey(t *testing.T) 
 	assert.Equal(t, "newer", channel.ChannelInfo.MultiKeyDisabledReason[0])
 	assert.EqualValues(t, 200, channel.ChannelInfo.MultiKeyDisabledTime[0])
 	assert.Equal(t, constant.MultiKeyModePolling, channel.ChannelInfo.MultiKeyMode)
+
+	channel.ChannelInfo.MultiKeyRecoveryIndex = 1
+	_, nextKey, ok := buildHealthCheckProbeChannel(channel)
+	require.True(t, ok)
+	assert.Equal(t, "key-d", nextKey)
+
+	channel.ChannelInfo.MultiKeyRecoveryIndex = 3
+	_, wrappedKey, ok := buildHealthCheckProbeChannel(channel)
+	require.True(t, ok)
+	assert.Equal(t, "key-b", wrappedKey)
+}
+
+func TestIsUpstreamProbeFailureRejectsCancellation(t *testing.T) {
+	assert.True(t, isUpstreamProbeFailure(context.Background(), errors.New("upstream rejected request")))
+	assert.False(t, isUpstreamProbeFailure(context.Background(), context.Canceled))
+	assert.False(t, isUpstreamProbeFailure(context.Background(), context.DeadlineExceeded))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.False(t, isUpstreamProbeFailure(ctx, errors.New("transport returned after cancellation")))
 }
 
 func TestChannelForHealthCheckProbesFinalAutoDisabledMultiKey(t *testing.T) {
@@ -1017,12 +1122,82 @@ func TestChannelForHealthCheckProbesFinalAutoDisabledMultiKey(t *testing.T) {
 				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
 				assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
 				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[2])
+				assert.Zero(t, stored.ChannelInfo.MultiKeyRecoveryIndex)
 				assert.True(t, ability.Enabled)
 				return
 			}
 			assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
-			assert.Equal(t, channel.ChannelInfo, stored.ChannelInfo)
+			assert.Equal(t, 1, stored.ChannelInfo.MultiKeyRecoveryIndex)
 			assert.False(t, ability.Enabled)
+
+			secondSummary := testChannelForHealthCheck(
+				context.Background(),
+				&stored,
+				user.Id,
+				false,
+				10_000_000,
+			)
+			assert.Equal(t, 1, secondSummary.Tested)
+			assert.Equal(t, 1, secondSummary.Failed)
+			assert.Zero(t, secondSummary.Enabled)
+			require.Len(t, requestKeys, 1)
+			assert.Equal(t, "key-c", <-requestKeys)
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			assert.Equal(t, 2, stored.ChannelInfo.MultiKeyRecoveryIndex)
+		})
+	}
+}
+
+func TestChannelForHealthCheckDoesNotAdvanceRecoveryCursorWithoutUpstreamFailure(t *testing.T) {
+	tests := []struct {
+		name      string
+		testCtx   func() context.Context
+		channelID int
+	}{
+		{
+			name: "local setup failure",
+			testCtx: func() context.Context {
+				return context.Background()
+			},
+			channelID: 81,
+		},
+		{
+			name: "cancellation",
+			testCtx: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			channelID: 82,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			channel := model.Channel{
+				Id: testCase.channelID, Name: testCase.name,
+				Type: constant.ChannelTypeTaskPlugin,
+				Key:  "key-a\nkey-b", Status: common.ChannelStatusAutoDisabled,
+				Models: "unsupported-health-test", Group: "default",
+				ChannelInfo: model.ChannelInfo{
+					IsMultiKey:   true,
+					MultiKeySize: 2,
+					MultiKeyStatusList: map[int]int{
+						0: common.ChannelStatusAutoDisabled,
+						1: common.ChannelStatusAutoDisabled,
+					},
+					MultiKeyDisabledTime: map[int]int64{0: 100, 1: 200},
+				},
+			}
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+
+			testChannelForHealthCheck(testCase.testCtx(), &channel, 0, false, 10_000_000)
+
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			assert.Zero(t, stored.ChannelInfo.MultiKeyRecoveryIndex)
 		})
 	}
 }
