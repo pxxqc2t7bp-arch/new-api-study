@@ -202,6 +202,21 @@ func (channel *Channel) GetKeys() []string {
 	return keys
 }
 
+// HasEnabledKey reports whether any configured key is enabled by the per-key status map.
+func (channel *Channel) HasEnabledKey() bool {
+	if channel == nil {
+		return false
+	}
+	statusList := channel.ChannelInfo.MultiKeyStatusList
+	for index := range channel.GetKeys() {
+		status, exists := statusList[index]
+		if !exists || status == common.ChannelStatusEnabled {
+			return true
+		}
+	}
+	return false
+}
+
 func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 	// If not in multi-key mode, return the original key string directly.
 	if !channel.ChannelInfo.IsMultiKey {
@@ -726,7 +741,7 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 			channel.ChannelInfo.MultiKeyDisabledReason[keyIndex] = reason
 			channel.ChannelInfo.MultiKeyDisabledTime[keyIndex] = common.GetTimestamp()
 		}
-		if !hasEnabledMultiKey(keys, channel.ChannelInfo.MultiKeyStatusList) {
+		if !channel.HasEnabledKey() {
 			channel.Status = common.ChannelStatusAutoDisabled
 			info := channel.GetOtherInfo()
 			info["status_reason"] = "All keys are disabled"
@@ -736,19 +751,6 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 			channel.Status = common.ChannelStatusEnabled
 		}
 	}
-}
-
-func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
-	for i := range keys {
-		if statusList == nil {
-			return true
-		}
-		status, ok := statusList[i]
-		if !ok || status == common.ChannelStatusEnabled {
-			return true
-		}
-	}
-	return false
 }
 
 const channelStatusUpdateMaxAttempts = 3

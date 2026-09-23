@@ -638,6 +638,43 @@ func TestReconcileManagedUpstreamsPreservesPlanQuotaOwnership(t *testing.T) {
 	assert.False(t, abilities[1].Enabled)
 }
 
+func TestPreserveManagedPlanQuotaOwnershipRequiresAllMultiKeysDisabled(t *testing.T) {
+	allDisabled := &model.Channel{
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusAutoDisabled,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusManuallyDisabled,
+			},
+		},
+	}
+	oneEnabled := &model.Channel{
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusAutoDisabled,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+			},
+		},
+	}
+
+	assert.True(t, preserveManagedPlanQuotaOwnership(
+		allDisabled,
+		common.ChannelStatusEnabled,
+	))
+	assert.False(t, preserveManagedPlanQuotaOwnership(
+		oneEnabled,
+		common.ChannelStatusEnabled,
+	))
+	assert.False(t, preserveManagedPlanQuotaOwnership(
+		allDisabled,
+		common.ChannelStatusAutoDisabled,
+	))
+}
+
 func TestReconcileManagedUpstreamsPreservesConcurrentPlanQuotaDisable(t *testing.T) {
 	tests := []struct {
 		name                 string

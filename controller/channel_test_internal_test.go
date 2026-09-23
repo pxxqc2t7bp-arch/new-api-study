@@ -915,6 +915,190 @@ func TestChannelForHealthCheckProbesFinalAutoDisabledMultiKey(t *testing.T) {
 	}
 }
 
+func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedProbe(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.UpstreamSource{},
+		&model.UpstreamGroup{},
+		&model.UpstreamManagedRoute{},
+	))
+
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticDisableChannelEnabled := common.AutomaticDisableChannelEnabled
+	originalAutomaticEnableChannelEnabled := common.AutomaticEnableChannelEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	orchestrationSetting := operation_setting.GetUpstreamOrchestrationSetting()
+	originalOrchestrationSetting := *orchestrationSetting
+	common.MemoryCacheEnabled = true
+	common.LogConsumeEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	common.AutomaticEnableChannelEnabled = true
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-managed-final-key":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	orchestrationSetting.Enabled = true
+	orchestrationSetting.AutoEnroll = false
+	orchestrationSetting.CandidateLimit = 5
+	orchestrationSetting.MaxUpstreamMultiplier = 1
+	orchestrationSetting.SyncIntervalHours = 4
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableChannelEnabled
+		common.AutomaticEnableChannelEnabled = originalAutomaticEnableChannelEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+		*orchestrationSetting = originalOrchestrationSetting
+	})
+
+	user := model.User{
+		Username: "managed-final-key-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	requestKeys := make(chan string, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestKeys <- strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id":"chatcmpl-managed-final-key",
+			"object":"chat.completion",
+			"created":1,
+			"model":"gpt-managed-final-key",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer upstream.Close()
+
+	now := time.Now()
+	source := model.UpstreamSource{
+		Key:              "managed-final-key-source",
+		Name:             "Managed Final Key Source",
+		ConsoleURL:       "https://example.com",
+		SelectedEndpoint: upstream.URL,
+		Status:           model.UpstreamHealthOperational,
+		Enabled:          true,
+		LastSnapshotAt:   now.Unix(),
+		LastSuccessAt:    now.Unix(),
+	}
+	require.NoError(t, db.Create(&source).Error)
+	group := model.UpstreamGroup{
+		SourceID:            source.ID,
+		ExternalID:          "managed-final-key-group",
+		Name:                "Managed Final Key Group",
+		Platform:            "openai",
+		EffectiveMultiplier: 0.1,
+		HealthStatus:        model.UpstreamHealthOperational,
+		Models:              `["gpt-managed-final-key"]`,
+		ObservedAt:          now.Unix(),
+	}
+	require.NoError(t, db.Create(&group).Error)
+
+	autoBan := 1
+	tag := "plan:managed:final-key"
+	channel := model.Channel{
+		Name: "managed-final-key", Type: constant.ChannelTypeOpenAI,
+		Key: "key-a\nkey-b", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "gpt-managed-final-key", Group: "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledReason: map[int]string{
+				0: "previous structured quota failure",
+			},
+			MultiKeyDisabledTime: map[int]int64{
+				0: now.Add(-time.Hour).Unix(),
+			},
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	route := model.UpstreamManagedRoute{
+		SourceID: source.ID, ExternalGroupID: group.ExternalID,
+		Platform: group.Platform, Protocol: model.UpstreamProtocolOpenAI,
+		ChannelID: channel.Id, State: model.UpstreamRouteStateActive,
+	}
+	require.NoError(t, db.Create(&route).Error)
+	model.InitChannelCache()
+
+	apiError := relaytypes.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota. It will reset at unknown."),
+		relaytypes.ErrorCode("AccountQuotaExceeded"),
+		http.StatusTooManyRequests,
+	)
+	require.True(t, service.DisableChannelForAPIError(relaytypes.ChannelError{
+		ChannelId:   channel.Id,
+		ChannelName: channel.Name,
+		IsMultiKey:  true,
+		AutoBan:     true,
+		UsingKey:    "key-b",
+	}, tag, apiError))
+
+	var disabled model.Channel
+	require.NoError(t, db.First(&disabled, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, disabled.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, disabled.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, common.ChannelStatusAutoDisabled, disabled.ChannelInfo.MultiKeyStatusList[1])
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+	selected, err := model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
+	require.NoError(t, err)
+	assert.Nil(t, selected)
+
+	summary, err := service.ReconcileManagedUpstreams(now)
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.PrioritiesUpdated)
+
+	var reconciled model.Channel
+	require.NoError(t, db.First(&reconciled, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, reconciled.Status)
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+	selected, err = model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
+	require.NoError(t, err)
+	assert.Nil(t, selected)
+
+	probeSummary := testChannelForHealthCheck(
+		context.Background(),
+		&reconciled,
+		user.Id,
+		false,
+		10_000_000,
+	)
+	assert.Equal(t, 1, probeSummary.Tested)
+	assert.Equal(t, 1, probeSummary.Succeeded)
+	assert.Equal(t, 1, probeSummary.Enabled)
+	require.Len(t, requestKeys, 1)
+	assert.Equal(t, "key-a", <-requestKeys)
+
+	var recovered model.Channel
+	require.NoError(t, db.First(&recovered, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, recovered.Status)
+	assert.NotContains(t, recovered.ChannelInfo.MultiKeyStatusList, 0)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, recovered.ChannelInfo.MultiKeyStatusList[1])
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+	selected, err = model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, channel.Id, selected.Id)
+	selectedKey, _, keyErr := selected.GetNextEnabledKey()
+	require.Nil(t, keyErr)
+	assert.Equal(t, "key-a", selectedKey)
+}
+
 func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T) {
 	channels := []*model.Channel{
 		{Id: 1, Status: common.ChannelStatusEnabled},

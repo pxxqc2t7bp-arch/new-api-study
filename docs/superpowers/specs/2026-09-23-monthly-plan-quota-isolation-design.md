@@ -46,6 +46,9 @@ different tags can therefore continue receiving traffic.
   still has that exact empty credential and observed Plan tag.
 - Prevent managed reconciliation from enabling a channel while valid Plan
   quota ownership remains.
+- Prevent managed reconciliation from enabling an all-disabled multi-key
+  channel, while allowing reconciliation when at least one key remains
+  enabled.
 - Preserve immediate per-key isolation for structured Plan quota errors on
   managed multi-key channels, bypassing managed failure thresholds.
 - Count only health-check recoveries that actually commit, and fail passive
@@ -273,10 +276,13 @@ lives at the public service entry rather than only in controller policy, so
 relay, health-test, and future direct callers all obey the global switch.
 
 Managed reconciliation treats valid Plan quota metadata as separate ownership
-of channel availability. A transition to active no longer performs a
+of channel availability. It also treats a multi-key channel with no enabled
+key as the owner of its disabled state, even though per-key isolation does not
+write single-key Plan ownership metadata. A multi-key channel with any enabled
+key is not preserved by this rule. A transition to active no longer performs a
 pre-ranking enable. Final rank reconciliation reads a channel snapshot,
-calculates the desired status while preserving valid Plan ownership, and calls
-a model-owned compare-and-swap. The model holds the existing channel status
+calculates the desired status while preserving either owner, and calls a
+model-owned compare-and-swap. The model holds the existing channel status
 locks, starts one transaction, reads through `lockForUpdate`, and compares key,
 tag, status, and raw metadata. Its conditional channel update supplies the
 SQLite optimistic fence; MySQL and PostgreSQL also hold the row lock. A stale
@@ -335,7 +341,8 @@ atomicity are identical on MySQL and PostgreSQL; SQLite omits unsupported
 11. Managed reconciliation omits the pre-rank activation enable and uses one
     model-owned locked CAS transaction for rank, channel routing/status fields,
     and abilities. Valid Plan ownership survives either ordering of a
-    concurrent disable.
+    concurrent disable, and a multi-key channel remains disabled while every
+    configured key is disabled.
 
 ## Tests
 
@@ -431,6 +438,10 @@ atomicity are identical on MySQL and PostgreSQL; SQLite omits unsupported
 - Active managed-route reconciliation preserves valid Plan quota ownership in
   deterministic activation-transition and steady-state interleavings while
   atomically updating route rank, priority, endpoint, models, and abilities.
+- Structured final-key disable followed by healthy managed reconciliation
+  leaves the channel auto-disabled, abilities disabled, and cache routing
+  excluded; the isolated probe then recovers exactly its selected key and
+  restores the route. A multi-key channel with an enabled key is not preserved.
 - The model managed-channel CAS rejects stale status ownership without changing
   route rank, channel routing fields, or abilities, and commits all three on a
   fresh snapshot.

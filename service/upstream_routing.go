@@ -230,6 +230,11 @@ func preserveManagedPlanQuotaOwnership(channel *model.Channel, desiredStatus int
 	if desiredStatus != common.ChannelStatusEnabled {
 		return false
 	}
+	if channel != nil &&
+		channel.ChannelInfo.IsMultiKey &&
+		!channel.HasEnabledKey() {
+		return true
+	}
 	_, owned := PlanQuotaRecoveryDomainKey(channel)
 	return owned
 }

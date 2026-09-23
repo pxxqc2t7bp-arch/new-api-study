@@ -28,6 +28,66 @@ func setupChannelStatusTest(t *testing.T) {
 	})
 }
 
+func TestChannelHasEnabledKey(t *testing.T) {
+	tests := []struct {
+		name       string
+		key        string
+		statusList map[int]int
+		want       bool
+	}{
+		{
+			name: "missing status defaults to enabled",
+			key:  "key-a\nkey-b",
+			statusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+			},
+			want: true,
+		},
+		{
+			name: "explicit enabled status",
+			key:  "key-a\nkey-b",
+			statusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusEnabled,
+			},
+			want: true,
+		},
+		{
+			name: "all keys disabled",
+			key:  "key-a\nkey-b",
+			statusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusManuallyDisabled,
+			},
+		},
+		{
+			name: "status outside key range is ignored",
+			key:  "key-a",
+			statusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusEnabled,
+			},
+		},
+		{
+			name: "no keys",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			channel := &Channel{
+				Key: test.key,
+				ChannelInfo: ChannelInfo{
+					IsMultiKey:         true,
+					MultiKeyStatusList: test.statusList,
+				},
+			}
+
+			assert.Equal(t, test.want, channel.HasEnabledKey())
+		})
+	}
+}
+
 func TestUpdateChannelStatusPersistsMultiKeyState(t *testing.T) {
 	setupChannelStatusTest(t)
 

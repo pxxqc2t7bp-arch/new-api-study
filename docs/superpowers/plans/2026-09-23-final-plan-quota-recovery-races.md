@@ -932,3 +932,76 @@ Observed: all three package suites and focused race suites passed. `go vet`
 and `git diff --check` exited cleanly. Review found only the registered
 controller, model, service, test, and documentation changes; no deployment or
 schema files changed.
+
+### Task 18: Preserve Managed Final-Key Isolation During Reconciliation
+
+**Files:**
+
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `model/channel.go`
+- Modify: `model/channel_status_test.go`
+- Modify: `service/upstream_routing.go`
+- Modify: `service/upstream_orchestration_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: RED for the full managed final-key lifecycle**
+
+Disable a managed channel's final enabled key through the structured Plan
+quota path with memory caching enabled. Reconcile its healthy active route and
+require the channel to remain auto-disabled, its ability disabled, and its
+cache route excluded. Then probe the isolated oldest key and require exactly
+that key, the ability, and cached routing to recover.
+
+Run:
+
+```bash
+go test ./controller -run \
+  '^TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedProbe$' \
+  -count=1 -v
+```
+
+Observed RED: reconciliation changed channel status from auto-disabled to
+enabled, enabled the ability, restored cache routing, and left the isolated
+probe with no request or recovery.
+
+- [x] **Step 2: RED for the reusable key-availability contract**
+
+Require missing and explicit enabled statuses within the configured key range
+to count as enabled, and require empty or fully disabled key sets to report no
+enabled key. Require reconciliation preservation only for the fully disabled
+multi-key case when the desired status is enabled.
+
+Run:
+
+```bash
+go test ./model -run '^TestChannelHasEnabledKey$' -count=1
+go test ./service -run \
+  '^TestPreserveManagedPlanQuotaOwnershipRequiresAllMultiKeysDisabled$' \
+  -count=1 -v
+```
+
+Observed RED: the model method did not exist, and the reconciliation predicate
+did not preserve the fully disabled multi-key channel.
+
+- [x] **Step 3: GREEN with one model predicate and reconciliation guard**
+
+Add `Channel.HasEnabledKey`, reuse it from the existing multi-key status
+transition, and preserve the current managed channel status only when
+reconciliation wants to enable a multi-key channel that has no enabled key.
+Keep the existing single-key Plan ownership behavior and allow ordinary
+reconciliation whenever any configured key remains enabled.
+
+Observed: the focused model, service, and end-to-end controller regressions
+passed.
+
+- [x] **Step 4: Verify and commit**
+
+Run formatting, focused tests, full affected package tests, focused race
+tests, `go vet`, and `git diff --check`. Review the final diff and commit only
+the registered implementation, regression, and documentation files.
+
+Observed: `gofmt` produced no remaining diff; focused model, service, and
+controller tests passed; `go test ./model ./service ./controller -count=1`
+passed; all three focused race suites passed; `go vet ./model ./service
+./controller` and `git diff --check` exited cleanly.
