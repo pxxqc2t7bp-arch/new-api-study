@@ -21,6 +21,7 @@ import (
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -351,8 +352,9 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *te
 		deferred,
 	}
 
-	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModePassiveRecovery)
+	selected, err := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModePassiveRecovery)
 
+	require.NoError(t, err)
 	require.Len(t, selected, 1)
 	require.Equal(t, 2, selected[0].Id)
 }
@@ -389,7 +391,7 @@ func TestSelectChannelsForAutomaticTestDeduplicatesDuePlanDomain(t *testing.T) {
 	ordinary := &model.Channel{Id: 18, Status: common.ChannelStatusAutoDisabled, Tag: &ordinaryTag}
 	ordinary.SetOtherInfo(map[string]any{"disabled_until": past})
 
-	selected := selectChannelsForAutomaticTest(
+	selected, err := selectChannelsForAutomaticTest(
 		[]*model.Channel{
 			first,
 			sameMarkedDomain,
@@ -403,6 +405,7 @@ func TestSelectChannelsForAutomaticTestDeduplicatesDuePlanDomain(t *testing.T) {
 		operation_setting.ChannelTestModePassiveRecovery,
 	)
 
+	require.NoError(t, err)
 	selectedIDs := make([]int, len(selected))
 	for i, channel := range selected {
 		selectedIDs[i] = channel.Id
@@ -428,7 +431,7 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryUsesOldestDomainPeer(t *te
 	genericSecond := &model.Channel{Id: 17, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 400}
 	genericSecond.SetOtherInfo(map[string]any{"disabled_until": past, "status_reason": "transport failed"})
 
-	selected := selectChannelsForAutomaticTest(
+	selected, err := selectChannelsForAutomaticTest(
 		[]*model.Channel{
 			recent,
 			older,
@@ -440,6 +443,7 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryUsesOldestDomainPeer(t *te
 		operation_setting.ChannelTestModePassiveRecovery,
 	)
 
+	require.NoError(t, err)
 	selectedIDs := make([]int, len(selected))
 	for i, channel := range selected {
 		selectedIDs[i] = channel.Id
@@ -481,11 +485,12 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesManagedPlanQuota(t
 		}).Error)
 	}
 
-	selected := selectChannelsForAutomaticTest(
+	selected, err := selectChannelsForAutomaticTest(
 		[]*model.Channel{marked, legacy, ordinary},
 		operation_setting.ChannelTestModePassiveRecovery,
 	)
 
+	require.NoError(t, err)
 	selectedIDs := make([]int, len(selected))
 	for i, channel := range selected {
 		selectedIDs[i] = channel.Id
@@ -509,10 +514,77 @@ func TestSelectChannelsForAutomaticTestAlwaysSkipsManualDisabled(t *testing.T) {
 		operation_setting.ChannelTestModePassiveRecovery,
 	} {
 		t.Run(mode, func(t *testing.T) {
-			selected := selectChannelsForAutomaticTest([]*model.Channel{manual}, mode)
+			selected, err := selectChannelsForAutomaticTest([]*model.Channel{manual}, mode)
+			require.NoError(t, err)
 			assert.Empty(t, selected)
 		})
 	}
+}
+
+func TestRunChannelTestTaskFailsClosedWhenManagedRouteQueryFails(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = false
+	common.LogConsumeEnabled = false
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-fail-closed":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "passive-fail-closed-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id":"chatcmpl-fail-closed",
+			"object":"chat.completion",
+			"created":1,
+			"model":"gpt-fail-closed",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer upstream.Close()
+
+	channel := model.Channel{
+		Name: "ordinary-managed-unknown", Type: constant.ChannelTypeOpenAI,
+		Key: "credential", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusAutoDisabled,
+		Models: "gpt-fail-closed", Group: "default",
+	}
+	channel.SetOtherInfo(map[string]any{
+		"disabled_until": time.Now().Add(-time.Minute).Unix(),
+		"status_reason":  "ordinary failure",
+	})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	summary, err := runChannelTestTask(
+		context.Background(),
+		operation_setting.ChannelTestModePassiveRecovery,
+		false,
+		nil,
+	)
+
+	require.Error(t, err)
+	assert.Zero(t, summary.Tested)
+	assert.Zero(t, requests.Load())
 }
 
 func TestNormalizeChannelTestEndpointUsesAdvancedCustomRoute(t *testing.T) {
@@ -549,19 +621,107 @@ func TestShouldPrioritizePlanQuotaDisableForManagedChannel(t *testing.T) {
 		relaytypes.ErrorCode("AccountQuotaExceeded"),
 		http.StatusTooManyRequests,
 	)
+	remainingTokensError := relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+		Message: "You have 7 weighted tokens left",
+		Type:    "account_quota-exceeded",
+	}, http.StatusTooManyRequests)
+	wrongStatusError := relaytypes.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota."),
+		relaytypes.ErrorCode("AccountQuotaExceeded"),
+		http.StatusBadRequest,
+	)
+	wrongSemanticsError := relaytypes.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota."),
+		relaytypes.ErrorCode("rate_limit_exceeded"),
+		http.StatusTooManyRequests,
+	)
 	ordinaryManagedError := relaytypes.NewOpenAIError(
 		errors.New("upstream unavailable"),
 		relaytypes.ErrorCodeBadResponseStatusCode,
 		http.StatusBadGateway,
 	)
 
-	singleKey := relaytypes.ChannelError{ChannelId: 61}
-	assert.True(t, shouldPrioritizePlanQuotaDisable(singleKey, planQuotaError))
-	assert.False(t, shouldPrioritizePlanQuotaDisable(singleKey, ordinaryManagedError))
+	assert.True(t, shouldPrioritizePlanQuotaDisable(planQuotaError))
+	assert.True(t, shouldPrioritizePlanQuotaDisable(remainingTokensError))
+	assert.False(t, shouldPrioritizePlanQuotaDisable(wrongStatusError))
+	assert.False(t, shouldPrioritizePlanQuotaDisable(wrongSemanticsError))
+	assert.False(t, shouldPrioritizePlanQuotaDisable(ordinaryManagedError))
+	assert.False(t, shouldPrioritizePlanQuotaDisable(nil))
+}
 
-	multiKey := relaytypes.ChannelError{ChannelId: 61, IsMultiKey: true}
-	assert.False(t, shouldPrioritizePlanQuotaDisable(multiKey, planQuotaError))
-	assert.False(t, shouldPrioritizePlanQuotaDisable(singleKey, nil))
+func TestChannelForHealthCheckCountsOnlyCommittedRecoveries(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticEnableChannelEnabled := common.AutomaticEnableChannelEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = false
+	common.LogConsumeEnabled = false
+	common.AutomaticEnableChannelEnabled = true
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-health-recovery":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticEnableChannelEnabled = originalAutomaticEnableChannelEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "health-recovery-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id":"chatcmpl-health",
+			"object":"chat.completion",
+			"created":1,
+			"model":"gpt-health-recovery",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer upstream.Close()
+
+	autoBan := 1
+	tag := "plan:support:health-count"
+	quotaInfo := map[string]any{
+		"disabled_until": time.Now().Add(-time.Minute).Unix(),
+		"quota_domain":   tag,
+		"quota_type":     "plan",
+	}
+	channels := []model.Channel{
+		{
+			Name: "health-source", Type: constant.ChannelTypeOpenAI, Key: "credential",
+			BaseURL: &upstream.URL, Status: common.ChannelStatusAutoDisabled,
+			Tag: &tag, AutoBan: &autoBan, Models: "gpt-health-recovery", Group: "default",
+		},
+		{
+			Name: "health-peer", Type: constant.ChannelTypeOpenAI, Key: "credential",
+			BaseURL: &upstream.URL, Status: common.ChannelStatusAutoDisabled,
+			Tag: &tag, AutoBan: &autoBan, Models: "gpt-health-recovery", Group: "default",
+		},
+	}
+	channels[0].SetOtherInfo(quotaInfo)
+	channels[1].SetOtherInfo(quotaInfo)
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+
+	summary := testChannelForHealthCheck(context.Background(), &channels[0], user.Id, false, 10_000_000)
+	staleSummary := testChannelForHealthCheck(context.Background(), &channels[0], user.Id, false, 10_000_000)
+
+	assert.Equal(t, 2, summary.Enabled)
+	assert.Zero(t, staleSummary.Enabled)
 }
 
 func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T) {
@@ -571,8 +731,9 @@ func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T
 		{Id: 3, Status: common.ChannelStatusManuallyDisabled},
 	}
 
-	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeScheduledAll)
+	selected, err := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeScheduledAll)
 
+	require.NoError(t, err)
 	require.Len(t, selected, 2)
 	require.Equal(t, 1, selected[0].Id)
 	require.Equal(t, 2, selected[1].Id)
@@ -589,8 +750,9 @@ func TestSelectChannelsForAutomaticTestAutoBanOnlyUsesEligibleChannels(t *testin
 		{Id: 5, Status: common.ChannelStatusEnabled},
 	}
 
-	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeAutoBanOnly)
+	selected, err := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeAutoBanOnly)
 
+	require.NoError(t, err)
 	require.Len(t, selected, 2)
 	require.Equal(t, 1, selected[0].Id)
 	require.Equal(t, 3, selected[1].Id)

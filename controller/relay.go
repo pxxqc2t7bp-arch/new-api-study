@@ -307,7 +307,7 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
 
-		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), channel.GetTag(), newAPIError)
 		c.Set("channel_fallback_reason", fmt.Sprintf("status_%d:%s", newAPIError.StatusCode, newAPIError.GetErrorCode()))
 
 		if !shouldRetry(c, newAPIError, maxRetries-retryParam.GetRetry()) {
@@ -450,57 +450,56 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	return operation_setting.ShouldRetryByStatusCode(code)
 }
 
-func shouldPrioritizePlanQuotaDisable(channelError types.ChannelError, err *types.NewAPIError) bool {
-	if err == nil || channelError.IsMultiKey {
+func shouldPrioritizePlanQuotaDisable(err *types.NewAPIError) bool {
+	if err == nil {
 		return false
 	}
-	_, quotaLimited := service.ParsePlanQuotaReset(err.Error())
+	_, quotaLimited := service.ClassifyPlanQuotaError(err)
 	return quotaLimited
 }
 
-func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
+func processChannelError(c *gin.Context, channelError types.ChannelError, observedTag string, err *types.NewAPIError) {
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
-	if service.IsManagedChannel(channelError.ChannelId) {
-		if channelError.AutoBan && service.IsManagedModelUnsupported(err) {
-			modelName := c.GetString("original_model")
-			isolated, isolateErr := service.IsolateManagedRouteModel(
+	isManaged := service.IsManagedChannel(channelError.ChannelId)
+	handledManagedUnsupported := isManaged && channelError.AutoBan && service.IsManagedModelUnsupported(err)
+	if handledManagedUnsupported {
+		modelName := c.GetString("original_model")
+		isolated, isolateErr := service.IsolateManagedRouteModel(
+			channelError.ChannelId,
+			modelName,
+			err.ErrorWithStatusCode(),
+		)
+		if isolateErr != nil {
+			common.SysError(fmt.Sprintf(
+				"failed to isolate unsupported managed model: channel_id=%d model=%s error=%v",
 				channelError.ChannelId,
 				modelName,
-				err.ErrorWithStatusCode(),
-			)
-			if isolateErr != nil {
+				isolateErr,
+			))
+		} else if isolated {
+			logger.LogWarn(c, fmt.Sprintf(
+				"isolated unsupported managed model: channel_id=%d model=%s",
+				channelError.ChannelId,
+				modelName,
+			))
+		}
+	}
+	if !handledManagedUnsupported && channelError.AutoBan && shouldPrioritizePlanQuotaDisable(err) {
+		service.DisableChannelForAPIError(channelError, observedTag, err)
+	} else if !handledManagedUnsupported && isManaged && channelError.AutoBan && service.ShouldRecordManagedRouteFailure(err) {
+		reason := err.ErrorWithStatusCode()
+		gopool.Go(func() {
+			if _, _, recordErr := service.RecordManagedChannelFailure(channelError, reason); recordErr != nil {
 				common.SysError(fmt.Sprintf(
-					"failed to isolate unsupported managed model: channel_id=%d model=%s error=%v",
+					"failed to record managed channel failure: channel_id=%d error=%v",
 					channelError.ChannelId,
-					modelName,
-					isolateErr,
-				))
-			} else if isolated {
-				logger.LogWarn(c, fmt.Sprintf(
-					"isolated unsupported managed model: channel_id=%d model=%s",
-					channelError.ChannelId,
-					modelName,
+					recordErr,
 				))
 			}
-		} else if channelError.AutoBan && shouldPrioritizePlanQuotaDisable(channelError, err) {
-			gopool.Go(func() {
-				service.DisableChannel(channelError, err.ErrorWithStatusCode())
-			})
-		} else if channelError.AutoBan && service.ShouldRecordManagedRouteFailure(err) {
-			reason := err.ErrorWithStatusCode()
-			gopool.Go(func() {
-				if _, _, recordErr := service.RecordManagedChannelFailure(channelError, reason); recordErr != nil {
-					common.SysError(fmt.Sprintf(
-						"failed to record managed channel failure: channel_id=%d error=%v",
-						channelError.ChannelId,
-						recordErr,
-					))
-				}
-			})
-		}
-	} else if service.ShouldDisableChannel(err) && channelError.AutoBan {
+		})
+	} else if !isManaged && service.ShouldDisableChannel(err) && channelError.AutoBan {
 		gopool.Go(func() {
 			service.DisableChannel(channelError, err.ErrorWithStatusCode())
 		})
@@ -809,6 +808,7 @@ func executeTaskSubmissionWith(
 			processChannelError(c,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
+				channel.GetTag(),
 				types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode))
 		}
 

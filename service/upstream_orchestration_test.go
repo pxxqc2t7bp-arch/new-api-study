@@ -520,6 +520,123 @@ func TestRankManagedRoutesAppliesProtocolModelExclusions(t *testing.T) {
 	assert.Equal(t, "gpt-5.6-sol", anthropic.Models)
 }
 
+func TestReconcileManagedUpstreamsPreservesPlanQuotaOwnership(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+
+	now := time.Unix(1_788_320_000, 0)
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	originalSetting := *setting
+	setting.Enabled = true
+	setting.AutoEnroll = false
+	setting.CandidateLimit = 5
+	setting.MaxUpstreamMultiplier = 1
+	setting.SyncIntervalHours = 4
+	setting.ShadowSuccessesRequired = 3
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4.1":1}`))
+	t.Cleanup(func() {
+		*setting = originalSetting
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+	})
+
+	source := model.UpstreamSource{
+		Key:              "source",
+		Name:             "Source",
+		ConsoleURL:       "https://example.com",
+		SelectedEndpoint: "https://api.example.com",
+		Status:           model.UpstreamHealthOperational,
+		Enabled:          true,
+		LastSnapshotAt:   now.Unix(),
+		LastSuccessAt:    now.Unix(),
+	}
+	require.NoError(t, model.DB.Create(&source).Error)
+	group := model.UpstreamGroup{
+		SourceID:            source.ID,
+		ExternalID:          "group",
+		Name:                "Group",
+		Platform:            "openai",
+		EffectiveMultiplier: 0.1,
+		HealthStatus:        model.UpstreamHealthOperational,
+		Models:              `["gpt-4.1"]`,
+		ObservedAt:          now.Unix(),
+	}
+	require.NoError(t, model.DB.Create(&group).Error)
+
+	autoBan := 1
+	tag := "plan:managed:reconcile"
+	channels := []model.Channel{
+		{
+			Id: 71, Name: "activating", Key: "credential-a",
+			Status: common.ChannelStatusAutoDisabled, Tag: &tag, AutoBan: &autoBan,
+			Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Id: 72, Name: "steady-active", Key: "credential-b",
+			Status: common.ChannelStatusAutoDisabled, Tag: &tag, AutoBan: &autoBan,
+			Models: "gpt-4.1", Group: "default",
+		},
+	}
+	for i := range channels {
+		channels[i].SetOtherInfo(map[string]any{
+			"disabled_until":   now.Add(time.Hour).Unix(),
+			"quota_domain_id":  planQuotaDomainID(channels[i].Id, channels[i].Key),
+			"quota_generation": "generation",
+			"quota_type":       "plan",
+			"preserved_owner":  channels[i].Name,
+		})
+	}
+	require.NoError(t, model.DB.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+	routes := []model.UpstreamManagedRoute{
+		{
+			SourceID: source.ID, ExternalGroupID: group.ExternalID,
+			Platform: group.Platform, Protocol: model.UpstreamProtocolOpenAI,
+			ChannelID: channels[0].Id, State: model.UpstreamRouteStateShadow,
+			ConsecutiveSuccesses: setting.ShadowSuccessesRequired,
+		},
+		{
+			SourceID: source.ID, ExternalGroupID: group.ExternalID,
+			Platform: group.Platform, Protocol: model.UpstreamProtocolAnthropic,
+			ChannelID: channels[1].Id, State: model.UpstreamRouteStateActive,
+		},
+	}
+	require.NoError(t, model.DB.Create(&routes).Error)
+
+	summary, err := ReconcileManagedUpstreams(now)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.RoutesActivated)
+	assert.Equal(t, 2, summary.PrioritiesUpdated)
+
+	var storedRoutes []model.UpstreamManagedRoute
+	require.NoError(t, model.DB.Order("id").Find(&storedRoutes).Error)
+	require.Len(t, storedRoutes, 2)
+	assert.Equal(t, model.UpstreamRouteStateActive, storedRoutes[0].State)
+	assert.Equal(t, model.UpstreamRouteStateActive, storedRoutes[1].State)
+	assert.Equal(t, 1, storedRoutes[0].Rank)
+	assert.Equal(t, 1, storedRoutes[1].Rank)
+
+	var storedChannels []model.Channel
+	require.NoError(t, model.DB.Order("id").Find(&storedChannels).Error)
+	require.Len(t, storedChannels, 2)
+	for i := range storedChannels {
+		assert.Equal(t, common.ChannelStatusAutoDisabled, storedChannels[i].Status)
+		assert.Equal(t, channels[i].OtherInfo, storedChannels[i].OtherInfo)
+		require.NotNil(t, storedChannels[i].Priority)
+		assert.EqualValues(t, 999, *storedChannels[i].Priority)
+		assert.Equal(t, source.SelectedEndpoint, storedChannels[i].GetBaseURL())
+	}
+
+	var abilities []model.Ability
+	require.NoError(t, model.DB.Order("channel_id").Find(&abilities).Error)
+	require.Len(t, abilities, 2)
+	assert.False(t, abilities[0].Enabled)
+	assert.False(t, abilities[1].Enabled)
+}
+
 func TestRankManagedRoutesPreservesChannelWhenSnapshotIsStale(t *testing.T) {
 	setupUpstreamOrchestrationTest(t)
 	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))

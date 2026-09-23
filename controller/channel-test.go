@@ -959,13 +959,15 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 	}
 
 	if allowDisable && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
-		processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+		processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), channel.GetTag(), newAPIError)
 		summary.Disabled++
 	}
 
 	if result.localErr == nil && !isChannelEnabled && service.ShouldEnableChannel(newAPIError, channel.Status) {
-		service.EnableChannelForHealthCheck(channel, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey))
-		summary.Enabled++
+		summary.Enabled += service.EnableChannelForHealthCheck(
+			channel,
+			common.GetContextKeyString(result.context, constant.ContextKeyChannelKey),
+		)
 	}
 
 	channel.UpdateResponseTime(milliseconds)
@@ -1107,7 +1109,10 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 	if strings.TrimSpace(mode) == "" {
 		mode = operation_setting.GetMonitorSetting().ChannelTestMode
 	}
-	selected := selectChannelsForAutomaticTest(channels, mode)
+	selected, err := selectChannelsForAutomaticTest(channels, mode)
+	if err != nil {
+		return channelTestSummary{}, err
+	}
 	allowDisable := mode != operation_setting.ChannelTestModePassiveRecovery
 	concurrency := operation_setting.GetMonitorSetting().ChannelTestConcurrency
 	summary := performChannelTests(ctx, selected, testUserID, allowDisable, concurrency, report)
@@ -1117,7 +1122,7 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 	return summary, nil
 }
 
-func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*model.Channel {
+func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) ([]*model.Channel, error) {
 	selected := make([]*model.Channel, 0, len(channels))
 	selectedRecoveryDomains := make(map[string]int)
 	managedChannels := make(map[int]struct{})
@@ -1125,10 +1130,11 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 		var managedIDs []int
 		if err := model.DB.Model(&model.UpstreamManagedRoute{}).
 			Where("detached = ?", false).
-			Pluck("channel_id", &managedIDs).Error; err == nil {
-			for _, channelID := range managedIDs {
-				managedChannels[channelID] = struct{}{}
-			}
+			Pluck("channel_id", &managedIDs).Error; err != nil {
+			return nil, fmt.Errorf("failed to load managed channels for passive recovery: %w", err)
+		}
+		for _, channelID := range managedIDs {
+			managedChannels[channelID] = struct{}{}
 		}
 	}
 	now := time.Now().Unix()
@@ -1166,7 +1172,7 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 		}
 		selected = append(selected, channel)
 	}
-	return selected
+	return selected, nil
 }
 
 // TestAllChannels enqueues a channel_test system task instead of running the

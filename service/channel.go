@@ -16,7 +16,10 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 )
 
-var planQuotaResetPattern = regexp.MustCompile(`(?i)reset at\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4} [A-Z]+)`)
+var (
+	planQuotaResetPattern = regexp.MustCompile(`(?i)reset at\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4} [A-Z]+)`)
+	planQuotaTokensLeft   = regexp.MustCompile(`(?i)\byou have\s+[0-9][0-9,]*(?:\.[0-9]+)?\s+weighted tokens? left\b`)
+)
 
 func formatNotifyType(channelId int, status int) string {
 	return fmt.Sprintf("%s_%d_%d", dto.NotifyTypeChannelUpdate, channelId, status)
@@ -24,6 +27,29 @@ func formatNotifyType(channelId int, status int) string {
 
 // disable & notify
 func DisableChannel(channelError types.ChannelError, reason string) {
+	disableChannel(channelError, reason, nil)
+}
+
+type planQuotaDisableContext struct {
+	resetAt     int64
+	observedTag string
+}
+
+// DisableChannelForAPIError applies the structured Plan quota path when the
+// upstream response has all required quota evidence.
+func DisableChannelForAPIError(channelError types.ChannelError, observedTag string, err *types.NewAPIError) bool {
+	resetAt, planQuota := ClassifyPlanQuotaError(err)
+	if !planQuota {
+		return false
+	}
+	disableChannel(channelError, err.ErrorWithStatusCode(), &planQuotaDisableContext{
+		resetAt:     resetAt,
+		observedTag: observedTag,
+	})
+	return true
+}
+
+func disableChannel(channelError types.ChannelError, reason string, planQuota *planQuotaDisableContext) {
 	common.SysLog(fmt.Sprintf("通道「%s」（#%d）发生错误，准备禁用，原因：%s", channelError.ChannelName, channelError.ChannelId, common.LocalLogPreview(reason)))
 
 	// 检查是否启用自动禁用功能
@@ -32,10 +58,16 @@ func DisableChannel(channelError types.ChannelError, reason string) {
 		return
 	}
 
-	channel, _ := model.CacheGetChannel(channelError.ChannelId)
-	resetAt, quotaLimited := ParsePlanQuotaReset(reason)
-	if !channelError.IsMultiKey && isNonMultiKeyPlanChannel(channel) && quotaLimited {
-		disablePlanQuotaDomain(channel, reason, resetAt)
+	if !channelError.IsMultiKey &&
+		planQuota != nil &&
+		strings.HasPrefix(planQuota.observedTag, "plan:") {
+		disablePlanQuotaDomainWithCredential(
+			&model.Channel{Id: channelError.ChannelId},
+			channelError.UsingKey,
+			planQuota.observedTag,
+			reason,
+			planQuota.resetAt,
+		)
 		return
 	}
 
@@ -70,6 +102,47 @@ func ParsePlanQuotaReset(reason string) (int64, bool) {
 		return 0, true
 	}
 	return resetAt.Unix(), true
+}
+
+// ClassifyPlanQuotaError requires the upstream status, semantics, and message
+// evidence that identify a Plan account quota response.
+func ClassifyPlanQuotaError(err *types.NewAPIError) (int64, bool) {
+	if err == nil || err.StatusCode != 429 {
+		return 0, false
+	}
+	message := err.Error()
+	accountQuotaExceeded := isAccountQuotaExceededSemantic(err.GetErrorCode())
+	switch openAIError := err.RelayError.(type) {
+	case types.OpenAIError:
+		accountQuotaExceeded = accountQuotaExceeded ||
+			isAccountQuotaExceededSemantic(openAIError.Code) ||
+			isAccountQuotaExceededSemantic(openAIError.Type)
+		if openAIError.Message != "" {
+			message = openAIError.Message
+		}
+	case *types.OpenAIError:
+		if openAIError != nil {
+			accountQuotaExceeded = accountQuotaExceeded ||
+				isAccountQuotaExceededSemantic(openAIError.Code) ||
+				isAccountQuotaExceededSemantic(openAIError.Type)
+			if openAIError.Message != "" {
+				message = openAIError.Message
+			}
+		}
+	}
+	if !accountQuotaExceeded {
+		return 0, false
+	}
+	if resetAt, matched := ParsePlanQuotaReset(message); matched {
+		return resetAt, true
+	}
+	return 0, planQuotaTokensLeft.MatchString(message)
+}
+
+func isAccountQuotaExceededSemantic(value any) bool {
+	normalized := strings.ToLower(strings.TrimSpace(fmt.Sprint(value)))
+	normalized = strings.NewReplacer("_", "", "-", "").Replace(normalized)
+	return normalized == "accountquotaexceeded"
 }
 
 func isNonMultiKeyPlanChannel(channel *model.Channel) bool {
@@ -113,6 +186,25 @@ func PlanQuotaRecoveryDomainKey(channel *model.Channel) (string, bool) {
 }
 
 func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetAt int64) {
+	observedCredential := ""
+	observedTag := ""
+	if failingChannel != nil {
+		keys := failingChannel.GetKeys()
+		if len(keys) == 1 {
+			observedCredential = keys[0]
+		}
+		observedTag = failingChannel.GetTag()
+	}
+	disablePlanQuotaDomainWithCredential(failingChannel, observedCredential, observedTag, reason, resetAt)
+}
+
+func disablePlanQuotaDomainWithCredential(
+	failingChannel *model.Channel,
+	observedCredential string,
+	observedTag string,
+	reason string,
+	resetAt int64,
+) {
 	if failingChannel == nil {
 		common.SysError("failed to disable Plan quota domain: channel is nil")
 		return
@@ -124,16 +216,8 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 	}
 	failingChannel = currentFailingChannel
 
-	failingKeys := failingChannel.GetKeys()
-	if len(failingKeys) > 1 {
-		common.SysError(fmt.Sprintf("failed to disable Plan quota domain: channel_id=%d has multiple credentials", failingChannel.Id))
-		return
-	}
-
-	credential := ""
 	channels := []*model.Channel{failingChannel}
-	if len(failingKeys) == 1 {
-		credential = failingKeys[0]
+	if observedCredential != "" {
 		allChannels, err := model.GetAllChannels(0, 0, true, false)
 		if err != nil {
 			common.SysError(fmt.Sprintf("failed to load Plan quota credential domain: channel_id=%d error=%v", failingChannel.Id, err))
@@ -141,21 +225,21 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 		}
 		channels = allChannels
 	}
-	domainID := planQuotaDomainID(failingChannel.Id, credential)
+	domainID := planQuotaDomainID(failingChannel.Id, observedCredential)
 	generation := strconv.FormatInt(time.Now().UnixNano(), 10)
 
 	disabled := 0
 	for _, channel := range channels {
 		tag := channel.GetTag()
 		keys := channel.GetKeys()
-		if credential == "" {
+		if observedCredential == "" {
 			if channel.Id != failingChannel.Id {
 				continue
 			}
 		} else {
 			if !isNonMultiKeyPlanChannel(channel) ||
 				len(keys) != 1 ||
-				keys[0] != credential {
+				keys[0] != observedCredential {
 				continue
 			}
 		}
@@ -207,10 +291,9 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 		}
 	}
 	if disabled > 0 {
-		tag := failingChannel.GetTag()
-		subject := fmt.Sprintf("Plan 配额域「%s」已临时禁用", tag)
+		subject := fmt.Sprintf("Plan 配额域「%s」已临时禁用", observedTag)
 		content := fmt.Sprintf("%s，共禁用 %d 个协议渠道", reason, disabled)
-		NotifyRootUser("channel_plan_quota_"+tag, subject, content)
+		NotifyRootUser("channel_plan_quota_"+observedTag, subject, content)
 	}
 }
 
@@ -230,41 +313,47 @@ func EnableChannel(channelId int, usingKey string, channelName string) {
 // EnableChannelForHealthCheck recovers only the state observed before the
 // probe. Manual and internal callers that intentionally act on current state
 // should continue using EnableChannel.
-func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) {
+func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) int {
 	if channel == nil || channel.Status != common.ChannelStatusAutoDisabled {
-		return
+		return 0
 	}
 	if channel.ChannelInfo.IsMultiKey {
-		EnableChannel(channel.Id, usingKey, channel.Name)
-		return
+		if !model.UpdateChannelStatus(channel.Id, usingKey, common.ChannelStatusEnabled, "") {
+			return 0
+		}
+		subject := fmt.Sprintf("通道「%s」（#%d）已被启用", channel.Name, channel.Id)
+		content := fmt.Sprintf("通道「%s」（#%d）已被启用", channel.Name, channel.Id)
+		NotifyRootUser(formatNotifyType(channel.Id, common.ChannelStatusEnabled), subject, content)
+		return 1
 	}
 	if isNonMultiKeyPlanChannel(channel) {
 		if recoveryKey, owned := PlanQuotaRecoveryDomainKey(channel); owned {
-			enablePlanQuotaDomainForHealthCheck(channel, recoveryKey)
-			return
+			return enablePlanQuotaDomainForHealthCheck(channel, recoveryKey)
 		}
 	}
 
 	changed, err := enableSingleKeyChannelSnapshot(channel, false)
 	if err != nil {
 		common.SysError(fmt.Sprintf("failed to recover channel from health-check snapshot: channel_id=%d error=%v", channel.Id, err))
-		return
+		return 0
 	}
 	if changed {
 		subject := fmt.Sprintf("通道「%s」（#%d）已被启用", channel.Name, channel.Id)
 		content := fmt.Sprintf("通道「%s」（#%d）已被启用", channel.Name, channel.Id)
 		NotifyRootUser(formatNotifyType(channel.Id, common.ChannelStatusEnabled), subject, content)
+		return 1
 	}
+	return 0
 }
 
-func enablePlanQuotaDomainForHealthCheck(recoveringSnapshot *model.Channel, recoveryKey string) {
+func enablePlanQuotaDomainForHealthCheck(recoveringSnapshot *model.Channel, recoveryKey string) int {
 	changed, err := enableSingleKeyChannelSnapshot(recoveringSnapshot, true)
 	if err != nil {
 		common.SysError(fmt.Sprintf("failed to recover Plan quota source: channel_id=%d error=%v", recoveringSnapshot.Id, err))
-		return
+		return 0
 	}
 	if !changed {
-		return
+		return 0
 	}
 
 	enabled := 1
@@ -273,12 +362,16 @@ func enablePlanQuotaDomainForHealthCheck(recoveringSnapshot *model.Channel, reco
 		if err != nil {
 			common.SysError(fmt.Sprintf("failed to load Plan quota peers: channel_id=%d error=%v", recoveringSnapshot.Id, err))
 		} else {
+			now := time.Now().Unix()
 			for _, channel := range channels {
 				if channel.Id == recoveringSnapshot.Id {
 					continue
 				}
 				candidateKey, candidateOwned := PlanQuotaRecoveryDomainKey(channel)
-				if !candidateOwned || candidateKey != recoveryKey {
+				if !candidateOwned ||
+					candidateKey != recoveryKey ||
+					channel.GetDisabledUntil() > now ||
+					!planQuotaPeerGenerationMatches(recoveringSnapshot, channel) {
 					continue
 				}
 				changed, err := enableSingleKeyChannelSnapshot(channel, true)
@@ -297,6 +390,7 @@ func enablePlanQuotaDomainForHealthCheck(recoveringSnapshot *model.Channel, reco
 	NotifyRootUser("channel_plan_quota_recovered_"+tag,
 		fmt.Sprintf("Plan 配额域「%s」已恢复", tag),
 		fmt.Sprintf("已恢复 %d 个协议渠道", enabled))
+	return enabled
 }
 
 func planQuotaSnapshotMatchesCredentialMarker(channel *model.Channel) bool {
@@ -306,6 +400,19 @@ func planQuotaSnapshotMatchesCredentialMarker(channel *model.Channel) bool {
 	}
 	keys := channel.GetKeys()
 	return len(keys) == 1 && planQuotaDomainID(channel.Id, keys[0]) == domainID
+}
+
+func planQuotaPeerGenerationMatches(source *model.Channel, peer *model.Channel) bool {
+	sourceGeneration, sourceExists := source.GetOtherInfo()["quota_generation"]
+	peerGeneration, peerExists := peer.GetOtherInfo()["quota_generation"]
+	if !sourceExists && !peerExists {
+		return true
+	}
+	sourceValue, sourceValid := sourceGeneration.(string)
+	peerValue, peerValid := peerGeneration.(string)
+	return sourceValid && peerValid &&
+		sourceValue != "" &&
+		sourceValue == peerValue
 }
 
 func enableSingleKeyChannelSnapshot(channel *model.Channel, clearPlanQuota bool) (bool, error) {
@@ -418,7 +525,7 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 	if types.IsSkipRetryError(err) {
 		return false
 	}
-	if _, quotaLimited := ParsePlanQuotaReset(err.Error()); quotaLimited {
+	if _, quotaLimited := ClassifyPlanQuotaError(err); quotaLimited {
 		return true
 	}
 	if operation_setting.ShouldDisableByStatusCode(err.StatusCode) {

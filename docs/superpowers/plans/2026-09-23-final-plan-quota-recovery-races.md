@@ -336,3 +336,178 @@ go vet ./service ./controller ./model
 git diff --check
 git commit -m "fix(channel): bind quota recovery to probe snapshot"
 ```
+
+### Task 8: Require Structured Plan Quota Evidence
+
+**Files:**
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/channel.go`
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `controller/relay.go`
+
+- [x] **Step 1: Add classifier RED coverage**
+
+Cover HTTP 429 plus normalized `AccountQuotaExceeded` from
+`NewAPIError.GetErrorCode()` or available OpenAI code/type fields and
+recognized monthly, weekly, 5-hour, or remaining weighted-token evidence.
+Include `WithClaudeError` coverage. Reject ordinary 429s, wrong status, wrong
+code/type, and matching semantics without quota evidence.
+
+Observed RED:
+
+```text
+undefined: ClassifyPlanQuotaError
+```
+
+- [x] **Step 2: Add the service classifier**
+
+Keep `ParsePlanQuotaReset` as the message parser, but permit the Plan-domain
+path only through `ClassifyPlanQuotaError`. Leave configured generic status and
+keyword disables unchanged.
+
+- [x] **Step 3: Use the classifier in controller precedence**
+
+Replace text-only managed prioritization with the service classifier. Keep
+managed unsupported-model isolation first.
+
+### Task 9: Bind Disable to the Observed Request Identity
+
+**Files:**
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/channel.go`
+- Modify: `controller/relay.go`
+
+- [x] **Step 1: Add the credential-rotation RED regression**
+
+Send the failing request with a Plan tag and credential A, rotate both source
+tag and key to an ordinary/B identity, and assert that current Plan A peers are
+isolated while the rotated source and B peers remain enabled.
+
+Observed RED:
+
+```text
+undefined: DisableChannelForAPIError
+```
+
+- [x] **Step 2: Add the structured disable entry**
+
+`DisableChannelForAPIError` carries the classified reset,
+`ChannelError.UsingKey`, and selected channel snapshot tag into domain
+selection. The request-time tag decides Plan eligibility; current rows are
+matched exactly and written through the existing identity/status/metadata CAS.
+Empty observed credentials remain source-only.
+
+- [x] **Step 3: Make recognized Plan handling synchronous**
+
+Call the structured entry directly from `processChannelError` before retry
+selection. Keep generic disables asynchronous; the structured service entry
+retains multi-key per-key handling.
+
+### Task 10: Fence and Count Health-Check Recovery
+
+**Files:**
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/channel.go`
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `controller/channel-test.go`
+
+- [x] **Step 1: Add peer-fence RED coverage**
+
+After source CAS success, assert that peers with a different generation or a
+future `disabled_until` remain auto-disabled with disabled abilities. Preserve
+compatibility when both marked legacy rows omit generation.
+
+Observed RED: mismatched-generation and not-yet-due peers were enabled.
+
+- [x] **Step 2: Apply generation and due-time checks**
+
+Require matching non-empty generation strings, or explicit both-missing legacy
+compatibility, and require each peer to be due before its own CAS.
+
+- [x] **Step 3: Add committed-count RED coverage**
+
+Assert a source plus peer recovery returns two commits and a stale replay
+returns zero. Exercise `testChannelForHealthCheck` against a real local HTTP
+upstream and require the same summary values.
+
+Observed RED: the service API had no return value; after adding it, controller
+summaries reported one for both the two-row commit and stale no-op.
+
+- [x] **Step 4: Return and aggregate committed enables**
+
+Return the number of successful status CAS commits from
+`EnableChannelForHealthCheck` and add that exact number to the controller
+summary.
+
+### Task 11: Preserve Plan Ownership During Managed Reconciliation
+
+**Files:**
+- Modify: `service/upstream_orchestration_test.go`
+- Modify: `service/upstream_routing.go`
+
+- [x] **Step 1: Add the two-path RED regression**
+
+Run `ReconcileManagedUpstreams` with one shadow route becoming active and one
+already-active route entering steady-state ranking. Assert both owned channels
+remain disabled while route state, rank, priority, endpoint, and models update.
+
+Observed RED: both channels and abilities were enabled, and the activation
+path also appended generic status metadata.
+
+- [x] **Step 2: Share an ownership guard**
+
+Both the route-state activation writer and `rankManagedRoutes` consult
+`PlanQuotaRecoveryDomainKey` before selecting enabled status. Valid ownership
+preserves status, raw metadata, and disabled abilities; ordinary managed
+behavior is unchanged.
+
+### Task 12: Fail Passive Selection Closed
+
+**Files:**
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `controller/channel-test.go`
+
+- [x] **Step 1: Add a database-failure RED regression**
+
+Run the passive system task without the managed-route table and provide an
+otherwise probeable ordinary auto-disabled channel.
+
+Observed RED: the query error was ignored, the task returned success, and the
+upstream received a probe.
+
+- [x] **Step 2: Propagate selection errors**
+
+Return `([]*model.Channel, error)` from `selectChannelsForAutomaticTest`.
+Propagate managed-route query failures from `runChannelTestTask` before worker
+startup and update every selector call site.
+
+### Task 13: Final Verification and Commit
+
+**Files:**
+- Modify only the registered handoff occupancy list.
+
+- [x] **Step 1: Run formatting and focused/package tests**
+
+```bash
+gofmt -w service/channel.go service/channel_quota_test.go \
+  service/upstream_routing.go service/upstream_orchestration_test.go \
+  controller/relay.go controller/channel-test.go \
+  controller/channel_test_internal_test.go
+go test ./service ./controller -count=1
+```
+
+- [x] **Step 2: Run race, vet, and whitespace gates**
+
+```bash
+go test -race ./service -run \
+  'PlanQuota|ClassifyPlanQuota|ReconcileManagedUpstreamsPreservesPlanQuotaOwnership' -count=1
+go test -race ./controller -run \
+  'Test(ChannelForHealthCheckCountsOnlyCommittedRecoveries|RunChannelTestTaskFailsClosedWhenManagedRouteQueryFails|SelectChannelsForAutomaticTest.*|ShouldPrioritizePlanQuotaDisableForManagedChannel)' -count=1
+go vet ./service ./controller
+git diff --check
+```
+
+- [x] **Step 3: Self-review and commit**
+
+Review the cumulative diff for occupancy, secret disclosure, schema changes,
+multi-key behavior, and stale-write protection, then create one focused commit.

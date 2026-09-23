@@ -196,7 +196,13 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 			state,
 		))
 		if state == model.UpstreamRouteStateActive {
-			model.UpdateChannelStatus(route.ChannelID, "", common.ChannelStatusEnabled, "")
+			channel, err := model.GetChannelById(route.ChannelID, true)
+			if err != nil {
+				return summary, err
+			}
+			if !preserveManagedPlanQuotaOwnership(channel, common.ChannelStatusEnabled) {
+				model.UpdateChannelStatus(route.ChannelID, "", common.ChannelStatusEnabled, "")
+			}
 		} else {
 			model.UpdateChannelStatus(route.ChannelID, "", common.ChannelStatusAutoDisabled, reason)
 		}
@@ -228,6 +234,14 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 		}
 	}
 	return summary, nil
+}
+
+func preserveManagedPlanQuotaOwnership(channel *model.Channel, desiredStatus int) bool {
+	if desiredStatus != common.ChannelStatusEnabled {
+		return false
+	}
+	_, owned := PlanQuotaRecoveryDomainKey(channel)
+	return owned
 }
 
 func managedCandidateSelectionEvaluable(
@@ -639,6 +653,9 @@ func rankManagedRoutes(
 			var channel model.Channel
 			if err := tx.Where("id = ?", route.ChannelID).First(&channel).Error; err != nil {
 				return err
+			}
+			if preserveManagedPlanQuotaOwnership(&channel, status) {
+				status = channel.Status
 			}
 			channel.Priority = &priority
 			channel.BaseURL = &selectedEndpoint
