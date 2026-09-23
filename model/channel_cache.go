@@ -335,10 +335,41 @@ func CacheUpdateChannel(channel *Channel) {
 	if channelsIDM == nil {
 		channelsIDM = make(map[int]*Channel)
 	}
+	statusChanged := false
 	if oldChannel, ok := channelsIDM[channel.Id]; ok {
 		logger.LogDebug(nil, "CacheUpdateChannel before: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, oldChannel.ChannelInfo.MultiKeyPollingIndex)
+		statusChanged = oldChannel.Status != channel.Status
 	}
 	channelsIDM[channel.Id] = channel
+	if statusChanged {
+		for group, model2channels := range group2model2channels {
+			for model, channels := range model2channels {
+				for i := len(channels) - 1; i >= 0; i-- {
+					if channels[i] == channel.Id {
+						channels = append(channels[:i], channels[i+1:]...)
+					}
+				}
+				group2model2channels[group][model] = channels
+			}
+		}
+		if channel.Status == common.ChannelStatusEnabled {
+			if group2model2channels == nil {
+				group2model2channels = make(map[string]map[string][]int)
+			}
+			for _, group := range strings.Split(channel.Group, ",") {
+				if group2model2channels[group] == nil {
+					group2model2channels[group] = make(map[string][]int)
+				}
+				for _, model := range strings.Split(channel.Models, ",") {
+					channels := append(group2model2channels[group][model], channel.Id)
+					sort.Slice(channels, func(i, j int) bool {
+						return channelsIDM[channels[i]].GetPriority() > channelsIDM[channels[j]].GetPriority()
+					})
+					group2model2channels[group][model] = channels
+				}
+			}
+		}
+	}
 	if channel2advancedCustomConfig == nil {
 		channel2advancedCustomConfig = make(map[int]*kitdto.AdvancedCustomConfig)
 	}

@@ -305,6 +305,78 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedFencesSnapshot(t *testing.T) {
 	}
 }
 
+func TestUpdateMultiKeyChannelStatusIfUnchangedSynchronizesMemoryRouting(t *testing.T) {
+	setupChannelStatusTest(t)
+	tag := "plan:managed:memory-routing"
+	channel := Channel{
+		Name:   "multi-key-memory-routing",
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		Tag:    &tag,
+		Models: "gpt-3.5-turbo",
+		Group:  "default",
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:           true,
+			MultiKeySize:         2,
+			MultiKeyPollingIndex: 1,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+			},
+		},
+	}
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+
+	selected, err := GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, channel.Id, selected.Id)
+
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	changed, err := UpdateMultiKeyChannelStatusIfUnchanged(
+		expected,
+		tag,
+		"key-b",
+		common.ChannelStatusAutoDisabled,
+		"quota exhausted",
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, cached.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, cached.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, common.ChannelStatusAutoDisabled, cached.ChannelInfo.MultiKeyStatusList[1])
+	assert.Equal(t, 1, cached.ChannelInfo.MultiKeyPollingIndex)
+	selected, err = GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
+	require.NoError(t, err)
+	assert.Nil(t, selected)
+
+	expected, err = GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	changed, err = UpdateMultiKeyChannelStatusIfUnchanged(
+		expected,
+		tag,
+		"key-b",
+		common.ChannelStatusEnabled,
+		"",
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	selected, err = GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, channel.Id, selected.Id)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, selected.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, selected.ChannelInfo.MultiKeyStatusList, 1)
+	assert.Equal(t, 1, selected.ChannelInfo.MultiKeyPollingIndex)
+}
+
 func TestUpdateManagedChannelIfUnchangedPreservesConcurrentStatusOwner(t *testing.T) {
 	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
 		"owner": "before",

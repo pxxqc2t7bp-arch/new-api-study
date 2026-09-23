@@ -773,3 +773,50 @@ the focused model/service/controller race suites, `go vet`, and
 MySQL and PostgreSQL cases skipped because `TEST_MYSQL_DSN` and
 `TEST_POSTGRES_DSN` were unset. Diff review found only the six registered task
 files and no credential disclosure or schema change.
+
+### Task 16: Synchronize Final-Key Memory Routing
+
+**Files:**
+
+- Modify: `model/channel_cache.go`
+- Modify: `model/channel_status_cas_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: Add a cached-selection RED regression**
+
+Start with memory caching enabled and one remaining enabled key. Disable that
+final key through `UpdateMultiKeyChannelStatusIfUnchanged`, then assert cached
+selection returns no channel while the cached `channel_info` contains both
+disabled key states and retains its polling cursor. Re-enable one key and
+assert the channel becomes selectable again with the committed per-key state.
+
+Run:
+
+```bash
+go test ./model -run \
+  '^TestUpdateMultiKeyChannelStatusIfUnchangedSynchronizesMemoryRouting$' -count=1
+```
+
+Observed RED: cached selection returned the overall auto-disabled channel.
+
+- [x] **Step 2: Reconcile routing membership with the full cache update**
+
+When `CacheUpdateChannel` observes an overall status transition, remove all
+existing occurrences of the channel ID from the group/model routing index.
+Reinsert it, preserving priority order and avoiding duplicates, only when the
+committed status is enabled. Keep the full channel replacement and routing
+change under the same cache lock so the committed `channel_info` is retained.
+
+Run the focused test again. Observed: PASS.
+
+- [x] **Step 3: Run final verification and commit**
+
+Run focused model/service tests, the relevant race subsets, `go vet`, `gofmt`,
+and `git diff --check`. Review the final diff for scope, then create one
+focused commit without deployment changes.
+
+Observed: formatting was clean; full model/service package tests, focused
+model/service race subsets, `go vet ./model ./service ./controller`, and
+`git diff --check` passed. The diff contains only the cache implementation,
+its behavior regression, and the existing design/plan updates.

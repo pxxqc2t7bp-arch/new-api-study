@@ -235,7 +235,11 @@ It also compares the snapshot's key, status, raw status metadata, and complete
 `channel_info` before atomically persisting the per-key state and any required
 ability transition. A tag rotation or multi-key-to-single-key rotation is a
 no-op, so a credential introduced after request selection is never disabled.
-The general multi-key status API remains unchanged.
+After commit, the full updated channel replaces the memory-cache entry so the
+new per-key status remains available. When the overall channel status changes,
+that same cache update removes a disabled channel from the group/model routing
+index or restores an enabled channel without duplicate membership. The general
+multi-key status API remains unchanged.
 
 `DisableChannelForAPIError` rejects the structured path before classification
 or mutation when `common.AutomaticDisableChannelEnabled` is false. This guard
@@ -278,7 +282,9 @@ atomicity are identical on MySQL and PostgreSQL; SQLite omits unsupported
    mutation when global automatic disable is off.
 4. Multi-key Plan channels immediately use per-key status handling, including
    managed channels below their failure threshold, only if current tag, key
-   membership, and multi-key mode still match the failed request.
+   membership, and multi-key mode still match the failed request. A committed
+   overall status transition synchronizes both the cached channel state and its
+   group/model routing membership.
 5. For other Plan channels, exact single-key matches are selected in Go.
 6. Eligible enabled or same-marker auto-disabled snapshots build their complete
    desired status metadata with a fresh `quota_generation` and enter the
@@ -377,6 +383,9 @@ atomicity are identical on MySQL and PostgreSQL; SQLite omits unsupported
 - Managed structured Plan quota handling is a no-op after tag rotation or
   multi-key-to-single-key rotation, and never disables a replacement
   credential.
+- With memory caching enabled, disabling the final enabled key removes the
+  channel from cached selection while preserving the committed per-key state;
+  re-enabling a key restores routing membership without duplication.
 - Passive recovery chooses the oldest `TestTime` in a shared domain and uses
   channel ID as its deterministic tie-break.
 - Passive recovery includes managed marked and validated legacy Plan quota
