@@ -280,11 +280,10 @@ func requireEventually(t *testing.T, assertion func() bool) {
 
 func relayGoPoolDrain(t *testing.T) func() {
 	t.Helper()
-	baselineWorkers := gopool.WorkerCount()
 	return func() {
 		t.Helper()
 		require.Eventually(t, func() bool {
-			return gopool.WorkerCount() <= baselineWorkers
+			return gopool.WorkerCount() == 0
 		}, 2*time.Second, 10*time.Millisecond)
 	}
 }
