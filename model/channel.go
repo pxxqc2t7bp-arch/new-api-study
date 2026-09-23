@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -919,6 +920,89 @@ func updateSingleKeyChannelStatusIfUnchangedLocked(
 	return changed, nil
 }
 
+// UpdateMultiKeyChannelStatusIfUnchanged applies a request-selected key
+// failure only while the complete channel status snapshot and request identity
+// still match.
+func UpdateMultiKeyChannelStatusIfUnchanged(
+	expected *Channel,
+	observedTag string,
+	usingKey string,
+	status int,
+	reason string,
+) (bool, error) {
+	if expected == nil || expected.Id == 0 {
+		return false, errors.New("multi-key channel snapshot is missing")
+	}
+
+	return withChannelStatusLocks(expected.Id, func() (bool, error) {
+		changed := false
+		var updated Channel
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			var current Channel
+			if err := lockForUpdate(tx).Where("id = ?", expected.Id).First(&current).Error; err != nil {
+				return err
+			}
+			if current.Key != expected.Key ||
+				current.GetTag() != expected.GetTag() ||
+				current.Status != expected.Status ||
+				current.OtherInfo != expected.OtherInfo ||
+				!reflect.DeepEqual(current.ChannelInfo, expected.ChannelInfo) ||
+				current.GetTag() != observedTag ||
+				!current.ChannelInfo.IsMultiKey {
+				return nil
+			}
+			keyFound := false
+			for _, key := range current.GetKeys() {
+				if key == usingKey {
+					keyFound = true
+					break
+				}
+			}
+			if !keyFound {
+				return nil
+			}
+
+			updated = current
+			channelInfoJSON, err := common.Marshal(current.ChannelInfo)
+			if err != nil {
+				return err
+			}
+			if err := common.Unmarshal(channelInfoJSON, &updated.ChannelInfo); err != nil {
+				return err
+			}
+			handlerMultiKeyUpdate(&updated, usingKey, status, reason)
+			if updated.Status == current.Status &&
+				updated.OtherInfo == current.OtherInfo &&
+				reflect.DeepEqual(updated.ChannelInfo, current.ChannelInfo) {
+				return nil
+			}
+
+			if err := tx.Model(&Channel{}).Where("id = ?", current.Id).Updates(map[string]any{
+				"status":       updated.Status,
+				"other_info":   updated.OtherInfo,
+				"channel_info": updated.ChannelInfo,
+			}).Error; err != nil {
+				return err
+			}
+			if updated.Status != current.Status {
+				if err := tx.Model(&Ability{}).Where("channel_id = ?", current.Id).
+					Select("enabled").Update("enabled", updated.Status == common.ChannelStatusEnabled).Error; err != nil {
+					return err
+				}
+			}
+			changed = true
+			return nil
+		})
+		if err != nil {
+			return false, err
+		}
+		if changed {
+			CacheUpdateChannel(&updated)
+		}
+		return changed, nil
+	})
+}
+
 type ManagedChannelUpdate struct {
 	RouteID             int64
 	Rank                int
@@ -940,6 +1024,14 @@ func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpd
 	return withChannelStatusLocks(expected.Id, func() (bool, error) {
 		changed := false
 		err := DB.Transaction(func(tx *gorm.DB) error {
+			var currentRoute UpstreamManagedRoute
+			if err := lockForUpdate(tx).Where("id = ?", update.RouteID).First(&currentRoute).Error; err != nil {
+				return err
+			}
+			if currentRoute.ChannelID != expected.Id {
+				return nil
+			}
+
 			var current Channel
 			if err := lockForUpdate(tx).Where("id = ?", expected.Id).First(&current).Error; err != nil {
 				return err
@@ -992,7 +1084,7 @@ func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpd
 				}
 			}
 
-			if err := tx.Model(&UpstreamManagedRoute{}).Where("id = ?", update.RouteID).Updates(map[string]any{
+			if err := tx.Model(&UpstreamManagedRoute{}).Where("id = ?", currentRoute.ID).Updates(map[string]any{
 				"rank":                 update.Rank,
 				"effective_multiplier": update.EffectiveMultiplier,
 				"updated_at":           update.UpdatedAt,

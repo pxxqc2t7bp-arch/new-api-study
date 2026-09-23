@@ -595,3 +595,181 @@ Observed: `gofmt`, focused race suites for model/service/controller, full
 and `git diff --check` all passed. The optional configured-database test passed
 with its MySQL and PostgreSQL cases skipped because `TEST_MYSQL_DSN` and
 `TEST_POSTGRES_DSN` were unset. Cumulative review found no P0-P2 defect.
+
+### Task 15: Resolve Final Specification Review Findings
+
+**Files:**
+
+- Modify: `service/channel.go`
+- Modify: `service/channel_quota_test.go`
+- Modify: `model/channel.go`
+- Modify: `model/channel_status_cas_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: RED for the global automatic-disable gate**
+
+Call `DisableChannelForAPIError` with a qualifying structured 429 while
+`common.AutomaticDisableChannelEnabled` is false. Assert it returns false and
+preserves channel status, `other_info`, `channel_info`, abilities, and managed
+route counters.
+
+Run:
+
+```bash
+go test ./service -run '^TestDisableChannelForAPIErrorHonorsGlobalAutomaticDisable$' -count=1
+```
+
+Observed: FAIL because the entry returned handled, auto-disabled both domain
+rows, wrote quota metadata, and disabled both abilities.
+
+- [x] **Step 2: GREEN for the global gate**
+
+Add the service-entry guard:
+
+```go
+if !common.AutomaticDisableChannelEnabled {
+    return false
+}
+```
+
+Run the focused test and the existing structured classifier/disable tests.
+Observed: PASS.
+
+- [x] **Step 3: RED for disable/recovery overlap**
+
+Start from an owned, due Plan quota domain. During the fresh disable's
+`GetAllChannels` snapshot callback, recover the source and peer from the old
+generation. Assert the fresh disable leaves both rows auto-disabled with the
+same new generation and disabled abilities.
+
+Run:
+
+```bash
+go test ./service -run '^TestFreshPlanQuotaDisableWinsOverOverlappingRecovery$' -count=1
+```
+
+Observed: FAIL because both one-shot CAS calls used stale auto-disabled
+snapshots and left the recovered rows enabled without a new generation.
+
+- [x] **Step 4: GREEN with bounded re-evaluation**
+
+Extract a helper with this responsibility:
+
+```go
+func disablePlanQuotaChannel(
+    channel *model.Channel,
+    failingChannelID int,
+    observedCredential string,
+    observedTag string,
+    domainID string,
+    generation string,
+    reason string,
+    resetAt int64,
+) (bool, error)
+```
+
+For at most `planQuotaDisableMaxAttempts` service attempts, validate exact
+credential/tag/mode and enabled-or-same-owner status, build desired metadata,
+attempt the single-key CAS, then reload and re-evaluate only after a stale
+no-op. Keep the one event generation for every attempt. Stop immediately for
+manual disable, unrelated ownership, or identity/mode rotation.
+
+Run the overlap test plus the existing ownership and rotation tests. Observed:
+PASS.
+
+- [x] **Step 5: RED for managed multi-key request identity**
+
+Add table cases that rotate a request-selected managed multi-key Plan channel
+to another tag and from multi-key to a new single key before
+`DisableChannelForAPIError`. Assert no current key, channel metadata, ability,
+or route counter changes. Retain the unchanged managed multi-key case proving
+immediate `UsingKey` isolation.
+
+Run:
+
+```bash
+go test ./service -run '^TestDisableChannelManagedPlanMultiKey(RequestIdentityFence|ImmediatelyIsolatesUsedKey)$' -count=1
+```
+
+Observed: FAIL because tag rotation disabled the original key index and
+multi-key-to-single-key rotation disabled the replacement channel and ability.
+
+- [x] **Step 6: GREEN with an atomic multi-key request CAS**
+
+Add:
+
+```go
+func UpdateMultiKeyChannelStatusIfUnchanged(
+    expected *Channel,
+    observedTag string,
+    usingKey string,
+    status int,
+    reason string,
+) (bool, error)
+```
+
+Under `withChannelStatusLocks` and a transaction row lock, require the locked
+row to match expected key, tag, status, raw `other_info`, and complete
+`channel_info`; also require the observed tag, multi-key mode, and exact used
+key membership. Reuse `handlerMultiKeyUpdate`, persist status metadata and
+`channel_info` atomically, update abilities only when overall status changes,
+and refresh cache only after commit. Use this helper only for structured Plan
+multi-key handling; preserve general `UpdateChannelStatus`.
+
+Run focused model and service tests. Observed: PASS.
+
+- [x] **Step 7: RED for behavioral lock ordering**
+
+Register GORM query callbacks that record locked table reads inside
+`UpdateManagedChannelIfUnchanged`, then perform a real successful managed
+route/channel/ability update. Assert the first two transactional reads are
+`upstream_managed_routes` then `channels`, and assert all three persisted
+states changed atomically.
+
+Run:
+
+```bash
+go test ./model -run '^TestUpdateManagedChannelIfUnchangedLocksRouteBeforeChannel$' -count=1
+```
+
+Observed: FAIL with only a transactional `channels` read; the route had no
+locking read.
+
+- [x] **Step 8: GREEN with one route-first order**
+
+In `UpdateManagedChannelIfUnchanged`, lock and validate the route by route ID
+and expected channel ID before locking the channel. Keep route, channel, and
+ability writes in the same transaction. Both row reads use `lockForUpdate`, so
+SQLite skips unsupported syntax while MySQL/PostgreSQL retain row locks.
+
+Run the lock-order regression, managed snapshot CAS tests, reconciliation
+tests, and unsupported-model isolation tests. Observed: PASS with transactional
+read order `upstream_managed_routes`, then `channels`.
+
+- [x] **Step 9: Final verification and focused commit**
+
+```bash
+gofmt -w service/channel.go service/channel_quota_test.go \
+  model/channel.go model/channel_status_cas_test.go
+go test ./model ./service ./controller -count=1
+go test -race ./model -run \
+  '^(TestUpdateManagedChannelIfUnchanged|TestUpdateMultiKeyChannelStatusIfUnchanged)' -count=1
+go test -race ./service -run \
+  'PlanQuota|DisableChannelForAPIError|ManagedPlanMultiKey' -count=1
+go test -race ./controller -run \
+  'PlanQuota|ProcessChannelError|ShouldPrioritizePlanQuota' -count=1
+go vet ./model ./service ./controller
+git diff --check
+```
+
+Run the optional configured MySQL/PostgreSQL model matrix when both DSNs are
+available, review scope and credential handling, then create one focused
+commit.
+
+Observed: formatting was clean; the model/service/controller package suite,
+the focused model/service/controller race suites, `go vet`, and
+`git diff --check` passed. The configured-database harness passed with its
+MySQL and PostgreSQL cases skipped because `TEST_MYSQL_DSN` and
+`TEST_POSTGRES_DSN` were unset. Diff review found only the six registered task
+files and no credential disclosure or schema change.

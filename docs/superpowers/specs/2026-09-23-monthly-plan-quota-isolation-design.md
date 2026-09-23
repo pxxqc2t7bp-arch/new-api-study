@@ -50,6 +50,15 @@ different tags can therefore continue receiving traffic.
   managed multi-key channels, bypassing managed failure thresholds.
 - Count only health-check recoveries that actually commit, and fail passive
   selection closed when managed-route ownership cannot be queried.
+- Honor the global automatic-disable switch at the structured Plan service
+  entry so direct callers cannot mutate channel, ability, or route state while
+  automatic disable is off.
+- Make a fresh Plan quota generation win when recovery commits after the
+  disable sweep snapshot but before an individual disable CAS.
+- Fence managed multi-key Plan isolation against request-time tag, key
+  membership, and multi-key mode rotation.
+- Use route-before-channel row-lock ordering for managed reconciliation and
+  unsupported-model isolation.
 
 ## Non-Goals
 
@@ -127,6 +136,15 @@ owned by the same quota domain. This guarantees that a fresh disable changes
 the exact raw metadata expected by recovery. A recovery snapshot taken before
 that event therefore loses its CAS and cannot re-enable the channel. Successful
 recovery removes `quota_generation` with the other quota ownership fields.
+
+Each selected domain row is applied through a small bounded helper. A failed
+CAS causes the helper to reload that row, re-check exact request credential,
+Plan eligibility, multi-key mode, manual-disable state, and quota-domain
+ownership, and retry only while the row still qualifies. Every attempt uses
+the one generation allocated for the fresh disable event. This lets a fresh
+disable supersede a recovery that enabled an eligible row after the domain
+snapshot, while a manual disable, another quota owner, or key/tag/mode
+rotation terminates retries without mutation.
 
 The non-multi-key branch of legacy `UpdateChannelStatus` uses a bounded
 snapshot/CAS retry over the same internal lock and transaction primitive.
@@ -209,10 +227,20 @@ special case. A recognized Plan quota error is then sent through
 before retry selection and managed failure accounting. Generic disables remain
 asynchronous. Ordinary managed failures retain their existing threshold
 behavior. A structured Plan quota error for a managed multi-key channel calls
-the existing `UpdateChannelStatus` path immediately with the request's
-`UsingKey`, then returns without incrementing the managed failure threshold.
-Only the used key is disabled; the overall channel and abilities remain enabled
-while another key is available.
+an identity-fenced model CAS immediately with the request's `UsingKey`, then
+returns without incrementing the managed failure threshold. The CAS holds the
+existing channel status locks, locks the current channel row, and requires the
+request-observed tag, multi-key mode, and used-key membership to remain valid.
+It also compares the snapshot's key, status, raw status metadata, and complete
+`channel_info` before atomically persisting the per-key state and any required
+ability transition. A tag rotation or multi-key-to-single-key rotation is a
+no-op, so a credential introduced after request selection is never disabled.
+The general multi-key status API remains unchanged.
+
+`DisableChannelForAPIError` rejects the structured path before classification
+or mutation when `common.AutomaticDisableChannelEnabled` is false. This guard
+lives at the public service entry rather than only in controller policy, so
+relay, health-test, and future direct callers all obey the global switch.
 
 Managed reconciliation treats valid Plan quota metadata as separate ownership
 of channel availability. A transition to active no longer performs a
@@ -232,19 +260,30 @@ Reconciliation still updates route state separately and retains ordinary
 managed behavior, but valid quota ownership keeps channel status and abilities
 disabled until health-check or manual recovery clears ownership.
 
+The managed reconciliation transaction locks its
+`upstream_managed_routes` row before its `channels` row, matching
+unsupported-model isolation. It validates that the locked route still belongs
+to the expected channel, then compares the channel snapshot and atomically
+updates route rank, channel routing/status fields, and abilities. The order and
+atomicity are identical on MySQL and PostgreSQL; SQLite omits unsupported
+`FOR UPDATE` syntax and retains the same transactional operation order.
+
 ## Data Flow
 
 1. An upstream response becomes a `types.NewAPIError`.
 2. `ClassifyPlanQuotaError` validates status, upstream code/type, and message
    evidence; `ShouldDisableChannel` retains generic configured fallbacks.
 3. `DisableChannelForAPIError` carries the observed request tag, credential,
-   and parsed reset timestamp into the Plan disable path.
+   and parsed reset timestamp into the Plan disable path, but returns without
+   mutation when global automatic disable is off.
 4. Multi-key Plan channels immediately use per-key status handling, including
-   managed channels below their failure threshold.
+   managed channels below their failure threshold, only if current tag, key
+   membership, and multi-key mode still match the failed request.
 5. For other Plan channels, exact single-key matches are selected in Go.
 6. Eligible enabled or same-marker auto-disabled snapshots build their complete
    desired status metadata with a fresh `quota_generation` and enter the
-   transactional row-lock CAS.
+   transactional row-lock CAS. A stale CAS reloads and re-evaluates the row for
+   a bounded retry with the same generation.
 7. The CAS updates channel status, metadata, and ability enabled state only
    while key, tag, status, and raw metadata still match the snapshot.
 8. Existing retry logic sends the current request to the next eligible tier.
@@ -268,6 +307,8 @@ disabled until health-check or manual recovery clears ownership.
 - Monthly reset parsing returns the exact Unix timestamp.
 - Monthly quota errors trigger `ShouldDisableChannel` even when the configured
   keyword list does not contain monthly wording.
+- A qualifying structured Plan quota error causes no channel, ability, or
+  managed-route mutation when global automatic disable is off.
 - The Plan classifier rejects an ordinary 429, a wrong status, wrong upstream
   code/type, and matching semantics without quota evidence.
 - Remaining weighted-token evidence is recognized with structured 429
@@ -301,6 +342,11 @@ disabled until health-check or manual recovery clears ownership.
 - Stale key and stale tag snapshots make the model CAS a no-op.
 - A fresh disable of an already-owned auto-disabled channel changes
   `quota_generation` and rejects a stale recovery snapshot.
+- A recovery that enables an eligible row between the fresh disable's domain
+  snapshot and first CAS is superseded by a bounded re-read/re-evaluate retry
+  using the same new generation.
+- The bounded retry stops for a manual disable, unrelated quota owner, or
+  key/tag/multi-key-mode rotation.
 - A health-check snapshot taken before a fresh disable generation cannot
   enable either its source or its peers.
 - A health-check snapshot superseded by a manual source disable cannot enable
@@ -328,6 +374,9 @@ disabled until health-check or manual recovery clears ownership.
   channels.
 - Managed structured Plan quota handling immediately disables only the used key
   and does not increment the managed failure counter while another key remains.
+- Managed structured Plan quota handling is a no-op after tag rotation or
+  multi-key-to-single-key rotation, and never disables a replacement
+  credential.
 - Passive recovery chooses the oldest `TestTime` in a shared domain and uses
   channel ID as its deterministic tie-break.
 - Passive recovery includes managed marked and validated legacy Plan quota
@@ -340,6 +389,8 @@ disabled until health-check or manual recovery clears ownership.
 - The model managed-channel CAS rejects stale status ownership without changing
   route rank, channel routing fields, or abilities, and commits all three on a
   fresh snapshot.
+- Managed reconciliation observably locks the managed route before the channel
+  and preserves atomic route, channel, and ability updates.
 - A managed-route query failure aborts passive selection and performs zero
   probes.
 - Existing disable/enable lifecycle and no-reset behavior continue to pass.
