@@ -901,7 +901,7 @@ func UpdateSingleKeyChannelStatusIfUnchanged(
 }
 
 // RecoverSingleKeyChannelStatusIfUnchanged applies a passive recovery only
-// while any managed route for the channel remains routeable.
+// while the expected managed identity still has a routeable route.
 func RecoverSingleKeyChannelStatusIfUnchanged(
 	expected *Channel,
 	status int,
@@ -940,7 +940,7 @@ func updateSingleKeyChannelStatusIfUnchangedLocked(
 	var updated Channel
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		if managedRouteRecoveryAt != nil {
-			allowed, err := lockManagedRouteRecoveryFence(tx, channelId, *managedRouteRecoveryAt)
+			allowed, err := lockManagedRouteRecoveryFence(tx, channelId, expectedTag, *managedRouteRecoveryAt)
 			if err != nil || !allowed {
 				return err
 			}
@@ -985,11 +985,17 @@ func updateSingleKeyChannelStatusIfUnchangedLocked(
 	return changed, nil
 }
 
-func lockManagedRouteRecoveryFence(tx *gorm.DB, channelId int, recoveryAt int64) (bool, error) {
+func lockManagedRouteRecoveryFence(
+	tx *gorm.DB,
+	channelId int,
+	expectedTag string,
+	recoveryAt int64,
+) (bool, error) {
 	var route UpstreamManagedRoute
 	err := lockForUpdate(tx).Where("channel_id = ?", channelId).First(&route).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return true, nil
+		return !strings.HasPrefix(expectedTag, "managed:") &&
+			!strings.HasPrefix(expectedTag, "plan:managed:"), nil
 	}
 	if err != nil {
 		return false, err
@@ -1129,7 +1135,7 @@ func UpdateMultiKeyChannelStatusIfUnchanged(
 }
 
 // RecoverMultiKeyChannelStatusIfUnchanged applies a passive key recovery only
-// while any managed route for the channel remains routeable.
+// while the expected managed identity still has a routeable route.
 func RecoverMultiKeyChannelStatusIfUnchanged(
 	expected *Channel,
 	observedTag string,
@@ -1168,7 +1174,12 @@ func updateMultiKeyChannelStatusIfUnchanged(
 		var updated Channel
 		err := DB.Transaction(func(tx *gorm.DB) error {
 			if managedRouteRecoveryAt != nil {
-				allowed, err := lockManagedRouteRecoveryFence(tx, expected.Id, *managedRouteRecoveryAt)
+				allowed, err := lockManagedRouteRecoveryFence(
+					tx,
+					expected.Id,
+					expected.GetTag(),
+					*managedRouteRecoveryAt,
+				)
 				if err != nil || !allowed {
 					return err
 				}

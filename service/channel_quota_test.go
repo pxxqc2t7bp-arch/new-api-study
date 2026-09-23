@@ -1205,6 +1205,7 @@ func TestEnableChannelForHealthCheckReturnsCommittedRecoveryCount(t *testing.T) 
 func TestEnableChannelForHealthCheckFencesManagedSingleKeyRoute(t *testing.T) {
 	tests := []struct {
 		name             string
+		tag              string
 		managed          bool
 		routeState       string
 		detached         bool
@@ -1214,6 +1215,10 @@ func TestEnableChannelForHealthCheckFencesManagedSingleKeyRoute(t *testing.T) {
 		{
 			name:        "ordinary channel without route",
 			wantEnabled: 1,
+		},
+		{
+			name: "managed channel without route",
+			tag:  "managed:sub2api:source:group:openai",
 		},
 		{
 			name:        "active managed route",
@@ -1254,6 +1259,9 @@ func TestEnableChannelForHealthCheckFencesManagedSingleKeyRoute(t *testing.T) {
 				Status: common.ChannelStatusAutoDisabled,
 				Models: "gpt-3.5-turbo",
 				Group:  "default",
+			}
+			if testCase.tag != "" {
+				channel.Tag = &testCase.tag
 			}
 			channel.SetOtherInfo(map[string]any{
 				"disabled_until": time.Now().Add(-time.Minute).Unix(),
@@ -1350,16 +1358,28 @@ func TestEnableChannelBypassesManagedRouteRecoveryFence(t *testing.T) {
 func TestEnableChannelForHealthCheckFencesManagedMultiKeyRoute(t *testing.T) {
 	tests := []struct {
 		name        string
+		tag         string
+		managed     bool
 		routeState  string
 		wantEnabled int
 	}{
 		{
+			name:        "ordinary channel without route",
+			wantEnabled: 1,
+		},
+		{
+			name: "managed plan channel without route",
+			tag:  "plan:managed:missing",
+		},
+		{
 			name:        "active managed route",
+			managed:     true,
 			routeState:  model.UpstreamRouteStateActive,
 			wantEnabled: 1,
 		},
 		{
 			name:       "inactive managed route",
+			managed:    true,
 			routeState: model.UpstreamRouteStateQuarantined,
 		},
 	}
@@ -1392,26 +1412,31 @@ func TestEnableChannelForHealthCheckFencesManagedMultiKeyRoute(t *testing.T) {
 					},
 				},
 			}
+			if testCase.tag != "" {
+				channel.Tag = &testCase.tag
+			}
 			channel.SetOtherInfo(map[string]any{
 				"disabled_until": time.Now().Add(-time.Minute).Unix(),
 				"owner":          "health-check",
 			})
 			require.NoError(t, db.Create(&channel).Error)
 			require.NoError(t, channel.AddAbilities(nil))
-			route := model.UpstreamManagedRoute{
-				SourceID:        1,
-				ExternalGroupID: "multi-key-recovery-fence",
-				Platform:        "openai",
-				Protocol:        model.UpstreamProtocolOpenAI,
-				ChannelID:       channel.Id,
-				State:           model.UpstreamRouteStateActive,
+			if testCase.managed {
+				route := model.UpstreamManagedRoute{
+					SourceID:        1,
+					ExternalGroupID: "multi-key-recovery-fence",
+					Platform:        "openai",
+					Protocol:        model.UpstreamProtocolOpenAI,
+					ChannelID:       channel.Id,
+					State:           model.UpstreamRouteStateActive,
+				}
+				require.NoError(t, db.Create(&route).Error)
+				require.NoError(t, db.Model(&model.UpstreamManagedRoute{}).
+					Where("id = ?", route.ID).
+					Update("state", testCase.routeState).Error)
 			}
-			require.NoError(t, db.Create(&route).Error)
 			var probeSnapshot model.Channel
 			require.NoError(t, db.First(&probeSnapshot, channel.Id).Error)
-			require.NoError(t, db.Model(&model.UpstreamManagedRoute{}).
-				Where("id = ?", route.ID).
-				Update("state", testCase.routeState).Error)
 
 			common.MemoryCacheEnabled = true
 			model.InitChannelCache()

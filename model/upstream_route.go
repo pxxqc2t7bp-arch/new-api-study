@@ -53,10 +53,6 @@ type UpstreamManagedRoute struct {
 	UpdatedAt            int64   `json:"updated_at" gorm:"bigint;index"`
 }
 
-func (UpstreamManagedRoute) TableName() string {
-	return "upstream_managed_routes"
-}
-
 func (route *UpstreamManagedRoute) BeforeCreate(_ *gorm.DB) error {
 	now := common.GetTimestamp()
 	route.ExternalGroupID = strings.TrimSpace(route.ExternalGroupID)
