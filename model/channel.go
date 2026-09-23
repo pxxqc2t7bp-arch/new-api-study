@@ -1034,6 +1034,23 @@ type ManagedChannelUpdate struct {
 	Status              int
 }
 
+func managedChannelSnapshotMatches(current *Channel, expected *Channel) bool {
+	if current == nil || expected == nil {
+		return false
+	}
+	tagsMatch := current.Tag == nil && expected.Tag == nil
+	if current.Tag != nil && expected.Tag != nil {
+		tagsMatch = *current.Tag == *expected.Tag
+	}
+	return current.Key == expected.Key &&
+		tagsMatch &&
+		current.Status == expected.Status &&
+		current.OtherInfo == expected.OtherInfo &&
+		current.Models == expected.Models &&
+		reflect.DeepEqual(current.Priority, expected.Priority) &&
+		reflect.DeepEqual(current.BaseURL, expected.BaseURL)
+}
+
 // UpdateManagedChannelIfUnchanged commits managed rank, channel, and ability
 // state only while the channel still matches the reconciliation snapshot.
 func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpdate) (bool, error) {
@@ -1043,6 +1060,7 @@ func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpd
 
 	return withChannelStatusLocks(expected.Id, func() (bool, error) {
 		changed := false
+		var updated Channel
 		err := DB.Transaction(func(tx *gorm.DB) error {
 			var currentRoute UpstreamManagedRoute
 			if err := lockForUpdate(tx).Where("id = ?", update.RouteID).First(&currentRoute).Error; err != nil {
@@ -1051,19 +1069,16 @@ func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpd
 			if currentRoute.ChannelID != expected.Id {
 				return nil
 			}
+			if update.Status == common.ChannelStatusEnabled &&
+				(currentRoute.Detached || currentRoute.State != UpstreamRouteStateActive) {
+				return nil
+			}
 
 			var current Channel
 			if err := lockForUpdate(tx).Where("id = ?", expected.Id).First(&current).Error; err != nil {
 				return err
 			}
-			tagsMatch := current.Tag == nil && expected.Tag == nil
-			if current.Tag != nil && expected.Tag != nil {
-				tagsMatch = *current.Tag == *expected.Tag
-			}
-			if current.Key != expected.Key ||
-				!tagsMatch ||
-				current.Status != expected.Status ||
-				current.OtherInfo != expected.OtherInfo {
+			if !managedChannelSnapshotMatches(&current, expected) {
 				return nil
 			}
 
@@ -1072,11 +1087,22 @@ func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpd
 				"key":        expected.Key,
 				"status":     expected.Status,
 				"other_info": expected.OtherInfo,
+				"models":     expected.Models,
 			})
 			if expected.Tag == nil {
 				channelQuery = channelQuery.Where("tag IS NULL")
 			} else {
 				channelQuery = channelQuery.Where(map[string]any{"tag": *expected.Tag})
+			}
+			if expected.Priority == nil {
+				channelQuery = channelQuery.Where("priority IS NULL")
+			} else {
+				channelQuery = channelQuery.Where("priority = ?", *expected.Priority)
+			}
+			if expected.BaseURL == nil {
+				channelQuery = channelQuery.Where("base_url IS NULL")
+			} else {
+				channelQuery = channelQuery.Where("base_url = ?", *expected.BaseURL)
 			}
 			result := channelQuery.Updates(map[string]any{
 				"priority": update.Priority,
@@ -1092,14 +1118,7 @@ func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpd
 				if err := tx.Where("id = ?", expected.Id).First(&latest).Error; err != nil {
 					return err
 				}
-				latestTagsMatch := latest.Tag == nil && expected.Tag == nil
-				if latest.Tag != nil && expected.Tag != nil {
-					latestTagsMatch = *latest.Tag == *expected.Tag
-				}
-				if latest.Key != expected.Key ||
-					!latestTagsMatch ||
-					latest.Status != expected.Status ||
-					latest.OtherInfo != expected.OtherInfo {
+				if !managedChannelSnapshotMatches(&latest, expected) {
 					return nil
 				}
 			}
@@ -1119,6 +1138,7 @@ func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpd
 			if err := current.UpdateAbilities(tx); err != nil {
 				return err
 			}
+			updated = current
 			changed = true
 			return nil
 		})
@@ -1126,7 +1146,7 @@ func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpd
 			return false, err
 		}
 		if changed {
-			CacheUpdateChannelStatus(expected.Id, update.Status)
+			CacheUpdateChannel(&updated)
 		}
 		return changed, nil
 	})

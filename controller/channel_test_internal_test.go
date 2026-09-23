@@ -703,6 +703,64 @@ func TestShouldPrioritizePlanQuotaDisableForManagedChannel(t *testing.T) {
 	assert.False(t, shouldPrioritizePlanQuotaDisable(nil))
 }
 
+func TestProcessChannelErrorRecordsManagedFailureWhenAutomaticDisableIsOff(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.UpstreamManagedRoute{}))
+
+	originalAutomaticDisable := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	orchestrationSetting := operation_setting.GetUpstreamOrchestrationSetting()
+	originalOrchestrationSetting := *orchestrationSetting
+	common.AutomaticDisableChannelEnabled = false
+	constant.ErrorLogEnabled = false
+	orchestrationSetting.Enabled = true
+	orchestrationSetting.FailureThreshold = 2
+	orchestrationSetting.FailureWindowMinutes = 5
+	t.Cleanup(func() {
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisable
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		*orchestrationSetting = originalOrchestrationSetting
+	})
+
+	channel := model.Channel{
+		Name:   "managed-plan-global-disable-off",
+		Key:    "credential",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-3.5-turbo",
+		Group:  "default",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	route := model.UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "managed-plan-global-disable-off",
+		Platform:        "openai",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           model.UpstreamRouteStateActive,
+	}
+	require.NoError(t, db.Create(&route).Error)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	apiError := relaytypes.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota. It will reset at 2026-09-30 23:59:59 +0800 CST."),
+		relaytypes.ErrorCode("AccountQuotaExceeded"),
+		http.StatusTooManyRequests,
+	)
+	processChannelError(ctx, relaytypes.ChannelError{
+		ChannelId:   channel.Id,
+		ChannelName: channel.Name,
+		AutoBan:     true,
+	}, "", apiError)
+
+	require.Eventually(t, func() bool {
+		var stored model.UpstreamManagedRoute
+		if err := db.First(&stored, route.ID).Error; err != nil {
+			return false
+		}
+		return stored.ConsecutiveFailures == 1
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestChannelForHealthCheckCountsOnlyCommittedRecoveries(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	originalMemoryCacheEnabled := common.MemoryCacheEnabled

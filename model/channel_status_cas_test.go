@@ -558,6 +558,203 @@ func TestUpdateManagedChannelIfUnchangedPreservesConcurrentStatusOwner(t *testin
 	assert.Equal(t, 0.1, storedRoute.EffectiveMultiplier)
 }
 
+func TestUpdateManagedChannelIfUnchangedRejectsConcurrentManagedFieldChanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(t *testing.T, channel Channel)
+		verify func(t *testing.T, channel Channel)
+	}{
+		{
+			name: "models",
+			mutate: func(t *testing.T, channel Channel) {
+				t.Helper()
+				require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).
+					Update("models", "concurrent-model").Error)
+			},
+			verify: func(t *testing.T, channel Channel) {
+				t.Helper()
+				assert.Equal(t, "concurrent-model", channel.Models)
+			},
+		},
+		{
+			name: "priority",
+			mutate: func(t *testing.T, channel Channel) {
+				t.Helper()
+				require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).
+					Update("priority", 777).Error)
+			},
+			verify: func(t *testing.T, channel Channel) {
+				t.Helper()
+				require.NotNil(t, channel.Priority)
+				assert.EqualValues(t, 777, *channel.Priority)
+			},
+		},
+		{
+			name: "base_url",
+			mutate: func(t *testing.T, channel Channel) {
+				t.Helper()
+				require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).
+					Update("base_url", "https://concurrent.example.com").Error)
+			},
+			verify: func(t *testing.T, channel Channel) {
+				t.Helper()
+				assert.Equal(t, "https://concurrent.example.com", channel.GetBaseURL())
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+				"owner": "before",
+			})
+			require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+			require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+			route := UpstreamManagedRoute{
+				SourceID:        1,
+				ExternalGroupID: "managed-field-" + testCase.name,
+				Platform:        "openai",
+				Protocol:        UpstreamProtocolOpenAI,
+				ChannelID:       channel.Id,
+				State:           UpstreamRouteStateActive,
+				Rank:            7,
+			}
+			require.NoError(t, DB.Create(&route).Error)
+
+			expected, err := GetChannelById(channel.Id, true)
+			require.NoError(t, err)
+			testCase.mutate(t, channel)
+
+			changed, err := UpdateManagedChannelIfUnchanged(expected, ManagedChannelUpdate{
+				RouteID:             route.ID,
+				Rank:                1,
+				EffectiveMultiplier: 0.1,
+				UpdatedAt:           1_788_320_000,
+				Priority:            999,
+				BaseURL:             "https://desired.example.com",
+				Models:              "desired-model",
+				Status:              common.ChannelStatusEnabled,
+			})
+			require.NoError(t, err)
+			assert.False(t, changed)
+
+			stored, _ := loadChannelStatusCASFixture(t, channel.Id)
+			testCase.verify(t, stored)
+			var storedRoute UpstreamManagedRoute
+			require.NoError(t, DB.First(&storedRoute, route.ID).Error)
+			assert.Equal(t, 7, storedRoute.Rank)
+		})
+	}
+}
+
+func TestUpdateManagedChannelIfUnchangedRefreshesManagedFieldsInCache(t *testing.T) {
+	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+		"owner": "before",
+	})
+	require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+	require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+	route := UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "managed-cache",
+		Platform:        "openai",
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           UpstreamRouteStateActive,
+		Rank:            7,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	changed, err := UpdateManagedChannelIfUnchanged(expected, ManagedChannelUpdate{
+		RouteID:             route.ID,
+		Rank:                1,
+		EffectiveMultiplier: 0.1,
+		UpdatedAt:           1_788_320_000,
+		Priority:            999,
+		BaseURL:             "https://desired.example.com",
+		Models:              "desired-model",
+		Status:              common.ChannelStatusEnabled,
+	})
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "desired-model", cached.Models)
+	assert.EqualValues(t, 999, cached.GetPriority())
+	assert.Equal(t, "https://desired.example.com", cached.GetBaseURL())
+
+	channelSyncLock.RLock()
+	oldModelIDs := append([]int(nil), group2model2channels["default"]["gpt-3.5-turbo"]...)
+	newModelIDs := append([]int(nil), group2model2channels["default"]["desired-model"]...)
+	channelSyncLock.RUnlock()
+	assert.NotContains(t, oldModelIDs, channel.Id)
+	assert.Contains(t, newModelIDs, channel.Id)
+}
+
+func TestUpdateManagedChannelIfUnchangedRejectsEnableForInactiveRoute(t *testing.T) {
+	tests := []struct {
+		name     string
+		state    string
+		detached bool
+	}{
+		{name: "paused", state: UpstreamRouteStatePaused},
+		{name: "detached", state: UpstreamRouteStateActive, detached: true},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+				"owner": "managed",
+			})
+			require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+			require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+			require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).
+				Update("status", common.ChannelStatusAutoDisabled).Error)
+			require.NoError(t, DB.Model(&Ability{}).Where("channel_id = ?", channel.Id).
+				Update("enabled", false).Error)
+			route := UpstreamManagedRoute{
+				SourceID:        1,
+				ExternalGroupID: "inactive-" + testCase.name,
+				Platform:        "openai",
+				Protocol:        UpstreamProtocolOpenAI,
+				ChannelID:       channel.Id,
+				State:           testCase.state,
+				Detached:        testCase.detached,
+				Rank:            7,
+			}
+			require.NoError(t, DB.Create(&route).Error)
+			expected, err := GetChannelById(channel.Id, true)
+			require.NoError(t, err)
+
+			changed, err := UpdateManagedChannelIfUnchanged(expected, ManagedChannelUpdate{
+				RouteID:             route.ID,
+				Rank:                1,
+				EffectiveMultiplier: 0.1,
+				UpdatedAt:           1_788_320_000,
+				Priority:            999,
+				BaseURL:             "https://desired.example.com",
+				Models:              "desired-model",
+				Status:              common.ChannelStatusEnabled,
+			})
+			require.NoError(t, err)
+			assert.False(t, changed)
+
+			stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+			assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+			assert.False(t, ability.Enabled)
+			var storedRoute UpstreamManagedRoute
+			require.NoError(t, DB.First(&storedRoute, route.ID).Error)
+			assert.Equal(t, 7, storedRoute.Rank)
+			assert.Equal(t, testCase.state, storedRoute.State)
+			assert.Equal(t, testCase.detached, storedRoute.Detached)
+		})
+	}
+}
+
 func TestUpdateManagedChannelIfUnchangedLocksRouteBeforeChannel(t *testing.T) {
 	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
 		"owner": "before",

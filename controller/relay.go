@@ -486,9 +486,11 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, observ
 			))
 		}
 	}
+	handledPlanQuota := false
 	if !handledManagedUnsupported && channelError.AutoBan && shouldPrioritizePlanQuotaDisable(err) {
-		service.DisableChannelForAPIError(channelError, observedTag, err)
-	} else if !handledManagedUnsupported && isManaged && channelError.AutoBan && service.ShouldRecordManagedRouteFailure(err) {
+		handledPlanQuota = service.DisableChannelForAPIError(channelError, observedTag, err)
+	}
+	if !handledManagedUnsupported && !handledPlanQuota && isManaged && channelError.AutoBan && service.ShouldRecordManagedRouteFailure(err) {
 		reason := err.ErrorWithStatusCode()
 		gopool.Go(func() {
 			if _, _, recordErr := service.RecordManagedChannelFailure(channelError, reason); recordErr != nil {
@@ -499,7 +501,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, observ
 				))
 			}
 		})
-	} else if !isManaged && service.ShouldDisableChannel(err) && channelError.AutoBan {
+	} else if !handledPlanQuota && !isManaged && service.ShouldDisableChannel(err) && channelError.AutoBan {
 		gopool.Go(func() {
 			service.DisableChannel(channelError, err.ErrorWithStatusCode())
 		})
