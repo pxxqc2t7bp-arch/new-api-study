@@ -516,6 +516,52 @@ func TestDisablePlanQuotaDomainPreservesConcurrentOwnership(t *testing.T) {
 	assert.False(t, ability.Enabled)
 }
 
+func TestDisablePlanQuotaDomainStaleCASDoesNotMutateCachedMetadata(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+
+	autoBan := 1
+	tag := "plan:support:cached-stale"
+	channel := model.Channel{
+		Id:      44,
+		Name:    "cached-stale-snapshot",
+		Status:  common.ChannelStatusEnabled,
+		Tag:     &tag,
+		AutoBan: &autoBan,
+		Models:  "gpt-3.5-turbo",
+		Group:   "default",
+	}
+	channel.SetOtherInfo(map[string]any{"owner": "cached-snapshot"})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	common.MemoryCacheEnabled = true
+	model.InitChannelCache()
+	cached, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	cachedOtherInfo := cached.OtherInfo
+
+	concurrent := channel
+	concurrent.SetOtherInfo(map[string]any{"owner": "concurrent-update"})
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channel.Id).
+		Update("other_info", concurrent.OtherInfo).Error)
+
+	disablePlanQuotaDomain(cached, "quota exhausted", 2_000_000_000)
+
+	cachedAfter, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, cachedOtherInfo, cachedAfter.OtherInfo)
+	assert.Equal(t, common.ChannelStatusEnabled, cachedAfter.Status)
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, "id = ?", channel.Id).Error)
+	assert.Equal(t, concurrent.OtherInfo, stored.OtherInfo)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+}
+
 func TestDisablePlanQuotaCredentialDomainHandlesMissingCredential(t *testing.T) {
 	for _, testCase := range []struct {
 		name             string

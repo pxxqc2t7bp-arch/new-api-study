@@ -161,7 +161,8 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 
 		expectedStatus := channel.Status
 		expectedOtherInfo := channel.OtherInfo
-		metadata := channel.GetOtherInfo()
+		desiredChannel := *channel
+		metadata := desiredChannel.GetOtherInfo()
 		if expectedStatus != common.ChannelStatusAutoDisabled {
 			metadata["status_reason"] = reason
 			metadata["status_time"] = common.GetTimestamp()
@@ -176,14 +177,14 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 			delete(metadata, "quota_reset_at")
 			delete(metadata, "disabled_until")
 		}
-		channel.SetOtherInfo(metadata)
+		desiredChannel.SetOtherInfo(metadata)
 
 		changed, err := model.UpdateSingleKeyChannelStatusIfUnchanged(
 			channel.Id,
 			expectedStatus,
 			expectedOtherInfo,
 			common.ChannelStatusAutoDisabled,
-			channel.OtherInfo,
+			desiredChannel.OtherInfo,
 		)
 		if err != nil {
 			common.SysError(fmt.Sprintf("failed to disable Plan quota channel: channel_id=%d error=%v", channel.Id, err))
