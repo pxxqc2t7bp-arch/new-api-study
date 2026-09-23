@@ -126,7 +126,8 @@ func TestBuildStreamRecoveryIdentityUsesStableQueryAndBody(t *testing.T) {
 		[]byte(`{"model":"glm-5.3","input":"different"}`),
 	)
 	require.NoError(t, err)
-	assert.NotEqual(t, first.DedupeKey, changedBody.DedupeKey)
+	assert.Equal(t, first.DedupeKey, changedBody.DedupeKey)
+	assert.NotEqual(t, first.RequestDigest, changedBody.RequestDigest)
 }
 
 func TestBuildStreamRecoveryIdentityRequiresStableClientIdentity(t *testing.T) {

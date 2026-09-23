@@ -1,6 +1,8 @@
 package router
 
 import (
+	"strings"
+
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
@@ -66,46 +68,49 @@ func SetRelayRouter(router *gin.Engine) {
 	{
 		playgroundRouter.POST("/chat/completions", controller.Playground)
 	}
+	registerRealtimeRelayRoute(router)
+
 	relayV1Router := router.Group("/v1")
 	relayV1Router.Use(middleware.RouteTag("relay"))
 	relayV1Router.Use(middleware.SystemPerformanceCheck())
 	relayV1Router.Use(middleware.TokenAuth())
-	relayV1Router.Use(middleware.ModelRequestRateLimit())
+	{
+		// Responses WebSocket selects a channel after response.create and
+		// applies the ordinary request policy and limiter to each event.
+		relayV1Router.GET("/responses", controller.ResponsesWebSocket)
+	}
 	streamSessionRouter := relayV1Router.Group("/stream-sessions")
+	streamSessionRouter.Use(middleware.ModelRequestRateLimit())
 	{
 		streamSessionRouter.GET("/:stream_id", controller.GetStreamRecoverySession)
 		streamSessionRouter.DELETE("/:stream_id", controller.CancelStreamRecoverySession)
 	}
 	{
-		// WebSocket 路由（统一到 Relay）
-		wsRouter := relayV1Router.Group("")
-		wsRouter.Use(middleware.Distribute())
-		wsRouter.GET("/realtime", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIRealtime)
+		ordinaryRouter := relayV1Router.Group("")
+		ordinaryRouter.Use(middleware.OrdinaryRequestPolicy())
+		ordinaryRouter.Use(middleware.ModelRequestRateLimit())
+		ordinaryRouter.Use(middleware.Distribute())
+
+		ordinaryRouter.POST("/messages", func(c *gin.Context) {
+			controller.Relay(c, types.RelayFormatClaude)
+		})
+		ordinaryRouter.POST("/completions", func(c *gin.Context) {
+			controller.Relay(c, types.RelayFormatOpenAI)
+		})
+		ordinaryRouter.POST("/chat/completions", func(c *gin.Context) {
+			controller.Relay(c, types.RelayFormatOpenAI)
+		})
+		ordinaryRouter.POST("/responses/compact", func(c *gin.Context) {
+			controller.Relay(c, types.RelayFormatOpenAIResponsesCompaction)
+		})
+		ordinaryRouter.POST("/models/*path", func(c *gin.Context) {
+			controller.Relay(c, types.RelayFormatGemini)
 		})
 	}
 	{
 		//http router
 		httpRouter := relayV1Router.Group("")
-		httpRouter.Use(middleware.Distribute())
-
-		// claude related routes
-		httpRouter.POST("/messages", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatClaude)
-		})
-
-		// chat related routes
-		httpRouter.POST("/completions", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAI)
-		})
-		httpRouter.POST("/chat/completions", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAI)
-		})
-
-		// response related routes
-		httpRouter.POST("/responses/compact", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIResponsesCompaction)
-		})
+		httpRouter.Use(middleware.ModelRequestRateLimit(), middleware.Distribute())
 
 		// alpha search related routes (Codex standalone web search)
 		httpRouter.POST("/alpha/search", func(c *gin.Context) {
@@ -151,9 +156,6 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.POST("/engines/:model/embeddings", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatGemini)
 		})
-		httpRouter.POST("/models/*path", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatGemini)
-		})
 
 		// other relay routes
 		httpRouter.POST("/moderations", func(c *gin.Context) {
@@ -182,9 +184,19 @@ func SetRelayRouter(router *gin.Engine) {
 	//relayMjRouter.Use()
 
 	relayGeminiRouter := router.Group("/v1beta")
+	// :countTokens is not implemented. Answer it like an unregistered route
+	// before auth/channel selection instead of silently relaying it as
+	// generateContent (#7283).
+	relayGeminiRouter.Use(func(c *gin.Context) {
+		if strings.HasSuffix(c.Request.URL.Path, ":countTokens") {
+			controller.RelayNotFound(c)
+			c.Abort()
+		}
+	})
 	relayGeminiRouter.Use(middleware.RouteTag("relay"))
 	relayGeminiRouter.Use(middleware.SystemPerformanceCheck())
 	relayGeminiRouter.Use(middleware.TokenAuth())
+	relayGeminiRouter.Use(middleware.OrdinaryRequestPolicy())
 	relayGeminiRouter.Use(middleware.ModelRequestRateLimit())
 	relayGeminiRouter.Use(middleware.Distribute())
 	{

@@ -3,34 +3,45 @@ package model
 import (
 	"errors"
 	"fmt"
+	"hash/maphash"
+	"slices"
 	"strings"
+	"sync"
 
 	"github.com/QuantumNous/new-api/common"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
 )
 
 type Token struct {
-	Id                    int            `json:"id"`
-	UserId                int            `json:"user_id" gorm:"index"`
-	Key                   string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
-	Status                int            `json:"status" gorm:"default:1"`
-	Name                  string         `json:"name" gorm:"index" `
-	CreatedTime           int64          `json:"created_time" gorm:"bigint"`
-	AccessedTime          int64          `json:"accessed_time" gorm:"bigint"`
-	ExpiredTime           int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
-	RemainQuota           int            `json:"remain_quota" gorm:"default:0"`
-	UnlimitedQuota        bool           `json:"unlimited_quota"`
-	ModelLimitsEnabled    bool           `json:"model_limits_enabled"`
-	ModelLimits           string         `json:"model_limits" gorm:"type:text"`
-	AllowIps              *string        `json:"allow_ips" gorm:"default:''"`
-	StreamRecoveryEnabled bool           `json:"stream_recovery_enabled"`
-	UsedQuota             int            `json:"used_quota" gorm:"default:0"` // used quota
-	Group                 string         `json:"group" gorm:"default:''"`
-	CrossGroupRetry       bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
-	AutoGroups            string         `json:"-" gorm:"type:text"`
-	DeletedAt             gorm.DeletedAt `gorm:"index"`
+	Id                       int            `json:"id"`
+	UserId                   int            `json:"user_id" gorm:"index"`
+	Key                      string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
+	Status                   int            `json:"status" gorm:"default:1"`
+	Name                     string         `json:"name" gorm:"index" `
+	CreatedTime              int64          `json:"created_time" gorm:"bigint"`
+	AccessedTime             int64          `json:"accessed_time" gorm:"bigint"`
+	ExpiredTime              int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
+	RemainQuota              int            `json:"remain_quota" gorm:"default:0"`
+	UnlimitedQuota           bool           `json:"unlimited_quota"`
+	ModelLimitsEnabled       bool           `json:"model_limits_enabled"`
+	ModelLimits              string         `json:"model_limits" gorm:"type:text"`
+	AllowIps                 *string        `json:"allow_ips" gorm:"default:''"`
+	StreamRecoveryEnabled    bool           `json:"stream_recovery_enabled"`
+	UsedQuota                int            `json:"used_quota" gorm:"default:0"` // used quota
+	Group                    string         `json:"group" gorm:"default:''"`
+	CrossGroupRetry          bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
+	AutoGroups               string         `json:"-" gorm:"type:text"`
+	DefaultRoutingStrategy   string         `json:"default_routing_strategy" gorm:"type:varchar(16)"`
+	AllowedRoutingStrategies string         `json:"-" gorm:"type:text"`
+	DefaultConversionPolicy  string         `json:"default_conversion_policy" gorm:"type:varchar(16)"`
+	AllowLossyConversion     bool           `json:"allow_lossy_conversion"`
+	CacheGeneration          int64          `json:"-" gorm:"bigint;default:0"`
+	MetadataMutationId       string         `json:"-" gorm:"type:char(32)"`
+	DeletedAt                gorm.DeletedAt `gorm:"index"`
 }
 
 func (token *Token) GetAutoGroups() ([]string, error) {
@@ -55,6 +66,90 @@ func (token *Token) SetAutoGroups(groups []string) error {
 	}
 	token.AutoGroups = string(data)
 	return nil
+}
+
+func (token *Token) GetAllowedRoutingStrategies() ([]string, error) {
+	if token.AllowedRoutingStrategies == "" {
+		return []string{string(hosttypes.RoutingStrategyStable)}, nil
+	}
+	var values []string
+	if err := common.UnmarshalJsonStr(token.AllowedRoutingStrategies, &values); err != nil {
+		return nil, err
+	}
+	return normalizeRoutingStrategies(values)
+}
+
+func (token *Token) SetAllowedRoutingStrategies(values []string) error {
+	normalized, err := normalizeRoutingStrategies(values)
+	if err != nil {
+		return err
+	}
+	data, err := common.Marshal(normalized)
+	if err != nil {
+		return err
+	}
+	token.AllowedRoutingStrategies = string(data)
+	return nil
+}
+
+func (token *Token) NormalizeRequestPolicySettings() error {
+	defaultRouting := strings.TrimSpace(token.DefaultRoutingStrategy)
+	if defaultRouting == "" {
+		defaultRouting = string(hosttypes.RoutingStrategyStable)
+	}
+	routing, ok := hosttypes.ParseRoutingStrategy(defaultRouting)
+	if !ok {
+		return fmt.Errorf("unsupported default routing strategy %q", defaultRouting)
+	}
+
+	allowed, err := token.GetAllowedRoutingStrategies()
+	if err != nil {
+		return fmt.Errorf("invalid allowed routing strategies: %w", err)
+	}
+	if !slices.Contains(allowed, string(routing)) {
+		return fmt.Errorf("default routing strategy %q is not authorized", routing)
+	}
+
+	conversion := relaytypes.ConversionLossPolicy(strings.TrimSpace(token.DefaultConversionPolicy))
+	if conversion == "" {
+		conversion = relaytypes.ConversionLossPolicyStrict
+	}
+	switch conversion {
+	case relaytypes.ConversionLossPolicyStrict:
+	case relaytypes.ConversionLossPolicySafe, relaytypes.ConversionLossPolicyAllow:
+		if !token.AllowLossyConversion {
+			return fmt.Errorf("default conversion policy %q requires lossy conversion authorization", conversion)
+		}
+	default:
+		return fmt.Errorf("unsupported default conversion policy %q", conversion)
+	}
+
+	token.DefaultRoutingStrategy = string(routing)
+	if err := token.SetAllowedRoutingStrategies(allowed); err != nil {
+		return err
+	}
+	token.DefaultConversionPolicy = string(conversion)
+	return nil
+}
+
+func normalizeRoutingStrategies(values []string) ([]string, error) {
+	if len(values) == 0 {
+		return []string{string(hosttypes.RoutingStrategyStable)}, nil
+	}
+	normalized := make([]string, 0, len(values))
+	seen := make(map[hosttypes.RoutingStrategy]struct{}, len(values))
+	for _, value := range values {
+		strategy, ok := hosttypes.ParseRoutingStrategy(value)
+		if !ok {
+			return nil, fmt.Errorf("unsupported routing strategy %q", strings.TrimSpace(value))
+		}
+		if _, exists := seen[strategy]; exists {
+			return nil, fmt.Errorf("duplicate routing strategy %q", strategy)
+		}
+		seen[strategy] = struct{}{}
+		normalized = append(normalized, string(strategy))
+	}
+	return normalized, nil
 }
 
 func (token *Token) Clean() {
@@ -93,8 +188,8 @@ func (token *Token) GetIpLimits() []string {
 	if cleanIps == "" {
 		return ipLimits
 	}
-	ips := strings.Split(cleanIps, "\n")
-	for _, ip := range ips {
+	ips := strings.SplitSeq(cleanIps, "\n")
+	for ip := range ips {
 		ip = strings.TrimSpace(ip)
 		ip = strings.ReplaceAll(ip, ",", "")
 		if ip != "" {
@@ -278,27 +373,161 @@ func GetTokenById(id int) (*Token, error) {
 	return &token, err
 }
 
+func getTokenByKeyFromDB(key string) (*Token, error) {
+	token := &Token{}
+	if err := DB.Where(&Token{Key: key}).First(token).Error; err != nil {
+		return nil, err
+	}
+	return token, nil
+}
+
+// Single-token operations share the gate and coordinate on a bounded lock
+// shard. Mutations use the shard's read side so Redis still rejects concurrent
+// writers, while cold recovery takes the exclusive side. Batch deletion takes
+// the gate exclusively before it discovers and locks all affected token rows.
+const tokenCacheMutationShardCount = 64
+
+var (
+	tokenCacheMutationGate   sync.RWMutex
+	tokenCacheMutationSeed   = maphash.MakeSeed()
+	tokenCacheMutationShards [tokenCacheMutationShardCount]sync.RWMutex
+)
+
+func tokenCacheMutationLock(key string) *sync.RWMutex {
+	index := maphash.String(tokenCacheMutationSeed, key) % uint64(len(tokenCacheMutationShards))
+	return &tokenCacheMutationShards[index]
+}
+
+func recoverTokenCacheFromDatabase(key string) (*Token, error) {
+	tokenCacheMutationGate.RLock()
+	defer tokenCacheMutationGate.RUnlock()
+	cacheLock := tokenCacheMutationLock(key)
+	cacheLock.Lock()
+	defer cacheLock.Unlock()
+
+	tx := DB.Begin()
+	if tx.Error != nil {
+		return nil, tx.Error
+	}
+	defer func() {
+		_ = tx.Rollback().Error
+	}()
+
+	for range 3 {
+		loaded := &Token{}
+		readErr := lockForUpdate(tx).Where(&Token{Key: key}).First(loaded).Error
+		state, stateErr := loadTokenCacheGenerationState(key)
+		if stateErr != nil {
+			return nil, stateErr
+		}
+		expectedGeneration := state.generation
+		if state.pendingMarker {
+			return nil, errTokenCacheMutationPending
+		}
+		if expectedGeneration%2 != 0 {
+			switch {
+			case errors.Is(readErr, gorm.ErrRecordNotFound):
+				if finishErr := commitTokenCacheDeleteMutation(key, expectedGeneration); finishErr != nil {
+					return nil, errTokenCacheMutationPending
+				}
+				continue
+			case readErr != nil:
+				return nil, readErr
+			case loaded.CacheGeneration == expectedGeneration+1:
+				if finishErr := commitTokenCacheMutation(*loaded, expectedGeneration); finishErr != nil {
+					return nil, errTokenCacheMutationPending
+				}
+				continue
+			default:
+				return nil, errTokenCacheMutationPending
+			}
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+		if loaded.CacheGeneration > expectedGeneration && loaded.CacheGeneration%2 == 0 {
+			restored, restoreErr := restoreTokenCacheGenerationForColdCache(key, loaded.CacheGeneration)
+			if restoreErr != nil || !restored {
+				return nil, errTokenCacheMutationPending
+			}
+			continue
+		}
+		code, cacheErr := cacheInitToken(*loaded, expectedGeneration)
+		if cacheErr != nil {
+			return nil, fmt.Errorf("failed to init token cache: %w", cacheErr)
+		}
+
+		var result *Token
+		switch code {
+		case 1:
+			result = loaded
+		case 2:
+			result, cacheErr = cacheGetTokenByKey(key)
+			if cacheErr != nil {
+				return nil, cacheErr
+			}
+		default:
+			continue
+		}
+		if commitErr := tx.Commit().Error; commitErr != nil {
+			return nil, commitErr
+		}
+		return result, nil
+	}
+	return nil, errTokenCacheMutationPending
+}
+
+func getTokenByKeyAcrossGeneration(key string) (*Token, error) {
+	for range 3 {
+		state, err := loadTokenCacheGenerationState(key)
+		if err != nil {
+			return nil, err
+		}
+		expectedGeneration := state.generation
+		loaded, readErr := getTokenByKeyFromDB(key)
+		if state.pendingMarker {
+			return nil, errTokenCacheMutationPending
+		}
+		if expectedGeneration%2 != 0 {
+			switch {
+			case errors.Is(readErr, gorm.ErrRecordNotFound):
+				if finishErr := commitTokenCacheDeleteMutation(key, expectedGeneration); finishErr != nil {
+					return nil, errTokenCacheMutationPending
+				}
+				continue
+			case readErr != nil:
+				return nil, readErr
+			case loaded.CacheGeneration == expectedGeneration+1:
+				if finishErr := commitTokenCacheMutation(*loaded, expectedGeneration); finishErr != nil {
+					return nil, errTokenCacheMutationPending
+				}
+				continue
+			default:
+				return nil, errTokenCacheMutationPending
+			}
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+		return recoverTokenCacheFromDatabase(key)
+	}
+	return nil, errTokenCacheMutationPending
+}
+
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 	if !fromDB && common.RedisEnabled {
-		// Try Redis first
 		token, err := cacheGetTokenByKey(key)
 		if err == nil {
 			return token, nil
 		}
-		// Don't return error - fall through to DB
-	}
-	token = &Token{}
-	if err = DB.Where(commonKeyCol+" = ?", key).First(token).Error; err != nil {
-		return nil, err
-	}
-	if common.RedisEnabled {
-		// 冷缓存时用数据库快照初始化；已存在的哈希只刷新 TTL，
-		// 避免快照覆盖 Redis 中已被原子预扣的余额。初始化失败不影响本次读取。
-		if _, cacheErr := cacheInitToken(*token); cacheErr != nil {
-			common.SysLog("failed to init token cache: " + cacheErr.Error())
+		if errors.Is(err, errTokenCacheMutationPending) {
+			return getTokenByKeyAcrossGeneration(key)
 		}
 	}
-	return token, nil
+	if common.RedisEnabled {
+		return getTokenByKeyAcrossGeneration(key)
+	}
+	return getTokenByKeyFromDB(key)
 }
 
 func (token *Token) Insert() error {
@@ -307,30 +536,218 @@ func (token *Token) Insert() error {
 	return err
 }
 
+var ErrTokenMutationCommitted = errors.New("token database mutation committed but cache synchronization failed")
+
+var commitTokenMutationTransaction = func(tx *gorm.DB) error {
+	return tx.Commit().Error
+}
+
+type TokenMutationCommittedError struct {
+	Count int
+	Cause error
+}
+
+func (err *TokenMutationCommittedError) Error() string {
+	return fmt.Sprintf("%s (committed_count=%d): %v", ErrTokenMutationCommitted, err.Count, err.Cause)
+}
+
+func (err *TokenMutationCommittedError) Unwrap() error {
+	return err.Cause
+}
+
+func (*TokenMutationCommittedError) Is(target error) bool {
+	return target == ErrTokenMutationCommitted
+}
+
+func (err *TokenMutationCommittedError) CommittedCount() int {
+	return err.Count
+}
+
+func reconcileTokenMutationCommitError(token *Token, expected *Token, deleteCache bool, generation int64, commitErr error) error {
+	stored, readErr := getTokenByKeyFromDB(token.Key)
+	if deleteCache && errors.Is(readErr, gorm.ErrRecordNotFound) {
+		causes := []error{
+			commitErr,
+			errors.New("token delete outcome is uncertain because the deleted row has no mutation identity"),
+		}
+		if generation > 0 {
+			if finalizeErr := commitTokenCacheDeleteMutation(token.Key, generation); finalizeErr != nil {
+				causes = append(causes, finalizeErr)
+			}
+		}
+		return errors.Join(causes...)
+	}
+	if readErr == nil && !deleteCache && expected != nil &&
+		stored.Id == expected.Id &&
+		stored.Key == expected.Key &&
+		stored.CacheGeneration == expected.CacheGeneration &&
+		stored.MetadataMutationId != "" &&
+		stored.MetadataMutationId == expected.MetadataMutationId {
+		*token = *stored
+		if generation == 0 {
+			return nil
+		}
+		finalizeErr := commitTokenCacheMutation(*stored, generation)
+		return &TokenMutationCommittedError{
+			Count: 1,
+			Cause: errors.Join(commitErr, finalizeErr),
+		}
+	}
+	if readErr != nil && !errors.Is(readErr, gorm.ErrRecordNotFound) {
+		return errors.Join(commitErr, fmt.Errorf("failed to reconcile token database mutation: %w", readErr))
+	}
+	return errors.Join(commitErr, errors.New("token database mutation outcome is uncertain"))
+}
+
+func mutateTokenMetadata(token *Token, deleteCache bool, mutation func(*gorm.DB, int64) error) error {
+	tokenCacheMutationGate.RLock()
+	defer tokenCacheMutationGate.RUnlock()
+	cacheLock := tokenCacheMutationLock(token.Key)
+	cacheLock.RLock()
+	defer cacheLock.RUnlock()
+
+	tx := DB.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	var current Token
+	if lockErr := lockForUpdate(tx).
+		Where(&Token{Id: token.Id, Key: token.Key}).
+		First(&current).Error; lockErr != nil {
+		if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+			return errors.Join(lockErr, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
+		}
+		return lockErr
+	}
+
+	minimumGeneration := current.CacheGeneration
+	token.CacheGeneration = minimumGeneration
+	if minimumGeneration < 0 || minimumGeneration%2 != 0 {
+		if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+			return errors.Join(
+				errors.New("invalid token database cache generation"),
+				fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr),
+			)
+		}
+		return errors.New("invalid token database cache generation")
+	}
+	generation, beginErr := beginTokenCacheMutation(token.Key, minimumGeneration)
+	if beginErr != nil {
+		if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+			return errors.Join(beginErr, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
+		}
+		return beginErr
+	}
+	committedGeneration := minimumGeneration + 2
+	if generation > 0 {
+		committedGeneration = generation + 1
+	}
+	if !deleteCache {
+		token.MetadataMutationId = common.GetUUID()
+	}
+	if mutationErr := mutation(tx, committedGeneration); mutationErr != nil {
+		if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+			return errors.Join(mutationErr, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
+		}
+		token.CacheGeneration = minimumGeneration
+		token.MetadataMutationId = current.MetadataMutationId
+		if rollbackErr := rollbackTokenCacheMutation(token.Key, generation); rollbackErr != nil {
+			return errors.Join(mutationErr, fmt.Errorf("failed to roll back token cache fence: %w", rollbackErr))
+		}
+		return mutationErr
+	}
+	var expected *Token
+	if !deleteCache {
+		expected = &Token{}
+		if readErr := tx.Where(&Token{Key: token.Key}).First(expected).Error; readErr != nil {
+			if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+				return errors.Join(readErr, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
+			}
+			token.CacheGeneration = minimumGeneration
+			token.MetadataMutationId = current.MetadataMutationId
+			if rollbackErr := rollbackTokenCacheMutation(token.Key, generation); rollbackErr != nil {
+				return errors.Join(readErr, fmt.Errorf("failed to roll back token cache fence: %w", rollbackErr))
+			}
+			return readErr
+		}
+	}
+	if commitErr := commitTokenMutationTransaction(tx); commitErr != nil {
+		return reconcileTokenMutationCommitError(token, expected, deleteCache, generation, commitErr)
+	}
+	if generation == 0 {
+		if expected != nil {
+			*token = *expected
+		}
+		return nil
+	}
+	if deleteCache {
+		if finalizeErr := commitTokenCacheDeleteMutation(token.Key, generation); finalizeErr != nil {
+			return &TokenMutationCommittedError{Count: 1, Cause: finalizeErr}
+		}
+		return nil
+	}
+
+	stored, err := getTokenByKeyFromDB(token.Key)
+	if err != nil {
+		return &TokenMutationCommittedError{
+			Count: 1,
+			Cause: fmt.Errorf("failed to reload committed token metadata: %w", err),
+		}
+	}
+	if stored.Id != token.Id || stored.CacheGeneration != committedGeneration {
+		return &TokenMutationCommittedError{
+			Count: 1,
+			Cause: errors.New("committed token cache generation could not be verified"),
+		}
+	}
+	*token = *stored
+	if err := commitTokenCacheMutation(*stored, generation); err != nil {
+		return &TokenMutationCommittedError{Count: 1, Cause: err}
+	}
+	return nil
+}
+
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (token *Token) Update() (err error) {
-	// 写库前失效缓存并设置 fence，防止并发读者把过期快照重新写回缓存。
-	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		common.SysLog("failed to invalidate token cache before update: " + cacheErr.Error())
-	}
-	return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
-		"model_limits_enabled", "model_limits", "allow_ips", "stream_recovery_enabled", "group",
-		"cross_group_retry", "auto_groups").Updates(token).Error
+	return token.update(nil)
+}
+
+// UpdateWithQuotaDelta applies an administrator-requested quota adjustment
+// relative to the snapshot they edited, preserving quota writes that committed
+// after that snapshot was read.
+func (token *Token) UpdateWithQuotaDelta(quotaDelta int64) error {
+	return token.update(&quotaDelta)
+}
+
+func (token *Token) update(quotaDelta *int64) error {
+	return mutateTokenMetadata(token, false, func(tx *gorm.DB, committedGeneration int64) error {
+		token.CacheGeneration = committedGeneration
+		fields := []string{"name", "status", "expired_time", "unlimited_quota",
+			"model_limits_enabled", "model_limits", "allow_ips", "stream_recovery_enabled", "group",
+			"cross_group_retry", "auto_groups", "default_routing_strategy", "allowed_routing_strategies",
+			"default_conversion_policy", "allow_lossy_conversion", "cache_generation", "metadata_mutation_id"}
+		if err := tx.Model(token).Select(fields).Updates(token).Error; err != nil {
+			return err
+		}
+		if quotaDelta != nil && *quotaDelta != 0 {
+			return tx.Model(token).UpdateColumn("remain_quota", gorm.Expr("remain_quota + ?", *quotaDelta)).Error
+		}
+		return nil
+	})
 }
 
 func (token *Token) SelectUpdate() (err error) {
-	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		common.SysLog("failed to invalidate token cache before status update: " + cacheErr.Error())
-	}
-	// This can update zero values
-	return DB.Model(token).Select("accessed_time", "status").Updates(token).Error
+	return mutateTokenMetadata(token, false, func(tx *gorm.DB, committedGeneration int64) error {
+		token.CacheGeneration = committedGeneration
+		// Select is required so disabled/exhausted zero values are persisted.
+		return tx.Model(token).Select("status", "cache_generation", "metadata_mutation_id").Updates(token).Error
+	})
 }
 
 func (token *Token) Delete() (err error) {
-	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		common.SysLog("failed to invalidate token cache before delete: " + cacheErr.Error())
-	}
-	return DB.Delete(token).Error
+	return mutateTokenMetadata(token, true, func(tx *gorm.DB, _ int64) error {
+		return tx.Delete(token).Error
+	})
 }
 
 func (token *Token) IsModelLimitsEnabled() bool {
@@ -398,7 +815,7 @@ func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
 
 func increaseTokenQuota(id int, quota int) (err error) {
 	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
+		map[string]any{
 			"remain_quota":  gorm.Expr("remain_quota + ?", quota),
 			"used_quota":    gorm.Expr("used_quota - ?", quota),
 			"accessed_time": common.GetTimestamp(),
@@ -427,7 +844,7 @@ func DecreaseTokenQuota(id int, key string, quota int) (err error) {
 
 func decreaseTokenQuota(id int, quota int) (err error) {
 	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
+		map[string]any{
 			"remain_quota":  gorm.Expr("remain_quota - ?", quota),
 			"used_quota":    gorm.Expr("used_quota + ?", quota),
 			"accessed_time": common.GetTimestamp(),
@@ -443,32 +860,121 @@ func CountUserTokens(userId int) (int64, error) {
 	return total, err
 }
 
+type tokenCacheMutation struct {
+	id         int
+	key        string
+	generation int64
+}
+
+func reconcileBatchTokenDeleteCommit(cacheMutations []tokenCacheMutation, commitErr error) (int, error) {
+	observedMissing := 0
+	causes := []error{commitErr}
+	for _, mutation := range cacheMutations {
+		var stored Token
+		readErr := DB.Where(&Token{Id: mutation.id, Key: mutation.key}).First(&stored).Error
+		switch {
+		case errors.Is(readErr, gorm.ErrRecordNotFound):
+			observedMissing++
+			if finalizeErr := commitTokenCacheDeleteMutation(mutation.key, mutation.generation); finalizeErr != nil {
+				causes = append(causes, finalizeErr)
+			}
+		case readErr != nil:
+			causes = append(causes, fmt.Errorf("failed to reconcile deleted token %d: %w", mutation.id, readErr))
+		}
+	}
+	if observedMissing > 0 {
+		causes = append(causes, fmt.Errorf(
+			"batch token delete outcome is uncertain because %d of %d rows are absent without mutation identities",
+			observedMissing,
+			len(cacheMutations),
+		))
+	}
+	return 0, errors.Join(causes...)
+}
+
 // BatchDeleteTokens 删除指定用户的一组令牌，返回成功删除数量
 func BatchDeleteTokens(ids []int, userId int) (int, error) {
 	if len(ids) == 0 {
 		return 0, errors.New("ids 不能为空！")
 	}
 
+	tokenCacheMutationGate.Lock()
+	defer tokenCacheMutationGate.Unlock()
+
 	tx := DB.Begin()
-
-	var tokens []Token
-	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Find(&tokens).Error; err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-	if err := invalidateTokensCache(tokens); err != nil {
-		common.SysLog("failed to invalidate token cache before batch delete: " + err.Error())
+	if tx.Error != nil {
+		return 0, tx.Error
 	}
 
-	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Delete(&Token{}).Error; err != nil {
-		tx.Rollback()
-		return 0, err
+	sortedIDs := slices.Clone(ids)
+	slices.Sort(sortedIDs)
+	sortedIDs = slices.Compact(sortedIDs)
+	tokens := make([]Token, 0, len(sortedIDs))
+	lockedIDs := make([]int, 0, len(sortedIDs))
+	for _, id := range sortedIDs {
+		var token Token
+		err := lockForUpdate(tx).
+			Where("user_id = ? AND id = ?", userId, id).
+			First(&token).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			continue
+		}
+		if err != nil {
+			if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+				return 0, errors.Join(err, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
+			}
+			return 0, err
+		}
+		tokens = append(tokens, token)
+		lockedIDs = append(lockedIDs, token.Id)
+	}
+	cacheMutations := make([]tokenCacheMutation, 0, len(tokens))
+	for _, token := range tokens {
+		generation, err := beginTokenCacheMutation(token.Key, token.CacheGeneration)
+		if err != nil {
+			if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+				return 0, errors.Join(err, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
+			}
+			for _, mutation := range cacheMutations {
+				if rollbackErr := rollbackTokenCacheMutation(mutation.key, mutation.generation); rollbackErr != nil {
+					common.SysError("failed to roll back token cache fence: " + rollbackErr.Error())
+				}
+			}
+			return 0, err
+		}
+		cacheMutations = append(cacheMutations, tokenCacheMutation{id: token.Id, key: token.Key, generation: generation})
 	}
 
-	if err := tx.Commit().Error; err != nil {
-		return 0, err
+	if len(lockedIDs) > 0 {
+		if err := tx.Where("user_id = ? AND id IN (?)", userId, lockedIDs).Delete(&Token{}).Error; err != nil {
+			if rollbackErr := tx.Rollback().Error; rollbackErr != nil {
+				return 0, errors.Join(err, fmt.Errorf("failed to roll back token database transaction: %w", rollbackErr))
+			}
+			for _, mutation := range cacheMutations {
+				if rollbackErr := rollbackTokenCacheMutation(mutation.key, mutation.generation); rollbackErr != nil {
+					common.SysError("failed to roll back token cache fence: " + rollbackErr.Error())
+				}
+			}
+			return 0, err
+		}
 	}
 
+	if err := commitTokenMutationTransaction(tx); err != nil {
+		return reconcileBatchTokenDeleteCommit(cacheMutations, err)
+	}
+
+	var finalizationErrors []error
+	for _, mutation := range cacheMutations {
+		if err := commitTokenCacheDeleteMutation(mutation.key, mutation.generation); err != nil {
+			finalizationErrors = append(finalizationErrors, err)
+		}
+	}
+	if len(finalizationErrors) > 0 {
+		return len(tokens), &TokenMutationCommittedError{
+			Count: len(tokens),
+			Cause: errors.Join(finalizationErrors...),
+		}
+	}
 	return len(tokens), nil
 }
 
@@ -509,7 +1015,7 @@ func invalidateTokensCache(tokens []Token) error {
 		if t.Key == "" {
 			continue
 		}
-		if err := invalidateTokenCacheForMutation(t.Key); err != nil && firstErr == nil {
+		if err := invalidateTokenCache(t.Key); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

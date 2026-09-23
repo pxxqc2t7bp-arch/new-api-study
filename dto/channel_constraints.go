@@ -40,15 +40,20 @@ const (
 	FilterTaskPluginIdentity ChannelFilterKind = "task_plugin_identity"
 	FilterRoutingAccount     ChannelFilterKind = "routing_account"
 	FilterExcludeChannelIDs  ChannelFilterKind = "exclude_channel_ids"
+	FilterChannelTypes       ChannelFilterKind = "channel_types"
+	FilterGeminiLive         ChannelFilterKind = "gemini_live"
+	FilterResponsesWebSocket ChannelFilterKind = "responses_websocket"
 )
 
 type ChannelFilter struct {
 	Kind                   ChannelFilterKind
 	RequestPath            string
 	TaskPluginKey          string
+	TaskPluginKeys         []string
 	TaskPluginChannelTypes []int
 	RoutingAccount         string
 	ExcludedChannelIDs     []int
+	AllowedChannelTypes    []int
 }
 
 type ChannelConstraints struct {

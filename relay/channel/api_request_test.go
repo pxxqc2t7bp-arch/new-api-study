@@ -8,6 +8,7 @@ import (
 
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -22,6 +23,25 @@ func TestNewTaskAPIRequestInheritsClientCancellation(t *testing.T) {
 	cancel()
 
 	require.ErrorIs(t, upstream.Context().Err(), context.Canceled)
+}
+
+func TestWebSocketDialerForProxy(t *testing.T) {
+	httpDialer, err := websocketDialerForProxy("http://proxy.example:8080")
+	require.NoError(t, err)
+	require.NotNil(t, httpDialer.Proxy)
+	proxyURL, err := httpDialer.Proxy(
+		httptest.NewRequest(http.MethodGet, "https://provider.example", nil),
+	)
+	require.NoError(t, err)
+	require.Equal(t, "http://proxy.example:8080", proxyURL.String())
+
+	socksDialer, err := websocketDialerForProxy("socks5://user:pass@proxy.example:1080")
+	require.NoError(t, err)
+	require.Nil(t, socksDialer.Proxy)
+	require.NotNil(t, socksDialer.NetDialContext)
+
+	_, err = websocketDialerForProxy("ftp://proxy.example")
+	require.Error(t, err)
 }
 
 func TestProcessHeaderOverride_ChannelTestSkipsPassthroughRules(t *testing.T) {
@@ -134,6 +154,7 @@ func TestProcessHeaderOverride_PassthroughSkipsAcceptEncoding(t *testing.T) {
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	ctx.Request.Header.Set("X-Trace-Id", "trace-123")
 	ctx.Request.Header.Set("Accept-Encoding", "gzip")
+	ctx.Request.Header.Set("X-NewAPI-Realtime-Ticket", "rt-secret")
 
 	info := &relaycommon.RelayInfo{
 		IsChannelTest: false,
@@ -150,6 +171,8 @@ func TestProcessHeaderOverride_PassthroughSkipsAcceptEncoding(t *testing.T) {
 
 	_, hasAcceptEncoding := headers["accept-encoding"]
 	require.False(t, hasAcceptEncoding)
+	_, hasRealtimeTicket := headers["x-newapi-realtime-ticket"]
+	require.False(t, hasRealtimeTicket)
 }
 
 func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.T) {
@@ -204,4 +227,15 @@ func TestProcessHeaderOverride_PassHeadersTemplateSetsRuntimeHeaders(t *testing.
 	require.Equal(t, "Codex CLI", upstreamReq.Header.Get("Originator"))
 	require.Equal(t, "sess-123", upstreamReq.Header.Get("Session_id"))
 	require.Empty(t, upstreamReq.Header.Get("X-Codex-Beta-Features"))
+}
+
+func TestToWebSocketURL(t *testing.T) {
+	for input, want := range map[string]string{
+		"https://api.openai.com/v1/responses":             "wss://api.openai.com/v1/responses",
+		"http://127.0.0.1:3000/v1/responses":              "ws://127.0.0.1:3000/v1/responses",
+		"wss://chatgpt.com/backend-api/codex/responses":   "wss://chatgpt.com/backend-api/codex/responses",
+		"ws://127.0.0.1:3000/backend-api/codex/responses": "ws://127.0.0.1:3000/backend-api/codex/responses",
+	} {
+		assert.Equal(t, want, toWebSocketURL(input), input)
+	}
 }

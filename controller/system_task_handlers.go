@@ -28,6 +28,8 @@ func RegisterScheduledSystemTasks() {
 	service.RegisterSystemTaskHandler(upstreamProbeHandler{})
 	service.RegisterSystemTaskHandler(upstreamReconcileHandler{})
 	service.RegisterSystemTaskHandler(upstreamDailyHandler{})
+	service.RegisterSystemTaskHandler(streamRecoveryReconcileHandler{})
+	service.RegisterSystemTaskHandler(appTaskReconcileHandler{})
 }
 
 // channelTestHandler runs the scheduled "test all channels" job. Enablement and
@@ -156,6 +158,39 @@ func (asyncTaskPollHandler) NewPayload() any { return nil }
 func (asyncTaskPollHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	summary := service.RunTaskPollingOnce(ctx, service.NewSystemTaskProgressReporter(task, runnerID))
 	finishSystemTaskHandler(task, runnerID, model.SystemTaskStatusSucceeded, summary, nil)
+}
+
+type appTaskReconcileHandler struct{}
+
+func (appTaskReconcileHandler) Type() string { return model.SystemTaskTypeAppTaskReconcile }
+func (appTaskReconcileHandler) Enabled() bool {
+	return model.HasPendingAppTaskReconciliation()
+}
+func (appTaskReconcileHandler) Interval() time.Duration { return 15 * time.Second }
+func (appTaskReconcileHandler) NewPayload() any         { return nil }
+func (appTaskReconcileHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
+	processed, deferred := 0, 0
+	for range 32 {
+		if ctx.Err() != nil {
+			break
+		}
+		worked, err := service.RunAppTaskReconcileOnce(ctx, model.DB, time.Now())
+		if worked {
+			processed++
+		}
+		if err != nil {
+			deferred++
+		}
+		if !worked {
+			break
+		}
+	}
+	status := model.SystemTaskStatusSucceeded
+	var resultErr error
+	if deferred != 0 {
+		status, resultErr = model.SystemTaskStatusFailed, fmt.Errorf("%d app observations deferred", deferred)
+	}
+	finishSystemTaskHandler(task, runnerID, status, map[string]int{"processed": processed, "deferred": deferred}, resultErr)
 }
 
 type batchFileCleanupHandler struct{}
@@ -293,6 +328,48 @@ func (upstreamDailyHandler) NewPayload() any { return nil }
 
 func (upstreamDailyHandler) Run(ctx context.Context, task *model.SystemTask, runnerID string) {
 	summary, err := service.RunUpstreamDailyMaintenance(ctx, time.Now())
+	status := model.SystemTaskStatusSucceeded
+	if err != nil {
+		status = model.SystemTaskStatusFailed
+	}
+	finishSystemTaskHandler(task, runnerID, status, summary, err)
+}
+
+type streamRecoveryReconcileHandler struct{}
+
+func (streamRecoveryReconcileHandler) Type() string {
+	return model.SystemTaskTypeStreamRecoveryReconcile
+}
+
+func (streamRecoveryReconcileHandler) Enabled() bool {
+	setting := operation_setting.GetStreamRecoverySetting()
+	return setting.Enabled ||
+		setting.IdentityMode == operation_setting.StreamRecoveryIdentityModeDraining
+}
+
+func (streamRecoveryReconcileHandler) Interval() time.Duration {
+	return 15 * time.Second
+}
+
+func (streamRecoveryReconcileHandler) NewPayload() any {
+	return nil
+}
+
+func (streamRecoveryReconcileHandler) Run(
+	ctx context.Context,
+	task *model.SystemTask,
+	runnerID string,
+) {
+	runtime, err := service.GetStreamRecoveryRuntime()
+	summary := streamRecoveryReconcileSummary{}
+	if err == nil {
+		summary, err = reconcileExpiredStreamExecutions(
+			ctx,
+			runtime.Store,
+			common.GetTimestamp(),
+			100,
+		)
+	}
 	status := model.SystemTaskStatusSucceeded
 	if err != nil {
 		status = model.SystemTaskStatusFailed

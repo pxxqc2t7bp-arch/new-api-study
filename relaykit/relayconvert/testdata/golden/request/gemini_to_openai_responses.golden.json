@@ -1,57 +1,87 @@
 {
-  "model": "upstream-model",
-  "input": [
+  "losses": [
     {
-      "content": [
-        {
-          "text": "What is in this image?",
-          "type": "input_text"
-        },
-        {
-          "image_url": "data:image/png;base64,aGVsbG8=",
-          "type": "input_image"
-        }
-      ],
-      "role": "user"
-    },
-    {
-      "content": "",
-      "role": "assistant"
-    },
-    {
-      "arguments": "{\"city\":\"Paris\"}",
-      "call_id": "call_1",
-      "name": "get_weather",
-      "status": "completed",
-      "type": "function_call"
-    },
-    {
-      "call_id": "call_0",
-      "output": "{\"result\":\"15 degrees\"}",
-      "status": "completed",
-      "type": "function_call_output"
+      "code": "structured_output_unsupported",
+      "path": "generationConfig.responseSchema",
+      "message": "Gemini structured-output configuration is not portable across protocols",
+      "severity": "warning",
+      "from": "gemini",
+      "to": "openai_responses"
     }
   ],
-  "instructions": "You are a helpful assistant.",
-  "max_output_tokens": 1024,
-  "stream": false,
-  "temperature": 0.7,
-  "tools": [
-    {
-      "description": "Get weather by city",
-      "name": "get_weather",
-      "parameters": {
-        "properties": {
-          "city": {
-            "type": "string"
+  "value": {
+    "model": "upstream-model",
+    "input": [
+      {
+        "content": [
+          {
+            "text": "What is in this image?",
+            "type": "input_text"
+          },
+          {
+            "image_url": "data:image/png;base64,aGVsbG8=",
+            "type": "input_image"
           }
-        },
-        "required": [
-          "city"
         ],
-        "type": "object"
+        "role": "user"
       },
+      {
+        "content": "",
+        "role": "assistant"
+      },
+      {
+        "arguments": "{\"city\":\"Paris\"}",
+        "call_id": "call_abc",
+        "name": "get_weather",
+        "status": "completed",
+        "type": "function_call"
+      },
+      {
+        "arguments": "{\"city\":\"London\"}",
+        "call_id": "call_xyz",
+        "name": "get_weather",
+        "status": "completed",
+        "type": "function_call"
+      },
+      {
+        "call_id": "call_abc",
+        "output": "{\"result\":\"15 degrees\"}",
+        "status": "completed",
+        "type": "function_call_output"
+      },
+      {
+        "call_id": "call_xyz",
+        "output": "{\"result\":\"12 degrees\"}",
+        "status": "completed",
+        "type": "function_call_output"
+      }
+    ],
+    "instructions": "You are a helpful assistant.",
+    "max_output_tokens": 1024,
+    "stream": false,
+    "temperature": 0,
+    "tool_choice": {
+      "name": "get_weather",
       "type": "function"
-    }
-  ]
+    },
+    "tools": [
+      {
+        "description": "Get weather by city",
+        "name": "get_weather",
+        "parameters": {
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "type": "object"
+        },
+        "type": "function"
+      }
+    ],
+    "top_p": 0
+  }
 }

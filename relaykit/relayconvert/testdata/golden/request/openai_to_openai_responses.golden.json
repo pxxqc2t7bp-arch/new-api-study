@@ -1,61 +1,89 @@
 {
-  "model": "gpt-test",
-  "input": [
-    {
-      "content": [
-        {
-          "text": "What is in this image?",
-          "type": "input_text"
-        },
-        {
-          "image_url": "https://example.com/cat.png",
-          "type": "input_image"
-        }
-      ],
-      "role": "user"
-    },
-    {
-      "content": "",
-      "role": "assistant"
-    },
-    {
-      "arguments": "{\"city\":\"Paris\"}",
-      "call_id": "call_abc",
-      "name": "get_weather",
-      "status": "completed",
-      "type": "function_call"
-    },
-    {
-      "call_id": "call_abc",
-      "output": "15 degrees",
-      "status": "completed",
-      "type": "function_call_output"
-    },
-    {
-      "content": "Summarize.",
-      "role": "user"
-    }
-  ],
-  "instructions": "You are a helpful assistant.",
-  "max_output_tokens": 1024,
-  "stream": true,
-  "tool_choice": "auto",
-  "tools": [
-    {
-      "description": "Get weather by city",
-      "name": "get_weather",
-      "parameters": {
-        "properties": {
-          "city": {
-            "type": "string"
+  "losses": null,
+  "value": {
+    "model": "gpt-test",
+    "input": [
+      {
+        "content": [
+          {
+            "text": "What is in this image?",
+            "type": "input_text"
+          },
+          {
+            "image_url": "https://example.com/cat.png",
+            "type": "input_image"
           }
-        },
-        "required": [
-          "city"
         ],
-        "type": "object"
+        "role": "user"
       },
+      {
+        "content": "",
+        "role": "assistant"
+      },
+      {
+        "arguments": "{\"city\":\"Paris\"}",
+        "call_id": "call_abc",
+        "name": "get_weather",
+        "status": "completed",
+        "type": "function_call"
+      },
+      {
+        "call_id": "call_abc",
+        "output": "15 degrees",
+        "status": "completed",
+        "type": "function_call_output"
+      },
+      {
+        "content": "Summarize.",
+        "role": "user"
+      }
+    ],
+    "instructions": "You are a helpful assistant.",
+    "max_output_tokens": 1024,
+    "parallel_tool_calls": false,
+    "stream": true,
+    "temperature": 0,
+    "text": {
+      "format": {
+        "name": "weather",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "summary"
+          ],
+          "type": "object"
+        },
+        "strict": true,
+        "type": "json_schema"
+      }
+    },
+    "tool_choice": {
+      "name": "get_weather",
       "type": "function"
-    }
-  ]
+    },
+    "tools": [
+      {
+        "description": "Get weather by city",
+        "name": "get_weather",
+        "parameters": {
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "type": "object"
+        },
+        "type": "function"
+      }
+    ],
+    "top_p": 0
+  }
 }

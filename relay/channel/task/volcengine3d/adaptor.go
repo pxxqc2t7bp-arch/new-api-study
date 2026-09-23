@@ -217,12 +217,11 @@ func (a *TaskAdaptor) AdjustBillingOnComplete(task *model.Task, result *relaycom
 	return quota
 }
 
-func (a *TaskAdaptor) FetchTask(baseURL, key string, body map[string]any, proxy string) (*http.Response, error) {
-	taskID, ok := body["task_id"].(string)
-	if !ok || taskID == "" {
+func (a *TaskAdaptor) FetchTask(baseURL, key string, task *model.Task, proxy string) (*http.Response, error) {
+	if task == nil || task.GetUpstreamTaskID() == "" {
 		return nil, fmt.Errorf("invalid task_id")
 	}
-	return doTaskRequest(http.MethodGet, baseURL, key, taskID, proxy)
+	return doTaskRequest(http.MethodGet, baseURL, key, task.GetUpstreamTaskID(), proxy)
 }
 
 func (a *TaskAdaptor) CancelTask(baseURL, key, taskID, proxy string) (*http.Response, error) {
@@ -247,7 +246,7 @@ func doTaskRequest(method, baseURL, key, taskID, proxy string) (*http.Response, 
 	return client.Do(req)
 }
 
-func (a *TaskAdaptor) ParseTaskResult(body []byte) (*relaycommon.TaskInfo, error) {
+func (a *TaskAdaptor) ParseTaskResult(_ *model.Task, _ *http.Response, body []byte) (*relaycommon.TaskInfo, error) {
 	var response responsePayload
 	if err := common.Unmarshal(body, &response); err != nil {
 		return nil, errors.Wrap(err, "unmarshal 3D task result failed")
@@ -275,8 +274,8 @@ func (a *TaskAdaptor) ParseTaskResult(body []byte) (*relaycommon.TaskInfo, error
 		result.Progress = taskcommon.ProgressComplete
 		result.Reason = response.Error.Message
 	default:
-		result.Status = model.TaskStatusInProgress
-		result.Progress = "30%"
+		result.Status = model.TaskStatusUnknown
+		result.Reason = "unrecognized status: " + response.Status
 	}
 	return result, nil
 }

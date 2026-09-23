@@ -24,6 +24,17 @@ func seedFlowLookupData(t *testing.T) {
 func TestGetFlowQuotaDataUsesQuotaDataRoleSpecificDimensions(t *testing.T) {
 	truncateTables(t)
 	seedFlowLookupData(t)
+	users := []User{
+		{
+			Id: 1, Username: "alice", Password: "password", Role: common.RoleCommonUser,
+			Status: common.UserStatusEnabled, Group: "default", AffCode: "flow-alice",
+		},
+		{
+			Id: 2, Username: "bob", Password: "password", Role: common.RolePluginAdminUser,
+			Status: common.UserStatusEnabled, Group: "default", AffCode: "flow-bob",
+		},
+	}
+	require.NoError(t, DB.Create(&users).Error)
 
 	seedFlowQuotaData(t, QuotaData{
 		UserID:    1,
@@ -86,6 +97,7 @@ func TestGetFlowQuotaDataUsesQuotaDataRoleSpecificDimensions(t *testing.T) {
 		Quota:     999,
 		TokenUsed: 999,
 	})
+	require.NoError(t, DB.Delete(&users[1]).Error)
 
 	rootRows, err := GetFlowQuotaData(900, 2000, "", 0, common.RoleRootUser)
 	require.NoError(t, err)
@@ -120,6 +132,24 @@ func TestGetFlowQuotaDataUsesQuotaDataRoleSpecificDimensions(t *testing.T) {
 	require.Equal(t, "vip", adminRows[0].UseGroup)
 	require.Equal(t, "east", adminRows[0].ChannelName)
 	require.Equal(t, 150, adminRows[0].Quota)
+
+	adminRows, err = GetFlowQuotaData(900, 2000, "", 0, common.RoleAdminUser)
+	require.NoError(t, err)
+	require.Len(t, adminRows, 2)
+	for _, row := range adminRows {
+		require.Equal(t, 1, row.UserID)
+		require.Equal(t, "alice", row.Username)
+	}
+
+	adminRows, err = GetFlowQuotaData(900, 2000, "bob", 0, common.RoleAdminUser)
+	require.NoError(t, err)
+	require.Empty(t, adminRows)
+
+	rootRows, err = GetFlowQuotaData(900, 2000, "bob", 0, common.RoleRootUser)
+	require.NoError(t, err)
+	require.Len(t, rootRows, 1)
+	require.Equal(t, 2, rootRows[0].UserID)
+	require.Equal(t, "bob", rootRows[0].Username)
 
 	selfRows, err := GetFlowQuotaData(900, 2000, "", 1, common.RoleCommonUser)
 	require.NoError(t, err)

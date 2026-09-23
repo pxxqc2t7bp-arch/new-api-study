@@ -19,6 +19,17 @@ import (
 
 const UserNameMaxLength = 20
 
+var (
+	ErrUserHardDeleteUnauthorized  = errors.New("user hard deletion is not authorized")
+	ErrUserNotManageable           = errors.New("user is not manageable")
+	ErrUserCannotDisableRoot       = errors.New("root user cannot be disabled")
+	ErrUserAdminCannotPromote      = errors.New("administrator cannot promote users")
+	ErrUserAlreadyAdmin            = errors.New("user is already an administrator")
+	ErrUserCannotDemoteRoot        = errors.New("root user cannot be demoted")
+	ErrUserAlreadyCommon           = errors.New("user is already common")
+	ErrInvalidUserManagementAction = errors.New("invalid user management action")
+)
+
 var userSortColumns = map[string]string{
 	"id":            "id",
 	"username":      "username",
@@ -77,39 +88,41 @@ func resolveUserSortOptions(sortOptions []UserSortOptions) UserSortOptions {
 // User if you add sensitive fields, don't forget to clean them in setupLogin function.
 // Otherwise, the sensitive information will be saved on local storage in plain text!
 type User struct {
-	Id               int                        `json:"id"`
-	Username         string                     `json:"username" gorm:"unique;index" validate:"max=20"`
-	Password         string                     `json:"password" gorm:"not null;" validate:"min=8,max=20"`
-	OriginalPassword string                     `json:"original_password" gorm:"-:all"` // this field is only for Password change verification, don't save it to database!
-	DisplayName      string                     `json:"display_name" gorm:"index" validate:"max=20"`
-	Role             int                        `json:"role" gorm:"type:int;default:1"`   // admin, common
-	Status           int                        `json:"status" gorm:"type:int;default:1"` // enabled, disabled
-	Email            string                     `json:"email" gorm:"index" validate:"max=50"`
-	GitHubId         string                     `json:"github_id" gorm:"column:github_id;index"`
-	DiscordId        string                     `json:"discord_id" gorm:"column:discord_id;index"`
-	OidcId           string                     `json:"oidc_id" gorm:"column:oidc_id;index"`
-	WeChatId         string                     `json:"wechat_id" gorm:"column:wechat_id;index"`
-	TelegramId       string                     `json:"telegram_id" gorm:"column:telegram_id;index"`
-	VerificationCode string                     `json:"verification_code" gorm:"-:all"`                         // this field is only for Email verification, don't save it to database!
-	AccessToken      *string                    `json:"-" gorm:"type:char(32);column:access_token;uniqueIndex"` // this token is for system management
-	Quota            int                        `json:"quota" gorm:"type:int;default:0"`
-	UsedQuota        int                        `json:"used_quota" gorm:"type:int;default:0;column:used_quota"` // used quota
-	RequestCount     int                        `json:"request_count" gorm:"type:int;default:0;"`               // request number
-	Group            string                     `json:"group" gorm:"type:varchar(64);default:'default'"`
-	AffCode          string                     `json:"aff_code" gorm:"type:varchar(32);column:aff_code;uniqueIndex"`
-	AffCount         int                        `json:"aff_count" gorm:"type:int;default:0;column:aff_count"`
-	AffQuota         int                        `json:"aff_quota" gorm:"type:int;default:0;column:aff_quota"`           // 邀请剩余额度
-	AffHistoryQuota  int                        `json:"aff_history_quota" gorm:"type:int;default:0;column:aff_history"` // 邀请历史额度
-	InviterId        int                        `json:"inviter_id" gorm:"type:int;column:inviter_id;index"`
-	DeletedAt        gorm.DeletedAt             `gorm:"index"`
-	LinuxDOId        string                     `json:"linux_do_id" gorm:"column:linux_do_id;index"`
-	Setting          string                     `json:"setting" gorm:"type:text;column:setting"`
-	Remark           string                     `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
-	StripeCustomer   string                     `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
-	CreatedAt        int64                      `json:"created_at" gorm:"autoCreateTime;column:created_at"`
-	LastLoginAt      int64                      `json:"last_login_at" gorm:"default:0;column:last_login_at"`
-	AuthVersion      int64                      `json:"-" gorm:"type:bigint;not null;default:1;column:auth_version"`
-	AdminPermissions map[string]map[string]bool `json:"admin_permissions,omitempty" gorm:"-:all"`
+	Id                   int                        `json:"id"`
+	Username             string                     `json:"username" gorm:"unique;index" validate:"max=20"`
+	Password             string                     `json:"password" gorm:"not null;" validate:"min=8,max=128"`
+	HasPassword          bool                       `json:"-" gorm:"-:all"`
+	OriginalPassword     string                     `json:"original_password" gorm:"-:all"` // this field is only for Password change verification, don't save it to database!
+	DisplayName          string                     `json:"display_name" gorm:"index" validate:"max=20"`
+	Role                 int                        `json:"role" gorm:"type:int;default:1"`   // admin, common
+	Status               int                        `json:"status" gorm:"type:int;default:1"` // enabled, disabled
+	Email                string                     `json:"email" gorm:"index" validate:"max=50"`
+	GitHubId             string                     `json:"github_id" gorm:"column:github_id;index"`
+	DiscordId            string                     `json:"discord_id" gorm:"column:discord_id;index"`
+	OidcId               string                     `json:"oidc_id" gorm:"column:oidc_id;index"`
+	WeChatId             string                     `json:"wechat_id" gorm:"column:wechat_id;index"`
+	TelegramId           string                     `json:"telegram_id" gorm:"column:telegram_id;index"`
+	VerificationCode     string                     `json:"verification_code" gorm:"-:all"`                         // this field is only for Email verification, don't save it to database!
+	AccessToken          *string                    `json:"-" gorm:"type:char(32);column:access_token;uniqueIndex"` // this token is for system management
+	AccessTokenCreatedAt *int64                     `json:"-" gorm:"type:bigint;column:access_token_created_at"`
+	Quota                int                        `json:"quota" gorm:"type:int;default:0"`
+	UsedQuota            int                        `json:"used_quota" gorm:"type:int;default:0;column:used_quota"` // used quota
+	RequestCount         int                        `json:"request_count" gorm:"type:int;default:0;"`               // request number
+	Group                string                     `json:"group" gorm:"type:varchar(64);default:'default'"`
+	AffCode              string                     `json:"aff_code" gorm:"type:varchar(32);column:aff_code;uniqueIndex"`
+	AffCount             int                        `json:"aff_count" gorm:"type:int;default:0;column:aff_count"`
+	AffQuota             int                        `json:"aff_quota" gorm:"type:int;default:0;column:aff_quota"`           // 邀请剩余额度
+	AffHistoryQuota      int                        `json:"aff_history_quota" gorm:"type:int;default:0;column:aff_history"` // 邀请历史额度
+	InviterId            int                        `json:"inviter_id" gorm:"type:int;column:inviter_id;index"`
+	DeletedAt            gorm.DeletedAt             `gorm:"index"`
+	LinuxDOId            string                     `json:"linux_do_id" gorm:"column:linux_do_id;index"`
+	Setting              string                     `json:"setting" gorm:"type:text;column:setting"`
+	Remark               string                     `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
+	StripeCustomer       string                     `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
+	CreatedAt            int64                      `json:"created_at" gorm:"autoCreateTime;column:created_at"`
+	LastLoginAt          int64                      `json:"last_login_at" gorm:"default:0;column:last_login_at"`
+	AuthVersion          int64                      `json:"-" gorm:"type:bigint;not null;default:1;column:auth_version"`
+	AdminPermissions     map[string]map[string]bool `json:"admin_permissions,omitempty" gorm:"-:all"`
 }
 
 func (user *User) ToBaseUser() *UserBase {
@@ -145,7 +158,9 @@ func UpdateUserAccessToken(id int, token string) error {
 	if id == 0 {
 		return errors.New("id 为空！")
 	}
-	result := DB.Model(&User{}).Where("id = ?", id).Update("access_token", token)
+	result := DB.Model(&User{}).Where("id = ?", id).Updates(map[string]any{
+		"access_token": token, "access_token_created_at": common.GetTimestamp(),
+	})
 	if result.Error != nil {
 		return result.Error
 	}
@@ -153,6 +168,23 @@ func UpdateUserAccessToken(id int, token string) error {
 		return gorm.ErrRecordNotFound
 	}
 	return nil
+}
+
+// RevokeUserAccessToken returns the generation actually revoked under the row lock.
+func RevokeUserAccessToken(id int) (string, error) {
+	var tokenRef string
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var user User
+		if err := lockForUpdate(tx).Select("id", "access_token").First(&user, id).Error; err != nil {
+			return err
+		}
+		tokenRef = AccessTokenFingerprint(user.GetAccessToken())
+		if tokenRef == "" {
+			return nil
+		}
+		return tx.Model(&User{}).Where("id = ?", id).Updates(map[string]any{"access_token": nil, "access_token_created_at": nil}).Error
+	})
+	return tokenRef, err
 }
 
 func (user *User) GetSetting() dto.UserSetting {
@@ -216,17 +248,17 @@ func UpdateUserBindColumn(userId int, column string, value string) error {
 
 // 根据用户角色生成默认的边栏配置
 func generateDefaultSidebarConfigForRole(userRole int) string {
-	defaultConfig := map[string]interface{}{}
+	defaultConfig := map[string]any{}
 
 	// 聊天区域 - 所有用户都可以访问
-	defaultConfig["chat"] = map[string]interface{}{
+	defaultConfig["chat"] = map[string]any{
 		"enabled":    true,
 		"playground": true,
 		"chat":       true,
 	}
 
 	// 控制台区域 - 所有用户都可以访问
-	defaultConfig["console"] = map[string]interface{}{
+	defaultConfig["console"] = map[string]any{
 		"enabled":    true,
 		"detail":     true,
 		"token":      true,
@@ -236,7 +268,7 @@ func generateDefaultSidebarConfigForRole(userRole int) string {
 	}
 
 	// 个人中心区域 - 所有用户都可以访问
-	defaultConfig["personal"] = map[string]interface{}{
+	defaultConfig["personal"] = map[string]any{
 		"enabled":  true,
 		"topup":    true,
 		"personal": true,
@@ -245,7 +277,7 @@ func generateDefaultSidebarConfigForRole(userRole int) string {
 	// 管理员区域 - 根据角色决定
 	if userRole == common.RoleAdminUser {
 		// 管理员可以访问管理员区域，但不能访问系统设置
-		defaultConfig["admin"] = map[string]interface{}{
+		defaultConfig["admin"] = map[string]any{
 			"enabled":    true,
 			"channel":    true,
 			"models":     true,
@@ -255,7 +287,7 @@ func generateDefaultSidebarConfigForRole(userRole int) string {
 		}
 	} else if userRole == common.RoleRootUser {
 		// 超级管理员可以访问所有功能
-		defaultConfig["admin"] = map[string]interface{}{
+		defaultConfig["admin"] = map[string]any{
 			"enabled":    true,
 			"channel":    true,
 			"models":     true,
@@ -362,9 +394,16 @@ func EnsureEmailAvailable(email string, excludeUserID int) error {
 //
 // An empty email is allowed to repeat and needs no serialization.
 func withNormalizedEmailLock(tx *gorm.DB, email string, fn func(tx *gorm.DB) error) error {
+	if err := lockNormalizedEmail(tx, email); err != nil {
+		return err
+	}
+	return fn(tx)
+}
+
+func lockNormalizedEmail(tx *gorm.DB, email string) error {
 	email = NormalizeEmail(email)
 	if email == "" {
-		return fn(tx)
+		return nil
 	}
 	switch {
 	case common.UsingMainDatabase(common.DatabaseTypePostgreSQL):
@@ -377,7 +416,7 @@ func withNormalizedEmailLock(tx *gorm.DB, email string, fn func(tx *gorm.DB) err
 			return err
 		}
 	}
-	return fn(tx)
+	return nil
 }
 
 func GetMaxUserId() int {
@@ -387,6 +426,10 @@ func GetMaxUserId() int {
 }
 
 func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (users []*User, total int64, err error) {
+	return GetAllUsersForViewer(common.RoleRootUser, pageInfo, sortOptions...)
+}
+
+func GetAllUsersForViewer(viewerRole int, pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (users []*User, total int64, err error) {
 	// Start transaction
 	tx := DB.Begin()
 	if tx.Error != nil {
@@ -398,8 +441,10 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
 		}
 	}()
 
+	query := applyUserListingVisibility(tx.Unscoped().Model(&User{}), viewerRole)
+
 	// Get total count within transaction
-	err = tx.Unscoped().Model(&User{}).Count(&total).Error
+	err = query.Count(&total).Error
 	if err != nil {
 		tx.Rollback()
 		return nil, 0, err
@@ -407,7 +452,7 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
 
 	// Get paginated users within same transaction
 	order := resolveUserSortOptions(sortOptions)
-	err = order.Apply(tx.Unscoped()).Limit(pageInfo.GetPageSize()).Offset(pageInfo.GetStartIdx()).Omit("password", "access_token").Find(&users).Error
+	err = order.Apply(query).Limit(pageInfo.GetPageSize()).Offset(pageInfo.GetStartIdx()).Omit("password", "access_token").Find(&users).Error
 	if err != nil {
 		tx.Rollback()
 		return nil, 0, err
@@ -422,6 +467,10 @@ func GetAllUsers(pageInfo *common.PageInfo, sortOptions ...UserSortOptions) (use
 }
 
 func SearchUsers(keyword string, group string, role *int, status *int, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
+	return SearchUsersForViewer(common.RoleRootUser, keyword, group, role, status, startIdx, num, sortOptions...)
+}
+
+func SearchUsersForViewer(viewerRole int, keyword string, group string, role *int, status *int, startIdx int, num int, sortOptions ...UserSortOptions) ([]*User, int64, error) {
 	var users []*User
 	var total int64
 	var err error
@@ -438,18 +487,18 @@ func SearchUsers(keyword string, group string, role *int, status *int, startIdx 
 	}()
 
 	// 构建基础查询
-	query := tx.Unscoped().Model(&User{})
+	query := applyUserListingVisibility(tx.Unscoped().Model(&User{}), viewerRole)
 
 	// 构建搜索条件
 	likeCondition := "username LIKE ? OR email LIKE ? OR display_name LIKE ?"
-	likeArgs := []interface{}{"%" + keyword + "%", "%" + keyword + "%", "%" + keyword + "%"}
+	likeArgs := []any{"%" + keyword + "%", "%" + keyword + "%", "%" + keyword + "%"}
 
 	// 尝试将关键字转换为整数ID
 	keywordInt, err := strconv.Atoi(keyword)
 	if err == nil {
 		// 如果是数字，同时搜索ID和其他字段
 		likeCondition = "id = ? OR " + likeCondition
-		likeArgs = append([]interface{}{keywordInt}, likeArgs...)
+		likeArgs = append([]any{keywordInt}, likeArgs...)
 	}
 
 	query = query.Where("("+likeCondition+")", likeArgs...)
@@ -490,6 +539,13 @@ func SearchUsers(keyword string, group string, role *int, status *int, startIdx 
 	return users, total, nil
 }
 
+func applyUserListingVisibility(query *gorm.DB, viewerRole int) *gorm.DB {
+	if viewerRole != common.RoleRootUser {
+		return query.Where("role <> ?", common.RolePluginAdminUser)
+	}
+	return query
+}
+
 func GetUserById(id int, selectAll bool) (*User, error) {
 	if id == 0 {
 		return nil, errors.New("id 为空！")
@@ -502,6 +558,49 @@ func GetUserById(id int, selectAll bool) (*User, error) {
 		err = DB.Omit("password", "access_token").First(&user, "id = ?", id).Error
 	}
 	return &user, err
+}
+
+func lockManageableUserTx(tx *gorm.DB, id int, operatorRole int, includeDeleted bool) (*User, error) {
+	if tx == nil || id <= 0 {
+		return nil, ErrUserNotManageable
+	}
+	query := tx
+	if includeDeleted {
+		query = tx.Unscoped()
+	}
+	var user User
+	if err := lockForUpdate(query).Where("id = ?", id).First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrUserNotManageable
+		}
+		return nil, err
+	}
+	if !common.CanManageUserRole(operatorRole, user.Role) {
+		return nil, ErrUserNotManageable
+	}
+	return &user, nil
+}
+
+// GetSelfUserById reads dashboard profile data and password existence in one
+// query. The password hash and management access token are never selected.
+func GetSelfUserById(id int) (*User, error) {
+	if id == 0 {
+		return nil, errors.New("id 为空！")
+	}
+	var profile struct {
+		User
+		HasPassword bool `gorm:"column:has_password"`
+	}
+	err := DB.Model(&User{}).Select([]string{
+		"id", "username", "display_name", "role", "status", "email",
+		"github_id", "discord_id", "oidc_id", "wechat_id", "telegram_id",
+		"group", "quota", "used_quota", "request_count", "aff_code", "aff_count",
+		"aff_quota", "aff_history", "inviter_id", "linux_do_id", "setting",
+		"stripe_customer", "auth_version",
+		"CASE WHEN password <> '' THEN 1 ELSE 0 END AS has_password",
+	}).First(&profile, "id = ?", id).Error
+	profile.User.HasPassword = profile.HasPassword
+	return &profile.User, err
 }
 
 func GetUserIdByAffCode(affCode string) (int, error) {
@@ -522,15 +621,19 @@ func DeleteUserById(id int) (err error) {
 }
 
 func HardDeleteUserById(id int) error {
+	return HardDeleteUserByIdForRole(id, common.RoleRootUser)
+}
+
+func HardDeleteUserByIdForRole(id int, operatorRole int) error {
 	if id == 0 {
 		return errors.New("id 为空！")
 	}
 	user := User{Id: id}
-	return user.HardDelete()
+	return user.hardDelete(operatorRole)
 }
 
 func inviteUser(inviterId int) error {
-	result := DB.Model(&User{}).Where("id = ?", inviterId).Updates(map[string]interface{}{
+	result := DB.Model(&User{}).Where("id = ?", inviterId).Updates(map[string]any{
 		"aff_count":   gorm.Expr("aff_count + ?", 1),
 		"aff_quota":   gorm.Expr("aff_quota + ?", common.QuotaForInviter),
 		"aff_history": gorm.Expr("aff_history + ?", common.QuotaForInviter),
@@ -590,7 +693,7 @@ func (user *User) prepareForInsert(tx *gorm.DB) error {
 		return nil
 	}
 	var err error
-	user.Password, err = common.Password2Hash(user.Password)
+	user.Password, err = common.HashAccountPassword(user.Password)
 	return err
 }
 
@@ -769,7 +872,7 @@ func (user *User) Update(updatePassword bool) error {
 func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 	var err error
 	if updatePassword {
-		user.Password, err = common.Password2Hash(user.Password)
+		user.Password, err = common.HashAccountPassword(user.Password)
 		if err != nil {
 			return err
 		}
@@ -830,14 +933,46 @@ func (user *User) Edit(updatePassword bool) error {
 func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 	var err error
 	if updatePassword {
-		user.Password, err = common.Password2Hash(user.Password)
+		user.Password, err = common.HashAccountPassword(user.Password)
 		if err != nil {
 			return err
 		}
 	}
 
+	current := User{}
+	if err = tx.First(&current, user.Id).Error; err != nil {
+		return err
+	}
+	_, err = user.editWithCurrentTx(tx, &current, updatePassword)
+	return err
+}
+
+// EditForRoleWithTx applies an administrative profile update only after the
+// current target row has been locked and authorized in the caller's transaction.
+func (user *User) EditForRoleWithTx(tx *gorm.DB, operatorRole int, updatePassword bool) (*User, bool, error) {
+	var err error
+	if updatePassword {
+		user.Password, err = common.HashAccountPassword(user.Password)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+
+	current, err := lockManageableUserTx(tx, user.Id, operatorRole, false)
+	if err != nil {
+		return nil, false, err
+	}
+	previous := *current
+	authChanged, err := user.editWithCurrentTx(tx, current, updatePassword)
+	if err != nil {
+		return nil, false, err
+	}
+	return &previous, authChanged, nil
+}
+
+func (user *User) editWithCurrentTx(tx *gorm.DB, current *User, updatePassword bool) (bool, error) {
 	newUser := *user
-	updates := map[string]interface{}{
+	updates := map[string]any{
 		"username":     newUser.Username,
 		"display_name": newUser.DisplayName,
 		"group":        newUser.Group,
@@ -847,24 +982,102 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 		updates["password"] = newUser.Password
 	}
 
-	current := User{}
-	if err = tx.First(&current, user.Id).Error; err != nil {
-		return err
-	}
 	authChanged := (updatePassword && current.Password != newUser.Password) || current.Group != newUser.Group
 	if authChanged {
-		newUser.AuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
-		if err != nil {
-			return err
+		if _, err := IncrementUserAuthVersionWithTx(tx, user.Id); err != nil {
+			return false, err
 		}
 	}
-	if err = tx.Model(&current).Updates(updates).Error; err != nil {
-		return err
+	if err := tx.Model(current).Updates(updates).Error; err != nil {
+		return false, err
 	}
-	return tx.First(user, user.Id).Error
+	if err := tx.First(user, user.Id).Error; err != nil {
+		return false, err
+	}
+	return authChanged, nil
+}
+
+// ManageUserForRoleWithTx changes only the requested role or status field from
+// a locked database snapshot. The caller may add related transactional work,
+// such as clearing authorization policy on demotion, before commit.
+func ManageUserForRoleWithTx(tx *gorm.DB, userID int, operatorRole int, action string) (*User, bool, error) {
+	user, err := lockManageableUserTx(tx, userID, operatorRole, true)
+	if err != nil {
+		return nil, false, err
+	}
+	if user.DeletedAt.Valid {
+		return nil, false, gorm.ErrRecordNotFound
+	}
+
+	var (
+		column string
+		value  int
+	)
+	switch action {
+	case "disable":
+		if user.Role == common.RoleRootUser {
+			return nil, false, ErrUserCannotDisableRoot
+		}
+		column, value = "status", common.UserStatusDisabled
+	case "enable":
+		column, value = "status", common.UserStatusEnabled
+	case "promote":
+		if operatorRole != common.RoleRootUser {
+			return nil, false, ErrUserAdminCannotPromote
+		}
+		if user.Role >= common.RoleAdminUser {
+			return nil, false, ErrUserAlreadyAdmin
+		}
+		column, value = "role", common.RoleAdminUser
+	case "demote":
+		if user.Role == common.RoleRootUser {
+			return nil, false, ErrUserCannotDemoteRoot
+		}
+		if user.Role == common.RoleCommonUser {
+			return nil, false, ErrUserAlreadyCommon
+		}
+		column, value = "role", common.RoleCommonUser
+	default:
+		return nil, false, ErrInvalidUserManagementAction
+	}
+
+	currentValue := user.Status
+	if column == "role" {
+		currentValue = user.Role
+	}
+	if currentValue == value {
+		return user, false, nil
+	}
+
+	nextAuthVersion, err := IncrementUserAuthVersionWithTx(tx, userID)
+	if err != nil {
+		return nil, false, err
+	}
+	result := tx.Model(&User{}).Where("id = ?", userID).Update(column, value)
+	if result.Error != nil {
+		return nil, false, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return nil, false, gorm.ErrRecordNotFound
+	}
+	if column == "role" {
+		user.Role = value
+	} else {
+		user.Status = value
+	}
+	user.AuthVersion = nextAuthVersion
+	return user, true, nil
 }
 
 func (user *User) ClearBinding(bindingType string) error {
+	return user.clearBinding(bindingType, nil)
+}
+
+func (user *User) ClearBindingForRole(bindingType string, operatorRole int) error {
+	return user.clearBinding(bindingType, &operatorRole)
+}
+
+func (user *User) clearBinding(bindingType string, operatorRole *int) error {
 	if user.Id == 0 {
 		return errors.New("user id is empty")
 	}
@@ -884,37 +1097,108 @@ func (user *User) ClearBinding(bindingType string) error {
 		return errors.New("invalid binding type")
 	}
 
+	var stored *User
 	if err := DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&User{}).Where("id = ?", user.Id).Update(column, "").Error; err != nil {
+		var err error
+		if operatorRole == nil {
+			stored = &User{}
+			err = lockForUpdate(tx).Where("id = ?", user.Id).First(stored).Error
+		} else {
+			stored, err = lockManageableUserTx(tx, user.Id, *operatorRole, false)
+		}
+		if err != nil {
+			return err
+		}
+		if err := tx.Model(stored).Update(column, "").Error; err != nil {
 			return err
 		}
 		if bindingType == ExternalIdentityProviderTelegram {
-			return ReleaseExternalIdentityWithTx(tx, ExternalIdentityProviderTelegram, user.Id)
+			if err := ReleaseExternalIdentityWithTx(tx, ExternalIdentityProviderTelegram, user.Id); err != nil {
+				return err
+			}
 		}
-		return nil
+		return tx.First(stored, user.Id).Error
 	}); err != nil {
 		return err
 	}
 
-	if err := DB.Where("id = ?", user.Id).First(user).Error; err != nil {
-		return err
-	}
-
+	*user = *stored
 	return updateUserCache(*user)
 }
 
 func (user *User) Delete() error {
+	return user.delete(nil)
+}
+
+func DeleteUserForSession(identity AuthSessionIdentity) error {
+	user := User{Id: identity.UserID}
+	return user.delete(&identity)
+}
+
+func SoftDeleteUserForRole(userID int, operatorRole int) (*User, error) {
+	if userID <= 0 {
+		return nil, ErrUserNotManageable
+	}
+	var (
+		user            *User
+		nextAuthVersion int64
+	)
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		user, err = lockManageableUserTx(tx, userID, operatorRole, true)
+		if err != nil {
+			return err
+		}
+		if user.Role == common.RoleRootUser {
+			return ErrCannotDeleteRootUser
+		}
+		nextAuthVersion, err = IncrementUserAuthVersionWithTx(tx, userID)
+		if err != nil {
+			return err
+		}
+		return softDeleteUserWithTx(tx, user)
+	}); err != nil {
+		return nil, err
+	}
+	if err := publishCommittedUserAuthVersion(userID, nextAuthVersion); err != nil {
+		return nil, err
+	}
+	if _, err := RevokeAllUserSessions(userID, "user_deleted"); err != nil {
+		return nil, err
+	}
+	if err := invalidateUserCache(userID); err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+func (user *User) delete(identity *AuthSessionIdentity) error {
 	if user.Id == 0 {
 		return errors.New("id 为空！")
 	}
 	var nextAuthVersion int64
 	if err := DB.Transaction(func(tx *gorm.DB) error {
+		if identity != nil {
+			if err := ValidateAuthSessionWithTx(tx, *identity); err != nil {
+				return err
+			}
+		}
+		var storedUser User
+		if err := lockForUpdate(tx.Unscoped()).
+			Select("id", "role").
+			Where("id = ?", user.Id).
+			First(&storedUser).Error; err != nil {
+			return err
+		}
+		if identity != nil && storedUser.Role == common.RoleRootUser {
+			return ErrCannotDeleteRootUser
+		}
 		var err error
 		nextAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
 		if err != nil {
 			return err
 		}
-		return tx.Delete(user).Error
+		return softDeleteUserWithTx(tx, &storedUser)
 	}); err != nil {
 		return err
 	}
@@ -928,12 +1212,26 @@ func (user *User) Delete() error {
 }
 
 func (user *User) HardDelete() error {
+	return user.hardDelete(common.RoleRootUser)
+}
+
+func (user *User) hardDelete(operatorRole int) error {
 	if user.Id == 0 {
 		return errors.New("id 为空！")
 	}
 	var tokens []Token
 	var deletedAuthVersion int64
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		var storedUser User
+		if err := lockForUpdate(tx.Unscoped()).
+			Select("id", "role").
+			Where("id = ?", user.Id).
+			First(&storedUser).Error; err != nil {
+			return err
+		}
+		if !common.CanManageLowerUserRole(operatorRole, storedUser.Role) {
+			return ErrUserHardDeleteUnauthorized
+		}
 		var err error
 		deletedAuthVersion, err = IncrementUserAuthVersionWithTx(tx, user.Id)
 		if err != nil {
@@ -947,7 +1245,10 @@ func (user *User) HardDelete() error {
 		if err := deleteUserAuthenticationData(tx, user.Id); err != nil {
 			return err
 		}
-		return tx.Unscoped().Delete(user).Error
+		if storedUser.Role == common.RolePluginAdminUser {
+			return softDeleteUserWithTx(tx, &storedUser)
+		}
+		return tx.Unscoped().Delete(&storedUser).Error
 	})
 	if err != nil {
 		return err
@@ -962,6 +1263,42 @@ func (user *User) HardDelete() error {
 		common.SysError(fmt.Sprintf("failed to invalidate user cache after hard deleting user %d: %v", user.Id, err))
 	}
 	return nil
+}
+
+func softDeleteUserWithTx(tx *gorm.DB, user *User) error {
+	if user.Role == common.RolePluginAdminUser {
+		if err := tx.Unscoped().Model(&User{}).Where("id = ?", user.Id).Updates(map[string]any{
+			"username":                nil,
+			"password":                "",
+			"display_name":            "",
+			"status":                  common.UserStatusDisabled,
+			"email":                   "",
+			"github_id":               "",
+			"discord_id":              "",
+			"oidc_id":                 "",
+			"wechat_id":               "",
+			"telegram_id":             "",
+			"access_token":            nil,
+			"access_token_created_at": nil,
+			"quota":                   0,
+			"used_quota":              0,
+			"request_count":           0,
+			"group":                   "",
+			"aff_code":                nil,
+			"aff_count":               0,
+			"aff_quota":               0,
+			"aff_history":             0,
+			"inviter_id":              0,
+			"linux_do_id":             "",
+			"setting":                 "",
+			"remark":                  "",
+			"stripe_customer":         "",
+			"last_login_at":           0,
+		}).Error; err != nil {
+			return err
+		}
+	}
+	return tx.Delete(user).Error
 }
 
 func deleteUserAuthenticationData(tx *gorm.DB, userId int) error {
@@ -1033,14 +1370,6 @@ func (user *User) FillUserByGitHubId() error {
 	}
 	DB.Where(User{GitHubId: user.GitHubId}).First(user)
 	return nil
-}
-
-// UpdateGitHubId updates the user's GitHub ID (used for migration from login to numeric ID)
-func (user *User) UpdateGitHubId(newGitHubId string) error {
-	if user.Id == 0 {
-		return errors.New("user id is empty")
-	}
-	return DB.Model(user).Update("github_id", newGitHubId).Error
 }
 
 func (user *User) FillUserByDiscordId() error {
@@ -1130,7 +1459,7 @@ func ResetUserPasswordByEmail(email string, password string) error {
 	if err != nil {
 		return err
 	}
-	hashedPassword, err := common.Password2Hash(password)
+	hashedPassword, err := common.HashAccountPassword(password)
 	if err != nil {
 		return err
 	}
@@ -1388,7 +1717,7 @@ func UpdateUserUsedQuota(id int, quota int) {
 
 func updateUserUsedQuotaAndRequestCount(id int, quota int, count int) {
 	err := DB.Model(&User{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
+		map[string]any{
 			"used_quota":    gorm.Expr("used_quota + ?", quota),
 			"request_count": gorm.Expr("request_count + ?", count),
 		},
@@ -1410,7 +1739,7 @@ func updateUserQuotaUsedQuotaAndRequestCount(id int, quota int, usedQuota int, r
 	}
 
 	err := DB.Model(&User{}).Where("id = ?", id).Updates(
-		map[string]interface{}{
+		map[string]any{
 			"quota":         gorm.Expr("quota + ?", quota),
 			"used_quota":    gorm.Expr("used_quota + ?", usedQuota),
 			"request_count": gorm.Expr("request_count + ?", requestCount),

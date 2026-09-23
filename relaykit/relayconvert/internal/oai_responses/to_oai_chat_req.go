@@ -1,13 +1,17 @@
 package oairesponses
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/internal/convdiag"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
+	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 const (
@@ -24,14 +28,30 @@ const (
 	ResponsesInputTypeCustomToolOutput   = responsesInputTypeCustomToolOutput
 )
 
-func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (*dto.GeneralOpenAIRequest, error) {
+type unsupportedStatefulFieldsError struct {
+	loss *types.ConversionLossError
+}
+
+func (e *unsupportedStatefulFieldsError) Error() string {
+	fields := make([]string, 0, len(e.loss.Diagnostics))
+	for _, diagnostic := range e.loss.Diagnostics {
+		fields = append(fields, diagnostic.Path)
+	}
+	return fmt.Sprintf("responses to chat conversion does not support stateful fields: %s", strings.Join(fields, ", "))
+}
+
+func (e *unsupportedStatefulFieldsError) Unwrap() error {
+	return e.loss
+}
+
+func ResponsesRequestToChatCompletionsRequest(ctx context.Context, req *dto.OpenAIResponsesRequest) (*dto.GeneralOpenAIRequest, error) {
 	if req == nil {
 		return nil, errors.New("request is nil")
 	}
 	if req.Model == "" {
 		return nil, errors.New("model is required")
 	}
-	if err := validateResponsesRequestChatUnsupportedFields(req); err != nil {
+	if err := validateResponsesRequestChatUnsupportedFields(req, types.RelayFormatOpenAI); err != nil {
 		return nil, err
 	}
 
@@ -85,8 +105,13 @@ func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (
 		return nil, fmt.Errorf("invalid presence_penalty: %w", err)
 	}
 
-	if req.Reasoning != nil {
-		out.ReasoningEffort = req.Reasoning.Effort
+	reasoningIntent, diagnostics, err := reasoning.FromOpenAIResponses(req)
+	if err != nil {
+		return nil, reasoning.AsClientError(err)
+	}
+	convdiag.Add(ctx, diagnostics...)
+	if err := reasoning.ApplyToOpenAIChat(out, reasoningIntent); err != nil {
+		return nil, reasoning.AsClientError(err)
 	}
 	if req.ServiceTier != "" {
 		out.ServiceTier, _ = kitutil.Marshal(req.ServiceTier)
@@ -107,7 +132,13 @@ func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (
 	return out, nil
 }
 
-func validateResponsesRequestChatUnsupportedFields(req *dto.OpenAIResponsesRequest) error {
+// UnsupportedStatefulFieldDiagnostics reports provider-owned Responses state
+// that cannot be dereferenced while converting to another protocol.
+func UnsupportedStatefulFieldDiagnostics(req *dto.OpenAIResponsesRequest, to types.RelayFormat) []types.ConversionDiagnostic {
+	if req == nil {
+		return nil
+	}
+
 	unsupported := make([]string, 0, 4)
 	if rawJSONPresent(req.Conversation) {
 		unsupported = append(unsupported, "conversation")
@@ -121,14 +152,35 @@ func validateResponsesRequestChatUnsupportedFields(req *dto.OpenAIResponsesReque
 	if rawJSONPresent(req.ContextManagement) {
 		unsupported = append(unsupported, "context_management")
 	}
-	if len(unsupported) > 0 {
-		return fmt.Errorf("responses to chat conversion does not support stateful fields: %s", strings.Join(unsupported, ", "))
+	if len(unsupported) == 0 {
+		return nil
 	}
-	return nil
+	diagnostics := make([]types.ConversionDiagnostic, 0, len(unsupported))
+	for _, field := range unsupported {
+		diagnostics = append(diagnostics, types.ConversionDiagnostic{
+			Code:     types.ConversionDiagnosticCodeSessionReferenceUnsupported,
+			Path:     field,
+			Message:  "responses conversion does not support stateful fields",
+			Severity: types.ConversionDiagnosticError,
+			From:     types.RelayFormatOpenAIResponses,
+			To:       to,
+		})
+	}
+	return diagnostics
 }
 
-func ValidateRequestChatUnsupportedFields(req *dto.OpenAIResponsesRequest) error {
-	return validateResponsesRequestChatUnsupportedFields(req)
+func validateResponsesRequestChatUnsupportedFields(req *dto.OpenAIResponsesRequest, to types.RelayFormat) error {
+	diagnostics := UnsupportedStatefulFieldDiagnostics(req, to)
+	if len(diagnostics) == 0 {
+		return nil
+	}
+	return &unsupportedStatefulFieldsError{
+		loss: &types.ConversionLossError{Diagnostics: diagnostics},
+	}
+}
+
+func ValidateRequestChatUnsupportedFields(req *dto.OpenAIResponsesRequest, to types.RelayFormat) error {
+	return validateResponsesRequestChatUnsupportedFields(req, to)
 }
 
 func responsesRequestMessagesToChat(req *dto.OpenAIResponsesRequest) ([]dto.Message, error) {

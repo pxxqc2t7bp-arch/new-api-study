@@ -1,6 +1,8 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest import mock
 
 import verify_model_alias_normalization as verify
 
@@ -63,6 +65,23 @@ class PublicModelVerificationTest(unittest.TestCase):
 
 
 class RegressionCompatibilityTest(unittest.TestCase):
+    def test_main_rejects_fewer_than_three_rounds_before_external_calls(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            verify,
+            "parse_args",
+            return_value=SimpleNamespace(
+                manifest="unused.json",
+                rounds=2,
+                output_dir="unused",
+            ),
+        ), mock.patch.object(verify, "root_headers") as root_headers:
+            with self.assertRaisesRegex(RuntimeError, "at least 3"):
+                verify.main()
+
+        root_headers.assert_not_called()
+
     def test_three_d_regressions_run_one_model_per_worker(self) -> None:
         class Profiles:
             TRANSLATION_MODELS = set()

@@ -3,6 +3,7 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -50,7 +51,7 @@ type pluginProtocolObservationLimiter struct {
 	global int
 	plugin map[string]int
 	user   map[int]int
-	token  map[int]int
+	token  map[string]int
 }
 
 func newPluginProtocolObservationLimiter(limits pluginProtocolObservationLimits) *pluginProtocolObservationLimiter {
@@ -58,7 +59,7 @@ func newPluginProtocolObservationLimiter(limits pluginProtocolObservationLimits)
 		limits: limits,
 		plugin: make(map[string]int),
 		user:   make(map[int]int),
-		token:  make(map[int]int),
+		token:  make(map[string]int),
 	}
 }
 
@@ -67,14 +68,21 @@ func (l *pluginProtocolObservationLimiter) acquire(
 	userID int,
 	tokenID int,
 ) (func(), error) {
+	if tokenID <= 0 {
+		return nil, fmt.Errorf("%w: token id must be positive", errInvalidPluginProtocolObservationIdentity)
+	}
+	return l.acquireSubject(pluginKey, userID, "token:"+strconv.Itoa(tokenID))
+}
+
+func (l *pluginProtocolObservationLimiter) acquireSubject(pluginKey string, userID int, subject string) (func(), error) {
 	pluginKey = strings.TrimSpace(pluginKey)
 	switch {
 	case pluginKey == "":
 		return nil, fmt.Errorf("%w: plugin key is required", errInvalidPluginProtocolObservationIdentity)
 	case userID <= 0:
 		return nil, fmt.Errorf("%w: user id must be positive", errInvalidPluginProtocolObservationIdentity)
-	case tokenID <= 0:
-		return nil, fmt.Errorf("%w: token id must be positive", errInvalidPluginProtocolObservationIdentity)
+	case subject == "":
+		return nil, fmt.Errorf("%w: subject is required", errInvalidPluginProtocolObservationIdentity)
 	}
 
 	l.mu.Lock()
@@ -111,7 +119,7 @@ func (l *pluginProtocolObservationLimiter) acquire(
 	}
 	l.user[userID]++
 
-	if l.token[tokenID] >= l.limits.perToken {
+	if l.token[subject] >= l.limits.perToken {
 		l.global--
 		l.plugin[pluginKey]--
 		if l.plugin[pluginKey] == 0 {
@@ -127,7 +135,7 @@ func (l *pluginProtocolObservationLimiter) acquire(
 			limit: l.limits.perToken,
 		}
 	}
-	l.token[tokenID]++
+	l.token[subject]++
 	l.mu.Unlock()
 
 	var once sync.Once
@@ -148,9 +156,9 @@ func (l *pluginProtocolObservationLimiter) acquire(
 				delete(l.user, userID)
 			}
 
-			l.token[tokenID]--
-			if l.token[tokenID] == 0 {
-				delete(l.token, tokenID)
+			l.token[subject]--
+			if l.token[subject] == 0 {
+				delete(l.token, subject)
 			}
 		})
 	}, nil

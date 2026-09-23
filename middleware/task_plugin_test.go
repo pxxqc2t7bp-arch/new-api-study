@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -19,6 +20,8 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
+	"github.com/QuantumNous/new-api/service"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
@@ -1243,6 +1246,46 @@ export const native = {error: function(ctx, error) {
 	assert.NotContains(t, recorder.Body.String(), "password")
 }
 
+func TestRespondTaskPluginErrorPreservesServiceUnavailable(t *testing.T) {
+	plugin := compileTaskRoutePlugin(t, `
+export const meta = {
+  apiVersion: 1, key: "route-storage-error", name: "Error", version: "1.0.0",
+  author: {name: "Test"}, models: ["error-model"], fetchMode: "per_task",
+};
+export function buildSubmitRequest() { return {url: "https://example.com"}; }
+export function parseSubmitResponse() { return {taskId: "one"}; }
+export function buildQueryRequest() { return {url: "https://example.com"}; }
+export function parseTaskResult() { return {status: "SUCCESS"}; }
+export const native = {error: function(ctx, error) { return error; }};
+`)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/vendor/failure", nil)
+	c.Set(jsplugin.ContextKeyPinnedRoute, jsplugin.PinnedRoute{Plugin: plugin})
+	c.Set(jsplugin.ContextKeyRouteRequest, jsplugin.RouteRequestContext{
+		Path: "/vendor/failure", Method: http.MethodPost,
+		Params: map[string]string{}, Query: map[string][]string{},
+	})
+
+	handled := RespondTaskPluginError(c, &dto.TaskError{
+		Code:       "service_unavailable",
+		Message:    "private database detail",
+		StatusCode: http.StatusServiceUnavailable,
+		Error:      errors.New("private database detail"),
+	})
+
+	assert.True(t, handled)
+	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+	assert.JSONEq(t, `{
+	  "code":"service_unavailable",
+	  "message":"Task request failed",
+	  "httpStatus":503,
+	  "retryable":true,
+	  "requestId":""
+	}`, recorder.Body.String())
+	assert.NotContains(t, recorder.Body.String(), "private database detail")
+}
+
 func TestTaskPluginErrorFallbackIsSanitized(t *testing.T) {
 	for _, testCase := range []struct {
 		name       string
@@ -1513,6 +1556,45 @@ func TestPrepareTaskPluginEndpointSurfacesDecodeHookMessage(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, recorder.Code)
 	assert.Contains(t, recorder.Body.String(), "model is required")
 	assert.NotContains(t, recorder.Body.String(), "Invalid task protocol request")
+}
+
+func TestPinTaskPluginEndpointBypassesNativeAppResponse(t *testing.T) {
+	const key = "native-overlap-pin-test"
+	_, err := jsplugin.DefaultRegistry.Register(taskProtocolPluginSource(
+		key,
+		"1.0.0",
+		`["overlapping-model"]`,
+		"/v1/responses",
+		`return {model: ctx.model, action: "task"};`,
+	), jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(key)) })
+
+	router := gin.New()
+	router.POST(
+		"/v1/responses",
+		func(c *gin.Context) {
+			c.Set(hosttypes.AppRelaySubjectContextKey, &hosttypes.AppRelaySubject{
+				ExecutionKind: model.AppExecutionModelKindNativeResponse,
+			})
+			c.Next()
+		},
+		PinTaskPluginEndpoint(),
+		PrepareTaskPluginEndpoint(),
+		func(c *gin.Context) {
+			_, pinned := c.Get(jsplugin.ContextKeyPinnedEndpoint)
+			assert.False(t, pinned)
+			c.Status(http.StatusNoContent)
+		},
+	)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(`{"model":"overlapping-model","input":"hello","max_output_tokens":16}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, request)
+
+	assert.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
 }
 
 func TestPinTaskPluginEndpointRejectsUnsupportedRequestForms(t *testing.T) {
@@ -1799,4 +1881,53 @@ func setupTaskPluginRouteDB(t *testing.T) {
 func insertTaskPluginRouteTask(t *testing.T, task *model.Task) {
 	t.Helper()
 	require.NoError(t, model.DB.Create(task).Error)
+}
+
+func TestPrepareTaskPluginEndpointFiltersEachSharedCandidate(t *testing.T) {
+	for _, tc := range []struct {
+		name, alpha, beta string
+		wantKeys          []string
+		wantError         string
+	}{
+		{name: "first decoder rejects", alpha: `throw new Error("alpha only accepts 720p")`, beta: `return {model:ctx.model,action:"beta",requestBody:{resolution:"1080p"}}`, wantKeys: []string{"decode-beta"}},
+		{name: "second decoder rejects", alpha: `return {model:ctx.model,action:"alpha"}`, beta: `throw new Error("beta rejects")`, wantKeys: []string{"decode-alpha"}},
+		{name: "both decoders accept", alpha: `return {model:ctx.model,action:"alpha"}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-alpha", "decode-beta"}},
+		{name: "all decoders reject", alpha: `throw new Error("alpha rejects first")`, beta: `throw new Error("beta rejects second")`, wantError: "decode-alpha: alpha rejects first; decode-beta: beta rejects second"},
+		{name: "duplicate failures are grouped", alpha: `throw new Error("unsupported resolution")`, beta: `throw new Error("unsupported resolution")`, wantError: "decode-alpha, decode-beta: unsupported resolution"},
+		{name: "invalid result is excluded", alpha: `return {kind:"query",model:ctx.model}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
+		{name: "rewritten model is excluded", alpha: `return {model:"another-model"}`, beta: `return {model:ctx.model,action:"beta"}`, wantKeys: []string{"decode-beta"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, spec := range []struct{ key, decode string }{{"decode-alpha", tc.alpha}, {"decode-beta", tc.beta}} {
+				_, err := jsplugin.DefaultRegistry.Register(taskResponsesPluginSource(spec.key, 0, `["decode-shared-model"]`, `["sync"]`, `renderFinal:function(){return {};}`, spec.decode), jsplugin.Options{})
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, jsplugin.DefaultRegistry.Unregister(spec.key)) })
+			}
+			var gotKeys []string
+			router := gin.New()
+			router.POST("/v1/responses", PinTaskPluginEndpoint(), PrepareTaskPluginEndpoint(), func(c *gin.Context) {
+				pinned := c.MustGet(jsplugin.ContextKeyPinnedEndpoint).(jsplugin.PinnedEndpoint)
+				for _, candidate := range pinned.Candidates {
+					gotKeys = append(gotKeys, candidate.Plugin.Meta.Key)
+				}
+				assert.Equal(t, tc.wantKeys[0], pinned.Plugin.Meta.Key)
+				assert.Equal(t, tc.wantKeys[0], c.GetString("task_plugin_key"))
+				assert.Same(t, pinned.Plugin, c.MustGet(jsplugin.ContextKeyPinnedPlugin).(jsplugin.PinnedPlugin).Plugin)
+				assert.Equal(t, tc.wantKeys, service.GetChannelConstraints(c).Filters[0].TaskPluginKeys)
+				c.Status(http.StatusNoContent)
+			})
+			request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"decode-shared-model","resolution":"1080p"}`))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if tc.wantError != "" {
+				assert.Equal(t, http.StatusBadRequest, recorder.Code)
+				assert.Contains(t, recorder.Body.String(), tc.wantError)
+				assert.Empty(t, gotKeys)
+			} else {
+				assert.Equal(t, http.StatusNoContent, recorder.Code, recorder.Body.String())
+				assert.Equal(t, tc.wantKeys, gotKeys)
+			}
+		})
+	}
 }

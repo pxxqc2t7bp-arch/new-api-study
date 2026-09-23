@@ -119,7 +119,33 @@ func BuildTaskArtifactContentURL(taskID, artifactKey string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return buildTaskArtifactContentURL(baseURL, taskID, artifactKey, access), nil
+}
 
+// BuildAppGrantTaskArtifactContentURL returns the exact artifact route without
+// embedding another credential. The caller must send its current AppGrant.
+func BuildAppGrantTaskArtifactContentURL(taskID, artifactKey string) (string, error) {
+	taskID = strings.TrimSpace(taskID)
+	artifactKey = strings.TrimSpace(artifactKey)
+	if taskID == "" || len(taskID) > maxTaskArtifactTaskIDLength ||
+		artifactKey == "" || len(artifactKey) > maxTaskArtifactKeyLength {
+		return "", ErrTaskArtifactAccessInvalid
+	}
+	baseAddress := strings.TrimSpace(system_setting.TaskPublicAddress)
+	if baseAddress == "" {
+		baseAddress = strings.TrimSpace(system_setting.ServerAddress)
+	}
+	if err := ValidateTaskArtifactBaseURL(baseAddress); err != nil {
+		return "", err
+	}
+	baseURL, err := url.Parse(baseAddress)
+	if err != nil {
+		return "", err
+	}
+	return buildTaskArtifactContentURL(baseURL, taskID, artifactKey, ""), nil
+}
+
+func buildTaskArtifactContentURL(baseURL *url.URL, taskID, artifactKey, access string) string {
 	basePath := strings.TrimRight(baseURL.Path, "/")
 	escapedBasePath := strings.TrimRight(baseURL.EscapedPath(), "/")
 	suffixPath := fmt.Sprintf("/v1/tasks/%s/artifacts/%s/content", taskID, artifactKey)
@@ -130,8 +156,10 @@ func BuildTaskArtifactContentURL(taskID, artifactKey string) (string, error) {
 	)
 	baseURL.Path = basePath + suffixPath
 	baseURL.RawPath = escapedBasePath + escapedSuffixPath
-	query := baseURL.Query()
-	query.Set(TaskArtifactAccessQueryParameter, access)
-	baseURL.RawQuery = query.Encode()
-	return baseURL.String(), nil
+	if access != "" {
+		query := baseURL.Query()
+		query.Set(TaskArtifactAccessQueryParameter, access)
+		baseURL.RawQuery = query.Encode()
+	}
+	return baseURL.String()
 }

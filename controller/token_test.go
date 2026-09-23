@@ -2,29 +2,46 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
 type tokenAPIResponse struct {
-	Success bool            `json:"success"`
-	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data"`
+	Success          bool            `json:"success"`
+	Message          string          `json:"message"`
+	Code             string          `json:"code"`
+	Committed        bool            `json:"committed"`
+	CommittedCount   int             `json:"committed_count"`
+	CacheSyncPending bool            `json:"cache_sync_pending"`
+	Recoverable      bool            `json:"recoverable"`
+	RetryMutation    bool            `json:"retry_mutation"`
+	Data             json.RawMessage `json:"data"`
 }
 
 type tokenPageResponse struct {
@@ -45,6 +62,31 @@ type tokenKeyResponse struct {
 type sqliteColumnInfo struct {
 	Name string `gorm:"column:name"`
 	Type string `gorm:"column:type"`
+}
+
+type controllerFailRedisEvalHook struct {
+	callCount atomic.Int64
+	failAt    int64
+	err       error
+}
+
+func (h *controllerFailRedisEvalHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	if cmd.Name() == "eval" && h.callCount.Add(1) == h.failAt {
+		return ctx, h.err
+	}
+	return ctx, nil
+}
+
+func (*controllerFailRedisEvalHook) AfterProcess(context.Context, redis.Cmder) error {
+	return nil
+}
+
+func (*controllerFailRedisEvalHook) BeforeProcessPipeline(ctx context.Context, _ []redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (*controllerFailRedisEvalHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
+	return nil
 }
 
 type legacyToken struct {
@@ -110,6 +152,24 @@ func setupTokenControllerTestDB(t *testing.T) *gorm.DB {
 	db := openTokenControllerTestDB(t)
 	migrateTokenControllerTestDB(t, db)
 	return db
+}
+
+func useTokenControllerMiniRedis(t *testing.T) *miniredis.Miniredis {
+	t.Helper()
+	server := miniredis.RunT(t)
+	oldRedisEnabled := common.RedisEnabled
+	oldRDB := common.RDB
+	oldSyncFrequency := common.SyncFrequency
+	common.RedisEnabled = true
+	common.SyncFrequency = 2
+	common.RDB = redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() {
+		_ = common.RDB.Close()
+		common.RedisEnabled = oldRedisEnabled
+		common.RDB = oldRDB
+		common.SyncFrequency = oldSyncFrequency
+	})
+	return server
 }
 
 func openTokenControllerExternalDB(t *testing.T, dialect string, dsn string) (*gorm.DB, *bool) {
@@ -301,6 +361,21 @@ func getTokenAutoGroupsColumnType(t *testing.T, db *gorm.DB, dialect string) str
 	}
 }
 
+func requireTokenPolicyColumns(t *testing.T, db *gorm.DB) {
+	t.Helper()
+
+	for _, column := range []string{
+		"default_routing_strategy",
+		"allowed_routing_strategies",
+		"default_conversion_policy",
+		"allow_lossy_conversion",
+		"metadata_mutation_id",
+	} {
+		require.Truef(t, db.Migrator().HasColumn(&model.Token{}, column), "expected tokens.%s column", column)
+	}
+	require.True(t, db.Migrator().HasColumn(&model.Token{}, "cache_generation"))
+}
+
 func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect string, managedTokensTable *bool) {
 	t.Helper()
 
@@ -348,49 +423,79 @@ func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect strin
 	if got := getTokenAutoGroupsColumnType(t, db, dialect); got != "text" {
 		t.Fatalf("expected migrated auto_groups column type text, got %q", got)
 	}
+	requireTokenPolicyColumns(t, db)
 
 	var migratedToken model.Token
-	if err := db.First(&migratedToken, "name = ?", "legacy-token").Error; err != nil {
-		t.Fatalf("failed to load migrated token row: %v", err)
-	}
-	if migratedToken.Key != legacyKey {
-		t.Fatalf("expected migrated token key %q, got %q", legacyKey, migratedToken.Key)
-	}
-	if migratedToken.Name != "legacy-token" {
-		t.Fatalf("expected migrated token name to be preserved, got %q", migratedToken.Name)
-	}
-	if migratedToken.AutoGroups != "" {
-		t.Fatalf("expected legacy token to inherit global Auto groups, got %q", migratedToken.AutoGroups)
-	}
+	require.NoError(t, db.First(&migratedToken, "name = ?", "legacy-token").Error)
+	assert.Equal(t, 7, migratedToken.UserId)
+	assert.Equal(t, legacyKey, migratedToken.Key)
+	assert.Equal(t, common.TokenStatusEnabled, migratedToken.Status)
+	assert.Equal(t, "legacy-token", migratedToken.Name)
+	assert.EqualValues(t, 1, migratedToken.CreatedTime)
+	assert.EqualValues(t, 1, migratedToken.AccessedTime)
+	assert.EqualValues(t, -1, migratedToken.ExpiredTime)
+	assert.Equal(t, 100, migratedToken.RemainQuota)
+	assert.True(t, migratedToken.UnlimitedQuota)
+	assert.False(t, migratedToken.ModelLimitsEnabled)
+	assert.Empty(t, migratedToken.ModelLimits)
+	require.NotNil(t, migratedToken.AllowIps)
+	assert.Empty(t, *migratedToken.AllowIps)
+	assert.Zero(t, migratedToken.UsedQuota)
+	assert.Equal(t, "default", migratedToken.Group)
+	assert.False(t, migratedToken.CrossGroupRetry)
+	assert.Empty(t, migratedToken.AutoGroups)
+	assert.Empty(t, migratedToken.DefaultRoutingStrategy)
+	assert.Empty(t, migratedToken.AllowedRoutingStrategies)
+	assert.Empty(t, migratedToken.DefaultConversionPolicy)
+	assert.False(t, migratedToken.AllowLossyConversion)
+	assert.Zero(t, migratedToken.CacheGeneration)
+
+	runtimePolicy := migratedToken
+	require.NoError(t, runtimePolicy.NormalizeRequestPolicySettings())
+	assert.Equal(t, "stable", runtimePolicy.DefaultRoutingStrategy)
+	assert.JSONEq(t, `["stable"]`, runtimePolicy.AllowedRoutingStrategies)
+	assert.Equal(t, "strict", runtimePolicy.DefaultConversionPolicy)
+	assert.False(t, runtimePolicy.AllowLossyConversion)
+
+	migrateTokenControllerTestDB(t, db)
+
+	var remigratedToken model.Token
+	require.NoError(t, db.First(&remigratedToken, migratedToken.Id).Error)
+	assert.Equal(t, migratedToken, remigratedToken)
 
 	inserted := model.Token{
-		UserId:             8,
-		Name:               "long-token",
-		Key:                longKey,
-		Status:             common.TokenStatusEnabled,
-		CreatedTime:        1,
-		AccessedTime:       1,
-		ExpiredTime:        -1,
-		RemainQuota:        200,
-		UnlimitedQuota:     true,
-		ModelLimitsEnabled: false,
-		ModelLimits:        "",
-		AllowIps:           common.GetPointer(""),
-		UsedQuota:          0,
-		Group:              "default",
-		CrossGroupRetry:    false,
+		UserId:                   8,
+		Name:                     "long-token",
+		Key:                      longKey,
+		Status:                   common.TokenStatusEnabled,
+		CreatedTime:              1,
+		AccessedTime:             1,
+		ExpiredTime:              -1,
+		RemainQuota:              200,
+		UnlimitedQuota:           true,
+		ModelLimitsEnabled:       false,
+		ModelLimits:              "",
+		AllowIps:                 common.GetPointer(""),
+		UsedQuota:                0,
+		Group:                    "default",
+		CrossGroupRetry:          false,
+		DefaultRoutingStrategy:   "latency",
+		AllowedRoutingStrategies: `["latency","economy"]`,
+		DefaultConversionPolicy:  "allow",
+		AllowLossyConversion:     true,
+		CacheGeneration:          42,
 	}
-	if err := db.Create(&inserted).Error; err != nil {
-		t.Fatalf("failed to insert long token after migration: %v", err)
-	}
+	require.NoError(t, db.Create(&inserted).Error)
+	migrateTokenControllerTestDB(t, db)
 
 	var fetched model.Token
-	if err := db.First(&fetched, "id = ?", inserted.Id).Error; err != nil {
-		t.Fatalf("failed to fetch long token after migration: %v", err)
-	}
-	if fetched.Key != longKey {
-		t.Fatalf("expected long token key %q, got %q", longKey, fetched.Key)
-	}
+	require.NoError(t, db.First(&fetched, "id = ?", inserted.Id).Error)
+	assert.Equal(t, longKey, fetched.Key)
+	assert.Equal(t, inserted.DefaultRoutingStrategy, fetched.DefaultRoutingStrategy)
+	assert.Equal(t, inserted.AllowedRoutingStrategies, fetched.AllowedRoutingStrategies)
+	assert.Equal(t, inserted.DefaultConversionPolicy, fetched.DefaultConversionPolicy)
+	assert.Equal(t, inserted.AllowLossyConversion, fetched.AllowLossyConversion)
+	assert.EqualValues(t, 42, fetched.CacheGeneration)
 }
 
 func TestTokenAutoMigrateUsesVarchar128KeyColumn(t *testing.T) {
@@ -402,6 +507,18 @@ func TestTokenAutoMigrateUsesVarchar128KeyColumn(t *testing.T) {
 	if got := getSQLiteColumnType(t, db, "tokens", "auto_groups"); got != "text" {
 		t.Fatalf("expected auto_groups column type text, got %q", got)
 	}
+	requireTokenPolicyColumns(t, db)
+
+	token := model.Token{UserId: 1, Key: "cache-generation-default", Name: "cache-generation-default"}
+	require.NoError(t, db.Create(&token).Error)
+	var stored model.Token
+	require.NoError(t, db.First(&stored, token.Id).Error)
+	assert.Zero(t, stored.CacheGeneration)
+
+	require.NoError(t, db.Model(&stored).Update("cache_generation", 8).Error)
+	migrateTokenControllerTestDB(t, db)
+	require.NoError(t, db.First(&stored, token.Id).Error)
+	assert.EqualValues(t, 8, stored.CacheGeneration)
 }
 
 func TestTokenMigrationFromChar48ToVarchar128(t *testing.T) {
@@ -553,6 +670,380 @@ func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
 	}
 }
 
+func TestAddTokenNormalizesAndPersistsRequestPolicy(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	body := map[string]any{
+		"name":                       "request-policy-token",
+		"expired_time":               -1,
+		"unlimited_quota":            true,
+		"group":                      "default",
+		"default_routing_strategy":   " economy ",
+		"allowed_routing_strategies": []string{" economy ", "latency"},
+		"default_conversion_policy":  " safe ",
+		"allow_lossy_conversion":     true,
+	}
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+	AddToken(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	require.True(t, response.Success, response.Message)
+	var token model.Token
+	require.NoError(t, db.Where("name = ?", "request-policy-token").First(&token).Error)
+	assert.Equal(t, "economy", token.DefaultRoutingStrategy)
+	assert.JSONEq(t, `["economy","latency"]`, token.AllowedRoutingStrategies)
+	assert.Equal(t, "safe", token.DefaultConversionPolicy)
+	assert.True(t, token.AllowLossyConversion)
+}
+
+func TestAddTokenRejectsInvalidRequestPolicy(t *testing.T) {
+	tests := []struct {
+		name   string
+		fields map[string]any
+	}{
+		{
+			name: "unknown routing default",
+			fields: map[string]any{
+				"default_routing_strategy": "fastest",
+			},
+		},
+		{
+			name: "unknown allowed routing strategy",
+			fields: map[string]any{
+				"allowed_routing_strategies": []string{"stable", "fastest"},
+			},
+		},
+		{
+			name: "routing default is not allowed",
+			fields: map[string]any{
+				"default_routing_strategy":   "economy",
+				"allowed_routing_strategies": []string{"stable"},
+			},
+		},
+		{
+			name: "unknown conversion default",
+			fields: map[string]any{
+				"default_conversion_policy": "lossy",
+			},
+		},
+		{
+			name: "lossy conversion default is unauthorized",
+			fields: map[string]any{
+				"default_conversion_policy": "allow",
+				"allow_lossy_conversion":    false,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := setupTokenControllerTestDB(t)
+			body := map[string]any{
+				"name":            "invalid-policy-token",
+				"expired_time":    -1,
+				"unlimited_quota": true,
+				"group":           "default",
+			}
+			for key, value := range test.fields {
+				body[key] = value
+			}
+
+			ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+			AddToken(ctx)
+
+			response := decodeAPIResponse(t, recorder)
+			assert.False(t, response.Success)
+			var count int64
+			require.NoError(t, db.Model(&model.Token{}).Count(&count).Error)
+			assert.Zero(t, count)
+		})
+	}
+}
+
+func TestUpdateTokenValidatesPersistsAndPreservesRequestPolicy(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	token := seedToken(t, db, 1, "policy-update-token", "policy-update-key")
+	token.DefaultRoutingStrategy = "economy"
+	token.AllowedRoutingStrategies = `["economy","latency"]`
+	token.DefaultConversionPolicy = "safe"
+	token.AllowLossyConversion = true
+	require.NoError(t, db.Save(token).Error)
+
+	baseBody := map[string]any{
+		"id":                   token.Id,
+		"name":                 "policy-update-token",
+		"status":               common.TokenStatusEnabled,
+		"expired_time":         -1,
+		"remain_quota":         100,
+		"unlimited_quota":      true,
+		"group":                "default",
+		"cross_group_retry":    false,
+		"model_limits_enabled": false,
+	}
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", baseBody, 1)
+	UpdateToken(ctx)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+
+	var preserved model.Token
+	require.NoError(t, db.First(&preserved, token.Id).Error)
+	assert.Equal(t, "economy", preserved.DefaultRoutingStrategy)
+	assert.JSONEq(t, `["economy","latency"]`, preserved.AllowedRoutingStrategies)
+	assert.Equal(t, "safe", preserved.DefaultConversionPolicy)
+	assert.True(t, preserved.AllowLossyConversion)
+
+	updateBody := make(map[string]any, len(baseBody)+4)
+	for key, value := range baseBody {
+		updateBody[key] = value
+	}
+	updateBody["default_routing_strategy"] = "latency"
+	updateBody["allowed_routing_strategies"] = []string{"stable", "latency"}
+	updateBody["default_conversion_policy"] = "allow"
+	updateBody["allow_lossy_conversion"] = true
+	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/", updateBody, 1)
+	UpdateToken(ctx)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+
+	var updated model.Token
+	require.NoError(t, db.First(&updated, token.Id).Error)
+	assert.Equal(t, "latency", updated.DefaultRoutingStrategy)
+	assert.JSONEq(t, `["stable","latency"]`, updated.AllowedRoutingStrategies)
+	assert.Equal(t, "allow", updated.DefaultConversionPolicy)
+	assert.True(t, updated.AllowLossyConversion)
+
+	updateBody["default_conversion_policy"] = "safe"
+	updateBody["allow_lossy_conversion"] = false
+	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/", updateBody, 1)
+	UpdateToken(ctx)
+	assert.False(t, decodeAPIResponse(t, recorder).Success)
+
+	var rejected model.Token
+	require.NoError(t, db.First(&rejected, token.Id).Error)
+	assert.Equal(t, "allow", rejected.DefaultConversionPolicy)
+	assert.True(t, rejected.AllowLossyConversion)
+}
+
+func TestUpdateTokenStatusOnlyPreservesConcurrentPolicyUpdate(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	token := seedToken(t, db, 1, "status-policy-token", "status-policy-key")
+	token.DefaultRoutingStrategy = "economy"
+	token.AllowedRoutingStrategies = `["stable","economy"]`
+	token.DefaultConversionPolicy = "allow"
+	token.AllowLossyConversion = true
+	require.NoError(t, db.Save(token).Error)
+
+	interleaved := false
+	const callbackName = "test:interleave_status_only_policy_update"
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if interleaved || tx.Statement.Table != "tokens" {
+			return
+		}
+		interleaved = true
+		result := db.Exec(
+			"UPDATE tokens SET accessed_time = ?, default_routing_strategy = ?, allowed_routing_strategies = ?, default_conversion_policy = ?, allow_lossy_conversion = ? WHERE id = ?",
+			99, "stable", `["stable"]`, "strict", false, token.Id,
+		)
+		if result.Error != nil {
+			tx.AddError(result.Error)
+		}
+	}))
+	t.Cleanup(func() {
+		_ = db.Callback().Query().Remove(callbackName)
+	})
+
+	body := map[string]any{
+		"id":     token.Id,
+		"status": common.TokenStatusDisabled,
+	}
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/?status_only=true", body, 1)
+	UpdateToken(ctx)
+
+	require.True(t, interleaved)
+	require.True(t, decodeAPIResponse(t, recorder).Success)
+	var updated model.Token
+	require.NoError(t, db.First(&updated, token.Id).Error)
+	assert.Equal(t, common.TokenStatusDisabled, updated.Status)
+	assert.EqualValues(t, 99, updated.AccessedTime)
+	assert.Equal(t, "stable", updated.DefaultRoutingStrategy)
+	assert.JSONEq(t, `["stable"]`, updated.AllowedRoutingStrategies)
+	assert.Equal(t, "strict", updated.DefaultConversionPolicy)
+	assert.False(t, updated.AllowLossyConversion)
+}
+
+func TestUpdateTokenPreservesConcurrentQuotaWrite(t *testing.T) {
+	tests := []struct {
+		name           string
+		requestedQuota int
+		expectedRemain int
+	}{
+		{name: "policy only", requestedQuota: 100, expectedRemain: 30},
+		{name: "explicit increase", requestedQuota: 150, expectedRemain: 80},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := setupTokenControllerTestDB(t)
+			token := seedToken(t, db, 1, "concurrent-quota-token", "concurrent-quota-key")
+
+			interleaved := false
+			callbackName := "test:interleave_token_quota_update_" + strings.ReplaceAll(test.name, " ", "_")
+			require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if interleaved || tx.Statement.Table != "tokens" {
+					return
+				}
+				interleaved = true
+				result := db.Model(&model.Token{}).Where("id = ?", token.Id).Updates(map[string]any{
+					"remain_quota": 30,
+					"used_quota":   70,
+				})
+				if result.Error != nil {
+					tx.AddError(result.Error)
+				}
+			}))
+			t.Cleanup(func() {
+				_ = db.Callback().Query().Remove(callbackName)
+			})
+
+			body := map[string]any{
+				"id":                       token.Id,
+				"name":                     token.Name,
+				"status":                   common.TokenStatusEnabled,
+				"expired_time":             -1,
+				"remain_quota":             test.requestedQuota,
+				"unlimited_quota":          true,
+				"group":                    "default",
+				"cross_group_retry":        false,
+				"model_limits_enabled":     false,
+				"default_routing_strategy": "stable",
+			}
+			ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, token.UserId)
+			UpdateToken(ctx)
+
+			require.True(t, interleaved)
+			require.True(t, decodeAPIResponse(t, recorder).Success)
+			var updated model.Token
+			require.NoError(t, db.First(&updated, token.Id).Error)
+			assert.Equal(t, test.expectedRemain, updated.RemainQuota)
+			assert.Equal(t, 70, updated.UsedQuota)
+			assert.Equal(t, "stable", updated.DefaultRoutingStrategy)
+		})
+	}
+}
+
+func TestTokenMutationControllersReportCommittedCacheSyncPending(t *testing.T) {
+	assertCommittedResponse := func(t *testing.T, ctx *gin.Context, recorder *httptest.ResponseRecorder, count int) tokenAPIResponse {
+		t.Helper()
+		assert.Equal(t, http.StatusAccepted, recorder.Code)
+		response := decodeAPIResponse(t, recorder)
+		assert.True(t, response.Success)
+		assert.Equal(t, "token_cache_sync_pending", response.Code)
+		assert.True(t, response.Committed)
+		assert.Equal(t, count, response.CommittedCount)
+		assert.True(t, response.CacheSyncPending)
+		assert.True(t, response.Recoverable)
+		assert.False(t, response.RetryMutation)
+		assert.True(t, common.GetContextKeyBool(ctx, constant.ContextKeyTokenAuditSucceeded))
+		params, ok := common.GetContextKeyType[model.AuditFields](ctx, constant.ContextKeyTokenAuditParams)
+		require.True(t, ok)
+		assert.Equal(t, count, params["committed_count"])
+		assert.Equal(t, true, params["cache_sync_pending"])
+		return response
+	}
+
+	t.Run("precommit fence failure", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		server := useTokenControllerMiniRedis(t)
+		token := seedToken(t, db, 1, "before-precommit-failure", "precommit-failure-key")
+		server.SetError("ERR token cache unavailable")
+
+		body := map[string]any{
+			"id":              token.Id,
+			"name":            "must-not-commit",
+			"expired_time":    -1,
+			"remain_quota":    100,
+			"unlimited_quota": true,
+			"group":           "default",
+		}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, token.UserId)
+		UpdateToken(ctx)
+
+		assert.Equal(t, http.StatusOK, recorder.Code)
+		response := decodeAPIResponse(t, recorder)
+		assert.False(t, response.Success)
+		assert.False(t, response.Committed)
+		assert.Empty(t, response.Code)
+		assert.False(t, common.GetContextKeyBool(ctx, constant.ContextKeyTokenAuditSucceeded))
+		var stored model.Token
+		require.NoError(t, db.First(&stored, token.Id).Error)
+		assert.Equal(t, "before-precommit-failure", stored.Name)
+	})
+
+	t.Run("update", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		useTokenControllerMiniRedis(t)
+		token := seedToken(t, db, 1, "before-committed-update", "committed-update-key")
+		finalizationErr := errors.New("forced update cache finalization failure")
+		common.RDB.AddHook(&controllerFailRedisEvalHook{failAt: 2, err: finalizationErr})
+
+		body := map[string]any{
+			"id":              token.Id,
+			"name":            "after-committed-update",
+			"expired_time":    -1,
+			"remain_quota":    100,
+			"unlimited_quota": true,
+			"group":           "default",
+		}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, token.UserId)
+		UpdateToken(ctx)
+
+		response := assertCommittedResponse(t, ctx, recorder, 1)
+		assert.NotEmpty(t, response.Data)
+		var stored model.Token
+		require.NoError(t, db.First(&stored, token.Id).Error)
+		assert.Equal(t, "after-committed-update", stored.Name)
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		useTokenControllerMiniRedis(t)
+		token := seedToken(t, db, 1, "committed-delete", "committed-delete-key")
+		finalizationErr := errors.New("forced delete cache finalization failure")
+		common.RDB.AddHook(&controllerFailRedisEvalHook{failAt: 2, err: finalizationErr})
+
+		ctx, recorder := newAuthenticatedContext(t, http.MethodDelete, "/api/token/"+strconv.Itoa(token.Id), nil, token.UserId)
+		ctx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(token.Id)}}
+		DeleteToken(ctx)
+
+		assertCommittedResponse(t, ctx, recorder, 1)
+		var count int64
+		require.NoError(t, db.Model(&model.Token{}).Where("id = ?", token.Id).Count(&count).Error)
+		assert.Zero(t, count)
+	})
+
+	t.Run("batch delete", func(t *testing.T) {
+		db := setupTokenControllerTestDB(t)
+		useTokenControllerMiniRedis(t)
+		first := seedToken(t, db, 1, "committed-batch-first", "committed-batch-first-key")
+		second := seedToken(t, db, 1, "committed-batch-second", "committed-batch-second-key")
+		finalizationErr := errors.New("forced batch cache finalization failure")
+		hook := &controllerFailRedisEvalHook{failAt: 3, err: finalizationErr}
+		common.RDB.AddHook(hook)
+
+		body := TokenBatch{Ids: []int{first.Id, second.Id}}
+		ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/batch", body, first.UserId)
+		DeleteTokenBatch(ctx)
+
+		response := assertCommittedResponse(t, ctx, recorder, 2)
+		assert.JSONEq(t, `2`, string(response.Data))
+		assert.EqualValues(t, 4, hook.callCount.Load())
+		params, ok := common.GetContextKeyType[model.AuditFields](ctx, constant.ContextKeyTokenAuditParams)
+		require.True(t, ok)
+		assert.Equal(t, 2, params["count"])
+		var count int64
+		require.NoError(t, db.Model(&model.Token{}).Where("id IN ?", []int{first.Id, second.Id}).Count(&count).Error)
+		assert.Zero(t, count)
+	})
+}
+
 func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	token := seedToken(t, db, 1, "owned-token", "owner1234token5678")
@@ -585,4 +1076,312 @@ func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
 	if strings.Contains(unauthorizedRecorder.Body.String(), token.Key) {
 		t.Fatalf("unauthorized key response leaked raw token key: %s", unauthorizedRecorder.Body.String())
 	}
+}
+
+func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
+	for _, database := range []struct {
+		name, env string
+		typ       common.DatabaseType
+	}{
+		{"sqlite", "", common.DatabaseTypeSQLite},
+		{"mysql", "AUDIT_MYSQL_DSN", common.DatabaseTypeMySQL},
+		{"postgres", "AUDIT_POSTGRES_DSN", common.DatabaseTypePostgreSQL},
+	} {
+		for _, separateLog := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/separate_log=%v", database.name, separateLog), func(t *testing.T) {
+				dsn := os.Getenv(database.env)
+				if database.env != "" && dsn == "" {
+					t.Skip(database.env + " is not configured")
+				}
+				previousDB, previousLogDB := model.DB, model.LOG_DB
+				previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+				previousRedis, previousMaster, previousSecret := common.RedisEnabled, common.IsMasterNode, common.SessionSecret
+				t.Cleanup(func() {
+					model.DB, model.LOG_DB = previousDB, previousLogDB
+					common.SetDatabaseTypes(previousMain, previousLog)
+					common.RedisEnabled, common.IsMasterNode, common.SessionSecret = previousRedis, previousMaster, previousSecret
+				})
+				common.RedisEnabled, common.IsMasterNode = false, true
+				common.SessionSecret = "api-token-audit-test-secret"
+				t.Setenv("LOG_SQL_DSN", "")
+				db, _ := newAuditTestDatabase(t, database.name, dsn)
+				model.DB = db
+				common.SetDatabaseTypes(database.typ, database.typ)
+				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}))
+				// Initialize production column quoting as well as the existing audit table.
+				require.NoError(t, model.InitLogDB())
+				if separateLog {
+					logDB, _ := newAuditTestDatabase(t, database.name, dsn)
+					model.LOG_DB = logDB
+					require.NoError(t, model.MigrateAuditLogs())
+				}
+				versionSQL := "SELECT version()"
+				if database.name == "sqlite" {
+					versionSQL = "SELECT sqlite_version()"
+				}
+				var version string
+				require.NoError(t, db.Raw(versionSQL).Scan(&version).Error)
+				t.Logf("database version: %s", version)
+				verifyAPITokenAudit(t)
+				if separateLog {
+					var count int64
+					require.NoError(t, db.Model(&model.AuditLog{}).Count(&count).Error)
+					assert.Zero(t, count, "all audit events must use the configured log database")
+				}
+			})
+		}
+	}
+}
+
+func verifyAPITokenAudit(t *testing.T) {
+	t.Helper()
+	pat := "api-token-audit-pat-secret"
+	user := &model.User{Username: "token-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AccessToken: &pat, AffCode: "token-owner"}
+	require.NoError(t, model.DB.Create(user).Error)
+	other := &model.User{Username: "other-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "other-owner"}
+	require.NoError(t, model.DB.Create(other).Error)
+	session := &model.UserSession{SID: "token-audit-session", UserID: user.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "placeholder", LoginMethod: "password", LastActiveAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	require.NoError(t, model.CreateUserSession(session))
+	jwt, _, err := service.IssueAccessToken(service.AuthIdentity{UserID: user.Id, SessionID: session.SID, UserAuthVersion: 1, SessionVersion: 1})
+	require.NoError(t, err)
+	router := gin.New()
+	router.Use(middleware.RequestId(), middleware.AccessTokenAudit())
+	tokenRoutes := router.Group("/api/token", middleware.UserAuth(), middleware.TokenOperationAudit())
+	tokenRoutes.POST("/", AddToken)
+	tokenRoutes.PUT("/", UpdateToken)
+	tokenRoutes.DELETE("/:id", DeleteToken)
+	tokenRoutes.POST("/batch", DeleteTokenBatch)
+	tokenRoutes.POST("/batch/keys", GetTokenKeysBatch)
+	tokenRoutes.POST("/:id/key", func(c *gin.Context) {
+		if c.GetHeader("X-Test-Limit") != "" {
+			c.AbortWithStatusJSON(429, gin.H{"success": false})
+			return
+		}
+		c.Next()
+	}, GetTokenKey)
+	tokenRoutes.GET("/", GetAllTokens)
+	tokenRoutes.GET("/:id", GetToken)
+	tokenRoutes.GET("/search", SearchTokens)
+	router.GET("/api/audit/self", middleware.UserAuth(), GetAuditLogs)
+
+	for index, tc := range []struct {
+		name, method, path, body, action string
+		success                          bool
+		params                           string
+		initialStatus                    int
+		failWrite, rateLimit, usePAT     bool
+	}{
+		{name: "create", method: "POST", path: "/", body: `{"name":"created","expired_time":-1,"unlimited_quota":true}`, action: "token.create", success: true},
+		{name: "invalid create", method: "POST", path: "/", body: `{"name":"attempt","remain_quota":-1}`, action: "token.create", params: `{"name":"attempt"}`},
+		{name: "malformed body", method: "POST", path: "/", body: `{"key":"raw-body-secret"`, action: "token.create", params: `{}`},
+		{name: "validation error exceeds audit buffer", method: "POST", path: "/", body: `{"remain_quota":` + strings.Repeat("9", 64*1024) + `}`, action: "token.create", params: `{}`},
+		{name: "create storage failure", method: "POST", path: "/", body: `{"name":"attempt","unlimited_quota":true}`, action: "token.create", params: `{"name":"attempt"}`, failWrite: true},
+		{name: "normalized update", method: "PUT", path: "/", body: `{"id":$id,"name":"renamed","expired_time":-1,"remain_quota":200,"unlimited_quota":true,"group":"default","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"renamed","changed_fields":["name","remain_quota","group","cross_group_retry","auto_groups"]}`},
+		{name: "configuration values stay private", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":42,"remain_quota":100,"unlimited_quota":false,"model_limits_enabled":true,"model_limits":"private-model-configuration","allow_ips":"203.0.113.57","group":"auto","cross_group_retry":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["expired_time","unlimited_quota","model_limits_enabled","model_limits","allow_ips"]}`},
+		{name: "unchanged update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":[]}`},
+		{name: "successful response exceeds audit buffer", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","model_limits":"` + strings.Repeat("m", 64*1024-128) + `"}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["model_limits"]}`},
+		{name: "update storage failure", method: "PUT", path: "/", body: `{"id":$id,"name":"failed-rename","unlimited_quota":true}`, action: "token.update", params: `{"id":$id,"name":"owned"}`, failWrite: true},
+		{name: "foreign update", method: "PUT", path: "/", body: `{"id":$other,"name":"forged-name","unlimited_quota":true}`, action: "token.update", params: `{"id":$other}`},
+		{name: "disable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":2}`, action: "token.status_update", success: true, params: `{"id":$id,"name":"owned","from":1,"to":2}`},
+		{name: "enable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":1}`, action: "token.status_update", success: true, params: `{"id":$id,"name":"owned","from":2,"to":1}`, initialStatus: common.TokenStatusDisabled},
+		{name: "expired enable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":1}`, action: "token.status_update", params: `{"id":$id,"name":"owned"}`, initialStatus: common.TokenStatusExpired},
+		{name: "delete", method: "DELETE", path: "/$id", action: "token.delete", success: true, params: `{"id":$id,"name":"owned"}`},
+		{name: "foreign delete", method: "DELETE", path: "/$other", action: "token.delete", params: `{"id":$other}`},
+		{name: "missing delete", method: "DELETE", path: "/999999", action: "token.delete", params: `{"id":999999}`},
+		{name: "key view", method: "POST", path: "/$id/key", action: "token.key_view", success: true, params: `{"id":$id,"name":"owned"}`},
+		{name: "PAT key view", method: "POST", path: "/$id/key", action: "token.key_view", success: true, params: `{"id":$id,"name":"owned"}`, usePAT: true},
+		{name: "foreign key view", method: "POST", path: "/$other/key", action: "token.key_view", params: `{"id":$other}`},
+		{name: "rate limited key view", method: "POST", path: "/$id/key", action: "token.key_view", params: `{"id":$id}`, rateLimit: true},
+		{name: "batch delete partial and duplicate", method: "POST", path: "/batch", body: `{"ids":[$id,$id,$other,999999]}`, action: "token.delete_batch", success: true, params: `{"requested_ids":[$id,$id,$other,999999],"total":4,"count":1}`},
+		{name: "empty batch delete", method: "POST", path: "/batch", body: `{"ids":[]}`, action: "token.delete_batch", params: `{"requested_ids":[],"total":0}`},
+		{name: "batch keys partial and duplicate", method: "POST", path: "/batch/keys", body: `{"ids":[$id,$id,$other,999999]}`, action: "token.key_view_batch", success: true, params: `{"requested_ids":[$id,$id,$other,999999],"total":4,"count":1,"returned_ids":[$id]}`},
+		{name: "batch keys no matches", method: "POST", path: "/batch/keys", body: `{"ids":[$other,999999]}`, action: "token.key_view_batch", success: true, params: `{"requested_ids":[$other,999999],"total":2,"count":0,"returned_ids":[]}`},
+		{name: "empty batch keys", method: "POST", path: "/batch/keys", body: `{"ids":[]}`, action: "token.key_view_batch", params: `{"requested_ids":[],"total":0}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			empty := ""
+			owned := &model.Token{UserId: user.Id, Name: "owned", Key: fmt.Sprintf("owned-key-secret-%d", index), Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 100, UnlimitedQuota: true, Group: "auto", CrossGroupRetry: true, AutoGroups: `["default"]`, AllowIps: &empty}
+			if tc.initialStatus != 0 {
+				owned.Status = tc.initialStatus
+			}
+			if owned.Status == common.TokenStatusExpired {
+				owned.ExpiredTime = 1
+			}
+			foreign := &model.Token{UserId: other.Id, Name: "private-foreign-name", Key: fmt.Sprintf("foreign-key-secret-%d", index)}
+			require.NoError(t, model.DB.Create(owned).Error)
+			require.NoError(t, model.DB.Create(foreign).Error)
+			replace := strings.NewReplacer("$id", strconv.Itoa(owned.Id), "$other", strconv.Itoa(foreign.Id))
+			if tc.failWrite {
+				fail := func(tx *gorm.DB) {
+					if tx.Statement.Table == "tokens" {
+						_ = tx.AddError(errors.New("raw-storage-error-secret"))
+					}
+				}
+				if tc.method == "POST" {
+					require.NoError(t, model.DB.Callback().Create().Before("gorm:create").Register("token-audit:fail", fail))
+					t.Cleanup(func() { require.NoError(t, model.DB.Callback().Create().Remove("token-audit:fail")) })
+				} else {
+					require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("token-audit:fail", fail))
+					t.Cleanup(func() { require.NoError(t, model.DB.Callback().Update().Remove("token-audit:fail")) })
+				}
+			}
+			request := httptest.NewRequest(tc.method, "/api/token"+replace.Replace(tc.path), strings.NewReader(replace.Replace(tc.body)))
+			credential := jwt
+			if tc.usePAT {
+				credential = pat
+			}
+			request.Header.Set("Authorization", "Bearer "+credential)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("User-Agent", "api-token-audit-client")
+			request.RemoteAddr = "192.0.2.12:4321"
+			if tc.rateLimit {
+				request.Header.Set("X-Test-Limit", "1")
+			}
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if strings.Contains(tc.name, "exceeds audit buffer") {
+				assert.Greater(t, response.Body.Len(), 64*1024)
+			}
+			var events []model.AuditLog
+			require.NoError(t, model.LOG_DB.Where("request_id = ?", response.Header().Get(common.RequestIdKey)).Find(&events).Error)
+			expectedEvents := 1
+			if tc.usePAT {
+				expectedEvents = 2
+			}
+			require.Len(t, events, expectedEvents)
+			var operation *model.AuditLog
+			for i := range events {
+				if events[i].Category == model.AuditCategorySecurity {
+					require.Nil(t, operation, "one operation event per request")
+					operation = &events[i]
+				} else {
+					assert.Equal(t, model.AuditCategoryAccessToken, events[i].Category)
+					assert.Equal(t, model.AccessTokenFingerprint(pat), events[i].TokenRef)
+				}
+			}
+			require.NotNil(t, operation)
+			assert.Equal(t, tc.action, operation.Action)
+			assert.Equal(t, tc.success, operation.Success)
+			assert.Equal(t, response.Code, operation.Status)
+			if tc.rateLimit {
+				assert.Equal(t, 429, response.Code)
+			} else {
+				assert.Equal(t, 200, response.Code)
+				assert.Equal(t, tc.success, decodeAPIResponse(t, response).Success)
+			}
+			assert.Equal(t, user.Id, operation.UserId)
+			assert.Equal(t, user.Username, operation.Username)
+			assert.Equal(t, common.RoleCommonUser, operation.ActorRole)
+			assert.Equal(t, "192.0.2.12", operation.Ip)
+			assert.Equal(t, "api-token-audit-client", operation.UserAgent)
+			assert.Equal(t, tc.method, operation.Method)
+			expectedRoute := strings.NewReplacer("$id", ":id", "$other", ":id", "999999", ":id").Replace(strings.Split(tc.path, "?")[0])
+			assert.Equal(t, "/api/token"+expectedRoute, operation.Route)
+			assert.NotEmpty(t, operation.RequestId)
+			assert.Empty(t, operation.TokenRef)
+			assert.Nil(t, operation.Other.AdminInfo)
+			authMethod := "session"
+			if tc.usePAT {
+				authMethod = "access_token"
+			}
+			assert.Equal(t, authMethod, operation.AuthMethod)
+			require.NotNil(t, operation.Other.Op)
+			assert.Equal(t, tc.action, operation.Other.Op.Action)
+			params, err := common.Marshal(operation.Other.Op.Params)
+			require.NoError(t, err)
+			if tc.name == "create" {
+				var created model.Token
+				require.NoError(t, model.DB.Where("user_id = ? AND name = ?", user.Id, "created").First(&created).Error)
+				assert.JSONEq(t, fmt.Sprintf(`{"id":%d,"name":"created"}`, created.Id), string(params))
+				assert.NotContains(t, string(params), created.Key)
+			} else if tc.params == `{}` {
+				assert.Empty(t, operation.Other.Op.Params)
+			} else {
+				assert.JSONEq(t, replace.Replace(tc.params), string(params))
+			}
+			encoded, err := common.Marshal(events)
+			require.NoError(t, err)
+			for _, secret := range []string{pat, jwt, owned.Key, foreign.Key, foreign.Name, "raw-body-secret", "raw-storage-error-secret", "private-model-configuration", "203.0.113.57", "Authorization"} {
+				assert.NotContains(t, string(encoded), secret)
+			}
+			if tc.action == "token.key_view" && tc.success {
+				assert.Contains(t, response.Body.String(), owned.GetFullKey())
+			}
+		})
+	}
+
+	t.Run("bounded batch metadata", func(t *testing.T) {
+		ids := make([]int, 101)
+		for i := range ids {
+			ids[i] = 10000 + i
+		}
+		body, err := common.Marshal(TokenBatch{Ids: ids})
+		require.NoError(t, err)
+		for _, path := range []string{"/api/token/batch", "/api/token/batch/keys"} {
+			request := httptest.NewRequest("POST", path, bytes.NewReader(body))
+			request.Header.Set("Authorization", "Bearer "+jwt)
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			var event model.AuditLog
+			require.NoError(t, model.LOG_DB.Where("request_id = ?", response.Header().Get(common.RequestIdKey)).First(&event).Error)
+			var params struct {
+				IDs       []int `json:"requested_ids"`
+				Truncated bool  `json:"requested_ids_truncated"`
+				Total     int   `json:"total"`
+				Count     *int  `json:"count"`
+			}
+			encoded, err := common.Marshal(event.Other.Op.Params)
+			require.NoError(t, err)
+			require.NoError(t, common.Unmarshal(encoded, &params))
+			assert.Equal(t, ids[:100], params.IDs)
+			assert.True(t, params.Truncated)
+			assert.Equal(t, 101, params.Total)
+			assert.Equal(t, path == "/api/token/batch", event.Success)
+			if event.Success {
+				require.NotNil(t, params.Count)
+				assert.Zero(t, *params.Count)
+			} else {
+				assert.Nil(t, params.Count)
+			}
+		}
+	})
+
+	t.Run("reads and unauthenticated writes add no operation audit", func(t *testing.T) {
+		for _, tc := range []struct{ method, path, credential string }{
+			{"GET", "/api/token/", jwt}, {"GET", "/api/token/search?keyword=private-search", jwt},
+			{"GET", "/api/token/999999", jwt}, {"POST", "/api/token/", ""},
+		} {
+			response := auditRequest(router, tc.method, tc.path, tc.credential)
+			var count int64
+			require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("request_id = ?", response.Header().Get(common.RequestIdKey)).Count(&count).Error)
+			assert.Zero(t, count)
+		}
+	})
+
+	t.Run("self audit excludes other owners", func(t *testing.T) {
+		model.RecordAuditLog(nil, model.AuditLog{UserId: other.Id, Username: other.Username, ActorRole: common.RoleCommonUser, Category: model.AuditCategorySecurity, Action: "token.delete", Content: "other-user-audit", Success: true})
+		response := auditRequest(router, "GET", "/api/audit/self?category=security&page_size=100", jwt)
+		assert.Equal(t, 200, response.Code)
+		assert.Contains(t, response.Body.String(), "token.create")
+		assert.NotContains(t, response.Body.String(), "other-user-audit")
+	})
+
+	t.Run("audit storage failure preserves operation result", func(t *testing.T) {
+		require.NoError(t, model.LOG_DB.Callback().Create().Before("gorm:create").Register("token-audit:log-fail", func(tx *gorm.DB) {
+			if tx.Statement.Table == "audit_logs" {
+				_ = tx.AddError(errors.New("audit unavailable"))
+			}
+		}))
+		t.Cleanup(func() { require.NoError(t, model.LOG_DB.Callback().Create().Remove("token-audit:log-fail")) })
+		request := httptest.NewRequest("POST", "/api/token/", strings.NewReader(`{"name":"audit-down","unlimited_quota":true}`))
+		request.Header.Set("Authorization", "Bearer "+jwt)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		require.True(t, decodeAPIResponse(t, response).Success)
+		var count int64
+		require.NoError(t, model.DB.Model(&model.Token{}).Where("name = ?", "audit-down").Count(&count).Error)
+		assert.EqualValues(t, 1, count)
+	})
 }

@@ -19,3 +19,14 @@ func TestUsedUsageKeysReturnsNilForEmptyOrInvalidExpressions(t *testing.T) {
 	assert.Nil(t, billingexpr.UsedUsageKeys(""))
 	assert.Nil(t, billingexpr.UsedUsageKeys(`tier("broken",`))
 }
+
+func TestExpressionMetadataCannotBeMutatedThroughReturnedMaps(t *testing.T) {
+	expression := `p + cr + u("tokens")`
+	vars := billingexpr.UsedVars(expression)
+	usageKeys := billingexpr.UsedUsageKeys(expression)
+	delete(vars, "cr")
+	delete(usageKeys, "tokens")
+
+	assert.True(t, billingexpr.UsedVars(expression)["cr"])
+	assert.True(t, billingexpr.UsedUsageKeys(expression)["tokens"])
+}

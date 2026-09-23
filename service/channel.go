@@ -19,6 +19,15 @@ func formatNotifyType(channelId int, status int) string {
 	return fmt.Sprintf("%s_%d_%d", dto.NotifyTypeChannelUpdate, channelId, status)
 }
 
+func shouldCloseActiveWebSocketsAfterDisable(channelId int) bool {
+	channel, err := model.GetChannelById(channelId, true)
+	if err != nil {
+		common.SysLog(fmt.Sprintf("failed to check channel status before closing active websockets: channel_id=%d, error=%v", channelId, err))
+		return true
+	}
+	return channel.Status != common.ChannelStatusEnabled
+}
+
 // disable & notify
 func DisableChannel(channelError types.ChannelError, reason string) {
 	common.SysLog(fmt.Sprintf("通道「%s」（#%d）发生错误，准备禁用，原因：%s", channelError.ChannelName, channelError.ChannelId, common.LocalLogPreview(reason)))
@@ -45,6 +54,9 @@ func DisableChannel(channelError types.ChannelError, reason string) {
 
 	success := model.UpdateChannelStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason)
 	if success {
+		if shouldCloseActiveWebSocketsAfterDisable(channelError.ChannelId) {
+			CloseActiveWebSocketsForChannel(channelError.ChannelId, ChannelDisabledCloseReason)
+		}
 		subject := fmt.Sprintf("通道「%s」（#%d）已被禁用", channelError.ChannelName, channelError.ChannelId)
 		content := fmt.Sprintf("通道「%s」（#%d）已被禁用，原因：%s", channelError.ChannelName, channelError.ChannelId, reason)
 		NotifyRootUser(formatNotifyType(channelError.ChannelId, common.ChannelStatusAutoDisabled), subject, content)
@@ -74,12 +86,12 @@ func disablePlanQuotaDomain(tag string, reason string, resetAt int64) {
 		common.SysError(fmt.Sprintf("failed to load Plan quota domain %s: %v", tag, err))
 		return
 	}
-	disabled := 0
+	disabledIDs := make([]int, 0, len(channels))
 	for _, channel := range channels {
 		if model.UpdateChannelStatus(channel.Id, "", common.ChannelStatusAutoDisabled, reason) {
-			disabled++
+			disabledIDs = append(disabledIDs, channel.Id)
 		}
-		metadata := map[string]interface{}{
+		metadata := map[string]any{
 			"quota_domain": tag,
 			"quota_type":   "plan",
 		}
@@ -94,9 +106,10 @@ func disablePlanQuotaDomain(tag string, reason string, resetAt int64) {
 			common.SysError(fmt.Sprintf("failed to persist Plan quota metadata: channel_id=%d error=%v", channel.Id, err))
 		}
 	}
-	if disabled > 0 {
+	if len(disabledIDs) > 0 {
+		CloseActiveWebSocketsForChannels(disabledIDs, ChannelDisabledCloseReason)
 		subject := fmt.Sprintf("Plan 配额域「%s」已临时禁用", tag)
-		content := fmt.Sprintf("%s，共禁用 %d 个协议渠道", reason, disabled)
+		content := fmt.Sprintf("%s，共禁用 %d 个协议渠道", reason, len(disabledIDs))
 		NotifyRootUser("channel_plan_quota_"+tag, subject, content)
 	}
 }

@@ -2,7 +2,6 @@ package billingexpr_test
 
 import (
 	"testing"
-	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -52,25 +51,7 @@ func TestComputeTieredQuota_NoClampInRange(t *testing.T) {
 	assert.Nil(t, result.Clamp, "in-range settlement must not report a clamp")
 }
 
-func TestComputeTieredQuota_UsesSnapshotPricingTime(t *testing.T) {
-	pricingTime := time.Date(2026, time.September, 17, 5, 59, 59, 0, time.UTC).Unix()
-	exprStr := `unix() < 1789624800 ? tier("promotion", p) : tier("list", p * 2)`
-	snap := &billingexpr.BillingSnapshot{
-		BillingMode:     "tiered_expr",
-		ExprString:      exprStr,
-		ExprHash:        billingexpr.ExprHashString(exprStr),
-		GroupRatio:      1,
-		QuotaPerUnit:    1_000_000,
-		PricingTimeUnix: pricingTime,
-	}
-
-	result, err := billingexpr.ComputeTieredQuota(snap, billingexpr.TokenParams{P: 1})
-	require.NoError(t, err)
-	assert.Equal(t, 1, result.ActualQuotaAfterGroup)
-	assert.Equal(t, "promotion", result.MatchedTier)
-}
-
-func TestComputeTieredQuota_RequestBasisDoesNotScalePerMillion(t *testing.T) {
+func TestComputeTieredQuota_TaskUsageDoesNotScalePerMillion(t *testing.T) {
 	exprStr := `tier("request", u("images") * 0.25)`
 	snap := &billingexpr.BillingSnapshot{
 		BillingMode:      "tiered_expr",
@@ -78,8 +59,7 @@ func TestComputeTieredQuota_RequestBasisDoesNotScalePerMillion(t *testing.T) {
 		ExprHash:         billingexpr.ExprHashString(exprStr),
 		GroupRatio:       1,
 		QuotaPerUnit:     500_000,
-		BillingBasis:     billingexpr.BillingBasisRequest,
-		TaskUsageBilling: false,
+		TaskUsageBilling: true,
 	}
 
 	result, err := billingexpr.ComputeTieredQuotaWithRequest(

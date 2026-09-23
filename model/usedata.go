@@ -128,7 +128,7 @@ func increaseQuotaData(quotaData *QuotaData) {
 	err := DB.Table("quota_data").
 		Where("user_id = ? and username = ? and model_name = ? and created_at = ? and use_group = ? and token_id = ? and channel_id = ? and node_name = ?",
 			quotaData.UserID, quotaData.Username, quotaData.ModelName, quotaData.CreatedAt, quotaData.UseGroup, quotaData.TokenID, quotaData.ChannelID, quotaData.NodeName).
-		Updates(map[string]interface{}{
+		Updates(map[string]any{
 			"count":      gorm.Expr("count + ?", quotaData.Count),
 			"quota":      gorm.Expr("quota + ?", quotaData.Quota),
 			"token_used": gorm.Expr("token_used + ?", quotaData.TokenUsed),
@@ -161,8 +161,16 @@ func GetQuotaDataByUserId(userId int, startTime int64, endTime int64) (quotaData
 }
 
 func GetQuotaDataGroupByUser(startTime int64, endTime int64) (quotaData []*QuotaData, err error) {
+	return GetQuotaDataGroupByUserForViewer(common.RoleRootUser, startTime, endTime)
+}
+
+func GetQuotaDataGroupByUserForViewer(viewerRole int, startTime int64, endTime int64) (quotaData []*QuotaData, err error) {
 	var quotaDatas []*QuotaData
-	err = DB.Table("quota_data").
+	query, err := usageQueryForViewer(DB.Table("quota_data"), viewerRole, "user_id")
+	if err != nil {
+		return nil, err
+	}
+	err = query.
 		Select("username, created_at, sum(count) as count, sum(quota) as quota, sum(token_used) as token_used").
 		Where("created_at >= ? and created_at <= ?", startTime, endTime).
 		Group("username, created_at").
@@ -171,13 +179,26 @@ func GetQuotaDataGroupByUser(startTime int64, endTime int64) (quotaData []*Quota
 }
 
 func GetAllQuotaDates(startTime int64, endTime int64, username string) (quotaData []*QuotaData, err error) {
-	if username != "" {
-		return GetQuotaDataByUsername(username, startTime, endTime)
+	return GetAllQuotaDatesForViewer(common.RoleRootUser, startTime, endTime, username)
+}
+
+func GetAllQuotaDatesForViewer(viewerRole int, startTime int64, endTime int64, username string) (quotaData []*QuotaData, err error) {
+	query, err := usageQueryForViewer(DB.Table("quota_data"), viewerRole, "user_id")
+	if err != nil {
+		return nil, err
 	}
 	var quotaDatas []*QuotaData
+	if username != "" {
+		err = query.
+			Select("user_id, username, model_name, created_at, sum(count) as count, sum(quota) as quota, sum(token_used) as token_used").
+			Where("username = ? and created_at >= ? and created_at <= ?", username, startTime, endTime).
+			Group("user_id, username, model_name, created_at").
+			Find(&quotaDatas).Error
+		return quotaDatas, err
+	}
 	// 从quota_data表中查询数据
 	// only select model_name, sum(count) as count, sum(quota) as quota, model_name, created_at from quota_data group by model_name, created_at;
 	//err = DB.Table("quota_data").Where("created_at >= ? and created_at <= ?", startTime, endTime).Find(&quotaDatas).Error
-	err = DB.Table("quota_data").Select("model_name, sum(count) as count, sum(quota) as quota, sum(token_used) as token_used, created_at").Where("created_at >= ? and created_at <= ?", startTime, endTime).Group("model_name, created_at").Find(&quotaDatas).Error
+	err = query.Select("model_name, sum(count) as count, sum(quota) as quota, sum(token_used) as token_used, created_at").Where("created_at >= ? and created_at <= ?", startTime, endTime).Group("model_name, created_at").Find(&quotaDatas).Error
 	return quotaDatas, err
 }

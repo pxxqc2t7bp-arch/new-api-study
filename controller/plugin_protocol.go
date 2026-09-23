@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay"
@@ -23,6 +24,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -33,6 +35,7 @@ type pluginProtocolBridgeDeps struct {
 	admissions         *pluginProtocolObservationLimiter
 	protocolLimits     relay.PluginProtocolLimits
 	artifactContentURL func(taskID, artifactKey string) (string, error)
+	retrievalArtifacts *[]hosttypes.TaskArtifact
 	submissionTimeout  time.Duration
 	observationTimeout time.Duration
 	loadTimeout        time.Duration
@@ -203,11 +206,14 @@ func serveTaskPluginProtocol(
 		protocolRequest.Stream,
 	)
 
-	release, admissionErr := deps.admissions.acquire(
-		pinned.Plugin.Meta.Key,
-		common.GetContextKeyInt(c, constant.ContextKeyUserId),
-		common.GetContextKeyInt(c, constant.ContextKeyTokenId),
-	)
+	var release func()
+	var admissionErr error
+	if subject, ok := common.GetContextKeyType[*hosttypes.AppRelaySubject](c, hosttypes.AppRelaySubjectContextKey); ok && subject != nil {
+		release, admissionErr = deps.admissions.acquireSubject(pinned.Plugin.Meta.Key, subject.UserID, "app_grant:"+subject.GrantID)
+	} else {
+		release, admissionErr = deps.admissions.acquire(pinned.Plugin.Meta.Key,
+			common.GetContextKeyInt(c, constant.ContextKeyUserId), common.GetContextKeyInt(c, constant.ContextKeyTokenId))
+	}
 	if admissionErr != nil {
 		if errors.Is(admissionErr, errPluginProtocolObservationLimitExceeded) {
 			logger.LogDebug(c, "task_plugin subsystem=protocol event=admission_rejected generation=%d plugin=%q reason=observation_limit", generation, pluginKey)
@@ -340,7 +346,7 @@ func serveTaskPluginProtocol(
 	}
 	if background {
 		outcome.Task.PrivateData.ResponsesBackground = true
-		if outcome.Task.ID != 0 {
+		if outcome.Task.ID != 0 && outcome.Task.ExecutionMode != model.TaskExecutionModeAppManaged {
 			if err := model.DB.Model(outcome.Task).Update("private_data", outcome.Task.PrivateData).Error; err != nil {
 				logger.LogError(c, "persist task background flag failed: "+err.Error())
 			}
@@ -496,7 +502,9 @@ func streamTaskPluginProtocol(
 			return
 		}
 		hookStarted := deps.now()
-		rendererContext, contextErr := taskPluginProtocolRendererContext(protocolRequest, pinned, task, deps.artifactContentURL)
+		rendererContext, contextErr := taskPluginProtocolRendererContext(
+			protocolRequest, pinned, task, deps.artifactContentURL, deps.retrievalArtifacts,
+		)
 		if contextErr != nil {
 			logger.LogError(c, "build task protocol renderer context failed")
 			writeTaskPluginProtocolFailure(c, machine, lastStatus)
@@ -849,6 +857,7 @@ func renderTaskPluginProtocolFinalResponse(
 		pinned,
 		task,
 		deps.artifactContentURL,
+		deps.retrievalArtifacts,
 	)
 	if err != nil {
 		return nil, 0, err
@@ -894,6 +903,7 @@ func renderTaskPluginProtocolEventsResponse(
 		pinned,
 		task,
 		deps.artifactContentURL,
+		deps.retrievalArtifacts,
 	)
 	if err != nil {
 		return nil, 0, err
@@ -933,25 +943,46 @@ func retrieveTaskPluginResponse(c *gin.Context, deps pluginProtocolBridgeDeps) {
 		writeTaskPluginResponseNotFound(c, responseID, "bad_prefix")
 		return
 	}
-	taskID := "task_" + strings.TrimPrefix(responseID, "resp_")
-	userID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
+	taskID := ""
+	var task *model.Task
+	appRetrieval, appRequest := middleware.GetAppGrantTaskRetrieval(c)
+	if appRequest {
+		taskID = appRetrieval.Execution.TaskID
+		if responseID != "resp_"+strings.TrimPrefix(taskID, "task_") {
+			writeTaskPluginResponseNotFound(c, responseID, "binding")
+			return
+		}
+		task = &appRetrieval.Task
+		deps.artifactContentURL = service.BuildAppGrantTaskArtifactContentURL
+		deps.retrievalArtifacts = &appRetrieval.Artifacts
+	} else {
+		taskID = "task_" + strings.TrimPrefix(responseID, "resp_")
+		userID := common.GetContextKeyInt(c, constant.ContextKeyUserId)
+		var exists bool
+		var err error
+		task, exists, err = deps.getByTaskId(userID, taskID)
+		if err != nil {
+			logger.LogError(c, "task protocol retrieve lookup failed")
+			logger.LogDebug(c, "task_plugin subsystem=protocol event=retrieve_failed reason=lookup_error public_task_id=%q", taskID)
+			respondPluginProtocolError(c, http.StatusInternalServerError, "task_protocol_error", "Task protocol request failed")
+			return
+		}
+		if !exists || task == nil {
+			writeTaskPluginResponseNotFound(c, responseID, "missing")
+			return
+		}
+	}
 	logger.LogDebug(c, "task_plugin subsystem=protocol event=retrieve_start response_id=%q public_task_id=%q", responseID, taskID)
-
-	task, exists, err := deps.getByTaskId(userID, taskID)
-	if err != nil {
-		logger.LogError(c, "task protocol retrieve lookup failed")
-		logger.LogDebug(c, "task_plugin subsystem=protocol event=retrieve_failed reason=lookup_error public_task_id=%q", taskID)
-		respondPluginProtocolError(c, http.StatusInternalServerError, "task_protocol_error", "Task protocol request failed")
-		return
-	}
-	if !exists || task == nil {
-		writeTaskPluginResponseNotFound(c, responseID, "missing")
-		return
-	}
 
 	plugin, generation, ok := deps.resolvePlugin(task.Platform)
 	if !ok || plugin == nil {
 		writeTaskPluginResponseNotFound(c, responseID, "no_plugin")
+		return
+	}
+	if appRequest && (plugin.Meta.Key != appRetrieval.Execution.PluginKey ||
+		plugin.Meta.Version != appRetrieval.Execution.PluginVersion ||
+		plugin.SourceSHA256() != appRetrieval.Execution.PluginSHA256) {
+		respondPluginProtocolError(c, http.StatusServiceUnavailable, "service_unavailable", "Task protocol is unavailable")
 		return
 	}
 	claimsProtocol := false
@@ -1156,6 +1187,7 @@ func taskPluginProtocolRendererContext(
 	pinned pluginruntime.PinnedEndpoint,
 	task *model.Task,
 	artifactContentURL func(taskID, artifactKey string) (string, error),
+	retrievalArtifacts *[]hosttypes.TaskArtifact,
 ) (map[string]any, error) {
 	rendererContext := request.JSValue()
 	if task == nil || task.Status != model.TaskStatusSuccess {
@@ -1165,11 +1197,17 @@ func taskPluginProtocolRendererContext(
 		return nil, errors.New("task artifact projection is unavailable")
 	}
 
-	artifacts, err := taskjsplugin.New(pinned.Plugin).ListArtifacts(task)
-	if err != nil {
-		return nil, fmt.Errorf("project task artifacts: %w", err)
+	var artifacts []hosttypes.TaskArtifact
+	if retrievalArtifacts != nil {
+		artifacts = append(artifacts, (*retrievalArtifacts)...)
+	} else {
+		var err error
+		artifacts, err = taskjsplugin.New(pinned.Plugin).ListArtifacts(task)
+		if err != nil {
+			return nil, fmt.Errorf("project task artifacts: %w", err)
+		}
 	}
-	artifacts, err = validateProjectedTaskArtifacts(artifacts)
+	artifacts, err := validateProjectedTaskArtifacts(artifacts)
 	if err != nil {
 		return nil, err
 	}
@@ -1247,6 +1285,22 @@ func respondPluginProtocolSubmissionError(c *gin.Context, taskErr *dto.TaskError
 	if taskErr != nil && taskErr.StatusCode >= 400 && taskErr.StatusCode <= 599 {
 		status = taskErr.StatusCode
 	}
+	if taskErr != nil && taskErr.Code == "service_unavailable" &&
+		status >= http.StatusInternalServerError {
+		respondPluginProtocolError(c, status, "service_unavailable", "Task protocol is unavailable")
+		return
+	}
+	if subject, ok := common.GetContextKeyType[*hosttypes.AppRelaySubject](
+		c, hosttypes.AppRelaySubjectContextKey,
+	); ok && subject != nil && taskErr != nil {
+		switch taskErr.Code {
+		case "app_execution_disabled", "execution_grant_expired", "funding_period_changed",
+			"idempotency_conflict", "identity_inactive", "insufficient_quota",
+			"invalid_funding", "invalid_grant", "scope_denied", "wallet_accounting_unavailable":
+			respondPluginProtocolError(c, status, taskErr.Code, "App task execution failed")
+			return
+		}
+	}
 	switch status {
 	case http.StatusBadRequest:
 		message := "Invalid task protocol request"
@@ -1268,9 +1322,10 @@ func respondPluginProtocolSubmissionError(c *gin.Context, taskErr *dto.TaskError
 func respondPluginProtocolError(c *gin.Context, status int, code, message string) {
 	c.JSON(status, gin.H{
 		"error": gin.H{
-			"message": message,
-			"type":    "new_api_error",
-			"code":    code,
+			"message":   message,
+			"type":      "new_api_error",
+			"code":      code,
+			"retryable": status >= http.StatusInternalServerError,
 		},
 	})
 }

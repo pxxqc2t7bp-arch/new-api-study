@@ -64,6 +64,7 @@ const (
 	ErrorCodeReadRequestBodyFailed ErrorCode = "read_request_body_failed"
 	ErrorCodeConvertRequestFailed  ErrorCode = "convert_request_failed"
 	ErrorCodeAccessDenied          ErrorCode = "access_denied"
+	ErrorCodeStatefulReplayUnsafe  ErrorCode = "STATEFUL_REPLAY_UNSAFE"
 
 	// request error
 	ErrorCodeBadRequestBody             ErrorCode = "bad_request_body"

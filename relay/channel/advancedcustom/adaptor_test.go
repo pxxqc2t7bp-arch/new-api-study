@@ -166,6 +166,29 @@ func TestAdaptorSetupRequestHeaderAddsClaudeDefaultHeaders(t *testing.T) {
 	assert.Equal(t, "2023-06-01", header.Get("anthropic-version"))
 }
 
+func TestAdaptorSetupRequestHeaderAddsClaudeHeadersForResponsesConversion(t *testing.T) {
+	adaptor := &Adaptor{}
+	info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
+		Routes: []dto.AdvancedCustomRoute{{
+			IncomingPath: "/v1/responses",
+			UpstreamPath: "/v1/messages",
+			Converter:    relayconvert.ConverterOpenAIResponsesToClaudeMessages,
+			Auth: &dto.AdvancedCustomRouteAuth{
+				Type:  dto.AdvancedCustomAuthTypeHeader,
+				Name:  "x-api-key",
+				Value: "{api_key}",
+			},
+		}},
+	})
+	info.RelayFormat = types.RelayFormatOpenAIResponses
+	info.RequestURLPath = "/v1/responses"
+	header := http.Header{}
+
+	require.NoError(t, adaptor.SetupRequestHeader(advancedCustomGinContext("/v1/responses"), &header, info))
+	assert.Equal(t, "sk-test", header.Get("x-api-key"))
+	assert.Equal(t, "2023-06-01", header.Get("anthropic-version"))
+}
+
 func TestAdaptorReturnsErrorWhenNoRouteMatchesPath(t *testing.T) {
 	adaptor := &Adaptor{}
 	info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
@@ -827,6 +850,231 @@ func TestAdaptorConvertsGeminiRequestToOpenAIChatUpstream(t *testing.T) {
 	assert.Equal(t, "gpt-test", chatReq.Model)
 	require.Len(t, chatReq.Messages, 1)
 	assert.Equal(t, "user", chatReq.Messages[0].Role)
+}
+
+func TestAdaptorConvertsEveryAllowedOrdinaryProtocolRoute(t *testing.T) {
+	maxTokens := uint(1024)
+	tests := []struct {
+		name         string
+		incomingPath string
+		upstreamPath string
+		converter    string
+		relayFormat  types.RelayFormat
+		convert      func(*Adaptor, *relaycommon.RelayInfo) (any, error)
+		want         any
+	}{
+		{
+			name: "Claude to Responses", incomingPath: "/v1/messages", upstreamPath: "/v1/responses",
+			converter: relayconvert.ConverterClaudeMessagesToOpenAIResponses, relayFormat: types.RelayFormatClaude,
+			convert: func(a *Adaptor, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertClaudeRequest(advancedCustomGinContext("/v1/messages"), info, &dto.ClaudeRequest{
+					Model: "gpt-test", MaxTokens: &maxTokens, Messages: []dto.ClaudeMessage{{Role: "user", Content: "hello"}},
+				})
+			},
+			want: &dto.OpenAIResponsesRequest{},
+		},
+		{
+			name: "Gemini to Responses", incomingPath: "/v1beta/models/{model}:generateContent", upstreamPath: "/v1/responses",
+			converter: relayconvert.ConverterGeminiContentToOpenAIResponses, relayFormat: types.RelayFormatGemini,
+			convert: func(a *Adaptor, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertGeminiRequest(advancedCustomGinContext("/v1beta/models/gemini-test:generateContent"), info, &dto.GeminiChatRequest{
+					Contents: []dto.GeminiChatContent{{Role: "user", Parts: []dto.GeminiPart{{Text: "hello"}}}},
+				})
+			},
+			want: &dto.OpenAIResponsesRequest{},
+		},
+		{
+			name: "Responses to Claude", incomingPath: "/v1/responses", upstreamPath: "/v1/messages",
+			converter: relayconvert.ConverterOpenAIResponsesToClaudeMessages, relayFormat: types.RelayFormatOpenAIResponses,
+			convert: func(a *Adaptor, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertOpenAIResponsesRequest(advancedCustomGinContext("/v1/responses"), info, dto.OpenAIResponsesRequest{
+					Model: "claude-test", MaxOutputTokens: &maxTokens, Input: mustAdvancedCustomRawMessage(t, "hello"),
+				})
+			},
+			want: &dto.ClaudeRequest{},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{
+				IncomingPath: test.incomingPath,
+				UpstreamPath: test.upstreamPath,
+				Converter:    test.converter,
+			}}}
+			require.NoError(t, config.Validate())
+			info := advancedCustomRelayInfo(config)
+			info.RelayFormat = test.relayFormat
+			info.RequestURLPath = test.incomingPath
+
+			converted, err := test.convert(&Adaptor{}, info)
+			require.NoError(t, err)
+			assert.IsType(t, test.want, converted)
+		})
+	}
+}
+
+func TestAdaptorCrossProtocolChatUpstreamRequestsStreamUsage(t *testing.T) {
+	claudeReq := &dto.ClaudeRequest{
+		Model:    "gpt-test",
+		Messages: []dto.ClaudeMessage{{Role: "user", Content: "hello"}},
+	}
+	geminiReq := &dto.GeminiChatRequest{
+		Contents: []dto.GeminiChatContent{{Role: "user", Parts: []dto.GeminiPart{{Text: "hello"}}}},
+	}
+	responsesReq := dto.OpenAIResponsesRequest{
+		Model: "gpt-test",
+		Input: mustAdvancedCustomRawMessage(t, "hello"),
+	}
+
+	tests := []struct {
+		name         string
+		route        dto.AdvancedCustomRoute
+		relayFormat  types.RelayFormat
+		relayMode    int
+		requestPath  string
+		convert      func(*Adaptor, *gin.Context, *relaycommon.RelayInfo) (any, error)
+		isStream     bool
+		supportUsage bool
+		wantUsage    bool
+	}{
+		{
+			name: "claude stream requests usage",
+			route: dto.AdvancedCustomRoute{
+				IncomingPath: "/v1/messages",
+				UpstreamPath: "/v1/chat/completions",
+				Converter:    relayconvert.ConverterClaudeMessagesToOpenAIChat,
+			},
+			relayFormat: types.RelayFormatClaude,
+			relayMode:   relayconstant.RelayModeChatCompletions,
+			requestPath: "/v1/messages",
+			convert: func(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertClaudeRequest(c, info, claudeReq)
+			},
+			isStream:     true,
+			supportUsage: true,
+			wantUsage:    true,
+		},
+		{
+			name: "gemini stream requests usage",
+			route: dto.AdvancedCustomRoute{
+				IncomingPath: "/v1beta/models/{model}:generateContent",
+				UpstreamPath: "/v1/chat/completions",
+				Converter:    relayconvert.ConverterGeminiContentToOpenAIChat,
+			},
+			relayFormat: types.RelayFormatGemini,
+			relayMode:   relayconstant.RelayModeGemini,
+			requestPath: "/v1beta/models/gpt-test:generateContent",
+			convert: func(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertGeminiRequest(c, info, geminiReq)
+			},
+			isStream:     true,
+			supportUsage: true,
+			wantUsage:    true,
+		},
+		{
+			name: "responses stream requests usage",
+			route: dto.AdvancedCustomRoute{
+				IncomingPath: "/v1/responses",
+				UpstreamPath: "/v1/chat/completions",
+				Converter:    relayconvert.ConverterOpenAIResponsesToOpenAIChat,
+			},
+			relayFormat: types.RelayFormatOpenAIResponses,
+			relayMode:   relayconstant.RelayModeResponses,
+			requestPath: "/v1/responses",
+			convert: func(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertOpenAIResponsesRequest(c, info, responsesReq)
+			},
+			isStream:     true,
+			supportUsage: true,
+			wantUsage:    true,
+		},
+		{
+			name: "claude non-stream leaves stream options unset",
+			route: dto.AdvancedCustomRoute{
+				IncomingPath: "/v1/messages",
+				UpstreamPath: "/v1/chat/completions",
+				Converter:    relayconvert.ConverterClaudeMessagesToOpenAIChat,
+			},
+			relayFormat: types.RelayFormatClaude,
+			relayMode:   relayconstant.RelayModeChatCompletions,
+			requestPath: "/v1/messages",
+			convert: func(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertClaudeRequest(c, info, claudeReq)
+			},
+			isStream:     false,
+			supportUsage: true,
+			wantUsage:    false,
+		},
+		{
+			name: "claude stream without stream options support",
+			route: dto.AdvancedCustomRoute{
+				IncomingPath: "/v1/messages",
+				UpstreamPath: "/v1/chat/completions",
+				Converter:    relayconvert.ConverterClaudeMessagesToOpenAIChat,
+			},
+			relayFormat: types.RelayFormatClaude,
+			relayMode:   relayconstant.RelayModeChatCompletions,
+			requestPath: "/v1/messages",
+			convert: func(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (any, error) {
+				return a.ConvertClaudeRequest(c, info, claudeReq)
+			},
+			isStream:     true,
+			supportUsage: false,
+			wantUsage:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			adaptor := &Adaptor{}
+			info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{tt.route}})
+			info.RelayFormat = tt.relayFormat
+			info.RelayMode = tt.relayMode
+			info.RequestURLPath = tt.requestPath
+			info.IsStream = tt.isStream
+			info.SupportStreamOptions = tt.supportUsage
+			c := advancedCustomGinContext(tt.requestPath)
+
+			converted, err := tt.convert(adaptor, c, info)
+			require.NoError(t, err)
+			chatReq, ok := converted.(*dto.GeneralOpenAIRequest)
+			require.True(t, ok)
+
+			if !tt.wantUsage {
+				assert.Nil(t, chatReq.StreamOptions)
+				return
+			}
+			require.NotNil(t, chatReq.StreamOptions)
+			assert.True(t, chatReq.StreamOptions.IncludeUsage)
+		})
+	}
+}
+
+func TestAdaptorChannelPolicyCannotAuthorizeLossyConversion(t *testing.T) {
+	config := &dto.AdvancedCustomConfig{Routes: []dto.AdvancedCustomRoute{{
+		IncomingPath: "/v1beta/models/{model}:generateContent",
+		UpstreamPath: "/v1/chat/completions",
+		Converter:    relayconvert.ConverterGeminiContentToOpenAIChat,
+	}}}
+	tools := mustAdvancedCustomRawMessage(t, []map[string]any{{"codeExecution": map[string]any{}}})
+	request := &dto.GeminiChatRequest{
+		Contents: []dto.GeminiChatContent{{Role: "user", Parts: []dto.GeminiPart{{Text: "run this"}}}},
+		Tools:    tools,
+	}
+
+	info := advancedCustomRelayInfo(config)
+	info.RelayFormat = types.RelayFormatGemini
+	info.RequestURLPath = "/v1beta/models/gemini-test:generateContent"
+	info.ChannelOtherSettings.ToolLossPolicy = string(types.ConversionLossPolicyAllow)
+
+	_, err := (&Adaptor{}).ConvertGeminiRequest(advancedCustomGinContext(info.RequestURLPath), info, request)
+
+	require.Error(t, err)
+	var loss *types.ConversionLossError
+	require.ErrorAs(t, err, &loss)
+	require.NotEmpty(t, info.ConversionDiagnostics())
+	assert.Equal(t, "unsupported_hosted_tool", info.ConversionDiagnostics()[0].Code)
 }
 
 func advancedCustomRelayInfo(config *dto.AdvancedCustomConfig) *relaycommon.RelayInfo {

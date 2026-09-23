@@ -66,6 +66,26 @@ func TestStreamRecoveryTerminalErrorRequiresProtocolTerminal(t *testing.T) {
 	assert.Nil(t, streamRecoveryTerminalError(context, info))
 }
 
+func TestStreamRecoveryTerminalErrorRejectsProtocolErrorEvent(t *testing.T) {
+	context, _ := gin.CreateTestContext(nil)
+	writer := newRelayStreamRecoveryWriter(t)
+	context.Writer = writer
+	common.SetContextKey(context, constant.ContextKeyStreamRecoveryWorker, true)
+	common.SetContextKey(context, constant.ContextKeyStreamRecoveryBroker, writer)
+	info := &relaycommon.RelayInfo{StreamStatus: relaycommon.NewStreamStatus()}
+
+	_, err := writer.WriteString(
+		"event: error\n" +
+			"data: {\"type\":\"error\",\"code\":\"upstream_error\"}\n\n",
+	)
+	require.NoError(t, err)
+	writer.Flush()
+
+	apiError := streamRecoveryTerminalError(context, info)
+	require.NotNil(t, apiError)
+	assert.Equal(t, 502, apiError.StatusCode)
+}
+
 func TestStreamRecoveryTerminalErrorDoesNotAffectOrdinaryStreams(t *testing.T) {
 	context, _ := gin.CreateTestContext(nil)
 	info := &relaycommon.RelayInfo{StreamStatus: relaycommon.NewStreamStatus()}

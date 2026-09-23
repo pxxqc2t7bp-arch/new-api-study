@@ -12,7 +12,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const TaskArtifactAccessContextKey = "task_artifact_access"
+const (
+	TaskArtifactAccessContextKey    = "task_artifact_access"
+	appTaskArtifactAccessContextKey = "app_task_artifact_access"
+)
 
 const (
 	taskArtifactAccessRawContextKey       = "task_artifact_access_raw"
@@ -20,7 +23,7 @@ const (
 	taskArtifactAccessInvalidContextKey   = "task_artifact_access_invalid"
 	taskArtifactAccessRateWindow          = time.Minute
 	taskArtifactAccessCleanupInterval     = time.Minute
-	maxEncodedTaskArtifactAccessQuerySize = 128
+	maxEncodedTaskArtifactAccessQuerySize = service.MaxAppTaskArtifactAccessLength
 )
 
 type taskArtifactRateEntry struct {
@@ -139,7 +142,7 @@ func popTaskArtifactAccessQuery(request *http.Request) (string, bool, bool) {
 	count := 0
 	invalid := false
 	kept := make([]string, 0)
-	for _, part := range strings.Split(request.URL.RawQuery, "&") {
+	for part := range strings.SplitSeq(request.URL.RawQuery, "&") {
 		rawKey, rawValue, _ := strings.Cut(part, "=")
 		key, err := url.QueryUnescape(rawKey)
 		if err != nil || key != service.TaskArtifactAccessQueryParameter {
@@ -185,6 +188,14 @@ func TokenOrTaskArtifactAccessAuth(taskParam, artifactParam string) gin.HandlerF
 			}
 			invalid = invalid || queryInvalid
 		}
+		if strings.HasPrefix(c.GetHeader("Authorization"), "AppGrant ") {
+			if present || invalid || !appGrantTaskRetrievalRouteAllowed(c, "") {
+				writeAppServiceAuthError(c, http.StatusForbidden, "scope_denied")
+				return
+			}
+			authenticateAppGrantTaskRetrieval(c, "", c.Param(taskParam))
+			return
+		}
 		if !present {
 			TokenAuth()(c)
 			return
@@ -196,7 +207,16 @@ func TokenOrTaskArtifactAccessAuth(taskParam, artifactParam string) gin.HandlerF
 		if ip == "" {
 			ip = "unknown"
 		}
-		if invalid || !service.VerifyTaskArtifactAccess(rawAccess, taskID, artifactKey) {
+		appAccess := service.AppTaskArtifactAccess{}
+		appAccessOK := false
+		isAppAccess := strings.HasPrefix(rawAccess, "app1.")
+		if isAppAccess {
+			appAccess, appAccessOK = service.VerifyAppTaskArtifactAccess(
+				rawAccess, taskID, artifactKey, service.ConfiguredAppPluginAuthOptions(),
+			)
+		}
+		if invalid || isAppAccess && !appAccessOK ||
+			!isAppAccess && !service.VerifyTaskArtifactAccess(rawAccess, taskID, artifactKey) {
 			if !taskArtifactAnonymousLimiter.invalidAttempt(time.Now(), ip) {
 				writeTaskArtifactAccessLimited(c)
 				return
@@ -213,12 +233,24 @@ func TokenOrTaskArtifactAccessAuth(taskParam, artifactParam string) gin.HandlerF
 		defer release()
 
 		c.Set(TaskArtifactAccessContextKey, true)
+		if appAccessOK {
+			c.Set(appTaskArtifactAccessContextKey, appAccess)
+		}
 		c.Next()
 	}
 }
 
 func IsTaskArtifactAccess(c *gin.Context) bool {
 	return c != nil && c.GetBool(TaskArtifactAccessContextKey)
+}
+
+func GetAppTaskArtifactAccess(c *gin.Context) (service.AppTaskArtifactAccess, bool) {
+	if c == nil {
+		return service.AppTaskArtifactAccess{}, false
+	}
+	value, exists := c.Get(appTaskArtifactAccessContextKey)
+	access, ok := value.(service.AppTaskArtifactAccess)
+	return access, exists && ok
 }
 
 func writeTaskArtifactAccessNotFound(c *gin.Context) {

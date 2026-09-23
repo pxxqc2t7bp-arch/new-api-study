@@ -1,94 +1,138 @@
 {
-  "contents": [
+  "losses": [
     {
-      "role": "user",
-      "parts": [
-        {
-          "text": "What is in this image?"
-        },
-        {
-          "inlineData": {
-            "mimeType": "image/png",
-            "data": "aGVsbG8="
-          }
-        }
-      ]
+      "code": "unsupported_function_strict",
+      "path": "tools[0].strict",
+      "message": "Gemini does not expose OpenAI function strictness",
+      "severity": "warning",
+      "from": "openai_responses",
+      "to": "gemini"
     },
     {
-      "role": "model",
-      "parts": [
-        {
-          "functionCall": {
-            "name": "get_weather",
-            "args": {
-              "city": "Paris"
-            }
+      "code": "unsupported_parallel_tool_control",
+      "path": "parallel_tool_calls",
+      "message": "Gemini generateContent does not expose a request field equivalent to parallel_tool_calls",
+      "severity": "error",
+      "from": "openai_responses",
+      "to": "gemini"
+    }
+  ],
+  "value": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "What is in this image?"
           },
-          "thoughtSignature": "context_engineering_is_the_way_to_go"
-        }
-      ]
-    },
-    {
-      "role": "user",
-      "parts": [
-        {
-          "functionResponse": {
-            "name": "get_weather",
-            "response": {
-              "content": "15 degrees"
+          {
+            "inlineData": {
+              "mimeType": "image/png",
+              "data": "aGVsbG8="
             }
           }
-        }
-      ]
-    }
-  ],
-  "safetySettings": [
-    {
-      "category": "HARM_CATEGORY_HARASSMENT",
-      "threshold": "OFF"
-    },
-    {
-      "category": "HARM_CATEGORY_HATE_SPEECH",
-      "threshold": "OFF"
-    },
-    {
-      "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-      "threshold": "OFF"
-    },
-    {
-      "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-      "threshold": "OFF"
-    }
-  ],
-  "generationConfig": {
-    "maxOutputTokens": 1024
-  },
-  "tools": [
-    {
-      "functionDeclarations": [
-        {
-          "description": "Get weather by city",
-          "name": "get_weather",
-          "parameters": {
-            "properties": {
-              "city": {
-                "type": "STRING"
+        ]
+      },
+      {
+        "role": "model",
+        "parts": [
+          {
+            "functionCall": {
+              "id": "call_abc",
+              "name": "get_weather",
+              "args": {
+                "city": "Paris"
               }
             },
-            "required": [
-              "city"
-            ],
-            "type": "OBJECT"
+            "thoughtSignature": "context_engineering_is_the_way_to_go"
           }
+        ]
+      },
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "get_weather",
+              "response": {
+                "content": "15 degrees"
+              },
+              "id": "call_abc"
+            }
+          }
+        ]
+      }
+    ],
+    "safetySettings": [
+      {
+        "category": "HARM_CATEGORY_HARASSMENT",
+        "threshold": "OFF"
+      },
+      {
+        "category": "HARM_CATEGORY_HATE_SPEECH",
+        "threshold": "OFF"
+      },
+      {
+        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "threshold": "OFF"
+      },
+      {
+        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "threshold": "OFF"
+      }
+    ],
+    "generationConfig": {
+      "temperature": 0,
+      "topP": 0,
+      "maxOutputTokens": 1024,
+      "responseMimeType": "application/json",
+      "responseSchema": {
+        "properties": {
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary"
+        ],
+        "type": "object"
+      }
+    },
+    "tools": [
+      {
+        "functionDeclarations": [
+          {
+            "description": "Get weather by city",
+            "name": "get_weather",
+            "parameters": {
+              "properties": {
+                "city": {
+                  "type": "STRING"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "type": "OBJECT"
+            }
+          }
+        ]
+      }
+    ],
+    "toolConfig": {
+      "functionCallingConfig": {
+        "mode": "ANY",
+        "allowedFunctionNames": [
+          "get_weather"
+        ]
+      }
+    },
+    "systemInstruction": {
+      "parts": [
+        {
+          "text": "You are a helpful assistant."
         }
       ]
     }
-  ],
-  "systemInstruction": {
-    "parts": [
-      {
-        "text": "You are a helpful assistant."
-      }
-    ]
   }
 }

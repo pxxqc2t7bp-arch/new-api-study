@@ -130,6 +130,28 @@ func TestRedactTaskArtifactAccessAlsoCoversLegacyVideoRoute(t *testing.T) {
 	assert.Equal(t, http.StatusNoContent, recorder.Code)
 }
 
+func TestAppGrantRetrievalRejectsRedactedAccessQuery(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(redactTaskArtifactAccessQuery())
+	router.GET("/v1/videos/:task_id/content", func(c *gin.Context) {
+		if appGrantTaskRetrievalRouteAllowed(c, "openai_video") {
+			c.Status(http.StatusNoContent)
+			return
+		}
+		c.Status(http.StatusForbidden)
+	})
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/v1/videos/task-1/content?access=ambiguous-credential",
+		nil,
+	)
+	request.Header.Set("Authorization", "AppGrant opaque")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	assert.Equal(t, http.StatusForbidden, recorder.Code)
+}
+
 func TestSetUpLoggerNeverWritesTaskArtifactAccess(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	previousWriter := gin.DefaultWriter

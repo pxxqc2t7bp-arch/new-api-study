@@ -2,14 +2,17 @@ package jsplugin
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"maps"
 	"math"
+	"net"
 	"net/url"
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,9 +35,16 @@ const (
 	maxUsageFieldDescriptionRunes = 256
 )
 
+var websiteHostLabelPattern = regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
+
 var pluginKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 var pluginVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)
 var localeTagPattern = regexp.MustCompile(`^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$`)
+
+// ValidPluginKey checks the canonical identifier accepted by plugin manifests.
+func ValidPluginKey(key string) bool {
+	return len(key) <= 30 && pluginKeyPattern.MatchString(key)
+}
 
 // LocalizedText is locale-keyed display copy. Plugin source may use a bare
 // string (normalized to {"en": s}) or a map that must include "en". API
@@ -75,22 +85,50 @@ func (t *LocalizedText) UnmarshalJSON(data []byte) error {
 }
 
 type Meta struct {
-	APIVersion    int                         `json:"apiVersion"`
-	Key           string                      `json:"key"`
-	Name          string                      `json:"name"`
-	Icon          string                      `json:"icon,omitempty"`
-	Description   LocalizedText               `json:"description,omitempty"`
-	Version       string                      `json:"version"`
-	Author        AuthorMeta                  `json:"author"`
-	ChannelTypes  []int                       `json:"channelTypes,omitempty"`
-	Models        []string                    `json:"models"`
-	FetchMode     string                      `json:"fetchMode"`
-	AllowedHosts  []string                    `json:"allowedHosts"`
-	Routes        []Route                     `json:"routes"`
-	Protocols     []ProtocolClaim             `json:"protocols"`
-	UsageSchema   map[string]UsageFieldSchema `json:"usageSchema,omitempty"`
-	UsageExamples []UsageExample              `json:"usageExamples,omitempty"`
-	Auth          AuthMeta                    `json:"auth"`
+	RequiredCapabilities []string                    `json:"requiredCapabilities,omitempty"`
+	SubmitResponseTypes  []string                    `json:"submitResponseTypes,omitempty"`
+	SortPriority         int                         `json:"sortPriority,omitempty"`
+	Website              string                      `json:"website,omitempty"`
+	APIVersion           int                         `json:"apiVersion"`
+	Key                  string                      `json:"key"`
+	Name                 string                      `json:"name"`
+	Icon                 string                      `json:"icon,omitempty"`
+	Description          LocalizedText               `json:"description,omitempty"`
+	Version              string                      `json:"version"`
+	Author               AuthorMeta                  `json:"author"`
+	BaseURL              string                      `json:"baseUrl,omitempty"`
+	ChannelTypes         []int                       `json:"channelTypes,omitempty"`
+	Models               []string                    `json:"models"`
+	FetchMode            string                      `json:"fetchMode"`
+	AllowedHosts         []string                    `json:"allowedHosts"`
+	Routes               []Route                     `json:"routes"`
+	Protocols            []ProtocolClaim             `json:"protocols"`
+	UsageSchema          map[string]UsageFieldSchema `json:"usageSchema,omitempty"`
+	UsageExamples        []UsageExample              `json:"usageExamples,omitempty"`
+	UsageProfiles        []UsageProfile              `json:"usageProfiles,omitempty"`
+	Auth                 AuthMeta                    `json:"auth"`
+}
+
+// UsageProfile replaces the plugin's default usage metadata for its models.
+type UsageProfile struct {
+	Models   []string                    `json:"models"`
+	Schema   map[string]UsageFieldSchema `json:"schema"`
+	Examples []UsageExample              `json:"examples,omitempty"`
+}
+
+// UsageForModel returns read-only usage metadata for a declared model. Aliases
+// must be resolved by the host first; an unknown or ambiguous model uses the
+// plugin defaults. Profile examples never inherit the default examples.
+func (m Meta) UsageForModel(model string) (map[string]UsageFieldSchema, []UsageExample) {
+	folded := asciiFold(model)
+	for _, profile := range m.UsageProfiles {
+		for _, declared := range profile.Models {
+			if asciiFold(declared) == folded {
+				return profile.Schema, profile.Examples
+			}
+		}
+	}
+	return m.UsageSchema, m.UsageExamples
 }
 
 // ProtocolSupports reports whether the named protocol claim includes mode.
@@ -123,15 +161,23 @@ type AuthMeta struct {
 // influence billing. Numeric facts use one of the host-owned canonical units;
 // boolean facts are flags; enum facts constrain non-numeric pricing selectors.
 type UsageFieldSchema struct {
-	Type        string        `json:"type,omitempty"`
-	Unit        string        `json:"unit,omitempty"`
-	Enum        []string      `json:"enum,omitempty"`
-	Description LocalizedText `json:"description,omitempty"`
+	Type        string                   `json:"type,omitempty"`
+	Unit        string                   `json:"unit,omitempty"`
+	UnitLabel   LocalizedText            `json:"unitLabel,omitempty"`
+	Enum        []string                 `json:"enum,omitempty"`
+	Description LocalizedText            `json:"description,omitempty"`
+	EnumLabels  map[string]LocalizedText `json:"enumLabels,omitempty"`
 }
 
 type LoadedPlugin struct {
-	Meta   Meta
-	Engine *Engine
+	Meta         Meta
+	Engine       *Engine
+	sourceSHA256 string
+}
+
+// SourceSHA256 identifies the exact source compiled into this runtime.
+func (p *LoadedPlugin) SourceSHA256() string {
+	return p.sourceSHA256
 }
 
 // RegistrySnapshot is a read-only copy of the metadata currently stored in
@@ -259,6 +305,13 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 	engine.key = meta.Key
 	engine.version = meta.Version
 	requiredHooks := []string{"buildSubmitRequest", "parseSubmitResponse", "parseTaskResult"}
+	if slices.Contains(meta.SubmitResponseTypes, "sse") {
+		if slices.Contains(meta.RequiredCapabilities, CapabilitySubmitSSEDelta) {
+			requiredHooks = append(requiredHooks, "parseSubmitEventDelta")
+		} else {
+			requiredHooks = append(requiredHooks, "parseSubmitEvent")
+		}
+	}
 	if meta.FetchMode == "batch" {
 		requiredHooks = append(requiredHooks, "buildBatchQueryRequest", "parseBatchResult")
 	} else {
@@ -435,7 +488,7 @@ func CompilePlugin(source string, options Options) (*LoadedPlugin, error) {
 			return nil, fmt.Errorf("plugin %s export %q is no longer supported", meta.Key, removed)
 		}
 	}
-	return &LoadedPlugin{Meta: meta, Engine: engine}, nil
+	return &LoadedPlugin{Meta: meta, Engine: engine, sourceSHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(source)))}, nil
 }
 
 func (r *Registry) Get(platform string) (*LoadedPlugin, bool) {
@@ -829,6 +882,8 @@ func (r *Registry) Snapshot() RegistrySnapshot {
 }
 
 func cloneMeta(meta Meta) Meta {
+	meta.SubmitResponseTypes = slices.Clone(meta.SubmitResponseTypes)
+	meta.RequiredCapabilities = slices.Clone(meta.RequiredCapabilities)
 	meta.ChannelTypes = append([]int(nil), meta.ChannelTypes...)
 	meta.Models = append([]string(nil), meta.Models...)
 	meta.AllowedHosts = append([]string(nil), meta.AllowedHosts...)
@@ -844,24 +899,46 @@ func cloneMeta(meta Meta) Meta {
 	if meta.Description != nil {
 		meta.Description = maps.Clone(meta.Description)
 	}
-	if meta.UsageSchema != nil {
-		usageSchema := make(map[string]UsageFieldSchema, len(meta.UsageSchema))
-		for key, field := range meta.UsageSchema {
-			if field.Enum != nil {
-				field.Enum = append([]string{}, field.Enum...)
-			}
-			if field.Description != nil {
-				field.Description = maps.Clone(field.Description)
-			}
-			usageSchema[key] = field
-		}
-		meta.UsageSchema = usageSchema
+	meta.UsageSchema = CloneUsageSchema(meta.UsageSchema)
+	meta.UsageExamples = CloneUsageExamples(meta.UsageExamples)
+	meta.UsageProfiles = append([]UsageProfile(nil), meta.UsageProfiles...)
+	for index := range meta.UsageProfiles {
+		profile := &meta.UsageProfiles[index]
+		profile.Models = append([]string(nil), profile.Models...)
+		profile.Schema = CloneUsageSchema(profile.Schema)
+		profile.Examples = CloneUsageExamples(profile.Examples)
 	}
-	meta.UsageExamples = cloneUsageExamples(meta.UsageExamples)
 	return meta
 }
 
-func cloneUsageExamples(examples []UsageExample) []UsageExample {
+// CloneUsageSchema copies schema fields and localized metadata for independent readers.
+func CloneUsageSchema(schema map[string]UsageFieldSchema) map[string]UsageFieldSchema {
+	if schema == nil {
+		return nil
+	}
+	cloned := make(map[string]UsageFieldSchema, len(schema))
+	for key, field := range schema {
+		if field.Enum != nil {
+			field.Enum = append([]string{}, field.Enum...)
+		}
+		if field.Description != nil {
+			field.Description = maps.Clone(field.Description)
+		}
+		field.UnitLabel = maps.Clone(field.UnitLabel)
+		if field.EnumLabels != nil {
+			labels := make(map[string]LocalizedText, len(field.EnumLabels))
+			for value, label := range field.EnumLabels {
+				labels[value] = maps.Clone(label)
+			}
+			field.EnumLabels = labels
+		}
+		cloned[key] = field
+	}
+	return cloned
+}
+
+// CloneUsageExamples copies example facts for independent readers.
+func CloneUsageExamples(examples []UsageExample) []UsageExample {
 	if examples == nil {
 		return nil
 	}
@@ -939,6 +1016,15 @@ func (r *Registry) resolveActiveOverrides(
 	return active
 }
 
+// UnknownMetaFieldError identifies a manifest field unsupported by this host.
+type UnknownMetaFieldError struct {
+	Field string
+}
+
+func (e *UnknownMetaFieldError) Error() string {
+	return fmt.Sprintf("plugin meta has unknown field %q", e.Field)
+}
+
 func decodeMeta(value any) (Meta, error) {
 	object, ok := value.(map[string]any)
 	if !ok {
@@ -946,9 +1032,9 @@ func decodeMeta(value any) (Meta, error) {
 	}
 	for field := range object {
 		switch field {
-		case "apiVersion", "key", "name", "icon", "description", "version", "author", "channelTypes", "channelType", "compatibleChannelTypes", "models", "fetchMode", "allowedHosts", "routes", "protocols", "usageSchema", "usageExamples", "auth", "endpoints", "submitPaths", "actions":
+		case "requiredCapabilities", "submitResponseTypes", "sortPriority", "website", "apiVersion", "key", "name", "icon", "description", "version", "author", "baseUrl", "channelTypes", "channelType", "compatibleChannelTypes", "models", "fetchMode", "allowedHosts", "routes", "protocols", "usageSchema", "usageExamples", "usageProfiles", "auth", "endpoints", "submitPaths", "actions":
 		default:
-			return Meta{}, fmt.Errorf("plugin meta has unknown field %q", field)
+			return Meta{}, &UnknownMetaFieldError{Field: field}
 		}
 	}
 	meta := Meta{}
@@ -964,6 +1050,12 @@ func decodeMeta(value any) (Meta, error) {
 		return Meta{}, err
 	}
 	if meta.Icon, err = stringMetaField(object, "icon"); err != nil {
+		return Meta{}, err
+	}
+	if meta.SortPriority, err = integerMetaField(object, "sortPriority"); err != nil {
+		return Meta{}, err
+	}
+	if meta.Website, err = stringMetaField(object, "website"); err != nil {
 		return Meta{}, err
 	}
 	meta.Icon = strings.TrimSpace(meta.Icon)
@@ -991,6 +1083,9 @@ func decodeMeta(value any) (Meta, error) {
 			return Meta{}, fmt.Errorf("plugin meta author field %q must be a string", "url")
 		}
 	}
+	if meta.BaseURL, err = stringMetaField(object, "baseUrl"); err != nil {
+		return Meta{}, err
+	}
 	if _, exists := object["channelType"]; exists {
 		return Meta{}, fmt.Errorf("plugin meta channelType is no longer supported; declare channelTypes instead")
 	}
@@ -1002,6 +1097,27 @@ func decodeMeta(value any) (Meta, error) {
 		return Meta{}, err
 	}
 	if meta.FetchMode, err = stringMetaField(object, "fetchMode"); err != nil {
+		return Meta{}, err
+	}
+	meta.SubmitResponseTypes = []string{"json"}
+	if _, present := object["submitResponseTypes"]; present {
+		meta.SubmitResponseTypes, err = strictStringSlice(object, "submitResponseTypes")
+		if err != nil {
+			return Meta{}, err
+		}
+		if len(meta.SubmitResponseTypes) == 0 {
+			return Meta{}, fmt.Errorf("submitResponseTypes must not be empty")
+		}
+		seen := make(map[string]bool)
+		for _, kind := range meta.SubmitResponseTypes {
+			if (kind != "json" && kind != "sse") || seen[kind] {
+				return Meta{}, fmt.Errorf("invalid or duplicate submitResponseTypes value %q", kind)
+			}
+			seen[kind] = true
+		}
+	}
+	meta.RequiredCapabilities, err = strictStringSlice(object, "requiredCapabilities")
+	if err != nil {
 		return Meta{}, err
 	}
 	meta.Models, err = strictStringSlice(object, "models")
@@ -1031,6 +1147,12 @@ func decodeMeta(value any) (Meta, error) {
 	}
 	if usageExamples, exists := object["usageExamples"]; exists {
 		meta.UsageExamples, err = decodeUsageExamples(usageExamples)
+		if err != nil {
+			return Meta{}, err
+		}
+	}
+	if usageProfiles, exists := object["usageProfiles"]; exists {
+		meta.UsageProfiles, err = decodeUsageProfiles(usageProfiles)
 		if err != nil {
 			return Meta{}, err
 		}
@@ -1084,6 +1206,48 @@ func ValidateV1Meta(meta Meta) error {
 }
 
 func normalizeV1Meta(meta *Meta) error {
+	seenCapabilities := make(map[string]bool, len(meta.RequiredCapabilities))
+	for _, name := range meta.RequiredCapabilities {
+		if !HasCapability(name) || seenCapabilities[name] {
+			return fmt.Errorf("unsupported or duplicate required capability %q", name)
+		}
+		if name == CapabilitySubmitSSEDelta && !slices.Contains(meta.SubmitResponseTypes, "sse") {
+			return fmt.Errorf("%s requires submitResponseTypes to include sse", name)
+		}
+		seenCapabilities[name] = true
+	}
+	if meta.SortPriority < math.MinInt32 || meta.SortPriority > math.MaxInt32 {
+		return fmt.Errorf("plugin meta sortPriority must be a signed 32-bit integer")
+	}
+	meta.Website = strings.TrimSpace(meta.Website)
+	if meta.Website != "" {
+		parsed, err := url.Parse(meta.Website)
+		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.Opaque != "" {
+			return fmt.Errorf("plugin meta website must be an absolute HTTPS URL without credentials")
+		}
+		for _, character := range meta.Website {
+			if unicode.IsSpace(character) || unicode.IsControl(character) || character == '\\' {
+				return fmt.Errorf("plugin meta website must not contain whitespace, control characters, or backslashes")
+			}
+		}
+		host := strings.TrimSuffix(parsed.Hostname(), ".")
+		if net.ParseIP(host) == nil {
+			if len(host) > 253 || host == "" {
+				return fmt.Errorf("plugin meta website must have a valid hostname")
+			}
+			for label := range strings.SplitSeq(host, ".") {
+				if !websiteHostLabelPattern.MatchString(label) {
+					return fmt.Errorf("plugin meta website must have a valid ASCII hostname; use punycode for internationalized domains")
+				}
+			}
+		}
+		if port := parsed.Port(); port != "" {
+			number, err := strconv.Atoi(port)
+			if err != nil || number < 0 || number > 65535 {
+				return fmt.Errorf("plugin meta website has an invalid port")
+			}
+		}
+	}
 	if meta.APIVersion != APIVersion1 {
 		return fmt.Errorf("unsupported plugin apiVersion %d", meta.APIVersion)
 	}
@@ -1091,6 +1255,9 @@ func normalizeV1Meta(meta *Meta) error {
 		return fmt.Errorf("plugin meta name is required")
 	}
 	meta.Icon = strings.TrimSpace(meta.Icon)
+	if strings.HasPrefix(meta.Icon, "data:") || strings.Contains(meta.Icon, "://") {
+		return fmt.Errorf("plugin meta icon must be a LobeHub icon name or text; ship an image logo as an icon.svg or icon.png file next to plugin.js instead")
+	}
 	if meta.Icon != "" {
 		if utf8.RuneCountInString(meta.Icon) > 128 {
 			return fmt.Errorf("plugin meta icon must not exceed 128 characters")
@@ -1115,11 +1282,19 @@ func normalizeV1Meta(meta *Meta) error {
 			return fmt.Errorf("plugin meta author url must be an absolute HTTP(S) URL")
 		}
 	}
-	if !pluginKeyPattern.MatchString(meta.Key) {
-		return fmt.Errorf("plugin meta key must match %s", pluginKeyPattern)
+	meta.BaseURL = strings.TrimSpace(meta.BaseURL)
+	if meta.BaseURL != "" {
+		normalized, err := normalizeMetaBaseURL(meta.BaseURL)
+		if err != nil {
+			return err
+		}
+		meta.BaseURL = normalized
 	}
 	if len(meta.Key) > 30 {
 		return fmt.Errorf("plugin meta key must not exceed 30 characters")
+	}
+	if !ValidPluginKey(meta.Key) {
+		return fmt.Errorf("plugin meta key must match %s", pluginKeyPattern)
 	}
 	if !pluginVersionPattern.MatchString(meta.Version) {
 		return fmt.Errorf("plugin meta version must be semver")
@@ -1157,14 +1332,16 @@ func normalizeV1Meta(meta *Meta) error {
 		models[model] = struct{}{}
 	}
 	hosts := make(map[string]struct{}, len(meta.AllowedHosts))
-	for _, host := range meta.AllowedHosts {
-		if strings.TrimSpace(host) == "" || strings.ContainsAny(host, "/:?#") {
-			return fmt.Errorf("plugin meta allowedHosts must contain hostnames without schemes, ports, or paths")
+	for index, host := range meta.AllowedHosts {
+		normalized, err := normalizeAllowedHost(host)
+		if err != nil {
+			return err
 		}
-		if _, exists := hosts[host]; exists {
+		if _, exists := hosts[normalized]; exists {
 			return fmt.Errorf("plugin meta allowedHosts must be unique")
 		}
-		hosts[host] = struct{}{}
+		hosts[normalized] = struct{}{}
+		meta.AllowedHosts[index] = normalized
 	}
 	routeKeys := make(map[string]struct{}, len(meta.Routes))
 	for index := range meta.Routes {
@@ -1239,7 +1416,44 @@ func normalizeV1Meta(meta *Meta) error {
 			}
 		}
 	}
-	for name, field := range meta.UsageSchema {
+	if err := validateUsageSchema(meta.UsageSchema); err != nil {
+		return err
+	}
+	if err := validateUsageExamples(meta.UsageSchema, meta.UsageExamples); err != nil {
+		return err
+	}
+	profileModels := make(map[string]struct{})
+	for index, profile := range meta.UsageProfiles {
+		if len(profile.Models) == 0 {
+			return fmt.Errorf("plugin meta usageProfiles[%d] models must contain at least one model", index)
+		}
+		if err := validateModelScope(profile.Models, fmt.Sprintf("usageProfiles[%d]", index)); err != nil {
+			return err
+		}
+		for _, model := range profile.Models {
+			if _, exists := models[model]; !exists {
+				return fmt.Errorf("plugin meta usageProfiles[%d] model %q is not declared in plugin meta models", index, model)
+			}
+			if _, duplicate := profileModels[model]; duplicate {
+				return fmt.Errorf("plugin meta usageProfiles model %q belongs to multiple profiles", model)
+			}
+			profileModels[model] = struct{}{}
+		}
+		if profile.Schema == nil {
+			return fmt.Errorf("plugin meta usageProfiles[%d] schema must be an object", index)
+		}
+		if err := validateUsageSchema(profile.Schema); err != nil {
+			return fmt.Errorf("plugin meta usageProfiles[%d]: %w", index, err)
+		}
+		if err := validateUsageExamples(profile.Schema, profile.Examples); err != nil {
+			return fmt.Errorf("plugin meta usageProfiles[%d]: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func validateUsageSchema(schema map[string]UsageFieldSchema) error {
+	for name, field := range schema {
 		if strings.TrimSpace(name) == "" || strings.TrimSpace(name) != name {
 			return fmt.Errorf("plugin meta usageSchema keys must be non-empty canonical names")
 		}
@@ -1247,10 +1461,43 @@ func normalizeV1Meta(meta *Meta) error {
 			return err
 		}
 	}
-	if err := validateUsageExamples(meta.UsageSchema, meta.UsageExamples); err != nil {
-		return err
-	}
 	return nil
+}
+
+func decodeUsageProfiles(value any) ([]UsageProfile, error) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("plugin meta usageProfiles must be an array")
+	}
+	profiles := make([]UsageProfile, 0, len(items))
+	for index, item := range items {
+		object, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("plugin meta usageProfiles[%d] must be an object", index)
+		}
+		for key := range object {
+			if key != "models" && key != "schema" && key != "examples" {
+				return nil, fmt.Errorf("plugin meta usageProfiles[%d] has unknown field %q", index, key)
+			}
+		}
+		models, err := strictStringSlice(object, "models")
+		if err != nil {
+			return nil, fmt.Errorf("plugin meta usageProfiles[%d]: %w", index, err)
+		}
+		schema, err := decodeUsageSchema(object["schema"])
+		if err != nil {
+			return nil, fmt.Errorf("plugin meta usageProfiles[%d]: %w", index, err)
+		}
+		profile := UsageProfile{Models: models, Schema: schema}
+		if examples, exists := object["examples"]; exists {
+			profile.Examples, err = decodeUsageExamples(examples)
+			if err != nil {
+				return nil, fmt.Errorf("plugin meta usageProfiles[%d]: %w", index, err)
+			}
+		}
+		profiles = append(profiles, profile)
+	}
+	return profiles, nil
 }
 
 func decodeUsageSchema(value any) (map[string]UsageFieldSchema, error) {
@@ -1269,7 +1516,7 @@ func decodeUsageSchema(value any) (map[string]UsageFieldSchema, error) {
 		}
 		for key := range fieldObject {
 			switch key {
-			case "type", "unit", "enum", "description":
+			case "type", "unit", "unitLabel", "enum", "description", "enumLabels":
 			default:
 				return nil, fmt.Errorf("plugin meta usageSchema field %q has unknown property %q", name, key)
 			}
@@ -1282,12 +1529,29 @@ func decodeUsageSchema(value any) (map[string]UsageFieldSchema, error) {
 		if field.Unit, err = stringMetaField(fieldObject, "unit"); err != nil {
 			return nil, err
 		}
+		if field.UnitLabel, err = localizedTextMetaField(fieldObject, "unitLabel", maxUsageFieldDescriptionRunes); err != nil {
+			return nil, err
+		}
 		if field.Description, err = localizedTextMetaField(fieldObject, "description", maxUsageFieldDescriptionRunes); err != nil {
 			return nil, err
 		}
 		if _, exists := fieldObject["enum"]; exists {
 			if field.Enum, err = strictStringSlice(fieldObject, "enum"); err != nil {
 				return nil, err
+			}
+		}
+		if rawLabels, exists := fieldObject["enumLabels"]; exists {
+			labels, ok := rawLabels.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("plugin meta usageSchema field %q enumLabels must be an object", name)
+			}
+			field.EnumLabels = make(map[string]LocalizedText, len(labels))
+			for value := range labels {
+				label, err := localizedTextMetaField(labels, value, maxUsageFieldDescriptionRunes)
+				if err != nil {
+					return nil, fmt.Errorf("plugin meta usageSchema field %q enumLabels: %w", name, err)
+				}
+				field.EnumLabels[value] = label
 			}
 		}
 		if err = validateUsageFieldSchema(name, field); err != nil {
@@ -1299,8 +1563,19 @@ func decodeUsageSchema(value any) (map[string]UsageFieldSchema, error) {
 }
 
 func validateUsageFieldSchema(name string, field UsageFieldSchema) error {
+	if field.UnitLabel != nil {
+		if field.Type != "number" || field.Unit != "count" || field.Enum != nil {
+			return fmt.Errorf("plugin meta usageSchema field %q unitLabel requires a number field with count unit", name)
+		}
+		if err := validateLocalizedText(field.UnitLabel, fmt.Sprintf("usageSchema field %q unitLabel", name), maxUsageFieldDescriptionRunes); err != nil {
+			return err
+		}
+	}
 	if err := validateLocalizedText(field.Description, fmt.Sprintf("usageSchema field %q description", name), maxUsageFieldDescriptionRunes); err != nil {
 		return err
+	}
+	if field.EnumLabels != nil && field.Enum == nil {
+		return fmt.Errorf("plugin meta usageSchema field %q enumLabels requires enum", name)
 	}
 	if field.Enum != nil {
 		if field.Type != "" || field.Unit != "" {
@@ -1315,6 +1590,17 @@ func validateUsageFieldSchema(name string, field UsageFieldSchema) error {
 				return fmt.Errorf("plugin meta usageSchema field %q enum values must be unique", name)
 			}
 			values[value] = struct{}{}
+		}
+		for value, label := range field.EnumLabels {
+			if _, exists := values[value]; !exists {
+				return fmt.Errorf("plugin meta usageSchema field %q enumLabels has undeclared enum value %q", name, value)
+			}
+			if label == nil {
+				return fmt.Errorf("plugin meta usageSchema field %q enumLabels value %q must include a non-empty label", name, value)
+			}
+			if err := validateLocalizedText(label, fmt.Sprintf("usageSchema field %q enumLabels value %q", name, value), maxUsageFieldDescriptionRunes); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -1638,6 +1924,94 @@ func integerSliceMetaField(object map[string]any, name string) ([]int, error) {
 	return numbers, nil
 }
 
+// MaxMetaBaseURLLength bounds a normalized plugin default base URL. The value
+// is persisted into channel.base_url, which the pinned MySQL driver creates as
+// varchar(191); a longer default would store on SQLite and PostgreSQL but fail
+// on MySQL.
+const MaxMetaBaseURLLength = 191
+
+// normalizeMetaBaseURL admits an absolute http(s) URL that a channel can adopt
+// verbatim as its base URL: no credentials, query, or fragment, an ASCII
+// lowercase host, and no trailing slash so plugins can concatenate paths.
+func normalizeMetaBaseURL(raw string) (string, error) {
+	for _, character := range raw {
+		if unicode.IsSpace(character) || unicode.IsControl(character) {
+			return "", fmt.Errorf("plugin meta baseUrl must not contain whitespace or control characters")
+		}
+	}
+	if strings.ContainsAny(raw, "?#") {
+		return "", fmt.Errorf("plugin meta baseUrl must not contain a query or fragment")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Opaque != "" || parsed.Host == "" || parsed.Hostname() == "" {
+		return "", fmt.Errorf("plugin meta baseUrl must be an absolute HTTP(S) URL")
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("plugin meta baseUrl must use the http or https scheme")
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("plugin meta baseUrl must not contain credentials")
+	}
+	hostname := parsed.Hostname()
+	for _, character := range hostname {
+		if character > unicode.MaxASCII {
+			return "", fmt.Errorf("plugin meta baseUrl host must be ASCII; use punycode for internationalized domains")
+		}
+	}
+	host := strings.ToLower(hostname)
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port := parsed.Port(); port != "" {
+		host += ":" + port
+	}
+	normalized := scheme + "://" + host + strings.TrimRight(parsed.EscapedPath(), "/")
+	if len(normalized) > MaxMetaBaseURLLength {
+		return "", fmt.Errorf("plugin meta baseUrl must not exceed %d characters", MaxMetaBaseURLLength)
+	}
+	return normalized, nil
+}
+
+// normalizeAllowedHost accepts "host" or "host:port" (IPv6 literals bracketed)
+// and rejects schemes, paths, credentials, and queries so the entry stays a
+// pure host match for ValidateRequestURL.
+func normalizeAllowedHost(raw string) (string, error) {
+	entry := strings.TrimSpace(raw)
+	if entry == "" || strings.ContainsAny(entry, "/?#@") {
+		return "", fmt.Errorf("plugin meta allowedHosts must contain hostnames (optionally with a port) without schemes, paths, or credentials")
+	}
+	host, port := entry, ""
+	if splitHost, splitPort, err := net.SplitHostPort(entry); err == nil {
+		host, port = splitHost, splitPort
+	} else if strings.HasPrefix(entry, "[") && strings.HasSuffix(entry, "]") {
+		host = entry[1 : len(entry)-1]
+	}
+	if host == "" {
+		return "", fmt.Errorf("plugin meta allowedHosts must contain hostnames (optionally with a port) without schemes, paths, or credentials")
+	}
+	for _, character := range host {
+		if character > unicode.MaxASCII || unicode.IsSpace(character) || unicode.IsControl(character) {
+			return "", fmt.Errorf("plugin meta allowedHosts must contain ASCII hostnames; use punycode for internationalized domains")
+		}
+	}
+	host = strings.ToLower(host)
+	if strings.Contains(host, ":") {
+		if net.ParseIP(host) == nil {
+			return "", fmt.Errorf("plugin meta allowedHosts entries must be host or host:port; IPv6 literals must be bracketed")
+		}
+		host = "[" + host + "]"
+	}
+	if port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return "", fmt.Errorf("plugin meta allowedHosts port must be between 1 and 65535")
+		}
+		host += ":" + port
+	}
+	return host, nil
+}
+
 func stringMetaField(object map[string]any, name string) (string, error) {
 	value, exists := object[name]
 	if !exists {
@@ -1713,9 +2087,7 @@ func validateLocalizedText(text LocalizedText, name string, maxRunes int) error 
 	for locale := range text {
 		delete(text, locale)
 	}
-	for locale, value := range canonical {
-		text[locale] = value
-	}
+	maps.Copy(text, canonical)
 	return nil
 }
 

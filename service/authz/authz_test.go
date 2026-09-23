@@ -1,10 +1,14 @@
 package authz
 
 import (
+	"encoding/json"
+	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -34,16 +38,20 @@ func TestInitSeedsBuiltInRolesAndPoliciesOnce(t *testing.T) {
 	require.NoError(t, Init(db))
 
 	// root is a superuser role and is granted everything implicitly, so only the
-	// admin baseline is written as explicit policy rows.
+	// non-superuser baselines are written as explicit policy rows.
 	var count int64
 	require.NoError(t, db.Model(&model.CasbinRule{}).Count(&count).Error)
-	assert.Equal(t, int64(len(PermissionsForRole(BuiltInRoleAdmin))), count)
+	assert.Equal(t, int64(
+		len(PermissionsForRole(BuiltInRoleAdmin))+
+			len(PermissionsForRole(BuiltInRolePluginAdmin)),
+	), count)
 
 	var roles []model.AuthzRole
 	require.NoError(t, db.Order("sort asc").Find(&roles).Error)
-	require.Len(t, roles, 2)
+	require.Len(t, roles, 3)
 	assert.Equal(t, BuiltInRoleRoot, roles[0].Key)
 	assert.Equal(t, BuiltInRoleAdmin, roles[1].Key)
+	assert.Equal(t, BuiltInRolePluginAdmin, roles[2].Key)
 
 	assert.True(t, Can(1, common.RoleRootUser, ChannelSensitiveWrite))
 	assert.True(t, Can(2, common.RoleAdminUser, ChannelRead))
@@ -77,6 +85,55 @@ func TestInitOnSlaveOnlyLoadsPolicies(t *testing.T) {
 	assert.False(t, Can(2, common.RoleAdminUser, ChannelRead))
 }
 
+func TestLegacyScopedPoliciesDoNotExpandPermissions(t *testing.T) {
+	for _, master := range []bool{true, false} {
+		name := "master"
+		if !master {
+			name = "slave"
+		}
+		t.Run(name, func(t *testing.T) {
+			db := newAuthzTestDB(t)
+			common.IsMasterNode = master
+			rules := []model.CasbinRule{
+				{Ptype: "p", V0: "role:vendor", V1: "channel", V2: "read", V3: "allow", V4: "own"},
+				{Ptype: "p", V0: UserSubject(42), V1: "channel", V2: "read", V3: "allow", V4: "own"},
+				{Ptype: "p", V0: UserSubject(43), V1: "channel", V2: "sensitive_write", V3: "allow", V4: "all"},
+				{Ptype: "p", V0: UserSubject(44), V1: "channel", V2: "secret_view", V3: "deny", V4: "all"},
+				{Ptype: "p", V0: UserSubject(45), V1: "channel", V2: "read"},
+				{Ptype: "p", V0: UserSubject(46), V1: "channel", V2: "read", V3: "allow", V4: "unknown-scope"},
+				{Ptype: "p", V0: UserSubject(47), V1: "channel", V2: "read", V3: "allow", V5: "own"},
+				{Ptype: "p", V0: UserSubject(48), V1: "channel", V2: "read", V3: "allow", V4: "own"},
+				{Ptype: "p", V0: UserSubject(48), V1: "channel", V2: "read", V3: "allow", V4: "all"},
+				{Ptype: "p", V0: RoleSubject(BuiltInRoleAdmin), V1: "channel", V2: "operate", V3: "allow", V4: "own"},
+				{Ptype: "p", V0: UserSubject(50), V1: "channel", V2: "sensitive_write", V3: "allow"},
+				{Ptype: "g", V0: UserSubject(99), V1: RoleSubject(BuiltInRoleAdmin)},
+			}
+			require.NoError(t, db.Create(&rules).Error)
+			ids := make([]uint, len(rules))
+			for i := range rules {
+				ids[i] = rules[i].Id
+			}
+			for range 2 {
+				require.NoError(t, Init(db))
+				require.NoError(t, ReloadPolicy())
+				assert.False(t, Can(42, common.RoleAdminUser, ChannelRead), "own must not fall back to the admin allow baseline")
+				assert.True(t, Can(43, common.RoleAdminUser, ChannelSensitiveWrite))
+				assert.False(t, Can(44, common.RoleAdminUser, ChannelSecretView))
+				assert.True(t, Can(45, common.RoleAdminUser, ChannelRead))
+				for _, userID := range []int{46, 47, 48} {
+					assert.False(t, Can(userID, common.RoleAdminUser, ChannelRead))
+				}
+				assert.False(t, Can(51, common.RoleAdminUser, ChannelOperate), "reseed must not erase a scoped role restriction")
+				assert.True(t, Can(50, common.RoleAdminUser, ChannelSensitiveWrite))
+				assert.False(t, Can(99, common.RoleCommonUser, ChannelRead))
+				var stored []model.CasbinRule
+				require.NoError(t, db.Where("id IN ?", ids).Order("id").Find(&stored).Error)
+				assert.Equal(t, rules, stored, "legacy rows must remain available for administrator review")
+			}
+		})
+	}
+}
+
 func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 	db := newAuthzTestDB(t)
 	require.NoError(t, Init(db))
@@ -108,6 +165,10 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 		ResourceTaskPlugin: {
 			ActionBind: false,
 		},
+		ResourceAppPlugin: {
+			ActionManage: false,
+		},
+		ResourceAudit: {ActionRead: false},
 	}, ExplicitUserPermissions(42))
 	assert.Equal(t, PermissionsMap{
 		ResourceChannel: {
@@ -139,6 +200,10 @@ func TestSetUserPermissionsStoresOnlyOverrides(t *testing.T) {
 		ResourceTaskPlugin: {
 			ActionBind: false,
 		},
+		ResourceAppPlugin: {
+			ActionManage: false,
+		},
+		ResourceAudit: {ActionRead: false},
 	}, ExplicitUserPermissions(42))
 	assert.Empty(t, ExplicitUserOverrides(42))
 }
@@ -233,6 +298,7 @@ func TestCapabilitiesUseCatalogShape(t *testing.T) {
 	assert.False(t, capabilities[ResourceChannel][ActionSensitiveWrite])
 	assert.False(t, capabilities[ResourceChannel][ActionSecretView])
 	assert.False(t, capabilities[ResourceTaskPlugin][ActionBind])
+	assert.False(t, capabilities[ResourceAppPlugin][ActionManage])
 }
 
 func TestTaskPluginBindIsRootOnlyUntilGranted(t *testing.T) {
@@ -268,4 +334,115 @@ func TestTaskPluginBindIsRootOnlyUntilGranted(t *testing.T) {
 	_, err = enforcer.RemovePolicy(RoleSubject(BuiltInRoleAdmin), ResourceTaskPlugin, ActionBind, EffectAllow)
 	require.NoError(t, err)
 	assert.False(t, Can(2, common.RoleAdminUser, TaskPluginBind))
+}
+
+func TestAppPluginFlagsDefaultOff(t *testing.T) {
+	assert.False(t, operation_setting.AppPluginV1Enabled)
+	assert.False(t, operation_setting.AppPluginSeedanceEnabled)
+	assert.False(t, operation_setting.AppPluginEmbeddedSurfaceEnabled)
+	assert.False(t, operation_setting.AppExecutionGrantsEnabled)
+}
+
+func TestPluginAdminHasOnlyAppPluginManage(t *testing.T) {
+	db := newAuthzTestDB(t)
+	require.NoError(t, Init(db))
+
+	assert.Equal(t, 5, common.RolePluginAdminUser)
+	assert.True(t, common.IsValidateRole(common.RolePluginAdminUser))
+	assert.True(t, Can(42, common.RolePluginAdminUser, AppPluginManage))
+	assert.False(t, Can(42, common.RolePluginAdminUser, ChannelRead))
+	assert.False(t, Can(42, common.RolePluginAdminUser, AuditRead))
+	assert.False(t, Can(42, common.RolePluginAdminUser, TaskPluginBind))
+
+	assert.Equal(t, []Permission{AppPluginManage}, PermissionsForRole(BuiltInRolePluginAdmin))
+
+	var pluginAdmin *RoleDescriptor
+	for _, role := range Roles() {
+		if role.Key == BuiltInRolePluginAdmin {
+			role := role
+			pluginAdmin = &role
+			break
+		}
+	}
+	require.NotNil(t, pluginAdmin)
+	assert.False(t, pluginAdmin.Superuser)
+	assert.Equal(t, PermissionsMap{
+		ResourceChannel: {
+			ActionRead:           false,
+			ActionOperate:        false,
+			ActionWrite:          false,
+			ActionSensitiveWrite: false,
+			ActionSecretView:     false,
+		},
+		ResourceTaskPlugin: {
+			ActionBind: false,
+		},
+		ResourceAudit: {
+			ActionRead: false,
+		},
+		ResourceAppPlugin: {
+			ActionManage: true,
+		},
+	}, pluginAdmin.Grants)
+
+	var policies []model.CasbinRule
+	require.NoError(t, db.Where("v0 = ?", RoleSubject(BuiltInRolePluginAdmin)).Find(&policies).Error)
+	require.Len(t, policies, 1)
+	assert.Equal(t, ResourceAppPlugin, policies[0].V1)
+	assert.Equal(t, ActionManage, policies[0].V2)
+	assert.Equal(t, EffectAllow, policies[0].V3)
+
+	root, ok := roleSpec(BuiltInRoleRoot)
+	require.True(t, ok)
+	assert.True(t, roleGrants(root)[ResourceAppPlugin][ActionManage])
+	assert.NotContains(t, PermissionsForRole(BuiltInRoleAdmin), AppPluginManage)
+	assert.NotContains(t, PermissionsForRole(BuiltInRoleAdmin), AuditRead)
+}
+
+func TestAppPluginErrorsUseStableEnvelope(t *testing.T) {
+	const (
+		privateDetail = "secret-token plugin-object-123"
+		requestID     = "request-app-plugin-123"
+	)
+	tests := []struct {
+		name       string
+		code       AppPluginErrorCode
+		stableCode string
+		message    string
+		retryable  bool
+		statusCode int
+	}{
+		{name: "feature disabled", code: AppPluginErrorCodeFeatureDisabled, stableCode: "app_plugin_disabled", message: "App plugin API is disabled", statusCode: http.StatusForbidden},
+		{name: "invalid request", code: AppPluginErrorCodeInvalidRequest, stableCode: "invalid_request", message: "Invalid app plugin request", statusCode: http.StatusBadRequest},
+		{name: "permission denied", code: AppPluginErrorCodePermissionDenied, stableCode: "not_found", message: "App plugin not found", statusCode: http.StatusNotFound},
+		{name: "not found", code: AppPluginErrorCodeNotFound, stableCode: "not_found", message: "App plugin not found", statusCode: http.StatusNotFound},
+		{name: "conflict", code: AppPluginErrorCodeConflict, stableCode: "app_version_conflict", message: "App plugin state conflict", statusCode: http.StatusConflict},
+		{name: "internal", code: AppPluginErrorCodeInternal, stableCode: "service_unavailable", message: "App plugin request failed", retryable: true, statusCode: http.StatusServiceUnavailable},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			envelope := NewAppPluginError(test.code, requestID, errors.New(privateDetail))
+			assert.Equal(t, test.statusCode, envelope.StatusCode)
+			encoded, err := json.Marshal(envelope)
+			require.NoError(t, err)
+			expected, err := json.Marshal(map[string]any{
+				"error": map[string]any{
+					"code":         test.stableCode,
+					"message":      test.message,
+					"field_errors": []any{},
+					"retryable":    test.retryable,
+					"request_id":   requestID,
+				},
+			})
+			require.NoError(t, err)
+			assert.JSONEq(t, string(expected), string(encoded))
+			assert.NotContains(t, string(encoded), privateDetail)
+			assert.NotContains(t, string(encoded), "plugin-object-123")
+		})
+	}
+
+	notFound := NewAppPluginError(AppPluginErrorCodeNotFound, requestID, errors.New("object does not exist"))
+	notAllowed := NewAppPluginError(AppPluginErrorCodePermissionDenied, requestID, errors.New("plugin-object-123 exists but is forbidden"))
+	assert.Equal(t, notFound, notAllowed)
 }

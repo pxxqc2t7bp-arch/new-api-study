@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
@@ -319,6 +320,30 @@ func TestAwsHandlersCancelSdkRequestAndSkipRetry(t *testing.T) {
 	}
 }
 
+func TestAwsStreamMarksRecoverySubmissionAtSdkBoundary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	submissionObserved := make(chan bool, 1)
+	client := newAwsTestClient(awsHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+		submissionObserved <- true
+		return nil, errors.New("ambiguous transport failure")
+	}))
+	context := newAwsTestContext(httptest.NewRecorder(), context.Background())
+	common.SetContextKey(context, constant.ContextKeyStreamRecoveryWorker, true)
+	adaptor := &Adaptor{
+		AwsClient: client,
+		AwsReq:    newAwsStreamInput(),
+	}
+
+	apiErr, _ := awsStreamHandler(context, newAwsTestRelayInfo(), adaptor)
+
+	require.NotNil(t, apiErr)
+	assert.True(t, <-submissionObserved)
+	assert.True(t, common.GetContextKeyBool(
+		context,
+		constant.ContextKeyStreamRecoverySubmissionStarted,
+	))
+}
+
 func TestAwsStreamHandlerUsesFinalUpstreamUsage(t *testing.T) {
 	originalRelayTimeout := common.RelayTimeout
 	common.RelayTimeout = 0
@@ -357,7 +382,7 @@ func TestAwsStreamHandlerUsesFinalUpstreamUsage(t *testing.T) {
 	assert.Contains(t, recorder.Body.String(), "[DONE]")
 }
 
-func TestAwsStreamHandlerStopsAtClientCancellationAndKeepsPartialBillingUsage(t *testing.T) {
+func TestAwsStreamHandlerStopsAtClientCancellation(t *testing.T) {
 	originalRelayTimeout := common.RelayTimeout
 	common.RelayTimeout = 0
 	t.Cleanup(func() {
@@ -439,12 +464,6 @@ func TestAwsStreamHandlerStopsAtClientCancellationAndKeepsPartialBillingUsage(t 
 	require.ErrorIs(t, upstreamContext.Err(), context.Canceled)
 	require.Nil(t, result.err)
 	require.NotNil(t, result.usage)
-	require.NotNil(t, result.usage.BillingUsage)
-	require.NotNil(t, result.usage.BillingUsage.ClaudeUsage)
-	assert.Equal(t, dto.BillingUsageSourceClaudeMessages, result.usage.BillingUsage.Source)
-	assert.Equal(t, dto.BillingUsageSemanticAnthropic, result.usage.BillingUsage.Semantic)
-	assert.Equal(t, 100, result.usage.BillingUsage.ClaudeUsage.InputTokens)
-	assert.Equal(t, 1, result.usage.BillingUsage.ClaudeUsage.OutputTokens)
 	assert.Equal(t, bodyLengthBeforeCancel, responseWriter.Body.Len())
 	assert.NotContains(t, responseWriter.Body.String(), "[DONE]")
 

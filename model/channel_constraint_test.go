@@ -258,3 +258,56 @@ func TestChannelSatisfiesFilters(t *testing.T) {
 	assert.False(t, ok)
 	assert.Equal(t, dto.FilterRoutingAccount, kind)
 }
+
+func TestChannelSatisfiesGeminiLiveTypeFilter(t *testing.T) {
+	filter := []dto.ChannelFilter{{
+		Kind:                dto.FilterChannelTypes,
+		AllowedChannelTypes: []int{constant.ChannelTypeGemini},
+	}}
+
+	ok, kind := ChannelSatisfiesFilters(
+		&Channel{Type: constant.ChannelTypeGemini},
+		"gemini-live-test",
+		filter,
+	)
+	require.True(t, ok)
+	assert.Empty(t, kind)
+
+	for _, channelType := range []int{
+		constant.ChannelTypeVertexAi,
+		constant.ChannelTypeOpenAI,
+	} {
+		ok, kind = ChannelSatisfiesFilters(
+			&Channel{Type: channelType},
+			"gemini-live-test",
+			filter,
+		)
+		assert.False(t, ok)
+		assert.Equal(t, dto.FilterChannelTypes, kind)
+	}
+}
+
+func TestChannelSatisfiesGeminiLiveCapabilityFilter(t *testing.T) {
+	filterKind := dto.FilterGeminiLive
+	filter := []dto.ChannelFilter{{Kind: filterKind}}
+	enabled := &Channel{
+		Type:          constant.ChannelTypeGemini,
+		OtherSettings: `{"gemini_live_enabled":true}`,
+	}
+
+	ok, kind := ChannelSatisfiesFilters(enabled, "gemini-live-test", filter)
+	require.True(t, ok)
+	assert.Empty(t, kind)
+
+	for _, channel := range []*Channel{
+		{Type: constant.ChannelTypeGemini},
+		{
+			Type:          constant.ChannelTypeGemini,
+			OtherSettings: `{"gemini_live_enabled":false}`,
+		},
+	} {
+		ok, kind = ChannelSatisfiesFilters(channel, "gemini-live-test", filter)
+		assert.False(t, ok)
+		assert.Equal(t, filterKind, kind)
+	}
+}

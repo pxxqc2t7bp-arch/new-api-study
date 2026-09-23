@@ -7,8 +7,15 @@ import (
 	"github.com/QuantumNous/new-api/setting/config"
 )
 
+const (
+	StreamRecoveryIdentityModeLegacy   = "legacy"
+	StreamRecoveryIdentityModeDraining = "draining"
+	StreamRecoveryIdentityModeStable   = "stable"
+)
+
 type StreamRecoverySetting struct {
 	Enabled              bool     `json:"enabled"`
+	IdentityMode         string   `json:"identity_mode"`
 	AllowedModels        []string `json:"allowed_models"`
 	TTLSeconds           int      `json:"ttl_seconds"`
 	HeartbeatSeconds     int      `json:"heartbeat_seconds"`
@@ -20,6 +27,7 @@ type StreamRecoverySetting struct {
 
 var streamRecoverySetting = StreamRecoverySetting{
 	Enabled:              false,
+	IdentityMode:         StreamRecoveryIdentityModeLegacy,
 	AllowedModels:        []string{"glm-5.3"},
 	TTLSeconds:           24 * 60 * 60,
 	HeartbeatSeconds:     10,
@@ -47,6 +55,14 @@ func IsStreamRecoveryModelAllowed(model string) bool {
 }
 
 func normalizeStreamRecoverySetting(setting *StreamRecoverySetting) {
+	setting.IdentityMode = strings.ToLower(strings.TrimSpace(setting.IdentityMode))
+	switch setting.IdentityMode {
+	case StreamRecoveryIdentityModeLegacy,
+		StreamRecoveryIdentityModeDraining,
+		StreamRecoveryIdentityModeStable:
+	default:
+		setting.IdentityMode = StreamRecoveryIdentityModeLegacy
+	}
 	if setting.TTLSeconds < 60 {
 		setting.TTLSeconds = 24 * 60 * 60
 	}

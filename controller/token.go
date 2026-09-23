@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -32,14 +33,53 @@ func (input *tokenAutoGroupsInput) UnmarshalJSON(data []byte) error {
 	return common.Unmarshal(data, &input.Groups)
 }
 
+type tokenRoutingStrategiesInput struct {
+	Set        bool
+	Strategies []string
+}
+
+func respondTokenCacheSyncPending(c *gin.Context, err error, data any) bool {
+	var committedErr *model.TokenMutationCommittedError
+	if !errors.As(err, &committedErr) {
+		return false
+	}
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
+	c.JSON(http.StatusAccepted, gin.H{
+		"success":            true,
+		"message":            "database mutation committed; token cache synchronization pending",
+		"code":               "token_cache_sync_pending",
+		"committed":          true,
+		"committed_count":    committedErr.CommittedCount(),
+		"cache_sync_pending": true,
+		"recoverable":        true,
+		"retry_mutation":     false,
+		"data":               data,
+	})
+	return true
+}
+
+func (input *tokenRoutingStrategiesInput) UnmarshalJSON(data []byte) error {
+	input.Set = true
+	if strings.TrimSpace(string(data)) == "null" {
+		input.Strategies = nil
+		return nil
+	}
+	return common.Unmarshal(data, &input.Strategies)
+}
+
 type tokenRequest struct {
 	model.Token
-	AutoGroups tokenAutoGroupsInput `json:"auto_groups"`
+	AutoGroups               tokenAutoGroupsInput        `json:"auto_groups"`
+	DefaultRoutingStrategy   *string                     `json:"default_routing_strategy"`
+	AllowedRoutingStrategies tokenRoutingStrategiesInput `json:"allowed_routing_strategies"`
+	DefaultConversionPolicy  *string                     `json:"default_conversion_policy"`
+	AllowLossyConversion     *bool                       `json:"allow_lossy_conversion"`
 }
 
 type tokenResponse struct {
 	*model.Token
-	AutoGroups []string `json:"auto_groups"`
+	AutoGroups               []string `json:"auto_groups"`
+	AllowedRoutingStrategies []string `json:"allowed_routing_strategies"`
 }
 
 func maxTokenQuota() int {
@@ -66,7 +106,16 @@ func buildMaskedTokenResponse(token *model.Token) *tokenResponse {
 	if len(autoGroups) == 0 {
 		autoGroups = nil
 	}
-	return &tokenResponse{Token: &maskedToken, AutoGroups: autoGroups}
+	allowedRouting, err := token.GetAllowedRoutingStrategies()
+	if err != nil {
+		common.SysError(fmt.Sprintf("failed to parse routing strategies for token %d: %v", token.Id, err))
+		allowedRouting = []string{"stable"}
+	}
+	return &tokenResponse{
+		Token:                    &maskedToken,
+		AutoGroups:               autoGroups,
+		AllowedRoutingStrategies: allowedRouting,
+	}
 }
 
 func buildMaskedTokenResponses(tokens []*model.Token) []*tokenResponse {
@@ -121,6 +170,36 @@ func setTokenAutoGroups(c *gin.Context, token *model.Token, groups []string) boo
 	}
 
 	if err := token.SetAutoGroups(groups); err != nil {
+		common.ApiError(c, err)
+		return false
+	}
+	return true
+}
+
+func applyTokenRequestPolicy(c *gin.Context, token *model.Token, request tokenRequest, initialize bool) bool {
+	hasPolicyUpdate := request.DefaultRoutingStrategy != nil ||
+		request.AllowedRoutingStrategies.Set ||
+		request.DefaultConversionPolicy != nil ||
+		request.AllowLossyConversion != nil
+	if !initialize && !hasPolicyUpdate {
+		return true
+	}
+	if request.DefaultRoutingStrategy != nil {
+		token.DefaultRoutingStrategy = *request.DefaultRoutingStrategy
+	}
+	if request.AllowedRoutingStrategies.Set {
+		if err := token.SetAllowedRoutingStrategies(request.AllowedRoutingStrategies.Strategies); err != nil {
+			common.ApiError(c, err)
+			return false
+		}
+	}
+	if request.DefaultConversionPolicy != nil {
+		token.DefaultConversionPolicy = *request.DefaultConversionPolicy
+	}
+	if request.AllowLossyConversion != nil {
+		token.AllowLossyConversion = *request.AllowLossyConversion
+	}
+	if err := token.NormalizeRequestPolicySettings(); err != nil {
 		common.ApiError(c, err)
 		return false
 	}
@@ -197,6 +276,9 @@ func GetTokenKey(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	params := tokenAuditParams(c)
+	params["id"], params["name"] = token.Id, token.Name
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
 	common.ApiSuccess(c, gin.H{
 		"key": token.GetFullKey(),
 	})
@@ -284,6 +366,11 @@ func AddToken(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgTokenNameTooLong)
 		return
 	}
+	if !applyTokenRequestPolicy(c, &token, request, true) {
+		return
+	}
+	params := tokenAuditParams(c)
+	params["name"] = token.Name
 	// 非无限额度时，检查额度值是否超出有效范围
 	if !token.UnlimitedQuota {
 		if token.RemainQuota < 0 {
@@ -325,27 +412,33 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	cleanToken := model.Token{
-		UserId:                c.GetInt("id"),
-		Name:                  token.Name,
-		Key:                   key,
-		CreatedTime:           common.GetTimestamp(),
-		AccessedTime:          common.GetTimestamp(),
-		ExpiredTime:           token.ExpiredTime,
-		RemainQuota:           token.RemainQuota,
-		UnlimitedQuota:        token.UnlimitedQuota,
-		ModelLimitsEnabled:    token.ModelLimitsEnabled,
-		ModelLimits:           token.ModelLimits,
-		AllowIps:              token.AllowIps,
-		StreamRecoveryEnabled: token.StreamRecoveryEnabled,
-		Group:                 token.Group,
-		CrossGroupRetry:       token.CrossGroupRetry,
-		AutoGroups:            token.AutoGroups,
+		UserId:                   c.GetInt("id"),
+		Name:                     token.Name,
+		Key:                      key,
+		CreatedTime:              common.GetTimestamp(),
+		AccessedTime:             common.GetTimestamp(),
+		ExpiredTime:              token.ExpiredTime,
+		RemainQuota:              token.RemainQuota,
+		UnlimitedQuota:           token.UnlimitedQuota,
+		ModelLimitsEnabled:       token.ModelLimitsEnabled,
+		ModelLimits:              token.ModelLimits,
+		AllowIps:                 token.AllowIps,
+		StreamRecoveryEnabled:    token.StreamRecoveryEnabled,
+		Group:                    token.Group,
+		CrossGroupRetry:          token.CrossGroupRetry,
+		AutoGroups:               token.AutoGroups,
+		DefaultRoutingStrategy:   token.DefaultRoutingStrategy,
+		AllowedRoutingStrategies: token.AllowedRoutingStrategies,
+		DefaultConversionPolicy:  token.DefaultConversionPolicy,
+		AllowLossyConversion:     token.AllowLossyConversion,
 	}
 	err = cleanToken.Insert()
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	params["id"] = cleanToken.Id
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -355,11 +448,24 @@ func AddToken(c *gin.Context) {
 func DeleteToken(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
 	userId := c.GetInt("id")
-	err := model.DeleteTokenById(id, userId)
+	token, err := model.GetTokenByIds(id, userId)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
+	params := tokenAuditParams(c)
+	params["id"], params["name"] = token.Id, token.Name
+	err = token.Delete()
+	if err != nil {
+		if respondTokenCacheSyncPending(c, err, nil) {
+			params["committed_count"] = 1
+			params["cache_sync_pending"] = true
+			return
+		}
+		common.ApiError(c, err)
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -376,6 +482,10 @@ func UpdateToken(c *gin.Context) {
 		return
 	}
 	token := request.Token
+	params := tokenAuditParams(c)
+	if token.Id > 0 {
+		params["id"] = token.Id
+	}
 	if len(token.Name) > 50 {
 		common.ApiErrorI18n(c, i18n.MsgTokenNameTooLong)
 		return
@@ -396,6 +506,9 @@ func UpdateToken(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	params["name"] = cleanToken.Name
+	previous := *cleanToken
+	quotaDelta := int64(token.RemainQuota) - int64(previous.RemainQuota)
 	if token.Status == common.TokenStatusEnabled {
 		if cleanToken.Status == common.TokenStatusExpired && cleanToken.ExpiredTime <= common.GetTimestamp() && cleanToken.ExpiredTime != -1 {
 			common.ApiErrorI18n(c, i18n.MsgTokenExpiredCannotEnable)
@@ -428,12 +541,59 @@ func UpdateToken(c *gin.Context) {
 				return
 			}
 		}
+		if !applyTokenRequestPolicy(c, cleanToken, request, false) {
+			return
+		}
 	}
-	err = cleanToken.Update()
+	if statusOnly != "" {
+		err = cleanToken.SelectUpdate()
+	} else {
+		err = cleanToken.UpdateWithQuotaDelta(quotaDelta)
+	}
+	mutationCommitted := errors.Is(err, model.ErrTokenMutationCommitted)
+	if err == nil || mutationCommitted {
+		params["name"] = cleanToken.Name
+		if statusOnly != "" {
+			params["from"], params["to"] = previous.Status, cleanToken.Status
+		} else {
+			changedFields := []string{}
+			for _, field := range []struct {
+				name    string
+				changed bool
+			}{
+				{"name", previous.Name != cleanToken.Name},
+				{"expired_time", previous.ExpiredTime != cleanToken.ExpiredTime},
+				{"remain_quota", quotaDelta != 0},
+				{"unlimited_quota", previous.UnlimitedQuota != cleanToken.UnlimitedQuota},
+				{"model_limits_enabled", previous.ModelLimitsEnabled != cleanToken.ModelLimitsEnabled},
+				{"model_limits", previous.ModelLimits != cleanToken.ModelLimits},
+				{"allow_ips", (previous.AllowIps == nil) != (cleanToken.AllowIps == nil) ||
+					(previous.AllowIps != nil && cleanToken.AllowIps != nil && *previous.AllowIps != *cleanToken.AllowIps)},
+				{"group", previous.Group != cleanToken.Group},
+				{"cross_group_retry", previous.CrossGroupRetry != cleanToken.CrossGroupRetry},
+				{"auto_groups", previous.AutoGroups != cleanToken.AutoGroups},
+				{"default_routing_strategy", previous.DefaultRoutingStrategy != cleanToken.DefaultRoutingStrategy},
+				{"allowed_routing_strategies", previous.AllowedRoutingStrategies != cleanToken.AllowedRoutingStrategies},
+				{"default_conversion_policy", previous.DefaultConversionPolicy != cleanToken.DefaultConversionPolicy},
+				{"allow_lossy_conversion", previous.AllowLossyConversion != cleanToken.AllowLossyConversion},
+			} {
+				if field.changed {
+					changedFields = append(changedFields, field.name)
+				}
+			}
+			params["changed_fields"] = changedFields
+		}
+	}
 	if err != nil {
+		if respondTokenCacheSyncPending(c, err, buildMaskedTokenResponse(cleanToken)) {
+			params["committed_count"] = 1
+			params["cache_sync_pending"] = true
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -447,16 +607,29 @@ type TokenBatch struct {
 
 func DeleteTokenBatch(c *gin.Context) {
 	tokenBatch := TokenBatch{}
-	if err := c.ShouldBindJSON(&tokenBatch); err != nil || len(tokenBatch.Ids) == 0 {
+	if err := c.ShouldBindJSON(&tokenBatch); err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	params := tokenBatchAuditParams(c, tokenBatch.Ids)
+	if len(tokenBatch.Ids) == 0 {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
 	userId := c.GetInt("id")
 	count, err := model.BatchDeleteTokens(tokenBatch.Ids, userId)
 	if err != nil {
+		if respondTokenCacheSyncPending(c, err, count) {
+			params["count"] = count
+			params["committed_count"] = count
+			params["cache_sync_pending"] = true
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
+	params["count"] = count
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
@@ -466,7 +639,12 @@ func DeleteTokenBatch(c *gin.Context) {
 
 func GetTokenKeysBatch(c *gin.Context) {
 	tokenBatch := TokenBatch{}
-	if err := c.ShouldBindJSON(&tokenBatch); err != nil || len(tokenBatch.Ids) == 0 {
+	if err := c.ShouldBindJSON(&tokenBatch); err != nil {
+		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
+		return
+	}
+	params := tokenBatchAuditParams(c, tokenBatch.Ids)
+	if len(tokenBatch.Ids) == 0 {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
@@ -481,8 +659,13 @@ func GetTokenKeysBatch(c *gin.Context) {
 		return
 	}
 	keysMap := make(map[int]string)
+	returnedIDs := make([]int, 0, len(tokens))
 	for _, t := range tokens {
 		keysMap[t.Id] = t.GetFullKey()
+		returnedIDs = append(returnedIDs, t.Id)
 	}
+	params["count"] = len(tokens)
+	params["returned_ids"] = returnedIDs
+	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
 	common.ApiSuccess(c, gin.H{"keys": keysMap})
 }

@@ -181,6 +181,7 @@
       }
     }
   ],
+  "losses": null,
   "usage": {
     "prompt_tokens": 4,
     "completion_tokens": 2,
@@ -202,7 +203,7 @@
     },
     "prompt_tokens_details": {
       "cached_tokens": 0,
-      "text_tokens": 0,
+      "text_tokens": 4,
       "audio_tokens": 0,
       "image_tokens": 0
     },

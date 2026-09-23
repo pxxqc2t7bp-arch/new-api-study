@@ -1,0 +1,18 @@
+{
+  "session_reference": {
+    "error": "responses to chat conversion does not support stateful fields: previous_response_id"
+  },
+  "strict_vendor_tool": {
+    "error": "conversion would lose protocol semantics: tools[0]: OpenAI Chat Completions cannot represent hosted tool \"codeExecution\"",
+    "losses": [
+      {
+        "code": "unsupported_hosted_tool",
+        "path": "tools[0]",
+        "message": "OpenAI Chat Completions cannot represent hosted tool \"codeExecution\"",
+        "severity": "error",
+        "from": "gemini",
+        "to": "openai"
+      }
+    ]
+  }
+}

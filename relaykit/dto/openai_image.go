@@ -2,10 +2,9 @@ package dto
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"reflect"
-	"strconv"
-	"strings"
 
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -14,6 +13,13 @@ import (
 // MaxImageN caps the image generation count. Without this bound a huge or
 // wrapped-negative n overflows quota calculation into a negative charge.
 const MaxImageN = 128
+
+// ImageBillingParameters contains only the provider scalars parsed by request
+// validation. Keep this separate from the complete provider request payload.
+type ImageBillingParameters struct {
+	N            *uint `json:"n,omitempty"`
+	PromptExtend *bool `json:"prompt_extend,omitempty"`
+}
 
 type ImageRequest struct {
 	Model             string          `json:"model"`
@@ -40,7 +46,29 @@ type ImageRequest struct {
 	UserId           json.RawMessage `json:"user_id,omitempty"`
 	Image            json.RawMessage `json:"image,omitempty"`
 	// 用匿名参数接收额外参数
-	Extra map[string]json.RawMessage `json:"-"`
+	Extra             map[string]json.RawMessage `json:"-"`
+	BillingParameters *ImageBillingParameters    `json:"-"`
+}
+
+// ImageCount resolves the validated request quantity. Top-level zero retains
+// its legacy default of one; an explicit provider count must be positive.
+func (i *ImageRequest) ImageCount(useProviderParameters bool) (int, error) {
+	n := uint(1)
+	if i.N != nil && *i.N != 0 {
+		n = *i.N
+	}
+	if n > MaxImageN {
+		return 0, fmt.Errorf("n must be an integer between 1 and %d", MaxImageN)
+	}
+	if parameters := i.BillingParameters; parameters != nil && parameters.N != nil {
+		if *parameters.N > MaxImageN || useProviderParameters && *parameters.N == 0 {
+			return 0, fmt.Errorf("parameters.n must be an integer between 1 and %d", MaxImageN)
+		}
+		if useProviderParameters {
+			n = *parameters.N
+		}
+	}
+	return int(n), nil
 }
 
 func (i *ImageRequest) UnmarshalJSON(data []byte) error {
@@ -51,7 +79,7 @@ func (i *ImageRequest) UnmarshalJSON(data []byte) error {
 	}
 
 	// 用 struct tag 获取所有已定义字段名
-	knownFields := GetJSONFieldNames(reflect.TypeOf(*i))
+	knownFields := GetJSONFieldNames(reflect.TypeFor[ImageRequest]())
 
 	// 再正常解析已定义字段
 	type Alias ImageRequest
@@ -132,35 +160,10 @@ func indexComma(s string) int {
 }
 
 func (i *ImageRequest) GetTokenCountMeta() *types.TokenCountMeta {
-	var sizeRatio = 1.0
-	var qualityRatio = 1.0
-
-	if strings.HasPrefix(i.Model, "dall-e") {
-		// Size
-		if i.Size == "256x256" {
-			sizeRatio = 0.4
-		} else if i.Size == "512x512" {
-			sizeRatio = 0.45
-		} else if i.Size == "1024x1024" {
-			sizeRatio = 1
-		} else if i.Size == "1024x1792" || i.Size == "1792x1024" {
-			sizeRatio = 2
-		}
-
-		if i.Model == "dall-e-3" && i.Quality == "hd" {
-			qualityRatio = 2.0
-			if i.Size == "1024x1792" || i.Size == "1792x1024" {
-				qualityRatio = 1.5
-			}
-		}
-	}
-
 	imageN := uint(1)
 	if i.N != nil && *i.N > 0 {
 		imageN = *i.N
 	}
-	resolution := normalizeImageBillingResolution(i.Model, i.Size)
-	referenceImageCount := imageReferenceCount(i.Image) + imageReferenceCount(i.Images)
 
 	// Keep n separate from ImagePriceRatio so size/quality and count remain
 	// independent billing dimensions. Fixed-price pre-consume stores this on
@@ -168,64 +171,9 @@ func (i *ImageRequest) GetTokenCountMeta() *types.TokenCountMeta {
 	return &types.TokenCountMeta{
 		CombineText:     i.Prompt,
 		MaxTokens:       1584,
-		ImagePriceRatio: sizeRatio * qualityRatio,
+		ImagePriceRatio: i.legacyDallePriceRatio(),
 		BillingRatios:   map[string]float64{"n": float64(imageN)},
-		BillingUsage: map[string]any{
-			"image_count":           float64(imageN),
-			"resolution":            resolution,
-			"reference_image_count": float64(referenceImageCount),
-		},
 	}
-}
-
-func normalizeImageBillingResolution(model, size string) string {
-	value := strings.ToUpper(strings.TrimSpace(size))
-	switch value {
-	case "1K", "2K", "3K", "4K":
-		return value
-	}
-	value = strings.ReplaceAll(value, "×", "X")
-	parts := strings.Split(value, "X")
-	if len(parts) == 2 {
-		width, widthErr := strconv.Atoi(parts[0])
-		height, heightErr := strconv.Atoi(parts[1])
-		if widthErr == nil && heightErr == nil && width > 0 && height > 0 {
-			longEdge := max(width, height)
-			switch {
-			case longEdge <= 1536:
-				return "1K"
-			case longEdge <= 2560:
-				return "2K"
-			case longEdge <= 3584:
-				return "3K"
-			default:
-				return "4K"
-			}
-		}
-	}
-	if strings.Contains(strings.ToLower(model), "seedream") {
-		return "2K"
-	}
-	return "1K"
-}
-
-func imageReferenceCount(raw json.RawMessage) int {
-	if len(raw) == 0 || string(raw) == "null" {
-		return 0
-	}
-	var value any
-	if err := kitutil.Unmarshal(raw, &value); err != nil {
-		return 0
-	}
-	switch typed := value.(type) {
-	case string:
-		if strings.TrimSpace(typed) != "" {
-			return 1
-		}
-	case []any:
-		return len(typed)
-	}
-	return 0
 }
 
 func (i *ImageRequest) IsStream(c *http.Request) bool {

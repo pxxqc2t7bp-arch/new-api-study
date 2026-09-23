@@ -76,6 +76,8 @@ func isSensitiveURLQueryKey(key string) bool {
 		"apikey",
 		"x-api-key",
 		"access_token",
+		"ticket",
+		"realtime_ticket",
 		"refresh_token",
 		"id_token",
 		"token",
@@ -173,7 +175,7 @@ func validateMultipartTaskRequest(c *gin.Context, info *RelayInfo, action string
 		Mode:     formData.Get("mode"),
 		Image:    formData.Get("image"),
 		Size:     formData.Get("size"),
-		Metadata: make(map[string]interface{}),
+		Metadata: make(map[string]any),
 	}
 
 	if durationStr := formData.Get("seconds"); durationStr != "" {

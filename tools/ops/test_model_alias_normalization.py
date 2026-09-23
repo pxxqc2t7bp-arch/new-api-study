@@ -348,6 +348,69 @@ class ChannelPlanTest(unittest.TestCase):
             any("channel 62 alias gpt-6" in item for item in manifest["blockers"])
         )
 
+    def test_unverified_mapped_alias_is_pruned_when_healthy_route_exists(
+        self,
+    ) -> None:
+        channels = [
+            {
+                "id": 50,
+                "name": "healthy",
+                "group": "default,cxy",
+                "priority": 999,
+                "models": "gpt-6-astra",
+                "model_mapping": "{}",
+            },
+            {
+                "id": 62,
+                "name": "unverified-mapped-alias",
+                "group": "default,cxy",
+                "priority": 997,
+                "models": "gpt-6",
+                "model_mapping": '{"gpt-6":"gpt-6-astra"}',
+            },
+            {
+                "id": 92,
+                "name": "rvcompute",
+                "group": "default,cxy",
+                "priority": 1000,
+                "models": "gpt-5.6-sol",
+                "model_mapping": "{}",
+            },
+            {
+                "id": 97,
+                "name": "deepseek",
+                "group": "default,cxy",
+                "priority": 25,
+                "models": "deepseek-v4-flash",
+                "model_mapping": "{}",
+            },
+        ]
+        options = {key: {} for key in migration.OPTION_KEYS}
+        options["ModelRatio"] = {
+            "deepseek-v4-flash": 0.2,
+            "gpt-5.6-sol": 0.1,
+            "gpt-6": 0.1,
+            "gpt-6-astra": 0.1,
+        }
+
+        manifest = migration.build_manifest(
+            channels,
+            options,
+            {
+                50: {"gpt-6-astra": 100},
+                92: {"gpt-5.6-sol": 200},
+                97: {"deepseek-v4-flash": 150},
+            },
+        )
+
+        plan = next(
+            item
+            for item in manifest["channel_changes"]
+            if item["channel_id"] == 62
+        )
+        self.assertNotIn("gpt-6", plan["models"])
+        self.assertEqual(plan["pruned_unverified_aliases"], ["gpt-6"])
+
     def test_advanced_route_filters_use_public_aliases(self) -> None:
         settings = {
             "routing_account": "support",

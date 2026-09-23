@@ -2,6 +2,8 @@ package middleware
 
 import (
 	"fmt"
+	"net/url"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/gin-gonic/gin"
@@ -27,6 +29,13 @@ func SetUpLogger(server *gin.Engine) {
 		if tag == "" {
 			tag = "web"
 		}
+		path := param.Path
+		// OAuth callbacks carry one-time codes and state in the query string.
+		// Redact the log value only; the handler still needs the original query.
+		if strings.HasPrefix(path, "/api/oauth/") || strings.HasPrefix(path, "/oauth/") {
+			path, _, _ = strings.Cut(path, "?")
+		}
+		path = redactRealtimeCredentialLogQuery(path)
 		return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",
 			param.TimeStamp.Format("2006/01/02 - 15:04:05"),
 			tag,
@@ -35,7 +44,28 @@ func SetUpLogger(server *gin.Engine) {
 			param.Latency,
 			param.ClientIP,
 			param.Method,
-			param.Path,
+			path,
 		)
 	}))
+}
+
+func redactRealtimeCredentialLogQuery(path string) string {
+	parsed, err := url.ParseRequestURI(path)
+	if err != nil {
+		return path
+	}
+	query := parsed.Query()
+	changed := false
+	for _, key := range []string{RealtimeTicketQuery, "key"} {
+		if _, ok := query[key]; !ok {
+			continue
+		}
+		query.Set(key, "***masked***")
+		changed = true
+	}
+	if !changed {
+		return path
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.RequestURI()
 }

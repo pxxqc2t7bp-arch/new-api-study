@@ -17,6 +17,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/service"
@@ -63,6 +64,26 @@ func VideoProxy(c *gin.Context) {
 	taskID := c.Param("task_id")
 	if taskID == "" {
 		videoProxyError(c, http.StatusBadRequest, "invalid_request_error", "task_id is required")
+		return
+	}
+	if retrieval, ok := middleware.GetAppGrantTaskRetrieval(c); ok {
+		var source string
+		for _, artifact := range retrieval.Artifacts {
+			if artifact.Type == "video" {
+				source = retrieval.Task.PrivateData.AppArtifactURLs[artifact.Key]
+				break
+			}
+		}
+		if retrieval.Task.TaskID != taskID || retrieval.Task.Status != model.TaskStatusSuccess ||
+			source == "" || source != strings.TrimSpace(source) {
+			writeTaskArtifactError(c, http.StatusNotFound, "artifact_not_found", "Task or artifact not found")
+			return
+		}
+		if err := proxyTaskMedia(c, &retrieval.Task, &relaychannel.TaskContentRequest{
+			URL: source, Method: c.Request.Method, Credentialless: true,
+		}); err != nil {
+			writeTaskMediaProxyError(c, err)
+		}
 		return
 	}
 

@@ -39,7 +39,11 @@ func resetBuiltInRolePolicies(db *gorm.DB) error {
 	for _, spec := range builtInRoles {
 		subjects = append(subjects, RoleSubject(spec.Key))
 	}
-	return db.Where("ptype = ? AND v0 IN ?", "p", subjects).Delete(&model.CasbinRule{}).Error
+	// Scoped legacy rules must survive baseline reseeding so the adapter can
+	// retain their restrictions instead of replacing them with global grants.
+	return db.Where("ptype = ? AND v0 IN ?", "p", subjects).
+		Where("(v4 = ? OR v4 IS NULL) AND (v5 = ? OR v5 IS NULL)", "", "").
+		Delete(&model.CasbinRule{}).Error
 }
 
 func seedDefaultPolicies() error {
@@ -52,11 +56,26 @@ func seedDefaultPolicies() error {
 		if spec.Superuser {
 			continue
 		}
-		for _, permission := range PermissionsForRole(spec.Key) {
+		permissions, err := permissionsForBuiltInRole(spec)
+		if err != nil {
+			return err
+		}
+		for _, permission := range permissions {
 			if _, err := e.AddPolicy(RoleSubject(spec.Key), permission.Resource, permission.Action, EffectAllow); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func permissionsForBuiltInRole(spec RoleSpec) ([]Permission, error) {
+	permissions := PermissionsForRole(spec.Key)
+	if spec.Key != BuiltInRolePluginAdmin {
+		return permissions, nil
+	}
+	if len(permissions) != 1 || permissions[0] != AppPluginManage {
+		return nil, fmt.Errorf("%s role must grant only %s.%s", BuiltInRolePluginAdmin, ResourceAppPlugin, ActionManage)
+	}
+	return permissions, nil
 }

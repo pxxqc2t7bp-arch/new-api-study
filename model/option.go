@@ -1,6 +1,10 @@
 package model
 
 import (
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,10 +19,11 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Option struct {
-	Key   string `json:"key" gorm:"primaryKey"`
+	Key   string `json:"key" gorm:"primaryKey;not null"`
 	Value string `json:"value"`
 }
 
@@ -58,6 +63,10 @@ func InitOptionMap() {
 	jsplugin.DefaultRegistry.SetEnabled(constant.TaskPluginEnabled)
 	common.OptionMap["TaskPluginOverrideEnabled"] = strconv.FormatBool(constant.TaskPluginOverrideEnabled)
 	jsplugin.DefaultRegistry.SetOverrideEnabled(constant.TaskPluginOverrideEnabled)
+	common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] = strconv.FormatBool(operation_setting.AppPluginV1Enabled)
+	common.OptionMap[operation_setting.AppPluginSeedanceEnabledOptionKey] = strconv.FormatBool(operation_setting.AppPluginSeedanceEnabled)
+	common.OptionMap[operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey] = strconv.FormatBool(operation_setting.AppPluginEmbeddedSurfaceEnabled)
+	common.OptionMap[operation_setting.AppExecutionGrantsEnabledOptionKey] = strconv.FormatBool(operation_setting.AppExecutionGrantsEnabled)
 	common.OptionMap[setting.TaskPluginMarketplaceSourcesKey] = setting.TaskPluginMarketplaceSources2JsonString()
 	common.OptionMap[setting.TaskPluginDisabledFactoryKeysKey] = "[]"
 	jsplugin.DefaultRegistry.SetDisabledFactoryKeys(nil)
@@ -189,22 +198,35 @@ func InitOptionMap() {
 
 	// 自动添加所有注册的模型配置
 	modelConfigs := config.GlobalConfig.ExportAllConfigs()
-	for k, v := range modelConfigs {
-		common.OptionMap[k] = v
-	}
+	maps.Copy(common.OptionMap, modelConfigs)
 
 	common.OptionMapRWMutex.Unlock()
 	loadOptionsFromDatabase()
 }
 
 func loadOptionsFromDatabase() {
+	requestPolicyOptionMutex.Lock()
+	defer requestPolicyOptionMutex.Unlock()
+	defer func() {
+		if err := refreshRequestPolicySnapshot(); err != nil {
+			common.SysError("invalid request policy: " + err.Error())
+		}
+	}()
+	passkeyOptionMutex.Lock()
+	defer passkeyOptionMutex.Unlock()
 	options, _ := AllOption()
+	passkeyOptions := make(map[string]string)
 	for _, option := range options {
+		if IsPasskeyDomainOption(option.Key) {
+			passkeyOptions[option.Key] = option.Value
+			continue
+		}
 		err := updateOptionMap(option.Key, option.Value)
 		if err != nil {
 			common.SysLog("failed to update option map: " + err.Error())
 		}
 	}
+	applyPasskeyDomainOptions(passkeyOptions)
 }
 
 func SyncOptions(frequency int) {
@@ -228,21 +250,210 @@ func validateOptionValue(key string, value string) error {
 	return nil
 }
 
+type optionWriteAuthority uint8
+
+const (
+	optionWriteGeneric optionWriteAuthority = iota
+	optionWritePasskey
+	optionWriteRequestPolicy
+	optionWriteAppPolicy
+)
+
+type protectedOptionGroup struct {
+	authority optionWriteAuthority
+	keys      []string
+}
+
+func protectedOptionGroups() []protectedOptionGroup {
+	requestPolicyKeys := slices.Sorted(maps.Keys(requestPolicyDefaults))
+	return []protectedOptionGroup{
+		{authority: optionWritePasskey, keys: []string{
+			"ServerAddress", "passkey.legacy_rp_ids", "passkey.origins", "passkey.rp_id",
+		}},
+		{authority: optionWriteRequestPolicy, keys: requestPolicyKeys},
+		{authority: optionWriteAppPolicy, keys: []string{
+			AppArkImportDelegationsKey, AppModelInvokePolicyKey,
+		}},
+		{authority: optionWriteGeneric, keys: []string{
+			operation_setting.AppExecutionGrantsEnabledOptionKey,
+			operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey,
+			operation_setting.AppPluginSeedanceEnabledOptionKey,
+			operation_setting.AppPluginV1EnabledOptionKey,
+		}},
+	}
+}
+
+func optionAuthorityAllows(writer, required optionWriteAuthority) bool {
+	return writer == required || writer == optionWritePasskey && required == optionWriteGeneric
+}
+
+func protectedOptionWriteError(key string) error {
+	return fmt.Errorf("protected option %q requires its controlled writer", key)
+}
+
+func validateProtectedOptionKey(key string, writer optionWriteAuthority) error {
+	normalized := strings.TrimSpace(key)
+	for _, group := range protectedOptionGroups() {
+		for _, canonical := range group.keys {
+			if key == canonical {
+				if !optionAuthorityAllows(writer, group.authority) {
+					return protectedOptionWriteError(key)
+				}
+				return nil
+			}
+			if strings.EqualFold(normalized, canonical) {
+				return protectedOptionWriteError(key)
+			}
+		}
+	}
+	return nil
+}
+
+func lockOptionForWriteTx(tx *gorm.DB, key, initialValue string, writer optionWriteAuthority) (Option, error) {
+	if err := validateProtectedOptionKey(key, writer); err != nil {
+		return Option{}, err
+	}
+	var option Option
+	err := lockForUpdate(tx).
+		Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).
+		First(&option).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		candidate := Option{Key: key, Value: initialValue}
+		if createErr := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "key"}},
+			DoNothing: true,
+		}).Create(&candidate).Error; createErr != nil {
+			return Option{}, createErr
+		}
+	} else if err != nil {
+		return Option{}, err
+	}
+	option = Option{}
+	if err := lockForUpdate(tx).
+		Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).
+		First(&option).Error; err != nil {
+		return Option{}, err
+	}
+	for _, group := range protectedOptionGroups() {
+		values := make([]any, len(group.keys))
+		for i, protectedKey := range group.keys {
+			values[i] = protectedKey
+		}
+		var protected Option
+		result := lockForUpdate(tx).
+			Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: key}).
+			Where(clause.IN{Column: clause.Column{Name: "key"}, Values: values}).
+			Limit(1).Find(&protected)
+		if result.Error != nil {
+			return Option{}, result.Error
+		}
+		if result.RowsAffected == 0 {
+			continue
+		}
+		if option.Key != key || !slices.Contains(group.keys, key) ||
+			!optionAuthorityAllows(writer, group.authority) {
+			return Option{}, protectedOptionWriteError(key)
+		}
+		break
+	}
+	return option, nil
+}
+
+func AppExecutionRolloutAllowsTx(tx *gorm.DB, appKey string) (bool, error) {
+	keys := []string{
+		operation_setting.AppExecutionGrantsEnabledOptionKey,
+		operation_setting.AppPluginV1EnabledOptionKey,
+	}
+	if appKey == "seedance-repro" {
+		keys = append(keys, operation_setting.AppPluginSeedanceEnabledOptionKey)
+	}
+	slices.Sort(keys)
+	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+		if err := tx.Exec("UPDATE options SET value = value WHERE 0").Error; err != nil {
+			return false, err
+		}
+	}
+	values := make(map[string]string, len(keys))
+	keyValues := make([]any, len(keys))
+	for i, key := range keys {
+		keyValues[i] = key
+	}
+	var options []Option
+	if err := lockForShare(tx).
+		Where(clause.IN{Column: clause.Column{Name: "key"}, Values: keyValues}).
+		Order(clause.OrderByColumn{Column: clause.Column{Name: "key"}}).
+		Find(&options).Error; err != nil {
+		return false, err
+	}
+	for _, option := range options {
+		if slices.Contains(keys, option.Key) {
+			values[option.Key] = option.Value
+		}
+	}
+	return values[operation_setting.AppPluginV1EnabledOptionKey] == "true" &&
+		values[operation_setting.AppExecutionGrantsEnabledOptionKey] == "true" &&
+		(appKey != "seedance-repro" ||
+			values[operation_setting.AppPluginSeedanceEnabledOptionKey] == "true"), nil
+}
+
+func AppExecutionRolloutAllowsCached(appKey string) bool {
+	common.OptionMapRWMutex.RLock()
+	defer common.OptionMapRWMutex.RUnlock()
+	return common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] == "true" &&
+		common.OptionMap[operation_setting.AppExecutionGrantsEnabledOptionKey] == "true" &&
+		(appKey != "seedance-repro" ||
+			common.OptionMap[operation_setting.AppPluginSeedanceEnabledOptionKey] == "true")
+}
+
+func AppPluginRolloutAllowsCached(appKey, surface string) bool {
+	common.OptionMapRWMutex.RLock()
+	defer common.OptionMapRWMutex.RUnlock()
+	return common.OptionMap[operation_setting.AppPluginV1EnabledOptionKey] == "true" &&
+		(appKey != "seedance-repro" ||
+			common.OptionMap[operation_setting.AppPluginSeedanceEnabledOptionKey] == "true") &&
+		(surface != "embedded" ||
+			common.OptionMap[operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey] == "true")
+}
+
+func saveOptionTx(tx *gorm.DB, key, value string, writer optionWriteAuthority) error {
+	option, err := lockOptionForWriteTx(tx, key, value, writer)
+	if err != nil {
+		return err
+	}
+	option.Value = value
+	return tx.Save(&option).Error
+}
+
+func saveGenericOptionTx(tx *gorm.DB, key, value string) error {
+	return saveOptionTx(tx, key, value, optionWriteGeneric)
+}
+
+// Option-owned callbacks contain database work only. Retrying the fresh outer
+// transaction is required when concurrent MySQL missing-row writers deadlock
+// while upgrading their gap locks; caller-owned transactions are never retried.
+func runOptionWriteTransaction(db *gorm.DB, transaction func(*gorm.DB) error) error {
+	return RunAppPluginTransaction(db, transaction)
+}
+
 func UpdateOption(key string, value string) error {
+	if IsRequestPolicyOption(key) {
+		return UpdateRequestPolicyOptions(map[string]string{key: value})
+	}
+	if IsPasskeyDomainOption(key) {
+		_, err := UpdatePasskeyDomainOptions(map[string]string{key: value}, false, "")
+		return err
+	}
+	if IsModelPricingOption(key) {
+		return UpdateModelPricingOptions(map[string]string{key: value})
+	}
 	if err := validateOptionValue(key, value); err != nil {
 		return err
 	}
-	// Save to database first
-	option := Option{
-		Key: key,
+	if err := runOptionWriteTransaction(DB, func(tx *gorm.DB) error {
+		return saveGenericOptionTx(tx, key, value)
+	}); err != nil {
+		return err
 	}
-	// https://gorm.io/docs/update.html#Save-All-Fields
-	DB.FirstOrCreate(&option, Option{Key: key})
-	option.Value = value
-	// Save is a combination function.
-	// If save value does not contain primary key, it will execute Create,
-	// otherwise it will execute Update (with all fields).
-	DB.Save(&option)
 	// Update OptionMap
 	return updateOptionMap(key, value)
 }
@@ -256,19 +467,44 @@ func UpdateOptionsBulk(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
 	}
+	for key := range values {
+		if IsPasskeyDomainOption(key) {
+			_, err := UpdatePasskeyDomainOptions(values, false, "")
+			return err
+		}
+	}
 	for key, value := range values {
 		if err := validateOptionValue(key, value); err != nil {
 			return err
 		}
 	}
-	err := DB.Transaction(func(tx *gorm.DB) error {
-		for k, v := range values {
-			option := Option{Key: k}
-			if err := tx.FirstOrCreate(&option, Option{Key: k}).Error; err != nil {
+	var policySnapshot *RequestPolicySnapshot
+	for key := range values {
+		if IsRequestPolicyOption(key) {
+			requestPolicyOptionMutex.Lock()
+			defer requestPolicyOptionMutex.Unlock()
+			options := maps.Clone(CurrentRequestPolicy().Options)
+			for key, value := range values {
+				if IsRequestPolicyOption(key) {
+					options[key] = value
+				}
+			}
+			var err error
+			policySnapshot, err = BuildRequestPolicy(options)
+			if err != nil {
 				return err
 			}
-			option.Value = v
-			if err := tx.Save(&option).Error; err != nil {
+			break
+		}
+	}
+
+	err := runOptionWriteTransaction(DB, func(tx *gorm.DB) error {
+		for _, key := range slices.Sorted(maps.Keys(values)) {
+			writer := optionWriteGeneric
+			if IsRequestPolicyOption(key) {
+				writer = optionWriteRequestPolicy
+			}
+			if err := saveOptionTx(tx, key, values[key], writer); err != nil {
 				return err
 			}
 		}
@@ -281,6 +517,9 @@ func UpdateOptionsBulk(values map[string]string) error {
 		if err := updateOptionMap(k, v); err != nil {
 			return err
 		}
+	}
+	if policySnapshot != nil {
+		requestPolicySnapshot.Store(policySnapshot)
 	}
 	return nil
 }
@@ -315,7 +554,7 @@ func updateOptionMap(key string, value string) (err error) {
 			common.ImageDownloadPermission = intValue
 		}
 	}
-	if strings.HasSuffix(key, "Enabled") || key == "DefaultCollapseSidebar" || key == "DefaultUseAutoGroup" || key == "SMTPForceAuthLogin" || key == "SMTPInsecureSkipVerify" {
+	if strings.HasSuffix(key, "Enabled") || operation_setting.IsAppPluginFeatureFlag(key) || key == "DefaultCollapseSidebar" || key == "DefaultUseAutoGroup" || key == "SMTPForceAuthLogin" || key == "SMTPInsecureSkipVerify" {
 		boolValue := value == "true"
 		switch key {
 		case "PasswordRegisterEnabled":
@@ -368,6 +607,14 @@ func updateOptionMap(key string, value string) (err error) {
 		case "TaskPluginOverrideEnabled":
 			constant.TaskPluginOverrideEnabled = boolValue
 			jsplugin.DefaultRegistry.SetOverrideEnabled(boolValue)
+		case operation_setting.AppPluginV1EnabledOptionKey:
+			operation_setting.AppPluginV1Enabled = boolValue
+		case operation_setting.AppPluginSeedanceEnabledOptionKey:
+			operation_setting.AppPluginSeedanceEnabled = boolValue
+		case operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey:
+			operation_setting.AppPluginEmbeddedSurfaceEnabled = boolValue
+		case operation_setting.AppExecutionGrantsEnabledOptionKey:
+			operation_setting.AppExecutionGrantsEnabled = boolValue
 		case "DataExportEnabled":
 			common.DataExportEnabled = boolValue
 		case "DefaultCollapseSidebar":
