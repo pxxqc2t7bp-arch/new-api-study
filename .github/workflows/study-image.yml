@@ -35,6 +35,14 @@ jobs:
         with:
           bun-version: "1.4.0"
       - name: Test backend
+        env:
+          APP_PLUGIN_TEST_DIALECT: sqlite
+          APP_PLUGIN_TEST_DSN: ""
+          APP_PLUGIN_TEST_DRIVER: github.com/glebarez/sqlite@v1.11.0
+          APP_PLUGIN_TEST_DATABASE_VERSION: 3.50.4
+          APP_PLUGIN_TEST_IMAGE: ""
+          APP_PLUGIN_TEST_PLATFORM: ""
+          TZ: Asia/Shanghai
         run: |
           mkdir -p web/dist
           touch web/dist/index.html
