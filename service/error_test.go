@@ -64,6 +64,64 @@ func TestResetStatusCode(t *testing.T) {
 	}
 }
 
+func TestTaskErrorFromAPIErrorUsesStructuredCodeThenType(t *testing.T) {
+	const message = "structured upstream error"
+	testCases := []struct {
+		name     string
+		code     any
+		errType  string
+		wantCode string
+	}{
+		{
+			name:     "explicit code takes priority",
+			code:     "rate_limit_exceeded",
+			errType:  "AccountQuotaExceeded",
+			wantCode: "rate_limit_exceeded",
+		},
+		{
+			name:     "missing code falls back to type",
+			errType:  "AccountQuotaExceeded",
+			wantCode: "AccountQuotaExceeded",
+		},
+		{
+			name:     "empty code falls back to type",
+			code:     "",
+			errType:  "AccountQuotaExceeded",
+			wantCode: "AccountQuotaExceeded",
+		},
+		{
+			name:     "unknown code falls back to type",
+			code:     "unknown",
+			errType:  "AccountQuotaExceeded",
+			wantCode: "AccountQuotaExceeded",
+		},
+		{
+			name:     "unknown error code falls back to type",
+			code:     "unknown_error",
+			errType:  "AccountQuotaExceeded",
+			wantCode: "AccountQuotaExceeded",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			apiErr := types.WithOpenAIError(types.OpenAIError{
+				Message: message,
+				Type:    testCase.errType,
+				Code:    testCase.code,
+			}, http.StatusTooManyRequests)
+
+			taskErr := TaskErrorFromAPIError(apiErr)
+
+			require.NotNil(t, taskErr)
+			require.Equal(t, testCase.wantCode, taskErr.Code)
+			require.Equal(t, message, taskErr.Message)
+			require.Equal(t, http.StatusTooManyRequests, taskErr.StatusCode)
+			require.False(t, taskErr.LocalError)
+		})
+	}
+}
+
 func TestRelayErrorHandlerTruncatesInvalidJSONBodyInLog(t *testing.T) {
 	withDebugEnabled(t, false)
 

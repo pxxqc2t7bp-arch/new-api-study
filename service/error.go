@@ -221,10 +221,37 @@ func TaskErrorFromAPIError(apiErr *types.NewAPIError) *taskdto.TaskError {
 	if apiErr == nil {
 		return nil
 	}
+	code := strings.TrimSpace(string(apiErr.GetErrorCode()))
+	var openAIError *types.OpenAIError
+	switch relayErr := apiErr.RelayError.(type) {
+	case types.OpenAIError:
+		openAIError = &relayErr
+	case *types.OpenAIError:
+		openAIError = relayErr
+	}
+	if openAIError != nil {
+		structuredCode := ""
+		if openAIError.Code != nil {
+			structuredCode = strings.TrimSpace(fmt.Sprint(openAIError.Code))
+		}
+		switch strings.ToLower(structuredCode) {
+		case "", "unknown", "unknown_error":
+			if structuredType := strings.TrimSpace(openAIError.Type); structuredType != "" {
+				code = structuredType
+			}
+		default:
+			code = structuredCode
+		}
+	}
+	message := apiErr.Error()
+	underlyingErr := apiErr.Err
+	if underlyingErr == nil {
+		underlyingErr = errors.New(message)
+	}
 	return &taskdto.TaskError{
-		Code:       string(apiErr.GetErrorCode()),
-		Message:    apiErr.Err.Error(),
+		Code:       code,
+		Message:    message,
 		StatusCode: apiErr.StatusCode,
-		Error:      apiErr.Err,
+		Error:      underlyingErr,
 	}
 }
