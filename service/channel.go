@@ -135,7 +135,7 @@ func ParsePlanQuotaReset(reason string) (int64, bool) {
 // ClassifyPlanQuotaError requires the upstream status, semantics, and message
 // evidence that identify a Plan account quota response.
 func ClassifyPlanQuotaError(err *types.NewAPIError) (int64, bool) {
-	if err == nil || err.StatusCode != 429 {
+	if err == nil || err.GetOriginalStatusCode() != 429 {
 		return 0, false
 	}
 	message := err.Error()

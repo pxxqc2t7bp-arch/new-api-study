@@ -161,6 +161,61 @@ func TestClassifyPlanQuotaErrorRequiresStructuredEvidence(t *testing.T) {
 	}
 }
 
+func TestClassifyPlanQuotaErrorUsesOriginalUpstreamStatus(t *testing.T) {
+	tests := []struct {
+		name              string
+		upstreamStatus    int
+		statusCodeMapping []string
+		wantStatus        int
+		wantMatched       bool
+	}{
+		{
+			name:              "upstream 429 mapped to 400 remains plan quota",
+			upstreamStatus:    http.StatusTooManyRequests,
+			statusCodeMapping: []string{`{"429":400}`},
+			wantStatus:        http.StatusBadRequest,
+			wantMatched:       true,
+		},
+		{
+			name:              "upstream 500 mapped to 429 is not plan quota",
+			upstreamStatus:    http.StatusInternalServerError,
+			statusCodeMapping: []string{`{"500":429}`},
+			wantStatus:        http.StatusTooManyRequests,
+			wantMatched:       false,
+		},
+		{
+			name:           "unmapped direct construction uses current status",
+			upstreamStatus: http.StatusTooManyRequests,
+			wantStatus:     http.StatusTooManyRequests,
+			wantMatched:    true,
+		},
+		{
+			name:              "consecutive mappings retain first upstream status",
+			upstreamStatus:    http.StatusTooManyRequests,
+			statusCodeMapping: []string{`{"429":400}`, `{"400":503}`},
+			wantStatus:        http.StatusServiceUnavailable,
+			wantMatched:       true,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			apiErr := types.WithOpenAIError(types.OpenAIError{
+				Message: "You have exceeded the monthly usage quota.",
+				Type:    "AccountQuotaExceeded",
+			}, testCase.upstreamStatus)
+			for _, mapping := range testCase.statusCodeMapping {
+				ResetStatusCode(apiErr, mapping)
+			}
+
+			_, matched := ClassifyPlanQuotaError(apiErr)
+
+			assert.Equal(t, testCase.wantStatus, apiErr.StatusCode)
+			assert.Equal(t, testCase.wantMatched, matched)
+		})
+	}
+}
+
 func TestShouldDisableChannelRetainsConfiguredGeneric429(t *testing.T) {
 	originalEnabled := common.AutomaticDisableChannelEnabled
 	originalRanges := operation_setting.AutomaticDisableStatusCodeRanges
