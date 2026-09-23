@@ -450,6 +450,14 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	return operation_setting.ShouldRetryByStatusCode(code)
 }
 
+func shouldPrioritizePlanQuotaDisable(channelError types.ChannelError, err *types.NewAPIError) bool {
+	if err == nil || channelError.IsMultiKey {
+		return false
+	}
+	_, quotaLimited := service.ParsePlanQuotaReset(err.Error())
+	return quotaLimited
+}
+
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
@@ -476,6 +484,10 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 					modelName,
 				))
 			}
+		} else if channelError.AutoBan && shouldPrioritizePlanQuotaDisable(channelError, err) {
+			gopool.Go(func() {
+				service.DisableChannel(channelError, err.ErrorWithStatusCode())
+			})
 		} else if channelError.AutoBan && service.ShouldRecordManagedRouteFailure(err) {
 			reason := err.ErrorWithStatusCode()
 			gopool.Go(func() {

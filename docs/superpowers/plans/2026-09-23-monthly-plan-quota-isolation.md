@@ -387,3 +387,26 @@ git add model/channel.go service/channel.go service/channel_quota_test.go \
   docs/superpowers/plans/2026-09-23-monthly-plan-quota-isolation.md
 git commit -m "fix(channel): scope plan quota recovery domains"
 ```
+
+### Final Review Addendum: Recovery Ordering and Fairness
+
+The final review adds these constraints to the original implementation plan:
+
+- A Plan disable event always refreshes a string `quota_generation`; recovery
+  removes it only in the same successful CAS that enables the channel.
+- The CAS expected snapshot includes exact key and tag values, preventing
+  credential or tag rotation from inheriting stale quota ownership.
+- Passive recovery chooses the eligible channel with the oldest `TestTime` for
+  each marked or validated legacy domain. Equal timestamps choose the lower
+  channel ID. Generic failures remain unique per channel.
+- Managed unsupported-model isolation remains first. Recognized single-key
+  Plan quota errors then enter `DisableChannel`, and `DisableChannel` performs
+  Plan domain isolation before managed failure accounting. Ordinary managed
+  failures and multi-key Plan errors retain their existing paths.
+
+Final focused commands:
+
+```bash
+go test ./service -run 'PlanQuota|MonthlyPlanQuota|ManagedModelUnsupported|ShouldRecordManagedRouteFailure' -count=1
+go test ./controller -run '^(TestSelectChannelsForAutomaticTest.*Recovery|TestSelectChannelsForAutomaticTestDeduplicatesDuePlanDomain|TestShouldPrioritizePlanQuotaDisableForManagedChannel)$' -count=1
+```

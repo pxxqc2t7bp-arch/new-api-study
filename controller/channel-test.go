@@ -1119,7 +1119,7 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 
 func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*model.Channel {
 	selected := make([]*model.Channel, 0, len(channels))
-	selectedRecoveryDomains := make(map[string]struct{})
+	selectedRecoveryDomains := make(map[string]int)
 	managedChannels := make(map[int]struct{})
 	if mode == operation_setting.ChannelTestModePassiveRecovery {
 		var managedIDs []int
@@ -1153,10 +1153,15 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 			if sharedRecoveryKey, owned := service.PlanQuotaRecoveryDomainKey(channel); owned {
 				recoveryKey = sharedRecoveryKey
 			}
-			if _, exists := selectedRecoveryDomains[recoveryKey]; exists {
+			if selectedIndex, exists := selectedRecoveryDomains[recoveryKey]; exists {
+				current := selected[selectedIndex]
+				if channel.TestTime < current.TestTime ||
+					channel.TestTime == current.TestTime && channel.Id < current.Id {
+					selected[selectedIndex] = channel
+				}
 				continue
 			}
-			selectedRecoveryDomains[recoveryKey] = struct{}{}
+			selectedRecoveryDomains[recoveryKey] = len(selected)
 		}
 		selected = append(selected, channel)
 	}

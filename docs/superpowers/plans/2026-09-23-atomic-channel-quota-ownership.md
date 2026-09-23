@@ -229,3 +229,29 @@ git add model/channel.go model/channel_status_cas_test.go \
   docs/superpowers/plans/2026-09-23-atomic-channel-quota-ownership.md
 git commit -m "fix(channel): make quota ownership updates atomic"
 ```
+
+### Final Review Addendum: Identity and Legacy Writer Fencing
+
+The final review extends this plan without adding schema:
+
+- `UpdateSingleKeyChannelStatusIfUnchanged` also receives the snapshot's exact
+  key and tag and compares both under the row lock.
+- Stale-key and stale-tag tests prove credential or routing identity rotation
+  makes the CAS a no-op.
+- Every Plan quota disable event stores a new string `quota_generation`, even
+  for an already-owned auto-disabled channel, so a stale recovery snapshot
+  cannot undo a fresh disable.
+- The non-multi-key branch of `UpdateChannelStatus` uses a bounded
+  snapshot/CAS retry over the same internal transaction. Channel status,
+  `other_info`, and abilities commit together, and cache status changes only
+  after commit.
+- Multi-key status-list handling remains on its existing path.
+
+Final focused commands:
+
+```bash
+go test ./model -run '^(TestUpdateChannelStatusSingleKey|TestUpdateSingleKeyChannelStatusIfUnchanged|TestUpdateChannelStatusPersistsMultiKeyState)' -count=1
+go test -race ./model -run '^(TestUpdateChannelStatusSingleKey|TestUpdateSingleKeyChannelStatusIfUnchanged)' -count=1
+TEST_MYSQL_DSN='...' TEST_POSTGRES_DSN='...' \
+  go test ./model -run '^TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases$' -count=1 -v
+```

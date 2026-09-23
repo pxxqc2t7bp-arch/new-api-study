@@ -750,7 +750,9 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 	return false
 }
 
-func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
+const channelStatusUpdateMaxAttempts = 3
+
+func withChannelStatusLocks(channelId int, update func() (bool, error)) (bool, error) {
 	if common.MemoryCacheEnabled {
 		channelStatusLock.Lock()
 		defer channelStatusLock.Unlock()
@@ -763,10 +765,25 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 	pollingLock.Lock()
 	defer pollingLock.Unlock()
 
+	return update()
+}
+
+func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
+	changed, err := withChannelStatusLocks(channelId, func() (bool, error) {
+		return updateChannelStatusLocked(channelId, usingKey, status, reason)
+	})
+	if err != nil {
+		common.SysLog(fmt.Sprintf("failed to update channel status: channel_id=%d, status=%d, error=%v", channelId, status, err))
+		return false
+	}
+	return changed
+}
+
+func updateChannelStatusLocked(channelId int, usingKey string, status int, reason string) (bool, error) {
 	if common.MemoryCacheEnabled {
 		channelCache, _ := CacheGetChannel(channelId)
 		if channelCache == nil {
-			return false
+			return false, nil
 		}
 		if channelCache.ChannelInfo.IsMultiKey {
 			beforeStatus := channelCache.Status
@@ -777,73 +794,95 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 			}
 			//CacheUpdateChannel(channelCache)
 			//return true
-		} else {
-			// 如果缓存渠道存在，且状态已是目标状态，直接返回
-			if channelCache.Status == status {
-				return false
-			}
-			CacheUpdateChannelStatus(channelId, status)
 		}
 	}
 
-	shouldUpdateAbilities := false
-	defer func() {
-		if shouldUpdateAbilities {
-			err := UpdateAbilityStatus(channelId, status == common.ChannelStatusEnabled)
-			if err != nil {
+	channel, err := GetChannelById(channelId, true)
+	if err != nil {
+		return false, nil
+	}
+	if channel.Status == status {
+		return false, nil
+	}
+
+	if channel.ChannelInfo.IsMultiKey {
+		beforeStatus := channel.Status
+		handlerMultiKeyUpdate(channel, usingKey, status, reason)
+		if err := channel.saveStatusState(); err != nil {
+			return false, err
+		}
+		if beforeStatus != channel.Status {
+			if err := UpdateAbilityStatus(channelId, status == common.ChannelStatusEnabled); err != nil {
 				common.SysLog(fmt.Sprintf("failed to update ability status: channel_id=%d, error=%v", channelId, err))
 			}
 		}
-	}()
-	channel, err := GetChannelById(channelId, true)
-	if err != nil {
-		return false
-	} else {
-		if channel.Status == status {
-			return false
+		return true, nil
+	}
+
+	for range channelStatusUpdateMaxAttempts {
+		current, err := GetChannelById(channelId, true)
+		if err != nil {
+			return false, err
+		}
+		if current.ChannelInfo.IsMultiKey || current.Status == status {
+			return false, nil
 		}
 
-		if channel.ChannelInfo.IsMultiKey {
-			beforeStatus := channel.Status
-			handlerMultiKeyUpdate(channel, usingKey, status, reason)
-			if beforeStatus != channel.Status {
-				shouldUpdateAbilities = true
-			}
-		} else {
-			info := channel.GetOtherInfo()
-			info["status_reason"] = reason
-			info["status_time"] = common.GetTimestamp()
-			channel.SetOtherInfo(info)
-			channel.Status = status
-			shouldUpdateAbilities = true
-		}
-		err = channel.saveStatusState()
-		if err != nil {
-			common.SysLog(fmt.Sprintf("failed to update channel status: channel_id=%d, status=%d, error=%v", channel.Id, status, err))
-			return false
+		expectedOtherInfo := current.OtherInfo
+		info := current.GetOtherInfo()
+		info["status_reason"] = reason
+		info["status_time"] = common.GetTimestamp()
+		current.SetOtherInfo(info)
+
+		changed, err := updateSingleKeyChannelStatusIfUnchangedLocked(
+			channelId,
+			current.Key,
+			current.GetTag(),
+			current.Status,
+			expectedOtherInfo,
+			status,
+			current.OtherInfo,
+		)
+		if err != nil || changed {
+			return changed, err
 		}
 	}
-	return true
+	return false, nil
 }
 
 // UpdateSingleKeyChannelStatusIfUnchanged atomically updates status-owned
 // channel state only while the locked row still matches the caller's snapshot.
 func UpdateSingleKeyChannelStatusIfUnchanged(
 	channelId int,
+	expectedKey string,
+	expectedTag string,
 	expectedStatus int,
 	expectedOtherInfo string,
 	status int,
 	otherInfo string,
 ) (bool, error) {
-	if common.MemoryCacheEnabled {
-		channelStatusLock.Lock()
-		defer channelStatusLock.Unlock()
-	}
+	return withChannelStatusLocks(channelId, func() (bool, error) {
+		return updateSingleKeyChannelStatusIfUnchangedLocked(
+			channelId,
+			expectedKey,
+			expectedTag,
+			expectedStatus,
+			expectedOtherInfo,
+			status,
+			otherInfo,
+		)
+	})
+}
 
-	pollingLock := GetChannelPollingLock(channelId)
-	pollingLock.Lock()
-	defer pollingLock.Unlock()
-
+func updateSingleKeyChannelStatusIfUnchangedLocked(
+	channelId int,
+	expectedKey string,
+	expectedTag string,
+	expectedStatus int,
+	expectedOtherInfo string,
+	status int,
+	otherInfo string,
+) (bool, error) {
 	changed := false
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		var current Channel
@@ -851,6 +890,8 @@ func UpdateSingleKeyChannelStatusIfUnchanged(
 			return err
 		}
 		if current.ChannelInfo.IsMultiKey ||
+			current.Key != expectedKey ||
+			current.GetTag() != expectedTag ||
 			current.Status != expectedStatus ||
 			current.OtherInfo != expectedOtherInfo {
 			return nil

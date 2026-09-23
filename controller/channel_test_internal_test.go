@@ -410,6 +410,43 @@ func TestSelectChannelsForAutomaticTestDeduplicatesDuePlanDomain(t *testing.T) {
 	assert.Equal(t, []int{11, 13, 14, 16, 17, 18}, selectedIDs)
 }
 
+func TestSelectChannelsForAutomaticTestPassiveRecoveryUsesOldestDomainPeer(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
+	past := time.Now().Add(-time.Minute).Unix()
+	tag := "plan:support:fairness"
+	recent := &model.Channel{Id: 11, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 200}
+	recent.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-a"})
+	older := &model.Channel{Id: 12, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 100}
+	older.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-a"})
+	higherIDTie := &model.Channel{Id: 15, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 50}
+	higherIDTie.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-b"})
+	lowerIDTie := &model.Channel{Id: 14, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 50}
+	lowerIDTie.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-b"})
+	genericFirst := &model.Channel{Id: 16, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 300}
+	genericFirst.SetOtherInfo(map[string]any{"disabled_until": past, "status_reason": "authentication failed"})
+	genericSecond := &model.Channel{Id: 17, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 400}
+	genericSecond.SetOtherInfo(map[string]any{"disabled_until": past, "status_reason": "transport failed"})
+
+	selected := selectChannelsForAutomaticTest(
+		[]*model.Channel{
+			recent,
+			older,
+			higherIDTie,
+			lowerIDTie,
+			genericFirst,
+			genericSecond,
+		},
+		operation_setting.ChannelTestModePassiveRecovery,
+	)
+
+	selectedIDs := make([]int, len(selected))
+	for i, channel := range selected {
+		selectedIDs[i] = channel.Id
+	}
+	assert.Equal(t, []int{12, 14, 16, 17}, selectedIDs)
+}
+
 func TestSelectChannelsForAutomaticTestAlwaysSkipsManualDisabled(t *testing.T) {
 	setupAutomaticChannelSelectionTestDB(t)
 
@@ -458,6 +495,27 @@ func TestShouldRetryStopsAfterResponseWasWritten(t *testing.T) {
 	)
 
 	assert.False(t, shouldRetry(ctx, upstreamError, 3))
+}
+
+func TestShouldPrioritizePlanQuotaDisableForManagedChannel(t *testing.T) {
+	planQuotaError := relaytypes.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota. It will reset at 2026-09-30 23:59:59 +0800 CST."),
+		relaytypes.ErrorCode("AccountQuotaExceeded"),
+		http.StatusTooManyRequests,
+	)
+	ordinaryManagedError := relaytypes.NewOpenAIError(
+		errors.New("upstream unavailable"),
+		relaytypes.ErrorCodeBadResponseStatusCode,
+		http.StatusBadGateway,
+	)
+
+	singleKey := relaytypes.ChannelError{ChannelId: 61}
+	assert.True(t, shouldPrioritizePlanQuotaDisable(singleKey, planQuotaError))
+	assert.False(t, shouldPrioritizePlanQuotaDisable(singleKey, ordinaryManagedError))
+
+	multiKey := relaytypes.ChannelError{ChannelId: 61, IsMultiKey: true}
+	assert.False(t, shouldPrioritizePlanQuotaDisable(multiKey, planQuotaError))
+	assert.False(t, shouldPrioritizePlanQuotaDisable(singleKey, nil))
 }
 
 func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T) {

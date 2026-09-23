@@ -83,7 +83,12 @@ func setupPlanQuotaDomainTest(t *testing.T) *gorm.DB {
 		strings.ReplaceAll(t.Name(), "/", "_"),
 	)), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.Channel{}, &model.Ability{}, &model.User{}))
+	require.NoError(t, db.AutoMigrate(
+		&model.Channel{},
+		&model.Ability{},
+		&model.User{},
+		&model.UpstreamManagedRoute{},
+	))
 	model.DB = db
 	common.MemoryCacheEnabled = false
 	t.Cleanup(func() {
@@ -472,6 +477,72 @@ func TestEnablePlanQuotaDomainAfterCredentialRotation(t *testing.T) {
 	assert.False(t, abilities[1].Enabled)
 }
 
+func TestFreshPlanQuotaDisableFencesStaleRecoverySnapshot(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+
+	autoBan := 1
+	tag := "plan:support:generation"
+	channel := model.Channel{
+		Id:      43,
+		Name:    "generation",
+		Key:     "credential",
+		Status:  common.ChannelStatusEnabled,
+		Tag:     &tag,
+		AutoBan: &autoBan,
+		Models:  "gpt-3.5-turbo",
+		Group:   "default",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	const resetAt = int64(2_000_000_000)
+	disablePlanQuotaDomain(&channel, "quota exhausted", resetAt)
+
+	var staleRecoverySnapshot model.Channel
+	require.NoError(t, db.First(&staleRecoverySnapshot, channel.Id).Error)
+	firstGeneration, firstGenerationOK := staleRecoverySnapshot.GetOtherInfo()["quota_generation"].(string)
+
+	disablePlanQuotaDomain(&staleRecoverySnapshot, "quota exhausted", resetAt)
+
+	var freshlyDisabled model.Channel
+	require.NoError(t, db.First(&freshlyDisabled, channel.Id).Error)
+	secondGeneration, secondGenerationOK := freshlyDisabled.GetOtherInfo()["quota_generation"].(string)
+	assert.True(t, firstGenerationOK)
+	assert.True(t, secondGenerationOK)
+	assert.NotEqual(t, firstGeneration, secondGeneration)
+
+	expectedOtherInfo := staleRecoverySnapshot.OtherInfo
+	recoveryMetadata := staleRecoverySnapshot.GetOtherInfo()
+	recoveryMetadata["status_reason"] = ""
+	recoveryMetadata["status_time"] = common.GetTimestamp()
+	delete(recoveryMetadata, "disabled_until")
+	delete(recoveryMetadata, "quota_reset_at")
+	delete(recoveryMetadata, "quota_domain")
+	delete(recoveryMetadata, "quota_domain_id")
+	delete(recoveryMetadata, "quota_generation")
+	delete(recoveryMetadata, "quota_type")
+	staleRecoverySnapshot.SetOtherInfo(recoveryMetadata)
+
+	changed, err := model.UpdateSingleKeyChannelStatusIfUnchanged(
+		staleRecoverySnapshot.Id,
+		staleRecoverySnapshot.Key,
+		staleRecoverySnapshot.GetTag(),
+		staleRecoverySnapshot.Status,
+		expectedOtherInfo,
+		common.ChannelStatusEnabled,
+		staleRecoverySnapshot.OtherInfo,
+	)
+	require.NoError(t, err)
+	assert.False(t, changed)
+
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	require.NoError(t, db.First(&freshlyDisabled, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, freshlyDisabled.Status)
+	assert.Equal(t, secondGeneration, freshlyDisabled.GetOtherInfo()["quota_generation"])
+	assert.False(t, ability.Enabled)
+}
+
 func TestDisablePlanQuotaDomainPreservesConcurrentOwnership(t *testing.T) {
 	db := setupPlanQuotaDomainTest(t)
 
@@ -673,6 +744,77 @@ func TestDisableChannelPreservesPlanMultiKeyIsolation(t *testing.T) {
 	var ability model.Ability
 	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
 	assert.True(t, ability.Enabled)
+}
+
+func TestDisableChannelManagedPlanQuotaIsolatesCredentialDomain(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	originalSetting := *setting
+	setting.Enabled = true
+	setting.FailureThreshold = 3
+	setting.FailureWindowMinutes = 5
+	t.Cleanup(func() {
+		*setting = originalSetting
+	})
+
+	autoBan := 1
+	messagesTag := "plan:managed:messages"
+	responsesTag := "plan:managed:responses"
+	channels := []model.Channel{
+		{
+			Id: 61, Name: "managed-messages", Key: "shared-secret",
+			Status: common.ChannelStatusEnabled, Tag: &messagesTag, AutoBan: &autoBan,
+			Models: "gpt-3.5-turbo", Group: "default",
+		},
+		{
+			Id: 62, Name: "managed-responses", Key: "shared-secret",
+			Status: common.ChannelStatusEnabled, Tag: &responsesTag, AutoBan: &autoBan,
+			Models: "gpt-3.5-turbo", Group: "default",
+		},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+	route := model.UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "managed-plan",
+		Platform:        "plan",
+		Protocol:        "responses",
+		ChannelID:       channels[0].Id,
+		State:           model.UpstreamRouteStateActive,
+	}
+	require.NoError(t, db.Create(&route).Error)
+
+	DisableChannel(types.ChannelError{
+		ChannelId:   channels[0].Id,
+		ChannelName: channels[0].Name,
+		AutoBan:     true,
+	}, "You have exceeded the monthly usage quota. It will reset at 2026-09-30 23:59:59 +0800 CST.")
+
+	var stored []model.Channel
+	require.NoError(t, db.Order("id").Find(&stored).Error)
+	require.Len(t, stored, 2)
+	firstInfo := stored[0].GetOtherInfo()
+	secondInfo := stored[1].GetOtherInfo()
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[0].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[1].Status)
+	assert.Equal(t, firstInfo["quota_domain_id"], secondInfo["quota_domain_id"])
+	assert.NotEmpty(t, firstInfo["quota_generation"])
+	assert.Equal(t, firstInfo["quota_generation"], secondInfo["quota_generation"])
+	assert.NotContains(t, stored[0].OtherInfo, "shared-secret")
+	assert.NotContains(t, stored[1].OtherInfo, "shared-secret")
+
+	var abilities []model.Ability
+	require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
+	require.Len(t, abilities, 2)
+	assert.False(t, abilities[0].Enabled)
+	assert.False(t, abilities[1].Enabled)
+
+	var storedRoute model.UpstreamManagedRoute
+	require.NoError(t, db.First(&storedRoute, route.ID).Error)
+	assert.Zero(t, storedRoute.ConsecutiveFailures)
 }
 
 func TestDisablePlanQuotaDomainWithoutResetStillDisables(t *testing.T) {

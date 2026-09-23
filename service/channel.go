@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,17 +32,17 @@ func DisableChannel(channelError types.ChannelError, reason string) {
 		return
 	}
 
-	if handled, _, err := RecordManagedChannelFailure(channelError, reason); handled {
-		if err != nil {
-			common.SysError(fmt.Sprintf("failed to record managed channel failure: channel_id=%d error=%v", channelError.ChannelId, err))
-		}
-		return
-	}
-
 	channel, _ := model.CacheGetChannel(channelError.ChannelId)
 	resetAt, quotaLimited := ParsePlanQuotaReset(reason)
 	if !channelError.IsMultiKey && isNonMultiKeyPlanChannel(channel) && quotaLimited {
 		disablePlanQuotaDomain(channel, reason, resetAt)
+		return
+	}
+
+	if handled, _, err := RecordManagedChannelFailure(channelError, reason); handled {
+		if err != nil {
+			common.SysError(fmt.Sprintf("failed to record managed channel failure: channel_id=%d error=%v", channelError.ChannelId, err))
+		}
 		return
 	}
 
@@ -134,6 +135,7 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 		channels = allChannels
 	}
 	domainID := planQuotaDomainID(failingChannel.Id, credential)
+	generation := strconv.FormatInt(time.Now().UnixNano(), 10)
 
 	disabled := 0
 	for _, channel := range channels {
@@ -169,6 +171,7 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 		}
 		metadata["quota_domain"] = tag
 		metadata["quota_domain_id"] = domainID
+		metadata["quota_generation"] = generation
 		metadata["quota_type"] = "plan"
 		if resetAt > 0 {
 			metadata["quota_reset_at"] = resetAt
@@ -181,6 +184,8 @@ func disablePlanQuotaDomain(failingChannel *model.Channel, reason string, resetA
 
 		changed, err := model.UpdateSingleKeyChannelStatusIfUnchanged(
 			channel.Id,
+			channel.Key,
+			channel.GetTag(),
 			expectedStatus,
 			expectedOtherInfo,
 			common.ChannelStatusAutoDisabled,
@@ -275,11 +280,14 @@ func enablePlanQuotaDomain(recoveringChannel *model.Channel) bool {
 		delete(metadata, "quota_reset_at")
 		delete(metadata, "quota_domain")
 		delete(metadata, "quota_domain_id")
+		delete(metadata, "quota_generation")
 		delete(metadata, "quota_type")
 		channel.SetOtherInfo(metadata)
 
 		changed, err := model.UpdateSingleKeyChannelStatusIfUnchanged(
 			channel.Id,
+			channel.Key,
+			channel.GetTag(),
 			channel.Status,
 			expectedOtherInfo,
 			common.ChannelStatusEnabled,

@@ -59,6 +59,8 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedUpdatesChannelAndAbility(t *test
 
 	changed, err := UpdateSingleKeyChannelStatusIfUnchanged(
 		channel.Id,
+		channel.Key,
+		channel.GetTag(),
 		common.ChannelStatusEnabled,
 		expectedOtherInfo,
 		common.ChannelStatusAutoDisabled,
@@ -89,6 +91,8 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedRejectsStaleSnapshot(t *testing.
 
 		changed, err := UpdateSingleKeyChannelStatusIfUnchanged(
 			channel.Id,
+			channel.Key,
+			channel.GetTag(),
 			common.ChannelStatusEnabled,
 			expectedOtherInfo,
 			common.ChannelStatusAutoDisabled,
@@ -117,6 +121,8 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedRejectsStaleSnapshot(t *testing.
 
 		changed, err := UpdateSingleKeyChannelStatusIfUnchanged(
 			channel.Id,
+			channel.Key,
+			channel.GetTag(),
 			common.ChannelStatusEnabled,
 			expectedOtherInfo,
 			common.ChannelStatusAutoDisabled,
@@ -128,6 +134,64 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedRejectsStaleSnapshot(t *testing.
 		stored, ability := loadChannelStatusCASFixture(t, channel.Id)
 		assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
 		assert.Equal(t, concurrent.OtherInfo, stored.OtherInfo)
+		assert.True(t, ability.Enabled)
+	})
+
+	t.Run("key", func(t *testing.T) {
+		channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+			"owner": "snapshot",
+		})
+		expectedOtherInfo := channel.OtherInfo
+		require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).
+			Update("key", "rotated-credential").Error)
+
+		changed, err := UpdateSingleKeyChannelStatusIfUnchanged(
+			channel.Id,
+			channel.Key,
+			channel.GetTag(),
+			common.ChannelStatusEnabled,
+			expectedOtherInfo,
+			common.ChannelStatusAutoDisabled,
+			`{"owner":"quota"}`,
+		)
+		require.NoError(t, err)
+		assert.False(t, changed)
+
+		stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+		assert.Equal(t, "rotated-credential", stored.Key)
+		assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+		assert.Equal(t, expectedOtherInfo, stored.OtherInfo)
+		assert.True(t, ability.Enabled)
+	})
+
+	t.Run("tag", func(t *testing.T) {
+		channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+			"owner": "snapshot",
+		})
+		channel.SetTag("plan:original")
+		require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).
+			Update("tag", channel.Tag).Error)
+		expectedOtherInfo := channel.OtherInfo
+		rotatedTag := "plan:rotated"
+		require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).
+			Update("tag", rotatedTag).Error)
+
+		changed, err := UpdateSingleKeyChannelStatusIfUnchanged(
+			channel.Id,
+			channel.Key,
+			channel.GetTag(),
+			common.ChannelStatusEnabled,
+			expectedOtherInfo,
+			common.ChannelStatusAutoDisabled,
+			`{"owner":"quota"}`,
+		)
+		require.NoError(t, err)
+		assert.False(t, changed)
+
+		stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+		assert.Equal(t, rotatedTag, stored.GetTag())
+		assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+		assert.Equal(t, expectedOtherInfo, stored.OtherInfo)
 		assert.True(t, ability.Enabled)
 	})
 }
@@ -153,6 +217,8 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedRollsBackAbilityFailure(t *testi
 
 	changed, err := UpdateSingleKeyChannelStatusIfUnchanged(
 		channel.Id,
+		channel.Key,
+		channel.GetTag(),
 		common.ChannelStatusEnabled,
 		expectedOtherInfo,
 		common.ChannelStatusAutoDisabled,
@@ -257,6 +323,8 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 
 			changed, err := UpdateSingleKeyChannelStatusIfUnchanged(
 				channel.Id,
+				channel.Key,
+				channel.GetTag(),
 				common.ChannelStatusEnabled,
 				expectedOtherInfo,
 				common.ChannelStatusAutoDisabled,

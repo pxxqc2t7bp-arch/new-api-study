@@ -31,6 +31,11 @@ different tags can therefore continue receiving traffic.
   `disabled_until`.
 - Schedule one passive recovery probe per quota domain while leaving unrelated
   auto-disabled channels independently eligible.
+- Fence quota ownership writes against credential and tag rotation.
+- Prevent stale recovery snapshots from superseding a newer disable event.
+- Keep legacy single-key status writes atomic with ability state.
+- Apply Plan quota isolation to managed routes before managed failure
+  thresholds, without changing unsupported-model handling.
 
 ## Non-Goals
 
@@ -71,22 +76,35 @@ state.
 ### Atomic Ownership Transition
 
 The service builds the complete desired `other_info` from each selected
-channel snapshot. It passes the snapshot's exact status and raw `other_info`
-string to a focused model API for single-key channels. The model API holds the
-same process-local status and per-channel polling locks used by
+channel snapshot. It passes the snapshot's exact key, tag, status, and raw
+`other_info` string to a focused model API for single-key channels. The model
+API holds the same process-local status and per-channel polling locks used by
 `UpdateChannelStatus`, starts `DB.Transaction`, and reads the current channel
 through `lockForUpdate(tx)`. MySQL and PostgreSQL therefore hold a row lock;
 SQLite skips unsupported `FOR UPDATE` syntax and relies on its single-writer
 transaction behavior.
 
 The transaction proceeds only when the locked row is still single-key and its
-status and raw `other_info` exactly match the expected snapshot. It updates
-`channels.status`, `channels.other_info`, and all corresponding
-`abilities.enabled` rows in that transaction. A stale status or metadata
-snapshot returns `changed=false` without writing either table. Any channel or
-ability update error rolls the transaction back, so their enabled states
-cannot diverge. The in-memory channel status cache is updated only after a
-successful commit.
+key, tag, status, and raw `other_info` exactly match the expected snapshot. It
+updates `channels.status`, `channels.other_info`, and all corresponding
+`abilities.enabled` rows in that transaction. A stale identity, status, or
+metadata snapshot returns `changed=false` without writing either table. Any
+channel or ability update error rolls the transaction back, so their enabled
+states cannot diverge. The in-memory channel status cache is updated only
+after a successful commit.
+
+Every Plan quota disable event writes one new decimal Unix-nanosecond string
+as `quota_generation`, including when a channel is already auto-disabled and
+owned by the same quota domain. This guarantees that a fresh disable changes
+the exact raw metadata expected by recovery. A recovery snapshot taken before
+that event therefore loses its CAS and cannot re-enable the channel. Successful
+recovery removes `quota_generation` with the other quota ownership fields.
+
+The non-multi-key branch of legacy `UpdateChannelStatus` uses a bounded
+snapshot/CAS retry over the same internal lock and transaction primitive.
+Status, `other_info`, and abilities commit together, and cache status changes
+only after commit. The existing multi-key status-list behavior remains on its
+established path.
 
 Plan disable and recovery no longer call `UpdateChannelStatus` followed by
 `MergeChannelStatusMetadata`. A concurrent manual disable, unrelated
@@ -113,6 +131,8 @@ The same recovery-domain classifier is reused by passive test selection.
 Marked rows deduplicate by `quota_domain_id`, validated legacy rows deduplicate
 by their `quota_domain`/tag, and every other auto-disabled row receives an
 independent probe opportunity even when several such rows share a Plan tag.
+Within each shared recovery domain, the eligible row with the oldest
+`TestTime` is selected; equal timestamps choose the lower channel ID.
 
 Before marker-scoped recovery, the service computes a marker from the
 recovering channel's current single credential and compares it with the
@@ -124,6 +144,12 @@ If loading the shared credential domain fails, the operation remains
 fail-closed by logging the error and leaving the affected channels unchanged
 rather than partially updating an unknown set.
 
+Managed-route error handling retains unsupported-model isolation as its first
+special case. A recognized single-key Plan quota error is then sent through
+`DisableChannel`, where Plan domain isolation runs before managed failure
+accounting. Ordinary managed failures and multi-key Plan failures retain their
+existing threshold and per-key behavior.
+
 ## Data Flow
 
 1. An upstream response becomes a `types.NewAPIError`.
@@ -132,13 +158,14 @@ rather than partially updating an unknown set.
 4. Multi-key Plan channels fall through to per-key status handling.
 5. For other Plan channels, exact single-key matches are selected in Go.
 6. Eligible enabled or same-marker auto-disabled snapshots build their complete
-   desired status metadata and enter the transactional row-lock CAS.
+   desired status metadata with a fresh `quota_generation` and enter the
+   transactional row-lock CAS.
 7. The CAS updates channel status, metadata, and ability enabled state only
-   while the locked row still matches the snapshot.
+   while key, tag, status, and raw metadata still match the snapshot.
 8. Existing retry logic sends the current request to the next eligible tier.
 9. Passive recovery skips channels until `reset_at + 60 seconds`, then selects
-   one row per marked or validated legacy domain and each unrelated row
-   independently.
+   the oldest-tested row per marked or validated legacy domain and each
+   unrelated row independently.
 10. A successful recovery probe enables only auto-disabled rows in the same
    owned domain. Credential rotation restricts that recovery to the probed row.
 
@@ -165,18 +192,27 @@ rather than partially updating an unknown set.
   rows by domain/tag while selecting unrelated failures per channel.
 - Credential rotation recovers only the rotated channel and leaves peers under
   the old marker disabled.
+- Stale key and stale tag snapshots make the model CAS a no-op.
+- A fresh disable of an already-owned auto-disabled channel changes
+  `quota_generation` and rejects a stale recovery snapshot.
 - A successful model CAS updates status, raw metadata, and ability enabled
   state together.
 - A stale expected status or stale expected `other_info` returns no change and
   preserves both channel and ability rows.
 - A forced ability update failure rolls the transaction back without changing
   channel status or metadata.
+- Legacy single-key `UpdateChannelStatus` rolls back channel, metadata, ability,
+  and cache changes together and leaves no interleaving gap.
 - A stale service snapshot cannot overwrite a concurrent owner or status
   change.
 - Optional `TEST_MYSQL_DSN` and `TEST_POSTGRES_DSN` coverage exercises the same
   CAS against temporary migrated real-dialect channel and ability tables.
 - Public `DisableChannel` preserves per-key isolation for multi-key Plan
   channels.
+- Passive recovery chooses the oldest `TestTime` in a shared domain and uses
+  channel ID as its deterministic tie-break.
+- Managed single-key Plan quota failures isolate shared credential peers before
+  managed route failure thresholds are evaluated.
 - Existing disable/enable lifecycle and no-reset behavior continue to pass.
 
 ## Operational State
