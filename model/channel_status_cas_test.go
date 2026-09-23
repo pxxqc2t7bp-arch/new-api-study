@@ -17,6 +17,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/schema"
 )
 
@@ -2088,17 +2089,34 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 				State:           UpstreamRouteStateActive,
 			}
 			require.NoError(t, DB.Create(&isolationRoute).Error)
+			isolationRouteID := isolationRoute.ID
+			isolationRoute = UpstreamManagedRoute{}
+			require.NoError(t, DB.First(&isolationRoute, isolationRouteID).Error)
+			const exclusionOptionKey = "test.managed_model_exclusions"
+			require.NoError(t, DB.Create(&Option{
+				Key:   exclusionOptionKey,
+				Value: `{"configured-source:other":["gpt-existing"]}`,
+			}).Error)
 
 			isolated, optionValue, err := IsolateManagedRouteModel(
 				&isolationRoute,
 				"gpt-a",
 				"status_code=404",
 				1_788_320_000,
-				"test.managed_model_exclusions",
+				exclusionOptionKey,
 			)
 			require.NoError(t, err)
 			require.True(t, isolated)
-			assert.JSONEq(t, `{"configured-source:configured-group":["gpt-a"]}`, optionValue)
+			expectedOptionValue := `{
+				"configured-source:configured-group":["gpt-a"],
+				"configured-source:other":["gpt-existing"]
+			}`
+			assert.JSONEq(t, expectedOptionValue, optionValue)
+			var storedOption Option
+			require.NoError(t, DB.
+				Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: exclusionOptionKey}).
+				First(&storedOption).Error)
+			assert.JSONEq(t, expectedOptionValue, storedOption.Value)
 			var storedIsolationChannel Channel
 			require.NoError(t, DB.First(&storedIsolationChannel, isolationChannel.Id).Error)
 			assert.Equal(t, "gpt-b", storedIsolationChannel.Models)

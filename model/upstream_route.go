@@ -312,7 +312,7 @@ func IsolateManagedRouteModel(
 			var option Option
 			optionExists := true
 			if err := lockForUpdate(tx).
-				Where("key = ?", exclusionOptionKey).
+				Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: exclusionOptionKey}).
 				First(&option).Error; err != nil {
 				if !errors.Is(err, gorm.ErrRecordNotFound) {
 					return err
@@ -384,7 +384,7 @@ func IsolateManagedRouteModel(
 				option.Value = string(encoded)
 				if optionExists {
 					if err := tx.Model(&Option{}).
-						Where("key = ?", exclusionOptionKey).
+						Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: exclusionOptionKey}).
 						Update("value", option.Value).Error; err != nil {
 						return err
 					}
