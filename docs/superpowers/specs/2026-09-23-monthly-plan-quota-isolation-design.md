@@ -62,6 +62,9 @@ different tags can therefore continue receiving traffic.
   membership, and multi-key mode rotation.
 - Automatically probe an auto-disabled multi-key channel after its final
   enabled key is disabled without exposing that key to normal routing.
+- Persist a known structured Plan reset deadline when that final-key disable
+  makes the overall channel auto-disabled, without assigning shared-domain
+  ownership to the multi-key row.
 - Admit each due managed all-disabled multi-key channel to passive recovery as
   its own candidate even though per-key isolation has no quota-domain marker.
 - Restore or remove memory-cache routing membership for every production
@@ -276,6 +279,22 @@ recovery therefore restore enabled routing membership, remove disabled
 membership, preserve priority ordering, and avoid duplicate IDs. The general
 multi-key status API remains unchanged.
 
+The identity-fenced multi-key CAS accepts focused status-metadata options.
+After applying the selected key transition, it merges `quota_reset_at` and
+`disabled_until=quota_reset_at+60` only when a structured Plan update has a
+known reset and leaves the overall channel auto-disabled. A multi-key channel
+with another enabled key receives no deadline or shared Plan ownership fields.
+An unknown reset retains the existing no-deadline behavior, so passive
+selection remains immediately eligible. The reset fields commit in the same
+transaction as overall status, complete per-key state, and abilities. They do
+not contain raw credentials and do not add `quota_domain`,
+`quota_domain_id`, `quota_generation`, or `quota_type`.
+
+When an isolated health-check recovery enables the overall channel, the same
+CAS removes only `quota_reset_at` and `disabled_until`. All unrelated
+`other_info` survives, and a stale request identity or channel snapshot still
+causes a no-op before any metadata, key status, ability, or cache change.
+
 `DisableChannelForAPIError` rejects the structured path before classification
 or mutation when `common.AutomaticDisableChannelEnabled` is false. This guard
 lives at the public service entry rather than only in controller policy, so
@@ -321,7 +340,10 @@ atomicity are identical on MySQL and PostgreSQL; SQLite omits unsupported
 4. Multi-key Plan channels immediately use per-key status handling, including
    managed channels below their failure threshold, only if current tag, key
    membership, and multi-key mode still match the failed request. A committed
-   overall status transition synchronizes both the cached channel state and its
+   final-key transition also persists a known reset and its 60-second recovery
+   grace in the same transaction as disabled abilities. A partial key disable
+   and an unknown reset write no overall deadline. The committed overall
+   status transition synchronizes both the cached channel state and its
    group/model routing membership.
 5. For other Plan channels, exact single-key matches are selected in Go.
 6. Eligible enabled or same-marker auto-disabled snapshots build their complete
@@ -431,12 +453,18 @@ atomicity are identical on MySQL and PostgreSQL; SQLite omits unsupported
   channel from cached selection while preserving the committed per-key state;
   re-enabling a key through `EnableChannelForHealthCheck` or `EnableChannel`
   restores routing membership in priority order without duplication.
+- A structured final-key error with a known reset atomically persists
+  `quota_reset_at` and `disabled_until=reset+60` with per-key, overall status,
+  and ability disable state; passive recovery does not probe before that
+  deadline. A partial multi-key disable receives no deadline or shared-domain
+  marker, and an unknown reset retains no deadline.
 - An all-disabled multi-key health check probes the oldest auto-disabled key,
   breaks timestamp ties by lower index, and does not mutate the source
   snapshot, database key status, or cache before recovery.
 - A failed final-key probe preserves every disabled key. A successful probe
-  enables only the selected key, while stale channel info and key, tag, or
-  multi-key mode rotation make recovery a no-op.
+  enables only the selected key and clears only the overall reset deadline
+  fields, while stale channel info and key, tag, or multi-key mode rotation
+  make recovery a no-op.
 - Passive recovery chooses the oldest `TestTime` in a shared domain and uses
   channel ID as its deterministic tie-break.
 - Passive recovery includes managed marked and validated legacy Plan quota

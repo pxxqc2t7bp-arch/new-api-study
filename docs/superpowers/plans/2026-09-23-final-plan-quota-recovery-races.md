@@ -1062,3 +1062,72 @@ Observed: focused controller/model/service tests and matching race suites
 passed; `go vet ./controller ./model ./service`, `gofmt -d`, and
 `git diff --check` exited cleanly. Review found only the registered controller
 implementation, regression coverage, and design/plan updates.
+
+### Task 20: Persist Managed Final-Key Reset Metadata
+
+**Files:**
+
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `model/channel.go`
+- Modify: `model/channel_status_cas_test.go`
+- Modify: `service/channel.go`
+- Modify: `service/channel_quota_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: RED for the structured final-key lifecycle**
+
+Remove the manually seeded `disabled_until` from the managed end-to-end
+fixture. Send a structured final-key Plan error with a known reset and require
+the database row to persist `quota_reset_at` plus `disabled_until=reset+60`
+with the final per-key state and disabled ability. Require passive mode to test
+zero channels before due, then make only the deadline due and require one
+isolated recovery.
+
+Observed RED: both reset fields were absent, passive mode immediately probed
+and recovered the channel, and the later due run had no candidate.
+
+- [x] **Step 2: RED for the focused model contract**
+
+Call `UpdateMultiKeyChannelStatusIfUnchanged` with a wished-for focused options
+value. Require a known final-key reset to update metadata and a forced ability
+write failure to roll back status, complete per-key state, deadline metadata,
+and ability state together.
+
+Observed RED: the model package did not compile because the options contract
+and parameter did not exist.
+
+- [x] **Step 3: GREEN with an atomic metadata option**
+
+Add `MultiKeyChannelStatusUpdateOptions`. Merge only `quota_reset_at` and
+`disabled_until` after the selected-key transition leaves the overall channel
+auto-disabled and the structured reset is known. On health-check recovery,
+delete only those two fields after the selected-key transition makes the
+overall channel enabled. Keep all snapshot and request identity comparisons
+unchanged and perform metadata, channel, ability, and cache updates through the
+existing transaction and post-commit path.
+
+Observed: the focused model tests and full managed final-key lifecycle passed.
+
+- [x] **Step 4: Cover partial and unknown reset boundaries**
+
+Require a known structured error that leaves another multi-key credential
+enabled to write no overall deadline or shared Plan ownership marker. Require
+an unknown-reset final-key error to preserve the existing deadline-free
+behavior while still disabling the final key and ability.
+
+Observed: focused service tests passed.
+
+- [x] **Step 5: Verify, review, and commit**
+
+Run `gofmt`, focused and affected-package tests, focused race tests, `go vet`,
+and `git diff --check`. Review for CAS preservation, unrelated metadata
+retention, raw credential disclosure, schema changes, and deployment changes;
+then create one focused commit.
+
+Observed: focused model, service, and end-to-end controller regressions passed;
+`go test ./model ./service ./controller -count=1` passed; focused race suites
+for all three packages passed; `go vet`, `gofmt -d`, and `git diff --check`
+exited cleanly. The configured MySQL and PostgreSQL cases skipped because
+`TEST_MYSQL_DSN` and `TEST_POSTGRES_DSN` were unset. Review found no schema,
+credential, or deployment changes.

@@ -1665,11 +1665,71 @@ func TestDisableChannelPreservesPlanMultiKeyIsolation(t *testing.T) {
 	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
 	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
-	assert.NotContains(t, stored.GetOtherInfo(), "quota_domain_id")
+	storedInfo := stored.GetOtherInfo()
+	assert.NotContains(t, storedInfo, "quota_reset_at")
+	assert.NotContains(t, storedInfo, "disabled_until")
+	assert.NotContains(t, storedInfo, "quota_domain")
+	assert.NotContains(t, storedInfo, "quota_domain_id")
+	assert.NotContains(t, storedInfo, "quota_generation")
+	assert.NotContains(t, storedInfo, "quota_type")
 
 	var ability model.Ability
 	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
 	assert.True(t, ability.Enabled)
+}
+
+func TestDisableChannelPlanMultiKeyFinalKeyWithoutKnownResetKeepsNoDeadline(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+
+	autoBan := 1
+	tag := "plan:support:multi-key-unknown-reset"
+	channel := model.Channel{
+		Id:      42,
+		Name:    "multi-key-unknown-reset",
+		Key:     "key-a\nkey-b",
+		Status:  common.ChannelStatusEnabled,
+		Tag:     &tag,
+		AutoBan: &autoBan,
+		Models:  "gpt-3.5-turbo",
+		Group:   "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+			},
+		},
+	}
+	channel.SetOtherInfo(map[string]any{"owner": "preserved"})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	apiError := types.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota. It will reset at unknown."),
+		types.ErrorCode("AccountQuotaExceeded"),
+		http.StatusTooManyRequests,
+	)
+	require.True(t, DisableChannelForAPIError(types.ChannelError{
+		ChannelId:   channel.Id,
+		ChannelName: channel.Name,
+		IsMultiKey:  true,
+		AutoBan:     true,
+		UsingKey:    "key-b",
+	}, tag, apiError))
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, "id = ?", channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[1])
+	assert.Equal(t, "preserved", stored.GetOtherInfo()["owner"])
+	assert.NotContains(t, stored.GetOtherInfo(), "quota_reset_at")
+	assert.NotContains(t, stored.GetOtherInfo(), "disabled_until")
+	assert.NotContains(t, stored.GetOtherInfo(), "quota_domain_id")
+
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
 }
 
 func TestDisableChannelManagedPlanMultiKeyImmediatelyIsolatesUsedKey(t *testing.T) {

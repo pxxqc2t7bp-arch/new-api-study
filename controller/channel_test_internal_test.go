@@ -1077,7 +1077,7 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 		},
 	}
 	channel.SetOtherInfo(map[string]any{
-		"disabled_until": now.Add(time.Hour).Unix(),
+		"owner": "preserved",
 	})
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, channel.AddAbilities(nil))
@@ -1089,8 +1089,12 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 	require.NoError(t, db.Create(&route).Error)
 	model.InitChannelCache()
 
+	resetAt := now.Add(time.Hour).Truncate(time.Second)
 	apiError := relaytypes.NewOpenAIError(
-		errors.New("You have exceeded the monthly usage quota. It will reset at unknown."),
+		fmt.Errorf(
+			"You have exceeded the monthly usage quota. It will reset at %s.",
+			resetAt.Format("2006-01-02 15:04:05 -0700 MST"),
+		),
 		relaytypes.ErrorCode("AccountQuotaExceeded"),
 		http.StatusTooManyRequests,
 	)
@@ -1107,6 +1111,14 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 	assert.Equal(t, common.ChannelStatusAutoDisabled, disabled.Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, disabled.ChannelInfo.MultiKeyStatusList[0])
 	assert.Equal(t, common.ChannelStatusAutoDisabled, disabled.ChannelInfo.MultiKeyStatusList[1])
+	disabledInfo := disabled.GetOtherInfo()
+	assert.Equal(t, float64(resetAt.Unix()), disabledInfo["quota_reset_at"])
+	assert.Equal(t, resetAt.Unix()+60, disabled.GetDisabledUntil())
+	assert.Equal(t, "preserved", disabledInfo["owner"])
+	assert.NotContains(t, disabledInfo, "quota_domain")
+	assert.NotContains(t, disabledInfo, "quota_domain_id")
+	assert.NotContains(t, disabledInfo, "quota_generation")
+	assert.NotContains(t, disabledInfo, "quota_type")
 	var ability model.Ability
 	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
 	assert.False(t, ability.Enabled)
@@ -1121,6 +1133,8 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 	var reconciled model.Channel
 	require.NoError(t, db.First(&reconciled, channel.Id).Error)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, reconciled.Status)
+	assert.Equal(t, float64(resetAt.Unix()), reconciled.GetOtherInfo()["quota_reset_at"])
+	assert.Equal(t, resetAt.Unix()+60, reconciled.GetDisabledUntil())
 	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
 	assert.False(t, ability.Enabled)
 	selected, err = model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
@@ -1169,6 +1183,10 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 	assert.Equal(t, common.ChannelStatusEnabled, recovered.Status)
 	assert.NotContains(t, recovered.ChannelInfo.MultiKeyStatusList, 0)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, recovered.ChannelInfo.MultiKeyStatusList[1])
+	recoveredInfo := recovered.GetOtherInfo()
+	assert.Equal(t, "preserved", recoveredInfo["owner"])
+	assert.NotContains(t, recoveredInfo, "quota_reset_at")
+	assert.NotContains(t, recoveredInfo, "disabled_until")
 	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
 	assert.True(t, ability.Enabled)
 	selected, err = model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)

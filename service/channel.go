@@ -88,6 +88,9 @@ func disableChannel(channelError types.ChannelError, reason string, planQuota *p
 			channelError.UsingKey,
 			common.ChannelStatusAutoDisabled,
 			reason,
+			model.MultiKeyChannelStatusUpdateOptions{
+				PlanQuotaResetAt: planQuota.resetAt,
+			},
 		)
 		if err != nil {
 			common.SysError(fmt.Sprintf("failed to disable multi-key Plan quota channel: channel_id=%d error=%v", channelError.ChannelId, err))
@@ -398,6 +401,9 @@ func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) int {
 			usingKey,
 			common.ChannelStatusEnabled,
 			"",
+			model.MultiKeyChannelStatusUpdateOptions{
+				ClearPlanQuotaDeadline: true,
+			},
 		)
 		if err != nil {
 			common.SysError(fmt.Sprintf("failed to recover multi-key channel from health-check snapshot: channel_id=%d error=%v", channel.Id, err))

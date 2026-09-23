@@ -294,6 +294,7 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedFencesSnapshot(t *testing.T) {
 				"key-a",
 				common.ChannelStatusAutoDisabled,
 				"quota exhausted",
+				MultiKeyChannelStatusUpdateOptions{},
 			)
 			require.NoError(t, err)
 			assert.False(t, changed)
@@ -305,9 +306,66 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedFencesSnapshot(t *testing.T) {
 	}
 }
 
+func TestUpdateMultiKeyChannelStatusIfUnchangedRollsBackPlanDeadlineWithAbilityFailure(t *testing.T) {
+	setupChannelStatusTest(t)
+	tag := "plan:managed:deadline-rollback"
+	channel := Channel{
+		Name:   "multi-key-deadline-rollback",
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		Tag:    &tag,
+		Models: "gpt-3.5-turbo",
+		Group:  "default",
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+			},
+		},
+	}
+	channel.SetOtherInfo(map[string]any{"owner": "preserved"})
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+
+	forcedErr := errors.New("forced ability failure")
+	const callbackName = "test:fail_multi_key_plan_deadline_ability"
+	require.NoError(t, DB.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil && tx.Statement.Table == "abilities" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, DB.Callback().Update().Remove(callbackName))
+	})
+
+	changed, err := UpdateMultiKeyChannelStatusIfUnchanged(
+		expected,
+		tag,
+		"key-b",
+		common.ChannelStatusAutoDisabled,
+		"quota exhausted",
+		MultiKeyChannelStatusUpdateOptions{PlanQuotaResetAt: 2_000_000_000},
+	)
+	require.ErrorIs(t, err, forcedErr)
+	assert.False(t, changed)
+
+	stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+	assert.Equal(t, "preserved", stored.GetOtherInfo()["owner"])
+	assert.NotContains(t, stored.GetOtherInfo(), "quota_reset_at")
+	assert.NotContains(t, stored.GetOtherInfo(), "disabled_until")
+	assert.True(t, ability.Enabled)
+}
+
 func TestUpdateMultiKeyChannelStatusIfUnchangedSynchronizesMemoryRouting(t *testing.T) {
 	setupChannelStatusTest(t)
 	tag := "plan:managed:memory-routing"
+	const resetAt int64 = 2_000_000_000
 	channel := Channel{
 		Name:   "multi-key-memory-routing",
 		Key:    "key-a\nkey-b",
@@ -324,6 +382,7 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedSynchronizesMemoryRouting(t *test
 			},
 		},
 	}
+	channel.SetOtherInfo(map[string]any{"owner": "preserved"})
 	require.NoError(t, DB.Create(&channel).Error)
 	require.NoError(t, channel.AddAbilities(nil))
 	common.MemoryCacheEnabled = true
@@ -342,6 +401,7 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedSynchronizesMemoryRouting(t *test
 		"key-b",
 		common.ChannelStatusAutoDisabled,
 		"quota exhausted",
+		MultiKeyChannelStatusUpdateOptions{PlanQuotaResetAt: resetAt},
 	)
 	require.NoError(t, err)
 	require.True(t, changed)
@@ -352,6 +412,10 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedSynchronizesMemoryRouting(t *test
 	assert.Equal(t, common.ChannelStatusAutoDisabled, cached.ChannelInfo.MultiKeyStatusList[0])
 	assert.Equal(t, common.ChannelStatusAutoDisabled, cached.ChannelInfo.MultiKeyStatusList[1])
 	assert.Equal(t, 1, cached.ChannelInfo.MultiKeyPollingIndex)
+	assert.Equal(t, float64(resetAt), cached.GetOtherInfo()["quota_reset_at"])
+	assert.Equal(t, resetAt+60, cached.GetDisabledUntil())
+	assert.Equal(t, "preserved", cached.GetOtherInfo()["owner"])
+	assert.NotContains(t, cached.GetOtherInfo(), "quota_domain_id")
 	selected, err = GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
 	require.NoError(t, err)
 	assert.Nil(t, selected)
@@ -364,6 +428,7 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedSynchronizesMemoryRouting(t *test
 		"key-b",
 		common.ChannelStatusEnabled,
 		"",
+		MultiKeyChannelStatusUpdateOptions{ClearPlanQuotaDeadline: true},
 	)
 	require.NoError(t, err)
 	require.True(t, changed)
@@ -375,6 +440,9 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedSynchronizesMemoryRouting(t *test
 	assert.Equal(t, common.ChannelStatusAutoDisabled, selected.ChannelInfo.MultiKeyStatusList[0])
 	assert.NotContains(t, selected.ChannelInfo.MultiKeyStatusList, 1)
 	assert.Equal(t, 1, selected.ChannelInfo.MultiKeyPollingIndex)
+	assert.Equal(t, "preserved", selected.GetOtherInfo()["owner"])
+	assert.NotContains(t, selected.GetOtherInfo(), "quota_reset_at")
+	assert.NotContains(t, selected.GetOtherInfo(), "disabled_until")
 }
 
 func TestCacheUpdateChannelStatusRebuildsOrderedRoutingMembership(t *testing.T) {

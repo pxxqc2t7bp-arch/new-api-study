@@ -922,15 +922,21 @@ func updateSingleKeyChannelStatusIfUnchangedLocked(
 	return changed, nil
 }
 
+type MultiKeyChannelStatusUpdateOptions struct {
+	PlanQuotaResetAt       int64
+	ClearPlanQuotaDeadline bool
+}
+
 // UpdateMultiKeyChannelStatusIfUnchanged applies a request-selected key
-// failure only while the complete channel status snapshot and request identity
-// still match.
+// transition only while the complete channel status snapshot and request
+// identity still match.
 func UpdateMultiKeyChannelStatusIfUnchanged(
 	expected *Channel,
 	observedTag string,
 	usingKey string,
 	status int,
 	reason string,
+	options MultiKeyChannelStatusUpdateOptions,
 ) (bool, error) {
 	if expected == nil || expected.Id == 0 {
 		return false, errors.New("multi-key channel snapshot is missing")
@@ -973,6 +979,18 @@ func UpdateMultiKeyChannelStatusIfUnchanged(
 				return err
 			}
 			handlerMultiKeyUpdate(&updated, usingKey, status, reason)
+			if updated.Status == common.ChannelStatusAutoDisabled && options.PlanQuotaResetAt > 0 {
+				metadata := updated.GetOtherInfo()
+				metadata["quota_reset_at"] = options.PlanQuotaResetAt
+				metadata["disabled_until"] = options.PlanQuotaResetAt + 60
+				updated.SetOtherInfo(metadata)
+			}
+			if updated.Status == common.ChannelStatusEnabled && options.ClearPlanQuotaDeadline {
+				metadata := updated.GetOtherInfo()
+				delete(metadata, "quota_reset_at")
+				delete(metadata, "disabled_until")
+				updated.SetOtherInfo(metadata)
+			}
 			if updated.Status == current.Status &&
 				updated.OtherInfo == current.OtherInfo &&
 				reflect.DeepEqual(updated.ChannelInfo, current.ChannelInfo) {
