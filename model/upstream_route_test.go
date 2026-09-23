@@ -103,6 +103,7 @@ func TestIsolateManagedRouteModelLocksSourceGroupRouteChannel(t *testing.T) {
 		&UpstreamGroup{},
 		&Channel{},
 		&Ability{},
+		&Option{},
 	))
 	source := UpstreamSource{
 		Key:        "source",
@@ -138,6 +139,11 @@ func TestIsolateManagedRouteModelLocksSourceGroupRouteChannel(t *testing.T) {
 		State:           UpstreamRouteStateActive,
 	}
 	require.NoError(t, DB.Create(&route).Error)
+	const optionKey = "test.managed_model_exclusions"
+	require.NoError(t, DB.Create(&Option{
+		Key:   optionKey,
+		Value: `{"source:other":["gpt-existing"]}`,
+	}).Error)
 
 	var transactionalReads []string
 	const callbackName = "test:capture_managed_model_isolation_lock_order"
@@ -149,7 +155,7 @@ func TestIsolateManagedRouteModelLocksSourceGroupRouteChannel(t *testing.T) {
 			return
 		}
 		switch tx.Statement.Table {
-		case "upstream_sources", "upstream_groups", "upstream_managed_routes", "channels":
+		case "upstream_sources", "upstream_groups", "upstream_managed_routes", "channels", "options":
 			transactionalReads = append(transactionalReads, tx.Statement.Table)
 		}
 	}))
@@ -157,11 +163,12 @@ func TestIsolateManagedRouteModelLocksSourceGroupRouteChannel(t *testing.T) {
 		require.NoError(t, DB.Callback().Query().Remove(callbackName))
 	})
 
-	isolated, err := IsolateManagedRouteModel(
+	isolated, optionValue, err := IsolateManagedRouteModel(
 		&route,
 		"gpt-a",
 		"status_code=404",
 		1_788_320_000,
+		optionKey,
 	)
 
 	require.NoError(t, err)
@@ -171,6 +178,7 @@ func TestIsolateManagedRouteModelLocksSourceGroupRouteChannel(t *testing.T) {
 		"upstream_groups",
 		"upstream_managed_routes",
 		"channels",
+		"options",
 	}, transactionalReads)
 
 	var storedChannel Channel
@@ -189,4 +197,8 @@ func TestIsolateManagedRouteModelLocksSourceGroupRouteChannel(t *testing.T) {
 	assert.Equal(t, int64(1_788_320_000), storedRoute.LastFailureAt)
 	assert.Equal(t, "status_code=404", storedRoute.LastReason)
 	assert.Equal(t, int64(1_788_320_000), storedRoute.UpdatedAt)
+	var exclusions map[string][]string
+	require.NoError(t, common.UnmarshalJsonStr(optionValue, &exclusions))
+	assert.Equal(t, []string{"gpt-a"}, exclusions["source:group"])
+	assert.Equal(t, []string{"gpt-existing"}, exclusions["source:other"])
 }

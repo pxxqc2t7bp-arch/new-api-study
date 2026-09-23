@@ -1893,9 +1893,11 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 				&UpstreamSource{},
 				&UpstreamGroup{},
 				&UpstreamManagedRoute{},
+				&Option{},
 			))
 			t.Cleanup(func() {
 				require.NoError(t, database.Migrator().DropTable(
+					&Option{},
 					&UpstreamManagedRoute{},
 					&UpstreamGroup{},
 					&UpstreamSource{},
@@ -2087,14 +2089,16 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 			}
 			require.NoError(t, DB.Create(&isolationRoute).Error)
 
-			isolated, err := IsolateManagedRouteModel(
+			isolated, optionValue, err := IsolateManagedRouteModel(
 				&isolationRoute,
 				"gpt-a",
 				"status_code=404",
 				1_788_320_000,
+				"test.managed_model_exclusions",
 			)
 			require.NoError(t, err)
 			require.True(t, isolated)
+			assert.JSONEq(t, `{"configured-source:configured-group":["gpt-a"]}`, optionValue)
 			var storedIsolationChannel Channel
 			require.NoError(t, DB.First(&storedIsolationChannel, isolationChannel.Id).Error)
 			assert.Equal(t, "gpt-b", storedIsolationChannel.Models)

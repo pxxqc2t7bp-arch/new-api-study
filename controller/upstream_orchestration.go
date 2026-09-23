@@ -14,7 +14,6 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	notifydto "github.com/QuantumNous/new-api/relaykit/dto"
-	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
@@ -486,61 +485,36 @@ func runDueUpstreamProbeTask(ctx context.Context) (upstreamProbeSummary, error) 
 		summary.Tested++
 		if result.localErr == nil && result.newAPIError == nil {
 			before := route.State
-			if route.State == model.UpstreamRouteStateActive {
-				_, err = model.RecordUpstreamRouteSuccess(route.ChannelID, now, latency)
-				if err == nil {
-					err = model.DB.Model(&model.UpstreamManagedRoute{}).Where("id = ?", route.ID).
-						Updates(map[string]any{"last_probe_at": now, "next_probe_at": int64(0), "updated_at": now}).Error
-				}
-			} else {
-				err = service.MarkManagedRouteProbeResult(route.ID, true, latency, "")
-			}
+			transition, markErr := service.MarkManagedRouteProbeResult(&route, true, latency, "")
+			err = markErr
 			if err != nil {
 				return summary, err
 			}
 			summary.Succeeded++
-			if before != model.UpstreamRouteStateActive {
-				var current model.UpstreamManagedRoute
-				if model.DB.First(&current, route.ID).Error == nil && current.State == model.UpstreamRouteStateActive {
-					summary.Enabled++
-				}
+			if transition.Applied &&
+				before != model.UpstreamRouteStateActive &&
+				transition.State == model.UpstreamRouteStateActive {
+				summary.Enabled++
 			}
 			continue
 		}
 
 		message := "upstream probe failed"
-		statusCode := http.StatusServiceUnavailable
 		if result.newAPIError != nil {
 			message = result.newAPIError.ErrorWithStatusCode()
-			statusCode = result.newAPIError.StatusCode
 		} else if result.localErr != nil {
 			message = result.localErr.Error()
 		}
-		if route.State == model.UpstreamRouteStateActive {
-			_, disabled, recordErr := service.RecordManagedChannelFailure(
-				*relaytypes.NewChannelError(
-					channel.Id,
-					channel.Type,
-					channel.Name,
-					channel.ChannelInfo.IsMultiKey,
-					"",
-					channel.GetAutoBan(),
-				),
-				message,
-			)
-			if recordErr != nil {
-				return summary, recordErr
-			}
-			if disabled {
-				summary.Disabled++
-			} else {
-				_ = model.DB.Model(&model.UpstreamManagedRoute{}).Where("id = ?", route.ID).
-					Updates(map[string]any{"last_probe_at": now, "next_probe_at": now + 60, "updated_at": now}).Error
-			}
-		} else if err := service.MarkManagedRouteProbeResult(route.ID, false, latency, message); err != nil {
+		before := route.State
+		transition, err := service.MarkManagedRouteProbeResult(&route, false, latency, message)
+		if err != nil {
 			return summary, err
 		}
-		_ = statusCode
+		if transition.Applied &&
+			before == model.UpstreamRouteStateActive &&
+			transition.State == model.UpstreamRouteStateQuarantined {
+			summary.Disabled++
+		}
 		summary.Failed++
 	}
 	if summary.Enabled > 0 {

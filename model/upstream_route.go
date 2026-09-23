@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -124,6 +125,122 @@ func ListUpstreamManagedRoutes() ([]UpstreamManagedRoute, error) {
 	return routes, err
 }
 
+// UpdateManagedRouteProbeResultIfUnchanged applies a probe result only while
+// the complete route snapshot observed before the write is still current.
+func UpdateManagedRouteProbeResultIfUnchanged(
+	expected *UpstreamManagedRoute,
+	desired *UpstreamManagedRoute,
+	disableChannel bool,
+	statusReason string,
+	statusTime int64,
+) (bool, bool, error) {
+	if expected == nil ||
+		expected.ID == 0 ||
+		desired == nil ||
+		desired.ID != expected.ID ||
+		desired.SourceID != expected.SourceID ||
+		desired.ExternalGroupID != expected.ExternalGroupID ||
+		desired.Platform != expected.Platform ||
+		desired.Protocol != expected.Protocol ||
+		desired.ChannelID != expected.ChannelID {
+		return false, false, errors.New("managed route probe snapshot is missing or inconsistent")
+	}
+
+	update := func() (bool, bool, error) {
+		applied := false
+		channelDisabled := false
+		var updatedChannel Channel
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			var current UpstreamManagedRoute
+			err := lockForUpdate(tx).Where("id = ?", expected.ID).First(&current).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if !reflect.DeepEqual(current, *expected) {
+				return nil
+			}
+
+			if err := tx.Model(&UpstreamManagedRoute{}).
+				Where("id = ?", current.ID).
+				Updates(map[string]any{
+					"state":                 desired.State,
+					"consecutive_failures":  desired.ConsecutiveFailures,
+					"consecutive_successes": desired.ConsecutiveSuccesses,
+					"failure_window_start":  desired.FailureWindowStart,
+					"last_failure_at":       desired.LastFailureAt,
+					"last_success_at":       desired.LastSuccessAt,
+					"last_probe_at":         desired.LastProbeAt,
+					"last_latency_ms":       desired.LastLatencyMS,
+					"recovery_attempts":     desired.RecoveryAttempts,
+					"next_probe_at":         desired.NextProbeAt,
+					"last_reason":           desired.LastReason,
+					"updated_at":            desired.UpdatedAt,
+				}).Error; err != nil {
+				return err
+			}
+
+			if disableChannel {
+				var currentChannel Channel
+				if err := lockForUpdate(tx).
+					Where("id = ?", current.ChannelID).
+					First(&currentChannel).Error; err != nil {
+					return err
+				}
+				updatedChannel = currentChannel
+				if updatedChannel.Status == common.ChannelStatusEnabled {
+					updatedChannel.Status = common.ChannelStatusAutoDisabled
+					channelDisabled = true
+				}
+				info := updatedChannel.GetOtherInfo()
+				info["status_reason"] = statusReason
+				info["status_time"] = statusTime
+				updatedChannel.SetOtherInfo(info)
+				if err := tx.Model(&Channel{}).
+					Where("id = ?", updatedChannel.Id).
+					Updates(map[string]any{
+						"status":     updatedChannel.Status,
+						"other_info": updatedChannel.OtherInfo,
+					}).Error; err != nil {
+					return err
+				}
+				if err := tx.Model(&Ability{}).
+					Where("channel_id = ?", updatedChannel.Id).
+					Select("enabled").
+					Update("enabled", false).Error; err != nil {
+					return err
+				}
+			}
+
+			applied = true
+			return nil
+		})
+		if err != nil {
+			return false, false, err
+		}
+		if applied && disableChannel {
+			CacheUpdateManagedChannelSnapshots([]ManagedChannelCacheUpdate{{
+				Snapshot:           &updatedChannel,
+				UpdateStatusReason: true,
+			}})
+		}
+		return applied, channelDisabled, nil
+	}
+	if disableChannel {
+		channelDisabled := false
+		applied, err := withChannelStatusLocks(expected.ChannelID, func() (bool, error) {
+			var applied bool
+			var err error
+			applied, channelDisabled, err = update()
+			return applied, err
+		})
+		return applied, channelDisabled, err
+	}
+	return update()
+}
+
 // IsolateManagedRouteModel removes one model from an attached managed route
 // while locking the managed decision rows in canonical order.
 func IsolateManagedRouteModel(
@@ -131,17 +248,24 @@ func IsolateManagedRouteModel(
 	modelName string,
 	reason string,
 	now int64,
-) (bool, error) {
+	exclusionOptionKey string,
+) (bool, string, error) {
 	modelName = strings.TrimSpace(modelName)
+	exclusionOptionKey = strings.TrimSpace(exclusionOptionKey)
 	if expectedRoute == nil ||
 		expectedRoute.ID == 0 ||
 		expectedRoute.SourceID == 0 ||
 		expectedRoute.ChannelID == 0 ||
-		modelName == "" {
-		return false, nil
+		modelName == "" ||
+		exclusionOptionKey == "" {
+		return false, "", nil
+	}
+	if err := validateOptionValue(exclusionOptionKey, "{}"); err != nil {
+		return false, "", err
 	}
 
-	return withChannelStatusLocks(expectedRoute.ChannelID, func() (bool, error) {
+	optionValue := ""
+	isolated, err := withChannelStatusLocks(expectedRoute.ChannelID, func() (bool, error) {
 		isolated := false
 		err := DB.Transaction(func(tx *gorm.DB) error {
 			var source UpstreamSource
@@ -160,7 +284,7 @@ func IsolateManagedRouteModel(
 
 			var route UpstreamManagedRoute
 			if err := lockForUpdate(tx).
-				Where("id = ? AND channel_id = ? AND detached = ?", expectedRoute.ID, expectedRoute.ChannelID, false).
+				Where("id = ?", expectedRoute.ID).
 				First(&route).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
 					return nil
@@ -169,7 +293,9 @@ func IsolateManagedRouteModel(
 			}
 			if route.SourceID != source.ID ||
 				route.ExternalGroupID != group.ExternalID ||
-				route.Platform != group.Platform {
+				route.Platform != group.Platform ||
+				route.Detached ||
+				!reflect.DeepEqual(route, *expectedRoute) {
 				return nil
 			}
 
@@ -180,8 +306,44 @@ func IsolateManagedRouteModel(
 				return err
 			}
 
-			channelModels, removed := removeManagedRouteModel(channel.Models, modelName)
-			if removed {
+			channelModels, channelRemoved := removeManagedRouteModel(channel.Models, modelName)
+			var groupModels []string
+			if err := common.UnmarshalJsonStr(group.Models, &groupModels); err != nil {
+				return err
+			}
+			groupModels, groupRemoved := removeManagedRouteModel(strings.Join(groupModels, ","), modelName)
+
+			var option Option
+			optionExists := true
+			if err := lockForUpdate(tx).
+				Where("key = ?", exclusionOptionKey).
+				First(&option).Error; err != nil {
+				if !errors.Is(err, gorm.ErrRecordNotFound) {
+					return err
+				}
+				optionExists = false
+				option.Key = exclusionOptionKey
+			}
+			exclusions := make(map[string][]string)
+			if optionExists && strings.TrimSpace(option.Value) != "" {
+				if err := common.UnmarshalJsonStr(option.Value, &exclusions); err != nil {
+					return err
+				}
+			}
+			exclusionKey := strings.ToLower(strings.TrimSpace(source.Key)) + ":" +
+				strings.TrimSpace(route.ExternalGroupID)
+			exclusionAdded := true
+			for _, excluded := range exclusions[exclusionKey] {
+				if strings.TrimSpace(excluded) == modelName {
+					exclusionAdded = false
+					break
+				}
+			}
+			if !exclusionAdded && !channelRemoved && !groupRemoved {
+				return nil
+			}
+
+			if channelRemoved {
 				channel.Models = strings.Join(channelModels, ",")
 				if err := tx.Model(&Channel{}).
 					Where("id = ?", channel.Id).
@@ -193,11 +355,6 @@ func IsolateManagedRouteModel(
 				}
 			}
 
-			var groupModels []string
-			if err := common.UnmarshalJsonStr(group.Models, &groupModels); err != nil {
-				return err
-			}
-			groupModels, groupRemoved := removeManagedRouteModel(strings.Join(groupModels, ","), modelName)
 			if groupRemoved {
 				encodedModels, err := common.Marshal(groupModels)
 				if err != nil {
@@ -212,7 +369,6 @@ func IsolateManagedRouteModel(
 					return err
 				}
 			}
-
 			if err := tx.Model(&UpstreamManagedRoute{}).
 				Where("id = ?", route.ID).
 				Updates(map[string]any{
@@ -222,11 +378,31 @@ func IsolateManagedRouteModel(
 				}).Error; err != nil {
 				return err
 			}
+
+			if exclusionAdded {
+				exclusions[exclusionKey] = append(exclusions[exclusionKey], modelName)
+				encoded, err := common.Marshal(exclusions)
+				if err != nil {
+					return err
+				}
+				option.Value = string(encoded)
+				if optionExists {
+					if err := tx.Model(&Option{}).
+						Where("key = ?", exclusionOptionKey).
+						Update("value", option.Value).Error; err != nil {
+						return err
+					}
+				} else if err := tx.Create(&option).Error; err != nil {
+					return err
+				}
+			}
+			optionValue = option.Value
 			isolated = true
 			return nil
 		})
 		return isolated, err
 	})
+	return isolated, optionValue, err
 }
 
 func removeManagedRouteModel(models string, target string) ([]string, bool) {

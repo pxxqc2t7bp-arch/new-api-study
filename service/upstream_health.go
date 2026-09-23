@@ -122,6 +122,9 @@ func IsolateManagedRouteModel(channelID int, modelName string, reason string) (b
 	if channelID <= 0 || modelName == "" {
 		return false, nil
 	}
+	managedModelExclusionMutex.Lock()
+	defer managedModelExclusionMutex.Unlock()
+
 	route, err := model.GetUpstreamManagedRouteByChannelID(channelID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -129,69 +132,24 @@ func IsolateManagedRouteModel(channelID int, modelName string, reason string) (b
 		}
 		return false, err
 	}
-	exclusionAdded, err := persistManagedModelExclusion(
-		route.SourceID,
-		route.ExternalGroupID,
-		modelName,
-	)
-	if err != nil {
-		return false, err
-	}
-	routeIsolated, err := model.IsolateManagedRouteModel(
+	isolated, optionValue, err := model.IsolateManagedRouteModel(
 		route,
 		modelName,
 		reason,
 		common.GetTimestamp(),
+		managedModelExclusionsOption,
 	)
 	if err != nil {
 		return false, err
 	}
-	isolated := exclusionAdded || routeIsolated
-	if isolated {
-		model.InitChannelCache()
-		invalidateManagedRouteAdminInfo(channelID)
+	if !isolated {
+		return false, nil
 	}
-	return isolated, nil
-}
-
-func persistManagedModelExclusion(
-	sourceID int64,
-	externalGroupID string,
-	modelName string,
-) (bool, error) {
-	managedModelExclusionMutex.Lock()
-	defer managedModelExclusionMutex.Unlock()
-
-	var source model.UpstreamSource
-	if err := model.DB.Select("key").First(&source, sourceID).Error; err != nil {
-		return false, err
+	if err := model.PublishOptionValue(managedModelExclusionsOption, optionValue); err != nil {
+		return true, err
 	}
-	var option model.Option
-	err := model.DB.Where("key = ?", managedModelExclusionsOption).First(&option).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return false, err
-	}
-	exclusions := make(map[string][]string)
-	if err == nil && strings.TrimSpace(option.Value) != "" {
-		if err := common.UnmarshalJsonStr(option.Value, &exclusions); err != nil {
-			return false, err
-		}
-	}
-	key := strings.ToLower(strings.TrimSpace(source.Key)) + ":" +
-		strings.TrimSpace(externalGroupID)
-	for _, excluded := range exclusions[key] {
-		if strings.TrimSpace(excluded) == modelName {
-			return false, nil
-		}
-	}
-	exclusions[key] = append(exclusions[key], modelName)
-	encoded, err := common.Marshal(exclusions)
-	if err != nil {
-		return false, err
-	}
-	if err := model.UpdateOption(managedModelExclusionsOption, string(encoded)); err != nil {
-		return false, err
-	}
+	model.InitChannelCache()
+	invalidateManagedRouteAdminInfo(channelID)
 	return true, nil
 }
 
@@ -342,68 +300,120 @@ func DetachManagedRoute(routeID int64) error {
 	return nil
 }
 
-func MarkManagedRouteProbeResult(routeID int64, succeeded bool, latencyMS int64, reason string) error {
+type ManagedRouteProbeResult struct {
+	Applied bool
+	State   string
+}
+
+func MarkManagedRouteProbeResult(
+	route *model.UpstreamManagedRoute,
+	succeeded bool,
+	latencyMS int64,
+	reason string,
+) (ManagedRouteProbeResult, error) {
+	result := ManagedRouteProbeResult{}
+	if route == nil || route.ID == 0 {
+		return result, errors.New("managed route probe snapshot is missing")
+	}
 	now := common.GetTimestamp()
-	var route model.UpstreamManagedRoute
-	if err := model.DB.First(&route, routeID).Error; err != nil {
-		return err
+	if route.Detached ||
+		route.State == model.UpstreamRouteStateLongRed ||
+		route.State == model.UpstreamRouteStatePaused {
+		return result, nil
 	}
-	if route.Detached || route.State == model.UpstreamRouteStateLongRed {
-		return nil
-	}
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	desired := *route
 	if succeeded {
 		nextState := model.UpstreamRouteStateActive
 		successes := route.ConsecutiveSuccesses + 1
 		if route.State == model.UpstreamRouteStateShadow &&
-			(!operation_setting.GetUpstreamOrchestrationSetting().Enabled ||
-				successes < operation_setting.GetUpstreamOrchestrationSetting().ShadowSuccessesRequired) {
+			(!setting.Enabled || successes < setting.ShadowSuccessesRequired) {
 			nextState = model.UpstreamRouteStateShadow
 		}
-		if err := model.DB.Model(&route).Updates(map[string]any{
-			"state":                 nextState,
-			"consecutive_failures":  0,
-			"consecutive_successes": successes,
-			"failure_window_start":  int64(0),
-			"recovery_attempts":     0,
-			"next_probe_at":         nextProbeAfterSuccess(nextState, now),
-			"last_probe_at":         now,
-			"last_success_at":       now,
-			"last_latency_ms":       latencyMS,
-			"last_reason":           "",
-			"updated_at":            now,
-		}).Error; err != nil {
-			return err
+		desired.State = nextState
+		desired.ConsecutiveFailures = 0
+		desired.ConsecutiveSuccesses = successes
+		desired.FailureWindowStart = 0
+		desired.RecoveryAttempts = 0
+		desired.NextProbeAt = nextProbeAfterSuccess(nextState, now)
+		desired.LastProbeAt = now
+		desired.LastSuccessAt = now
+		desired.LastLatencyMS = latencyMS
+		desired.LastReason = ""
+		desired.UpdatedAt = now
+		applied, _, err := model.UpdateManagedRouteProbeResultIfUnchanged(
+			route,
+			&desired,
+			false,
+			"",
+			now,
+		)
+		if err != nil {
+			return result, err
 		}
-		if nextState == model.UpstreamRouteStateActive {
-			EnableChannel(route.ChannelID, "", managedRouteChannelName(route.ChannelID))
+		if applied {
+			invalidateManagedRouteAdminInfo(route.ChannelID)
+			result.Applied = true
+			result.State = desired.State
 		}
-		invalidateManagedRouteAdminInfo(route.ChannelID)
-		return nil
+		return result, nil
 	}
 
-	attempts := route.RecoveryAttempts + 1
-	nextProbeAt := int64(0)
-	if attempts < len(upstreamRecoveryBackoff) {
-		nextProbeAt = now + int64(upstreamRecoveryBackoff[attempts].Seconds())
+	desired.ConsecutiveSuccesses = 0
+	desired.LastProbeAt = now
+	desired.LastFailureAt = now
+	desired.LastReason = common.LocalLogPreview(reason)
+	desired.UpdatedAt = now
+	quarantined := false
+	if route.State == model.UpstreamRouteStateActive {
+		windowSeconds := int64(setting.FailureWindowMinutes * 60)
+		if desired.FailureWindowStart == 0 || now-desired.FailureWindowStart > windowSeconds {
+			desired.FailureWindowStart = now
+			desired.ConsecutiveFailures = 1
+		} else {
+			desired.ConsecutiveFailures++
+		}
+		desired.NextProbeAt = now + 60
+		if desired.ConsecutiveFailures >= setting.FailureThreshold {
+			desired.State = model.UpstreamRouteStateQuarantined
+			desired.RecoveryAttempts = 0
+			desired.NextProbeAt = now
+			quarantined = true
+		}
+	} else {
+		desired.RecoveryAttempts++
+		desired.NextProbeAt = 0
+		if desired.RecoveryAttempts < len(upstreamRecoveryBackoff) {
+			desired.NextProbeAt = now + int64(upstreamRecoveryBackoff[desired.RecoveryAttempts].Seconds())
+		}
+		desired.State = model.UpstreamRouteStateQuarantined
+		if route.State == model.UpstreamRouteStateShadow {
+			desired.State = model.UpstreamRouteStateShadow
+		}
 	}
-	failureState := model.UpstreamRouteStateQuarantined
-	if route.State == model.UpstreamRouteStateShadow {
-		failureState = model.UpstreamRouteStateShadow
+	applied, channelDisabled, err := model.UpdateManagedRouteProbeResultIfUnchanged(
+		route,
+		&desired,
+		quarantined,
+		reason,
+		now,
+	)
+	if err != nil || !applied {
+		return result, err
 	}
-	err := model.DB.Model(&route).Updates(map[string]any{
-		"state":                 failureState,
-		"consecutive_successes": 0,
-		"recovery_attempts":     attempts,
-		"next_probe_at":         nextProbeAt,
-		"last_probe_at":         now,
-		"last_failure_at":       now,
-		"last_reason":           common.LocalLogPreview(reason),
-		"updated_at":            now,
-	}).Error
-	if err == nil {
-		invalidateManagedRouteAdminInfo(route.ChannelID)
+	invalidateManagedRouteAdminInfo(route.ChannelID)
+	result.Applied = true
+	result.State = desired.State
+	if channelDisabled {
+		if err := NotifyRootBark(
+			fmt.Sprintf("%s_managed_%d", dto.NotifyTypeChannelUpdate, route.ChannelID),
+			fmt.Sprintf("受管通道「%s」（#%d）已隔离", managedRouteChannelName(route.ChannelID), route.ChannelID),
+			fmt.Sprintf("%d 分钟内连续错误达到 %d 次，已停止生产流量。原因：%s", setting.FailureWindowMinutes, setting.FailureThreshold, common.LocalLogPreview(reason)),
+		); err != nil {
+			common.SysLog("upstream Bark notification skipped: " + err.Error())
+		}
 	}
-	return err
+	return result, nil
 }
 
 func nextProbeAfterSuccess(state string, now int64) int64 {

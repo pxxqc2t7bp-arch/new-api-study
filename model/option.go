@@ -247,6 +247,15 @@ func UpdateOption(key string, value string) error {
 	return updateOptionMap(key, value)
 }
 
+// PublishOptionValue updates in-memory consumers for an option whose database
+// write has already committed.
+func PublishOptionValue(key string, value string) error {
+	if err := validateOptionValue(key, value); err != nil {
+		return err
+	}
+	return updateOptionMap(key, value)
+}
+
 // UpdateOptionsBulk persists multiple key/value pairs in a single database
 // transaction, then dispatches them through updateOptionMap in one pass. If
 // any DB write fails the whole transaction rolls back and no in-memory state
