@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -863,6 +864,215 @@ func runSerializedPlanQuotaOperations(
 
 	require.NoError(t, <-firstResult)
 	require.NoError(t, <-secondResult)
+}
+
+func installFirstChannelQueryBarrier(t *testing.T, db *gorm.DB) (<-chan struct{}, func()) {
+	t.Helper()
+
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	var intercepted atomic.Bool
+	var releaseOnce sync.Once
+	callbackName := "test:plan_quota_channel_query_barrier:" + strings.ReplaceAll(t.Name(), "/", "_")
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil ||
+			tx.Statement.Schema == nil ||
+			tx.Statement.Schema.Name != "Channel" ||
+			!intercepted.CompareAndSwap(false, true) {
+			return
+		}
+		close(locked)
+		<-release
+	}))
+	releaseBarrier := func() {
+		releaseOnce.Do(func() {
+			close(release)
+		})
+	}
+	t.Cleanup(func() {
+		releaseBarrier()
+		require.NoError(t, db.Callback().Query().Remove(callbackName))
+	})
+	return locked, releaseBarrier
+}
+
+func TestEmptyCredentialPlanQuotaDisableSerializesRecoveryBothOrders(t *testing.T) {
+	for _, firstOperation := range []string{"recovery", "disable"} {
+		t.Run(firstOperation+"_first", func(t *testing.T) {
+			db := setupPlanQuotaAuthorityTest(t, "")
+			previousMemoryCacheEnabled := common.MemoryCacheEnabled
+			common.MemoryCacheEnabled = true
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = previousMemoryCacheEnabled
+			})
+			InitChannelCache()
+
+			tag := "plan:test:empty-disable-recovery"
+			channel := Channel{
+				Name: "empty-disable-recovery", Key: "", Tag: &tag,
+				Status: common.ChannelStatusAutoDisabled,
+				Models: "gpt-4.1", Group: "default",
+			}
+			require.NoError(t, db.Create(&channel).Error)
+			domainID := fmt.Sprintf("channel:%d", channel.Id)
+			channel.SetOtherInfo(map[string]any{
+				"disabled_until":   int64(1),
+				"quota_domain":     tag,
+				"quota_domain_id":  domainID,
+				"quota_generation": "41",
+				"quota_type":       "plan",
+			})
+			require.NoError(t, db.Model(&Channel{}).
+				Where("id = ?", channel.Id).
+				Update("other_info", channel.OtherInfo).Error)
+			require.NoError(t, channel.AddAbilities(db))
+			InitChannelCache()
+
+			recoverySnapshot, err := GetChannelById(channel.Id, true)
+			require.NoError(t, err)
+			recoveredInfo := recoverySnapshot.GetOtherInfo()
+			for _, key := range []string{
+				"disabled_until",
+				"quota_reset_at",
+				"quota_domain",
+				"quota_domain_id",
+				"quota_generation",
+				"quota_type",
+			} {
+				delete(recoveredInfo, key)
+			}
+			recoverySnapshot.SetOtherInfo(recoveredInfo)
+
+			locked, release := installFirstChannelQueryBarrier(t, db)
+			disableResult := make(chan PlanQuotaDomainTransitionResult, 1)
+			recoveryResult := make(chan bool, 1)
+			errs := make(chan error, 2)
+			disable := func() {
+				result, disableErr := DisableEmptyCredentialPlanQuotaSource(
+					EmptyCredentialPlanQuotaDisableRequest{
+						ChannelID:   channel.Id,
+						ObservedTag: tag,
+						Reason:      "fresh quota event",
+						ResetAt:     2_000_000_000,
+					},
+				)
+				disableResult <- result
+				errs <- disableErr
+			}
+			recoverSource := func() {
+				changed, recoverErr := RecoverSingleKeyChannelStatusIfUnchanged(
+					&channel,
+					common.ChannelStatusEnabled,
+					recoverySnapshot.OtherInfo,
+					2,
+				)
+				recoveryResult <- changed
+				errs <- recoverErr
+			}
+
+			if firstOperation == "recovery" {
+				go recoverSource()
+			} else {
+				go disable()
+			}
+			select {
+			case <-locked:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first operation did not reach the locked channel read")
+			}
+			if firstOperation == "recovery" {
+				go disable()
+			} else {
+				go recoverSource()
+			}
+			release()
+
+			require.NoError(t, <-errs)
+			require.NoError(t, <-errs)
+			result := <-disableResult
+			recovered := <-recoveryResult
+			assert.Equal(t, firstOperation == "recovery", recovered)
+			if firstOperation == "recovery" {
+				assert.Equal(t, 1, result.NewlyDisabled)
+			} else {
+				assert.Zero(t, result.NewlyDisabled)
+			}
+
+			var stored Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+			generationText, ok := stored.GetOtherInfo()["quota_generation"].(string)
+			require.True(t, ok)
+			generation, err := strconv.ParseInt(generationText, 10, 64)
+			require.NoError(t, err)
+			assert.Greater(t, generation, int64(41))
+			assert.Equal(t, domainID, stored.GetOtherInfo()["quota_domain_id"])
+
+			var ability Ability
+			require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+			assert.False(t, ability.Enabled)
+			cached, err := CacheGetChannel(channel.Id)
+			require.NoError(t, err)
+			assert.Equal(t, stored.Status, cached.Status)
+			assert.Equal(t, stored.OtherInfo, cached.OtherInfo)
+		})
+	}
+}
+
+func TestEmptyCredentialPlanQuotaDisableRollsBackAbilityFailure(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	previousMemoryCacheEnabled := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCacheEnabled
+	})
+
+	tag := "plan:test:empty-disable-rollback"
+	channel := Channel{
+		Name: "empty-disable-rollback", Key: "", Tag: &tag,
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-4.1", Group: "default",
+	}
+	channel.SetOtherInfo(map[string]any{"owner": "before"})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(db))
+	InitChannelCache()
+
+	forcedErr := errors.New("forced empty credential ability failure")
+	callbackName := "test:empty_credential_disable_rollback"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil &&
+			tx.Statement.Schema != nil &&
+			tx.Statement.Schema.Name == "Ability" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Update().Remove(callbackName))
+	})
+
+	result, err := DisableEmptyCredentialPlanQuotaSource(
+		EmptyCredentialPlanQuotaDisableRequest{
+			ChannelID:   channel.Id,
+			ObservedTag: tag,
+			Reason:      "quota exhausted",
+			ResetAt:     2_000_000_000,
+		},
+	)
+	require.ErrorIs(t, err, forcedErr)
+	assert.Empty(t, result.Channels)
+
+	var stored Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, channel.OtherInfo, stored.OtherInfo)
+	var ability Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+	cached, cacheErr := CacheGetChannel(channel.Id)
+	require.NoError(t, cacheErr)
+	assert.Equal(t, common.ChannelStatusEnabled, cached.Status)
+	assert.Equal(t, channel.OtherInfo, cached.OtherInfo)
 }
 
 func TestPlanQuotaDomainDisableSerializesConcurrentCreate(t *testing.T) {
@@ -1884,6 +2094,209 @@ func TestPlanQuotaDomainRecoveryRejectsStaleAuthorityGeneration(t *testing.T) {
 	assertPlanQuotaDomainChannelState(
 		t, db, source.Id, common.ChannelStatusAutoDisabled, 71, 1,
 	)
+}
+
+func TestPlanQuotaDomainManualRecoveryFromOwnerlessAuthority(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		status      int
+		otherInfo   map[string]any
+		peerStatus  int
+		peerInfo    map[string]any
+		peerAbility bool
+	}{
+		{
+			name:       "all_members_manual",
+			status:     common.ChannelStatusManuallyDisabled,
+			otherInfo:  map[string]any{"status_reason": "selected manual pause"},
+			peerStatus: common.ChannelStatusManuallyDisabled,
+			peerInfo:   map[string]any{"status_reason": "peer manual pause"},
+		},
+		{
+			name:        "all_members_unrelated_owner",
+			status:      common.ChannelStatusAutoDisabled,
+			otherInfo:   map[string]any{"status_reason": "selected upstream failure", "failure_owner": "selected"},
+			peerStatus:  common.ChannelStatusAutoDisabled,
+			peerInfo:    map[string]any{"status_reason": "peer upstream failure", "failure_owner": "peer"},
+			peerAbility: false,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupPlanQuotaAuthorityTest(t, "")
+			tag := "plan:test:ownerless-" + testCase.name
+			credential := "authority-secret-ownerless-" + testCase.name
+			hash, ok := PlanQuotaDomainHash(credential)
+			require.True(t, ok)
+			require.NoError(t, db.Create(&PlanQuotaDomain{
+				CredentialHash: hash,
+				Generation:     211,
+				State:          PlanQuotaDomainStateDisabled,
+				DisabledUntil:  2_000_000_000,
+			}).Error)
+
+			channels := []Channel{
+				{
+					Name: "selected", Key: credential, Tag: &tag,
+					Status: testCase.status, Models: "gpt-4.1", Group: "default",
+				},
+				{
+					Name: "unselected", Key: credential, Tag: &tag,
+					Status: testCase.peerStatus, Models: "gpt-4.1", Group: "default",
+				},
+			}
+			channels[0].SetOtherInfo(testCase.otherInfo)
+			channels[1].SetOtherInfo(testCase.peerInfo)
+			require.NoError(t, db.Create(&channels).Error)
+			for index := range channels {
+				require.NoError(t, channels[index].AddAbilities(db))
+			}
+
+			future := Channel{
+				Name: "future-member", Key: credential, Tag: &tag,
+				Status: common.ChannelStatusEnabled, Models: "gpt-4.1", Group: "default",
+			}
+			require.NoError(t, future.Insert())
+			assertPlanQuotaDomainChannelState(
+				t, db, future.Id, common.ChannelStatusAutoDisabled, 211, 2_000_000_000,
+			)
+
+			selectedSnapshot, err := GetChannelById(channels[0].Id, true)
+			require.NoError(t, err)
+			result, err := RecoverPlanQuotaDomain(PlanQuotaDomainRecoveryRequest{
+				Source:               selectedSnapshot,
+				AllowOwnerlessManual: true,
+				EnableSource:         true,
+			})
+			require.NoError(t, err)
+			assert.True(t, result.Handled)
+			assert.True(t, result.Recovered)
+			assert.Equal(t, 1, result.NewlyEnabled)
+
+			var authority PlanQuotaDomain
+			require.NoError(t, db.First(&authority, "credential_hash = ?", hash).Error)
+			assert.Equal(t, PlanQuotaDomainStateActive, authority.State)
+			recoveredGeneration := authority.Generation
+			assert.Greater(t, recoveredGeneration, int64(211))
+
+			var selected Channel
+			require.NoError(t, db.First(&selected, channels[0].Id).Error)
+			assert.Equal(t, common.ChannelStatusEnabled, selected.Status)
+			selectedInfo := selected.GetOtherInfo()
+			assert.Equal(t, testCase.otherInfo["failure_owner"], selectedInfo["failure_owner"])
+			assert.Empty(t, selectedInfo["status_reason"])
+			var selectedAbility Ability
+			require.NoError(t, db.First(&selectedAbility, "channel_id = ?", selected.Id).Error)
+			assert.True(t, selectedAbility.Enabled)
+
+			var unselected Channel
+			require.NoError(t, db.First(&unselected, channels[1].Id).Error)
+			assert.Equal(t, testCase.peerStatus, unselected.Status)
+			assert.Equal(t, channels[1].OtherInfo, unselected.OtherInfo)
+			var unselectedAbility Ability
+			require.NoError(t, db.First(&unselectedAbility, "channel_id = ?", unselected.Id).Error)
+			assert.Equal(t, testCase.peerAbility, unselectedAbility.Enabled)
+
+			var fenced Channel
+			require.NoError(t, db.First(&fenced, future.Id).Error)
+			assert.Equal(t, common.ChannelStatusAutoDisabled, fenced.Status)
+			for _, key := range []string{
+				"disabled_until",
+				"quota_reset_at",
+				"quota_domain",
+				"quota_domain_id",
+				"quota_generation",
+				"quota_type",
+			} {
+				assert.NotContains(t, fenced.GetOtherInfo(), key)
+			}
+			var fencedAbility Ability
+			require.NoError(t, db.First(&fencedAbility, "channel_id = ?", fenced.Id).Error)
+			assert.False(t, fencedAbility.Enabled)
+
+			require.NoError(t, InitializePlanQuotaDomains())
+			require.NoError(t, db.First(&authority, "credential_hash = ?", hash).Error)
+			assert.Equal(t, PlanQuotaDomainStateActive, authority.State)
+			assert.Equal(t, recoveredGeneration, authority.Generation)
+			require.NoError(t, db.First(&unselected, channels[1].Id).Error)
+			assert.Equal(t, testCase.peerStatus, unselected.Status)
+			require.NoError(t, db.First(&fenced, future.Id).Error)
+			assert.Equal(t, common.ChannelStatusAutoDisabled, fenced.Status)
+		})
+	}
+}
+
+func TestPlanQuotaDomainManualRecoveryFromOwnerlessAuthorityRollsBack(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	previousMemoryCacheEnabled := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCacheEnabled
+	})
+
+	tag := "plan:test:ownerless-rollback"
+	credential := "authority-secret-ownerless-rollback"
+	hash, ok := PlanQuotaDomainHash(credential)
+	require.True(t, ok)
+	require.NoError(t, db.Create(&PlanQuotaDomain{
+		CredentialHash: hash,
+		Generation:     221,
+		State:          PlanQuotaDomainStateDisabled,
+		DisabledUntil:  2_000_000_000,
+	}).Error)
+	channel := Channel{
+		Name: "ownerless-rollback", Key: credential, Tag: &tag,
+		Status: common.ChannelStatusManuallyDisabled,
+		Models: "gpt-4.1", Group: "default",
+	}
+	channel.SetOtherInfo(map[string]any{
+		"status_reason": "operator pause",
+		"failure_owner": "independent",
+	})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(db))
+	InitChannelCache()
+
+	forcedErr := errors.New("forced ownerless recovery ability failure")
+	callbackName := "test:ownerless_recovery_rollback"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil &&
+			tx.Statement.Schema != nil &&
+			tx.Statement.Schema.Name == "Ability" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Update().Remove(callbackName))
+	})
+
+	snapshot, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	result, err := RecoverPlanQuotaDomain(PlanQuotaDomainRecoveryRequest{
+		Source:               snapshot,
+		AllowOwnerlessManual: true,
+		EnableSource:         true,
+	})
+	require.ErrorIs(t, err, forcedErr)
+	assert.Empty(t, result.Channels)
+	assert.False(t, result.Recovered)
+
+	var authority PlanQuotaDomain
+	require.NoError(t, db.First(&authority, "credential_hash = ?", hash).Error)
+	assert.Equal(t, PlanQuotaDomainStateDisabled, authority.State)
+	assert.Equal(t, int64(221), authority.Generation)
+	assert.Equal(t, int64(2_000_000_000), authority.DisabledUntil)
+
+	var stored Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.Status)
+	assert.Equal(t, channel.OtherInfo, stored.OtherInfo)
+	var ability Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+	cached, cacheErr := CacheGetChannel(channel.Id)
+	require.NoError(t, cacheErr)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, cached.Status)
+	assert.Equal(t, channel.OtherInfo, cached.OtherInfo)
 }
 
 func TestPlanQuotaDomainRecoveryClearsQuotaOwnerButPreservesManagedRouteDisable(t *testing.T) {

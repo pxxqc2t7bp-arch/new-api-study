@@ -226,3 +226,136 @@ func TestBatchUpdateChannelStatusManuallyRecoversPlanQuotaDomain(t *testing.T) {
 	assert.Equal(t, 1, response.Data)
 	assertControllerPlanQuotaDomainEnabled(t, db, channels)
 }
+
+func createControllerOwnerlessPlanQuotaDomain(
+	t *testing.T,
+	db *gorm.DB,
+	name string,
+	status int,
+) ([]model.Channel, string) {
+	t.Helper()
+
+	tag := "plan:test:controller-ownerless-" + name
+	credential := "controller-ownerless-credential-" + name
+	hash, ok := model.PlanQuotaDomainHash(credential)
+	require.True(t, ok)
+	require.NoError(t, db.Create(&model.PlanQuotaDomain{
+		CredentialHash: hash,
+		Generation:     171,
+		State:          model.PlanQuotaDomainStateDisabled,
+		DisabledUntil:  2_000_000_000,
+	}).Error)
+	channels := []model.Channel{
+		{
+			Name: "ownerless-selected", Key: credential, Tag: &tag,
+			Status: status, Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Name: "ownerless-unselected", Key: credential, Tag: &tag,
+			Status: status, Models: "gpt-4.1", Group: "default",
+		},
+	}
+	for index := range channels {
+		channels[index].SetOtherInfo(map[string]any{
+			"status_reason": fmt.Sprintf("independent owner %d", index),
+			"failure_owner": fmt.Sprintf("owner-%d", index),
+		})
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for index := range channels {
+		require.NoError(t, channels[index].AddAbilities(db))
+	}
+	return channels, hash
+}
+
+func assertControllerOwnerlessRecovery(
+	t *testing.T,
+	db *gorm.DB,
+	channels []model.Channel,
+	hash string,
+) {
+	t.Helper()
+
+	var authority model.PlanQuotaDomain
+	require.NoError(t, db.First(&authority, "credential_hash = ?", hash).Error)
+	assert.Equal(t, model.PlanQuotaDomainStateActive, authority.State)
+
+	var selected model.Channel
+	require.NoError(t, db.First(&selected, channels[0].Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, selected.Status)
+	assert.Equal(t, "owner-0", selected.GetOtherInfo()["failure_owner"])
+	var selectedAbility model.Ability
+	require.NoError(t, db.First(&selectedAbility, "channel_id = ?", selected.Id).Error)
+	assert.True(t, selectedAbility.Enabled)
+
+	var unselected model.Channel
+	require.NoError(t, db.First(&unselected, channels[1].Id).Error)
+	assert.Equal(t, channels[1].Status, unselected.Status)
+	assert.Equal(t, channels[1].OtherInfo, unselected.OtherInfo)
+	var unselectedAbility model.Ability
+	require.NoError(t, db.First(&unselectedAbility, "channel_id = ?", unselected.Id).Error)
+	assert.False(t, unselectedAbility.Enabled)
+}
+
+func TestUpdateChannelStatusManuallyRecoversOwnerlessDisabledAuthority(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	channels, hash := createControllerOwnerlessPlanQuotaDomain(
+		t,
+		db,
+		"single",
+		common.ChannelStatusManuallyDisabled,
+	)
+
+	body := []byte(fmt.Sprintf(`{"status":%d}`, common.ChannelStatusEnabled))
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Params = gin.Params{{Key: "id", Value: strconv.Itoa(channels[0].Id)}}
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/channel/status", bytes.NewReader(body))
+	context.Request.Header.Set("Content-Type", "application/json")
+
+	UpdateChannelStatus(context)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool `json:"success"`
+		Data    bool `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.True(t, response.Success)
+	assert.True(t, response.Data)
+	assertControllerOwnerlessRecovery(t, db, channels, hash)
+}
+
+func TestBatchUpdateChannelStatusManuallyRecoversOwnerlessDisabledAuthority(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	channels, hash := createControllerOwnerlessPlanQuotaDomain(
+		t,
+		db,
+		"batch",
+		common.ChannelStatusAutoDisabled,
+	)
+
+	body := []byte(fmt.Sprintf(
+		`{"ids":[%d],"status":%d}`,
+		channels[0].Id,
+		common.ChannelStatusEnabled,
+	))
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/channel/status/batch", bytes.NewReader(body))
+	context.Request.Header.Set("Content-Type", "application/json")
+
+	BatchUpdateChannelStatus(context)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool `json:"success"`
+		Data    int  `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.True(t, response.Success)
+	assert.Equal(t, 1, response.Data)
+	assertControllerOwnerlessRecovery(t, db, channels, hash)
+}

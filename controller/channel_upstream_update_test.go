@@ -3,9 +3,11 @@ package controller
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -15,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func newAdvancedCustomModelListChannel(baseURL string, key string, upstreamPath string, auth *dto.AdvancedCustomRouteAuth) *model.Channel {
@@ -423,6 +426,191 @@ func TestFailedAdvancedCustomDetectionDoesNotStageFullRemoval(t *testing.T) {
 	require.Empty(t, persistedSettings.UpstreamModelUpdateLastDetectedModels)
 	require.Empty(t, persistedSettings.UpstreamModelUpdateLastRemovedModels)
 	require.Equal(t, "gpt-4.1,o3", reloaded.Models)
+}
+
+func createUpstreamModelPlanQuotaChannel(
+	t *testing.T,
+	baseURL string,
+	name string,
+) (*model.Channel, dto.ChannelOtherSettings) {
+	t.Helper()
+
+	tag := "plan:test:upstream-model-" + name
+	channel := &model.Channel{
+		Type:    constant.ChannelTypeOpenAI,
+		Name:    "upstream-model-" + name,
+		Key:     "upstream-model-credential-" + name,
+		BaseURL: &baseURL,
+		Status:  common.ChannelStatusEnabled,
+		Tag:     &tag,
+		Models:  "old-model",
+		Group:   "default",
+	}
+	settings := dto.ChannelOtherSettings{
+		UpstreamModelUpdateCheckEnabled:    true,
+		UpstreamModelUpdateAutoSyncEnabled: true,
+	}
+	channel.SetOtherSettings(settings)
+	require.NoError(t, channel.Insert())
+	return channel, settings
+}
+
+func assertUpstreamModelQuotaDisabled(
+	t *testing.T,
+	db *gorm.DB,
+	channelID int,
+	expectedModels string,
+) {
+	t.Helper()
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channelID).Error)
+	assert.Equal(t, expectedModels, stored.Models)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	var enabledAbilities int64
+	require.NoError(t, db.Model(&model.Ability{}).
+		Where("channel_id = ? AND enabled = ?", channelID, true).
+		Count(&enabledAbilities).Error)
+	assert.Zero(t, enabledAbilities)
+}
+
+func TestCheckAndPersistUpstreamModelUpdatesPreservesConcurrentPlanQuotaDisable(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	previousMemoryCacheEnabled := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCacheEnabled
+	})
+
+	requestReceived := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseResponse)
+		})
+	}
+	t.Cleanup(release)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(requestReceived)
+		<-releaseResponse
+		_, _ = w.Write([]byte(`{"data":[{"id":"old-model"},{"id":"new-model"}]}`))
+	}))
+	t.Cleanup(server.Close)
+
+	channel, settings := createUpstreamModelPlanQuotaChannel(t, server.URL, "automatic-race")
+	model.InitChannelCache()
+	updateDone := make(chan error, 1)
+	go func() {
+		modelsChanged, autoAdded, err := checkAndPersistChannelUpstreamModelUpdates(
+			channel,
+			&settings,
+			true,
+			true,
+		)
+		if err == nil && (!modelsChanged || autoAdded != 1) {
+			err = fmt.Errorf("unexpected update result: changed=%t auto_added=%d", modelsChanged, autoAdded)
+		}
+		updateDone <- err
+	}()
+	<-requestReceived
+
+	disabled, err := model.DisablePlanQuotaDomain(model.PlanQuotaDomainDisableRequest{
+		FailingChannelID:   channel.Id,
+		ObservedCredential: channel.Key,
+		ObservedTag:        channel.GetTag(),
+		Reason:             "quota exhausted",
+		ResetAt:            2_000_000_000,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, disabled.NewlyDisabled)
+	release()
+	require.NoError(t, <-updateDone)
+
+	assertUpstreamModelQuotaDisabled(t, db, channel.Id, "old-model,new-model")
+	cached, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, cached.Status)
+	assert.Equal(t, "old-model,new-model", cached.Models)
+}
+
+func TestApplyUpstreamModelUpdatesPreservesPriorPlanQuotaDisable(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	channel, settings := createUpstreamModelPlanQuotaChannel(t, "http://127.0.0.1", "explicit-race")
+	settings.UpstreamModelUpdateLastDetectedModels = []string{"new-model"}
+	channel.SetOtherSettings(settings)
+	require.NoError(t, db.Model(&model.Channel{}).
+		Where("id = ?", channel.Id).
+		Update("settings", channel.OtherSettings).Error)
+
+	staleSnapshot, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	disabled, err := model.DisablePlanQuotaDomain(model.PlanQuotaDomainDisableRequest{
+		FailingChannelID:   channel.Id,
+		ObservedCredential: channel.Key,
+		ObservedTag:        channel.GetTag(),
+		Reason:             "quota exhausted",
+		ResetAt:            2_000_000_000,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, disabled.NewlyDisabled)
+
+	added, removed, remaining, remainingRemoved, changed, err := applyChannelUpstreamModelUpdates(
+		staleSnapshot,
+		[]string{"new-model"},
+		nil,
+		nil,
+	)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, []string{"new-model"}, added)
+	assert.Empty(t, removed)
+	assert.Empty(t, remaining)
+	assert.Empty(t, remainingRemoved)
+	assertUpstreamModelQuotaDisabled(t, db, channel.Id, "old-model,new-model")
+}
+
+func TestApplyUpstreamModelUpdatesRollsBackModelAndSettingsOnAbilityFailure(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	channel, settings := createUpstreamModelPlanQuotaChannel(t, "http://127.0.0.1", "rollback")
+	settings.UpstreamModelUpdateLastDetectedModels = []string{"new-model"}
+	channel.SetOtherSettings(settings)
+	require.NoError(t, db.Model(&model.Channel{}).
+		Where("id = ?", channel.Id).
+		Update("settings", channel.OtherSettings).Error)
+	originalSettings := channel.OtherSettings
+
+	forcedErr := errors.New("forced upstream model ability failure")
+	callbackName := "test:upstream_model_ability_rollback"
+	require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil &&
+			tx.Statement.Schema != nil &&
+			tx.Statement.Schema.Name == "Ability" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Delete().Remove(callbackName))
+	})
+
+	_, _, _, _, changed, err := applyChannelUpstreamModelUpdates(
+		channel,
+		[]string{"new-model"},
+		nil,
+		nil,
+	)
+	require.ErrorIs(t, err, forcedErr)
+	assert.False(t, changed)
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, "old-model", stored.Models)
+	assert.Equal(t, originalSettings, stored.OtherSettings)
+	var abilities []model.Ability
+	require.NoError(t, db.Where("channel_id = ?", channel.Id).Find(&abilities).Error)
+	require.Len(t, abilities, 1)
+	assert.Equal(t, "old-model", abilities[0].Model)
+	assert.True(t, abilities[0].Enabled)
 }
 
 func TestFetchModelsUsesSharedChannelFetchBehavior(t *testing.T) {

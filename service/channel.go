@@ -3,7 +3,6 @@ package service
 import (
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -274,60 +273,13 @@ func disableEmptyCredentialPlanQuotaSource(
 	reason string,
 	resetAt int64,
 ) {
-	current, err := model.GetChannelById(channelID, true)
-	if err != nil {
-		common.SysError(fmt.Sprintf(
-			"failed to load empty-credential Plan quota source: channel_id=%d error=%v",
-			channelID,
-			err,
-		))
-		return
-	}
-	if current.ChannelInfo.IsMultiKey ||
-		current.Key != "" ||
-		current.GetTag() != observedTag {
-		return
-	}
-	domainID := planQuotaDomainID(channelID, "")
-	if current.Status != common.ChannelStatusEnabled {
-		owner, owned := current.GetOtherInfo()["quota_domain_id"].(string)
-		if current.Status != common.ChannelStatusAutoDisabled ||
-			!owned ||
-			owner != domainID {
-			return
-		}
-	}
-	desired := *current
-	info := desired.GetOtherInfo()
-	info["status_reason"] = reason
-	info["status_time"] = common.GetTimestamp()
-	info["quota_domain"] = current.GetTag()
-	info["quota_domain_id"] = domainID
-	generation := time.Now().UnixNano()
-	if previous, ok := info["quota_generation"].(string); ok {
-		if parsed, parseErr := strconv.ParseInt(previous, 10, 64); parseErr == nil &&
-			generation <= parsed {
-			generation = parsed + 1
-		}
-	}
-	info["quota_generation"] = strconv.FormatInt(generation, 10)
-	info["quota_type"] = "plan"
-	if resetAt > 0 {
-		info["quota_reset_at"] = resetAt
-		info["disabled_until"] = resetAt + 60
-	} else {
-		delete(info, "quota_reset_at")
-		delete(info, "disabled_until")
-	}
-	desired.SetOtherInfo(info)
-	_, err = model.UpdateSingleKeyChannelStatusIfUnchanged(
-		current.Id,
-		current.Key,
-		current.GetTag(),
-		current.Status,
-		current.OtherInfo,
-		common.ChannelStatusAutoDisabled,
-		desired.OtherInfo,
+	_, err := model.DisableEmptyCredentialPlanQuotaSource(
+		model.EmptyCredentialPlanQuotaDisableRequest{
+			ChannelID:   channelID,
+			ObservedTag: observedTag,
+			Reason:      reason,
+			ResetAt:     resetAt,
+		},
 	)
 	if err != nil {
 		common.SysError(fmt.Sprintf(
@@ -551,13 +503,10 @@ func enablePlanQuotaDomain(recoveringChannel *model.Channel) (bool, bool) {
 
 	tag := current.GetTag()
 	_, owned := PlanQuotaRecoveryDomainKey(current)
-	if !owned {
-		return false, false
-	}
 
 	enabled := 0
 	recovered := false
-	if !planQuotaSnapshotMatchesCredentialMarker(current) {
+	if owned && !planQuotaSnapshotMatchesCredentialMarker(current) {
 		changed, err := enableSingleKeyChannelSnapshot(current, true, nil)
 		if err != nil {
 			common.SysError(fmt.Sprintf("failed to recover rotated Plan quota source: channel_id=%d error=%v", current.Id, err))
@@ -568,12 +517,20 @@ func enablePlanQuotaDomain(recoveringChannel *model.Channel) (bool, bool) {
 			recovered = true
 		}
 	} else {
+		if _, member := model.PlanQuotaDomainMembership(current); !member {
+			return owned, false
+		}
 		result, err := model.RecoverPlanQuotaDomain(model.PlanQuotaDomainRecoveryRequest{
-			Source: current,
+			Source:               current,
+			AllowOwnerlessManual: true,
+			EnableSource:         true,
 		})
 		if err != nil {
 			common.SysError(fmt.Sprintf("failed to recover Plan quota domain: channel_id=%d error=%v", current.Id, err))
 			return true, false
+		}
+		if !result.Handled {
+			return owned, false
 		}
 		enabled = result.NewlyEnabled
 		recovered = result.Recovered

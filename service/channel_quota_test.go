@@ -1202,6 +1202,94 @@ func TestEnableChannelManuallyRecoversFromOldGenerationManualPlanQuotaSource(t *
 	assert.Equal(t, independentBefore.OtherInfo, recovered[2].OtherInfo)
 }
 
+func TestEnableChannelManuallyRecoversOwnerlessDisabledAuthority(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+	tag := "plan:support:ownerless-manual"
+	const credential = "ownerless-manual-credential"
+	hash, ok := model.PlanQuotaDomainHash(credential)
+	require.True(t, ok)
+	require.NoError(t, db.Create(&model.PlanQuotaDomain{
+		CredentialHash: hash,
+		Generation:     81,
+		State:          model.PlanQuotaDomainStateDisabled,
+		DisabledUntil:  2_000_000_000,
+	}).Error)
+	channels := []model.Channel{
+		{
+			Name: "selected-ownerless", Key: credential, Tag: &tag,
+			Status: common.ChannelStatusManuallyDisabled,
+			Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Name: "unselected-ownerless", Key: credential, Tag: &tag,
+			Status: common.ChannelStatusManuallyDisabled,
+			Models: "gpt-4.1", Group: "default",
+		},
+	}
+	channels[0].SetOtherInfo(map[string]any{"status_reason": "selected manual pause"})
+	channels[1].SetOtherInfo(map[string]any{"status_reason": "peer manual pause"})
+	require.NoError(t, db.Create(&channels).Error)
+	for index := range channels {
+		require.NoError(t, channels[index].AddAbilities(db))
+	}
+
+	assert.True(t, EnableChannel(channels[0].Id, "", channels[0].Name))
+
+	var authority model.PlanQuotaDomain
+	require.NoError(t, db.First(&authority, "credential_hash = ?", hash).Error)
+	assert.Equal(t, model.PlanQuotaDomainStateActive, authority.State)
+	var selected model.Channel
+	require.NoError(t, db.First(&selected, channels[0].Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, selected.Status)
+	var selectedAbility model.Ability
+	require.NoError(t, db.First(&selectedAbility, "channel_id = ?", selected.Id).Error)
+	assert.True(t, selectedAbility.Enabled)
+	var unselected model.Channel
+	require.NoError(t, db.First(&unselected, channels[1].Id).Error)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, unselected.Status)
+	assert.Equal(t, channels[1].OtherInfo, unselected.OtherInfo)
+	var unselectedAbility model.Ability
+	require.NoError(t, db.First(&unselectedAbility, "channel_id = ?", unselected.Id).Error)
+	assert.False(t, unselectedAbility.Enabled)
+}
+
+func TestEnableChannelForHealthCheckCannotRecoverOwnerlessDisabledAuthority(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+	tag := "plan:support:ownerless-health"
+	const credential = "ownerless-health-credential"
+	hash, ok := model.PlanQuotaDomainHash(credential)
+	require.True(t, ok)
+	require.NoError(t, db.Create(&model.PlanQuotaDomain{
+		CredentialHash: hash,
+		Generation:     91,
+		State:          model.PlanQuotaDomainStateDisabled,
+		DisabledUntil:  1,
+	}).Error)
+	channel := model.Channel{
+		Name: "ownerless-health", Key: credential, Tag: &tag,
+		Status: common.ChannelStatusAutoDisabled,
+		Models: "gpt-4.1", Group: "default",
+	}
+	channel.SetOtherInfo(map[string]any{
+		"status_reason":  "unrelated upstream failure",
+		"disabled_until": int64(1),
+	})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(db))
+
+	assert.Zero(t, EnableChannelForHealthCheck(&channel, ""))
+
+	var authority model.PlanQuotaDomain
+	require.NoError(t, db.First(&authority, "credential_hash = ?", hash).Error)
+	assert.Equal(t, model.PlanQuotaDomainStateDisabled, authority.State)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+}
+
 func TestFreshPlanQuotaDisableWinsOverOverlappingRecovery(t *testing.T) {
 	db := setupPlanQuotaDomainTest(t)
 

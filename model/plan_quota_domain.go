@@ -102,16 +102,26 @@ type PlanQuotaDomainDisableRequest struct {
 	Generation         int64
 }
 
+type EmptyCredentialPlanQuotaDisableRequest struct {
+	ChannelID   int
+	ObservedTag string
+	Reason      string
+	ResetAt     int64
+}
+
 type PlanQuotaDomainRecoveryRequest struct {
-	Source     *Channel
-	RecoveryAt int64
-	RequireDue bool
+	Source               *Channel
+	RecoveryAt           int64
+	RequireDue           bool
+	AllowOwnerlessManual bool
+	EnableSource         bool
 }
 
 type PlanQuotaDomainTransitionResult struct {
 	Channels      []*Channel
 	NewlyDisabled int
 	NewlyEnabled  int
+	Handled       bool
 	Recovered     bool
 }
 
@@ -929,6 +939,103 @@ func nextPlanQuotaGeneration(current int64, requested int64) int64 {
 	return next
 }
 
+// DisableEmptyCredentialPlanQuotaSource atomically disables only the observed
+// empty-credential source. Empty credentials never form a shared authority.
+func DisableEmptyCredentialPlanQuotaSource(
+	request EmptyCredentialPlanQuotaDisableRequest,
+) (PlanQuotaDomainTransitionResult, error) {
+	var result PlanQuotaDomainTransitionResult
+	if request.ChannelID <= 0 || !strings.HasPrefix(request.ObservedTag, "plan:") {
+		return result, errors.New("empty-credential Plan quota disable identity is invalid")
+	}
+
+	observeChannelStatusPublication(channelStatusPublicationBeforeWrite)
+	_, err := withChannelStatusesLocks([]int{request.ChannelID}, func() (bool, error) {
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			var current Channel
+			if err := lockForUpdate(tx).
+				Where("id = ?", request.ChannelID).
+				First(&current).Error; err != nil {
+				return err
+			}
+			if current.ChannelInfo.IsMultiKey ||
+				current.Key != "" ||
+				current.GetTag() != request.ObservedTag {
+				return nil
+			}
+
+			domainID := fmt.Sprintf("channel:%d", current.Id)
+			if current.Status != common.ChannelStatusEnabled {
+				owner, owned := current.GetOtherInfo()["quota_domain_id"].(string)
+				if current.Status != common.ChannelStatusAutoDisabled ||
+					!owned ||
+					owner != domainID {
+					return nil
+				}
+			}
+
+			wasEnabled := current.Status == common.ChannelStatusEnabled
+			info := current.GetOtherInfo()
+			previousGeneration := int64(0)
+			if previous, ok := info["quota_generation"].(string); ok {
+				parsed, parseErr := strconv.ParseInt(previous, 10, 64)
+				if parseErr == nil && parsed > previousGeneration {
+					previousGeneration = parsed
+				}
+			}
+			current.Status = common.ChannelStatusAutoDisabled
+			info["status_reason"] = request.Reason
+			info["status_time"] = common.GetTimestamp()
+			info["quota_domain"] = current.GetTag()
+			info["quota_domain_id"] = domainID
+			info["quota_generation"] = strconv.FormatInt(
+				nextPlanQuotaGeneration(previousGeneration, 0),
+				10,
+			)
+			info["quota_type"] = "plan"
+			if request.ResetAt > 0 {
+				info["quota_reset_at"] = request.ResetAt
+				info["disabled_until"] = request.ResetAt + 60
+			} else {
+				delete(info, "quota_reset_at")
+				delete(info, "disabled_until")
+			}
+			current.SetOtherInfo(info)
+
+			if err := tx.Model(&Channel{}).
+				Where("id = ?", current.Id).
+				Updates(map[string]any{
+					"status":     current.Status,
+					"other_info": current.OtherInfo,
+				}).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&Ability{}).
+				Where("channel_id = ?", current.Id).
+				Select("enabled").
+				Update("enabled", false).Error; err != nil {
+				return err
+			}
+			snapshot := current
+			result.Channels = append(result.Channels, &snapshot)
+			if wasEnabled {
+				result.NewlyDisabled = 1
+			}
+			return nil
+		})
+		if err != nil {
+			return false, err
+		}
+		observeChannelStatusPublication(channelStatusPublicationAfterCommit)
+		publishPlanQuotaTransition(result.Channels)
+		return len(result.Channels) > 0, nil
+	})
+	if err != nil {
+		return PlanQuotaDomainTransitionResult{}, err
+	}
+	return result, nil
+}
+
 func DisablePlanQuotaDomain(
 	request PlanQuotaDomainDisableRequest,
 ) (PlanQuotaDomainTransitionResult, error) {
@@ -1061,23 +1168,37 @@ func RecoverPlanQuotaDomain(
 					return err
 				}
 				domain := domains[hash]
-				sourceGeneration, sourceDeadline, valid := planQuotaRecoverySnapshot(request.Source, hash)
-				if domain.State != PlanQuotaDomainStateDisabled || !valid {
+				if domain.State != PlanQuotaDomainStateDisabled {
 					return nil
 				}
-				switch request.Source.Status {
-				case common.ChannelStatusAutoDisabled:
-					if domain.Generation != sourceGeneration ||
-						domain.DisabledUntil != sourceDeadline ||
-						(request.RequireDue && domain.DisabledUntil > request.RecoveryAt) {
+				result.Handled = true
+
+				sourceGeneration, sourceDeadline, valid := planQuotaRecoverySnapshot(request.Source, hash)
+				ownerlessManual := false
+				if valid {
+					switch request.Source.Status {
+					case common.ChannelStatusAutoDisabled:
+						if domain.Generation != sourceGeneration ||
+							domain.DisabledUntil != sourceDeadline ||
+							(request.RequireDue && domain.DisabledUntil > request.RecoveryAt) {
+							return nil
+						}
+					case common.ChannelStatusManuallyDisabled:
+						if request.RequireDue {
+							return nil
+						}
+					default:
 						return nil
 					}
-				case common.ChannelStatusManuallyDisabled:
-					if request.RequireDue {
+				} else {
+					if !request.AllowOwnerlessManual ||
+						request.RequireDue ||
+						(request.Source.Status != common.ChannelStatusAutoDisabled &&
+							request.Source.Status != common.ChannelStatusManuallyDisabled) ||
+						hasMatchingPlanQuotaDomainOwnership(request.Source, hash) {
 						return nil
 					}
-				default:
-					return nil
+					ownerlessManual = true
 				}
 
 				members, err := findPlanQuotaDomainMembers(tx, credential)
@@ -1103,17 +1224,19 @@ func RecoverPlanQuotaDomain(
 					return nil
 				}
 
-				for index := range lockedMembers {
-					channel := &lockedMembers[index]
-					if channel.Status != common.ChannelStatusAutoDisabled {
-						continue
-					}
-					generation, deadline, owned := planQuotaRecoverySnapshot(channel, hash)
-					if !owned {
-						continue
-					}
-					if generation != domain.Generation || deadline != domain.DisabledUntil {
-						return nil
+				if !ownerlessManual {
+					for index := range lockedMembers {
+						channel := &lockedMembers[index]
+						if channel.Status != common.ChannelStatusAutoDisabled {
+							continue
+						}
+						generation, deadline, owned := planQuotaRecoverySnapshot(channel, hash)
+						if !owned {
+							continue
+						}
+						if generation != domain.Generation || deadline != domain.DisabledUntil {
+							return nil
+						}
 					}
 				}
 
@@ -1133,6 +1256,47 @@ func RecoverPlanQuotaDomain(
 
 				for index := range lockedMembers {
 					channel := &lockedMembers[index]
+					if ownerlessManual {
+						ownershipCleared := clearPlanQuotaDomainOwnership(
+							channel,
+							hash,
+							channel.GetTag(),
+						)
+						sourceEnabled := channel.Id == request.Source.Id &&
+							request.EnableSource &&
+							channel.Status != common.ChannelStatusEnabled
+						if sourceEnabled {
+							channel.Status = common.ChannelStatusEnabled
+							info := channel.GetOtherInfo()
+							info["status_reason"] = ""
+							info["status_time"] = common.GetTimestamp()
+							channel.SetOtherInfo(info)
+							result.NewlyEnabled++
+						}
+						if !ownershipCleared && !sourceEnabled {
+							continue
+						}
+						if err := tx.Model(&Channel{}).
+							Where("id = ?", channel.Id).
+							Updates(map[string]any{
+								"status":     channel.Status,
+								"other_info": channel.OtherInfo,
+							}).Error; err != nil {
+							return err
+						}
+						if sourceEnabled {
+							if err := tx.Model(&Ability{}).
+								Where("channel_id = ?", channel.Id).
+								Select("enabled").
+								Update("enabled", true).Error; err != nil {
+								return err
+							}
+						}
+						snapshot := *channel
+						result.Channels = append(result.Channels, &snapshot)
+						continue
+					}
+
 					_, _, owned := planQuotaRecoverySnapshot(channel, hash)
 					if !owned {
 						continue
@@ -1179,6 +1343,14 @@ func RecoverPlanQuotaDomain(
 		return PlanQuotaDomainTransitionResult{}, err
 	}
 	return result, nil
+}
+
+func hasMatchingPlanQuotaDomainOwnership(channel *Channel, hash string) bool {
+	if channel == nil {
+		return false
+	}
+	snapshot := *channel
+	return clearPlanQuotaDomainOwnership(&snapshot, hash, channel.GetTag())
 }
 
 func findPlanQuotaDomainMembers(tx *gorm.DB, credential string) ([]Channel, error) {
