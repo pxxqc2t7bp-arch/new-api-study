@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/gemini"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
+	"github.com/QuantumNous/new-api/relay/channel/volcengine"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -561,11 +562,35 @@ func (a *Adaptor) convertOpenAICompatibleRequest(c *gin.Context, info *relaycomm
 }
 
 func (a *Adaptor) convertOpenAICompatibleResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
+	requestURL, err := a.routeURL(info)
+	if err != nil {
+		return nil, err
+	}
+	if isArkResponsesTarget(requestURL) {
+		request, err = volcengine.NormalizeOpenAIResponsesRequest(request)
+		if err != nil {
+			return nil, err
+		}
+	}
 	old := info.ChannelType
 	info.ChannelType = constant.ChannelTypeOpenAI
 	converted, err := a.openaiAdaptor.ConvertOpenAIResponsesRequest(c, info, request)
 	info.ChannelType = old
 	return converted, err
+}
+
+func isArkResponsesTarget(requestURL string) bool {
+	parsedURL, err := url.Parse(requestURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsedURL.Hostname())
+	labels := strings.Split(host, ".")
+	return len(labels) == 4 &&
+		labels[0] == "ark" &&
+		labels[1] != "" &&
+		labels[2] == "volces" &&
+		labels[3] == "com"
 }
 
 func (a *Adaptor) convertOpenAICompatibleEmbeddingRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.EmbeddingRequest) (any, error) {
