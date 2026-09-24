@@ -921,6 +921,94 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedTracksPerKeyPlanDeadline(t *testi
 	assert.True(t, ability.Enabled)
 }
 
+func TestRecoverMultiKeyChannelStatusIfUnchangedUsesFinalChannelDeadline(t *testing.T) {
+	setupChannelStatusTest(t)
+	require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+	require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+
+	const recoveryAt int64 = 2_000_000_000
+	tag := "plan:managed:final-key-deadline"
+	channel := Channel{
+		Name:   "managed-final-key-deadline",
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusAutoDisabled,
+		Tag:    &tag,
+		Models: "gpt-3.5-turbo",
+		Group:  "default",
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledTime: map[int]int64{
+				0: 100,
+				1: 200,
+			},
+			MultiKeyDisabledUntil: map[int]int64{
+				0: recoveryAt - 60,
+				1: recoveryAt + 3_600,
+			},
+		},
+	}
+	channel.SetOtherInfo(map[string]any{
+		"quota_reset_at": recoveryAt + 3_540,
+		"disabled_until": recoveryAt + 3_600,
+		"owner":          "preserved",
+	})
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	require.NoError(t, DB.Create(&UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "final-key-deadline",
+		Platform:        "plan",
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           UpstreamRouteStateActive,
+		Rank:            1,
+	}).Error)
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+
+	changed, err := RecoverMultiKeyChannelStatusIfUnchanged(
+		expected,
+		tag,
+		"key-a",
+		common.ChannelStatusEnabled,
+		"",
+		MultiKeyChannelStatusUpdateOptions{ClearPlanQuotaDeadline: true},
+		recoveryAt,
+	)
+	require.NoError(t, err)
+	assert.False(t, changed)
+	stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	assert.Equal(t, channel.OtherInfo, stored.OtherInfo)
+	assert.Equal(t, channel.ChannelInfo.MultiKeyStatusList, stored.ChannelInfo.MultiKeyStatusList)
+	assert.False(t, ability.Enabled)
+
+	changed, err = RecoverMultiKeyChannelStatusIfUnchanged(
+		expected,
+		tag,
+		"key-a",
+		common.ChannelStatusEnabled,
+		"",
+		MultiKeyChannelStatusUpdateOptions{ClearPlanQuotaDeadline: true},
+		recoveryAt+3_600,
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+	stored, ability = loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 0)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[1])
+	assert.NotContains(t, stored.GetOtherInfo(), "quota_reset_at")
+	assert.NotContains(t, stored.GetOtherInfo(), "disabled_until")
+	assert.Equal(t, "preserved", stored.GetOtherInfo()["owner"])
+	assert.True(t, ability.Enabled)
+}
+
 func TestAdvanceMultiKeyRecoveryCursorIfUnchangedFencesSnapshot(t *testing.T) {
 	t.Run("advances only recovery cursor", func(t *testing.T) {
 		setupChannelStatusTest(t)

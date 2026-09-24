@@ -913,6 +913,134 @@ func mutateChannelSnapshotsWithPlanQuotaDomains(
 	return updated, nil
 }
 
+const channelDeleteMaxAttempts = 3
+
+var errChannelDeleteSnapshotChanged = errors.New("channel delete snapshot changed")
+
+type channelDeleteDiscovery func(*gorm.DB) ([]Channel, error)
+
+func deleteChannelsWithPlanQuotaDomains(
+	requestedIDs []int,
+	discover channelDeleteDiscovery,
+) (int64, error) {
+	if discover == nil {
+		return 0, errors.New("channel delete discovery is missing")
+	}
+
+	normalizedRequestedIDs := append([]int(nil), requestedIDs...)
+	sort.Ints(normalizedRequestedIDs)
+	normalizedRequestedIDs = compactPositiveChannelIDs(normalizedRequestedIDs)
+
+	var deletedCount int64
+	observeChannelStatusPublication(channelStatusPublicationBeforeWrite)
+	err := withChannelStatusPublicationLock(func() error {
+		// Only retry snapshot drift detected before the first delete statement.
+		// Any write or commit error returns directly because its outcome may be unknown.
+		for range channelDeleteMaxAttempts {
+			expected, err := discover(DB)
+			if err != nil {
+				return err
+			}
+			sort.Slice(expected, func(i, j int) bool {
+				return expected[i].Id < expected[j].Id
+			})
+
+			deleteIDs := normalizedRequestedIDs
+			if len(deleteIDs) == 0 {
+				deleteIDs = make([]int, len(expected))
+				for index := range expected {
+					deleteIDs[index] = expected[index].Id
+				}
+			}
+			if len(deleteIDs) == 0 {
+				deletedCount = 0
+				return nil
+			}
+
+			attemptDeleted := int64(0)
+			err = DB.Transaction(func(tx *gorm.DB) error {
+				requests := make([]planQuotaCredentialLock, 0, len(expected))
+				for index := range expected {
+					if request, member := planQuotaCredentialForChannel(&expected[index], false); member {
+						requests = append(requests, request)
+					}
+				}
+				domains, domainErr := lockPlanQuotaDomains(tx, requests)
+				if domainErr != nil {
+					return domainErr
+				}
+
+				locked, snapshotErr := lockPlanQuotaMemberSnapshots(tx, expected)
+				if errors.Is(snapshotErr, gorm.ErrRecordNotFound) ||
+					errors.Is(snapshotErr, errPlanQuotaDomainSnapshotChanged) {
+					return errChannelDeleteSnapshotChanged
+				}
+				if snapshotErr != nil {
+					return snapshotErr
+				}
+				for index := range locked {
+					expectedHash, expectedMember := PlanQuotaDomainMembership(&expected[index])
+					currentHash, currentMember := PlanQuotaDomainMembership(&locked[index])
+					if expectedMember != currentMember ||
+						(expectedMember && expectedHash != currentHash) {
+						return errChannelDeleteSnapshotChanged
+					}
+					if currentMember && domains[currentHash] == nil {
+						return errPlanQuotaDomainInvariant
+					}
+				}
+
+				for start := 0; start < len(deleteIDs); start += 200 {
+					end := min(start+200, len(deleteIDs))
+					chunk := deleteIDs[start:end]
+					deleteErr := tx.Where("channel_id IN ?", chunk).
+						Delete(&Ability{}).Error
+					if deleteErr != nil {
+						return deleteErr
+					}
+					result := tx.Where("id IN ?", chunk).Delete(&Channel{})
+					if result.Error != nil {
+						return result.Error
+					}
+					attemptDeleted += result.RowsAffected
+				}
+				if attemptDeleted != int64(len(expected)) {
+					return errors.New("channel delete rows changed after snapshot verification")
+				}
+				return nil
+			})
+			if errors.Is(err, errChannelDeleteSnapshotChanged) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+
+			deletedCount = attemptDeleted
+			observeChannelStatusPublication(channelStatusPublicationAfterCommit)
+			CacheDeleteChannels(deleteIDs)
+			return nil
+		}
+		return errChannelDeleteSnapshotChanged
+	})
+	if err != nil {
+		return 0, err
+	}
+	return deletedCount, nil
+}
+
+func compactPositiveChannelIDs(sortedIDs []int) []int {
+	compacted := sortedIDs[:0]
+	for _, channelID := range sortedIDs {
+		if channelID <= 0 ||
+			len(compacted) > 0 && compacted[len(compacted)-1] == channelID {
+			continue
+		}
+		compacted = append(compacted, channelID)
+	}
+	return compacted
+}
+
 // UpdateChannelCredentialIfUnchanged rotates a credential only while the
 // caller's complete channel snapshot remains current.
 func UpdateChannelCredentialIfUnchanged(

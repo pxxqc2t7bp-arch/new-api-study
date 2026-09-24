@@ -901,6 +901,56 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesManagedPlanQuota(t
 	assert.Equal(t, []int{31, 32, 34, 35}, selectedIDs)
 }
 
+func TestSelectChannelsForAutomaticTestManagedFinalKeyUsesChannelDeadline(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
+	now := time.Now().Unix()
+	tag := "plan:managed:final-key-deadline"
+	channel := &model.Channel{
+		Id:     41,
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusAutoDisabled,
+		Tag:    &tag,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledUntil: map[int]int64{
+				0: now - 60,
+				1: now + 3_600,
+			},
+		},
+	}
+	channel.SetOtherInfo(map[string]any{"disabled_until": now + 3_600})
+	require.NoError(t, model.DB.Create(&model.UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "final-key-deadline",
+		Platform:        "plan",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           model.UpstreamRouteStateActive,
+		Rank:            1,
+	}).Error)
+
+	selected, err := selectChannelsForAutomaticTest(
+		[]*model.Channel{channel},
+		operation_setting.ChannelTestModePassiveRecovery,
+	)
+	require.NoError(t, err)
+	assert.Empty(t, selected)
+
+	channel.SetOtherInfo(map[string]any{"disabled_until": now - 1})
+	selected, err = selectChannelsForAutomaticTest(
+		[]*model.Channel{channel},
+		operation_setting.ChannelTestModePassiveRecovery,
+	)
+	require.NoError(t, err)
+	require.Len(t, selected, 1)
+	assert.Equal(t, channel.Id, selected[0].Id)
+}
+
 func TestSelectChannelsForAutomaticTestAlwaysSkipsManualDisabled(t *testing.T) {
 	setupAutomaticChannelSelectionTestDB(t)
 

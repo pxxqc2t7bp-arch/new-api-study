@@ -17,7 +17,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 
-	"github.com/samber/lo"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -621,28 +620,11 @@ func BatchDeleteChannels(ids []int) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	// 使用事务 分批删除channel表和abilities表
-	tx := DB.Begin()
-	if tx.Error != nil {
-		return 0, tx.Error
-	}
-	var deletedCount int64
-	for _, chunk := range lo.Chunk(ids, 200) {
-		result := tx.Where("id in (?)", chunk).Delete(&Channel{})
-		if result.Error != nil {
-			tx.Rollback()
-			return 0, result.Error
-		}
-		deletedCount += result.RowsAffected
-		if err := tx.Where("channel_id in (?)", chunk).Delete(&Ability{}).Error; err != nil {
-			tx.Rollback()
-			return 0, err
-		}
-	}
-	if err := tx.Commit().Error; err != nil {
-		return 0, err
-	}
-	return deletedCount, nil
+	return deleteChannelsWithPlanQuotaDomains(ids, func(db *gorm.DB) ([]Channel, error) {
+		var channels []Channel
+		err := db.Where("id IN ?", ids).Find(&channels).Error
+		return channels, err
+	})
 }
 
 func (channel *Channel) GetPriority() int64 {
@@ -852,12 +834,17 @@ func (channel *Channel) UpdateBalance(balance float64) {
 }
 
 func (channel *Channel) Delete() error {
-	var err error
-	err = DB.Delete(channel).Error
-	if err != nil {
-		return err
+	if channel == nil || channel.Id <= 0 {
+		return errors.New("channel delete id is missing")
 	}
-	err = channel.DeleteAbilities()
+	_, err := deleteChannelsWithPlanQuotaDomains(
+		[]int{channel.Id},
+		func(db *gorm.DB) ([]Channel, error) {
+			var channels []Channel
+			err := db.Where("id = ?", channel.Id).Find(&channels).Error
+			return channels, err
+		},
+	)
 	return err
 }
 
@@ -1612,6 +1599,11 @@ func (channel *Channel) DueAutoDisabledMultiKeyIndexes(now int64) []int {
 	if channel == nil {
 		return nil
 	}
+	if channel.Status == common.ChannelStatusAutoDisabled &&
+		!channel.HasEnabledKey() &&
+		channel.GetDisabledUntil() > now {
+		return nil
+	}
 	indexes := make([]int, 0, len(channel.GetKeys()))
 	useLegacyDeadline := channel.Status == common.ChannelStatusAutoDisabled &&
 		channel.ChannelInfo.MultiKeyDisabledUntil == nil
@@ -2123,13 +2115,23 @@ func updateChannelUsedQuota(id int, quota int) {
 }
 
 func DeleteChannelByStatus(status int64) (int64, error) {
-	result := DB.Where("status = ?", status).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	return deleteChannelsWithPlanQuotaDomains(nil, func(db *gorm.DB) ([]Channel, error) {
+		var channels []Channel
+		err := db.Where("status = ?", status).Find(&channels).Error
+		return channels, err
+	})
 }
 
 func DeleteDisabledChannel() (int64, error) {
-	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	return deleteChannelsWithPlanQuotaDomains(nil, func(db *gorm.DB) ([]Channel, error) {
+		var channels []Channel
+		err := db.Where(
+			"status = ? OR status = ?",
+			common.ChannelStatusAutoDisabled,
+			common.ChannelStatusManuallyDisabled,
+		).Find(&channels).Error
+		return channels, err
+	})
 }
 
 func GetPaginatedTags(offset int, limit int) ([]*string, error) {

@@ -501,3 +501,35 @@ func CacheUpdateChannels(channels []*Channel) {
 func CacheUpdateChannel(channel *Channel) {
 	CacheUpdateChannels([]*Channel{channel})
 }
+
+func CacheDeleteChannels(channelIDs []int) {
+	if !common.MemoryCacheEnabled || len(channelIDs) == 0 {
+		return
+	}
+
+	deleted := make(map[int]struct{}, len(channelIDs))
+	for _, channelID := range channelIDs {
+		deleted[channelID] = struct{}{}
+	}
+
+	channelSyncLock.Lock()
+	for channelID := range deleted {
+		delete(channelsIDM, channelID)
+		delete(channel2advancedCustomConfig, channelID)
+	}
+	for group, model2channels := range group2model2channels {
+		for model, channelIDs := range model2channels {
+			kept := channelIDs[:0]
+			for _, channelID := range channelIDs {
+				if _, remove := deleted[channelID]; !remove {
+					kept = append(kept, channelID)
+				}
+			}
+			group2model2channels[group][model] = kept
+		}
+	}
+	channelSyncLock.Unlock()
+
+	InvalidatePricingCache()
+	rebuildTaskAliasView()
+}

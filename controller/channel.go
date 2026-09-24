@@ -756,7 +756,6 @@ func DeleteChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
 	if channelLookupFailed {
 		service.ResetProxyClientCache()
 	} else {
@@ -779,7 +778,6 @@ func DeleteDisabledChannel(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
 	if rows > 0 {
 		service.ResetProxyClientCache()
 	}
@@ -938,7 +936,6 @@ func DeleteChannelBatch(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	model.InitChannelCache()
 	if deletedCount > 0 {
 		service.ResetProxyClientCache()
 	}
