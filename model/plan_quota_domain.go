@@ -112,6 +112,7 @@ type PlanQuotaDomainTransitionResult struct {
 	Channels      []*Channel
 	NewlyDisabled int
 	NewlyEnabled  int
+	Recovered     bool
 }
 
 func InitializePlanQuotaDomains() error {
@@ -122,12 +123,74 @@ func InitializePlanQuotaDomains() error {
 	var activeCount int
 	var disabledCount int
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		var channels []Channel
-		if err := tx.Find(&channels).Error; err != nil {
+		var discovered []Channel
+		if err := tx.
+			Select("key", "tag", "channel_info").
+			Where("tag LIKE ?", "plan:%").
+			Find(&discovered).Error; err != nil {
 			return err
 		}
 
-		backfill := make(map[string]planQuotaDomainBackfillState)
+		candidateHashes := make(map[string]struct{})
+		for index := range discovered {
+			credential, member := planQuotaDomainCredential(&discovered[index])
+			if !member {
+				continue
+			}
+			hash, _ := PlanQuotaDomainHash(credential)
+			candidateHashes[hash] = struct{}{}
+		}
+
+		hashes := make([]string, 0, len(candidateHashes))
+		for hash := range candidateHashes {
+			hashes = append(hashes, hash)
+		}
+		sort.Strings(hashes)
+		domains := make(map[string]*PlanQuotaDomain, len(hashes))
+		for _, hash := range hashes {
+			var domain PlanQuotaDomain
+			authorityDB := planQuotaAuthorityDB(tx)
+			query := lockForUpdate(authorityDB).
+				Where("credential_hash = ?", hash).
+				Limit(1).
+				Find(&domain)
+			queryErr := query.Error
+			if queryErr == nil && query.RowsAffected == 0 {
+				if createErr := authorityDB.Clauses(clause.OnConflict{
+					Columns:   []clause.Column{{Name: "credential_hash"}},
+					DoNothing: true,
+				}).Create(&PlanQuotaDomain{
+					CredentialHash: hash,
+					State:          PlanQuotaDomainStateActive,
+				}).Error; createErr != nil {
+					return createErr
+				}
+				query = lockForUpdate(authorityDB).
+					Where("credential_hash = ?", hash).
+					Limit(1).
+					Find(&domain)
+				queryErr = query.Error
+			}
+			switch {
+			case queryErr != nil:
+				return queryErr
+			case query.RowsAffected != 1:
+				return errPlanQuotaDomainInvariant
+			case domain.State != PlanQuotaDomainStateActive &&
+				domain.State != PlanQuotaDomainStateDisabled:
+				return errors.New("plan quota domain has an invalid authority state")
+			}
+			domains[hash] = &domain
+		}
+
+		var channels []Channel
+		if err := lockForUpdate(tx).
+			Order(clause.OrderByColumn{Column: clause.Column{Name: "id"}}).
+			Find(&channels).Error; err != nil {
+			return err
+		}
+
+		backfill := make(map[string]planQuotaDomainBackfillState, len(domains))
 		for index := range channels {
 			hash, member := PlanQuotaDomainMembership(&channels[index])
 			ownershipCleared, err := clearStalePlanQuotaDomainOwnership(
@@ -147,6 +210,9 @@ func InitializePlanQuotaDomains() error {
 			}
 			if !member {
 				continue
+			}
+			if _, exists := domains[hash]; !exists {
+				return errPlanQuotaDomainSnapshotChanged
 			}
 			state := backfill[hash]
 			ownership, err := planQuotaBackfillOwnership(&channels[index], hash)
@@ -184,72 +250,35 @@ func InitializePlanQuotaDomains() error {
 			backfill[hash] = state
 		}
 
-		hashes := make([]string, 0, len(backfill))
-		for hash := range backfill {
-			hashes = append(hashes, hash)
-		}
-		sort.Strings(hashes)
 		for _, hash := range hashes {
 			state := backfill[hash]
-			var current PlanQuotaDomain
-			authorityDB := planQuotaAuthorityDB(tx)
-			query := lockForUpdate(authorityDB).
-				Where("credential_hash = ?", hash).
-				Limit(1).
-				Find(&current)
-			err := query.Error
-			if err == nil && query.RowsAffected == 0 {
-				if createErr := authorityDB.Clauses(clause.OnConflict{
-					Columns:   []clause.Column{{Name: "credential_hash"}},
-					DoNothing: true,
-				}).Create(&PlanQuotaDomain{
-					CredentialHash: hash,
-					State:          PlanQuotaDomainStateActive,
-				}).Error; createErr != nil {
-					return createErr
-				}
-				query = lockForUpdate(authorityDB).
-					Where("credential_hash = ?", hash).
-					Limit(1).
-					Find(&current)
-				err = query.Error
+			domain := domains[hash]
+			if domain.Generation > state.generation {
+				state.generation = domain.Generation
 			}
-			switch {
-			case err != nil:
-				return err
-			case query.RowsAffected != 1:
-				return errPlanQuotaDomainInvariant
-			case current.State != PlanQuotaDomainStateActive &&
-				current.State != PlanQuotaDomainStateDisabled:
-				return errors.New("plan quota domain has an invalid authority state")
-			}
-
-			if current.Generation > state.generation {
-				state.generation = current.Generation
-			}
-			if current.State == PlanQuotaDomainStateDisabled {
+			if domain.State == PlanQuotaDomainStateDisabled {
 				state.disabled = true
-				if current.DisabledUntil > state.disabledUntil {
-					state.disabledUntil = current.DisabledUntil
+				if domain.DisabledUntil > state.disabledUntil {
+					state.disabledUntil = domain.DisabledUntil
 				}
 			}
-			current.Generation = state.generation
+			domain.Generation = state.generation
 			if state.disabled {
-				current.State = PlanQuotaDomainStateDisabled
-				current.DisabledUntil = state.disabledUntil
+				domain.State = PlanQuotaDomainStateDisabled
+				domain.DisabledUntil = state.disabledUntil
 				disabledCount++
 			} else {
-				current.State = PlanQuotaDomainStateActive
-				current.DisabledUntil = 0
+				domain.State = PlanQuotaDomainStateActive
+				domain.DisabledUntil = 0
 				activeCount++
 			}
 
-			if err := authorityDB.Model(&PlanQuotaDomain{}).
+			if err := planQuotaAuthorityDB(tx).Model(&PlanQuotaDomain{}).
 				Where("credential_hash = ?", hash).
 				Updates(map[string]any{
-					"generation":     current.Generation,
-					"state":          current.State,
-					"disabled_until": current.DisabledUntil,
+					"generation":     domain.Generation,
+					"state":          domain.State,
+					"disabled_until": domain.DisabledUntil,
 				}).Error; err != nil {
 				return err
 			}
@@ -261,10 +290,10 @@ func InitializePlanQuotaDomains() error {
 				channel.Status = common.ChannelStatusAutoDisabled
 				info := channel.GetOtherInfo()
 				info["quota_domain_id"] = hash
-				info["quota_generation"] = strconv.FormatInt(current.Generation, 10)
+				info["quota_generation"] = strconv.FormatInt(domain.Generation, 10)
 				info["quota_type"] = "plan"
-				if current.DisabledUntil > 0 {
-					info["disabled_until"] = current.DisabledUntil
+				if domain.DisabledUntil > 0 {
+					info["disabled_until"] = domain.DisabledUntil
 				} else {
 					delete(info, "disabled_until")
 					delete(info, "quota_reset_at")
@@ -703,9 +732,13 @@ func updateChannelWithPlanQuotaDomains(channel *Channel, expected *Channel) (*Ch
 		if !reflect.DeepEqual(current, *expected) {
 			return errPlanQuotaDomainSnapshotChanged
 		}
+		update := *channel
+		if reflect.DeepEqual(channel.ChannelInfo, expected.ChannelInfo) {
+			update.ChannelInfo = ChannelInfo{}
+		}
 		if err := tx.Model(&Channel{}).
 			Where("id = ?", current.Id).
-			Updates(channel).Error; err != nil {
+			Updates(&update).Error; err != nil {
 			return err
 		}
 		if err := tx.Where("id = ?", current.Id).First(&updated).Error; err != nil {
@@ -1029,12 +1062,21 @@ func RecoverPlanQuotaDomain(
 				}
 				domain := domains[hash]
 				sourceGeneration, sourceDeadline, valid := planQuotaRecoverySnapshot(request.Source, hash)
-				if request.Source.Status != common.ChannelStatusAutoDisabled ||
-					!valid ||
-					domain.State != PlanQuotaDomainStateDisabled ||
-					domain.Generation != sourceGeneration ||
-					domain.DisabledUntil != sourceDeadline ||
-					(request.RequireDue && domain.DisabledUntil > request.RecoveryAt) {
+				if domain.State != PlanQuotaDomainStateDisabled || !valid {
+					return nil
+				}
+				switch request.Source.Status {
+				case common.ChannelStatusAutoDisabled:
+					if domain.Generation != sourceGeneration ||
+						domain.DisabledUntil != sourceDeadline ||
+						(request.RequireDue && domain.DisabledUntil > request.RecoveryAt) {
+						return nil
+					}
+				case common.ChannelStatusManuallyDisabled:
+					if request.RequireDue {
+						return nil
+					}
+				default:
 					return nil
 				}
 
@@ -1063,6 +1105,9 @@ func RecoverPlanQuotaDomain(
 
 				for index := range lockedMembers {
 					channel := &lockedMembers[index]
+					if channel.Status != common.ChannelStatusAutoDisabled {
+						continue
+					}
 					generation, deadline, owned := planQuotaRecoverySnapshot(channel, hash)
 					if !owned {
 						continue
@@ -1075,6 +1120,7 @@ func RecoverPlanQuotaDomain(
 				domain.Generation = nextPlanQuotaGeneration(domain.Generation, 0)
 				domain.State = PlanQuotaDomainStateActive
 				domain.DisabledUntil = 0
+				result.Recovered = true
 				if err := planQuotaAuthorityDB(tx).Model(&PlanQuotaDomain{}).
 					Where("credential_hash = ?", hash).
 					Updates(map[string]any{

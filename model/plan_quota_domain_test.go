@@ -663,6 +663,84 @@ func TestInitializePlanQuotaDomainsLocksExistingAuthority(t *testing.T) {
 	assert.True(t, authorityLocked.Load())
 }
 
+func TestInitializePlanQuotaDomainsDoesNotReplayPreLockDisableAfterRecovery(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	tag := "plan:test:backfill-recovery-interleaving"
+	const credential = "authority-secret-backfill-recovery-interleaving"
+	source := createPlanQuotaDomainFixture(
+		t,
+		db,
+		credential,
+		tag,
+		PlanQuotaDomainStateDisabled,
+		61,
+		2_000_000_000,
+	)
+	hash, ok := PlanQuotaDomainHash(credential)
+	require.True(t, ok)
+
+	var recovered atomic.Bool
+	callbackName := "test:plan_quota_backfill_recovery_interleaving"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil ||
+			tx.Statement.Schema == nil ||
+			tx.Statement.Schema.Name != "PlanQuotaDomain" ||
+			!recovered.CompareAndSwap(false, true) {
+			return
+		}
+		recoveryDB := tx.Session(&gorm.Session{NewDB: true, SkipHooks: true})
+		if err := recoveryDB.Model(&PlanQuotaDomain{}).
+			Where("credential_hash = ?", hash).
+			Updates(map[string]any{
+				"generation":     int64(62),
+				"state":          PlanQuotaDomainStateActive,
+				"disabled_until": int64(0),
+			}).Error; err != nil {
+			tx.AddError(err)
+			return
+		}
+		recoveredChannel := Channel{}
+		recoveredChannel.SetOtherInfo(map[string]any{
+			"status_reason": "",
+			"status_time":   int64(123),
+		})
+		if err := recoveryDB.Model(&Channel{}).
+			Where("id = ?", source.Id).
+			Updates(map[string]any{
+				"status":     common.ChannelStatusEnabled,
+				"other_info": recoveredChannel.OtherInfo,
+			}).Error; err != nil {
+			tx.AddError(err)
+			return
+		}
+		if err := recoveryDB.Model(&Ability{}).
+			Where("channel_id = ?", source.Id).
+			Update("enabled", true).Error; err != nil {
+			tx.AddError(err)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Query().Remove(callbackName))
+	})
+
+	require.NoError(t, InitializePlanQuotaDomains())
+	require.True(t, recovered.Load())
+
+	var authority PlanQuotaDomain
+	require.NoError(t, db.First(&authority, "credential_hash = ?", hash).Error)
+	assert.Equal(t, PlanQuotaDomainStateActive, authority.State)
+	assert.Equal(t, int64(62), authority.Generation)
+	assert.Zero(t, authority.DisabledUntil)
+	var stored Channel
+	require.NoError(t, db.First(&stored, source.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.NotContains(t, stored.GetOtherInfo(), "quota_domain_id")
+	assert.NotContains(t, stored.GetOtherInfo(), "quota_generation")
+	var ability Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", source.Id).Error)
+	assert.True(t, ability.Enabled)
+}
+
 func createPlanQuotaDomainFixture(
 	t *testing.T,
 	db *gorm.DB,

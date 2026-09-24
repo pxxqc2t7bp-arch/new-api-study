@@ -380,6 +380,171 @@ func TestManageMultiKeysMaintainsPerKeyDeadlines(t *testing.T) {
 	}
 }
 
+func TestUpdateChannelRejectsConcurrentPerKeyDisableFromCallerSnapshot(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	channel := model.Channel{
+		Name:   "snapshot-before",
+		Type:   constant.ChannelTypeOpenAI,
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-4.1",
+		Group:  "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	statusSnapshot, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+
+	var intercepted atomic.Bool
+	var statusChanged bool
+	var statusErr error
+	statusFinished := make(chan struct{})
+	const callbackName = "test:update_channel_caller_snapshot"
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil ||
+			tx.Statement.Schema == nil ||
+			tx.Statement.Schema.Name != "Channel" {
+			return
+		}
+		loaded, ok := tx.Statement.Dest.(*model.Channel)
+		if !ok || loaded.Id != channel.Id || !intercepted.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			statusChanged, statusErr = model.UpdateMultiKeyChannelStatusIfUnchanged(
+				statusSnapshot,
+				statusSnapshot.GetTag(),
+				"key-a",
+				common.ChannelStatusAutoDisabled,
+				"quota exhausted",
+				model.MultiKeyChannelStatusUpdateOptions{PlanQuotaResetAt: 2_000_000_000},
+			)
+			close(statusFinished)
+		}()
+		<-statusFinished
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Query().Remove(callbackName))
+	})
+
+	body := []byte(fmt.Sprintf(
+		`{"id":%d,"type":%d,"name":"stale-request-name","models":"gpt-4.1","group":"default"}`,
+		channel.Id,
+		channel.Type,
+	))
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/channel/", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	UpdateChannel(ctx)
+
+	require.NoError(t, statusErr)
+	require.True(t, statusChanged)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool `json:"success"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.False(t, response.Success)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, channel.Name, stored.Name)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, int64(2_000_000_060), stored.ChannelInfo.MultiKeyDisabledUntil[0])
+}
+
+func TestManageMultiKeysRejectsConcurrentPerKeyDisableWithoutStaleReplay(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	channel := model.Channel{
+		Name:   "manage-snapshot",
+		Type:   constant.ChannelTypeOpenAI,
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-4.1",
+		Group:  "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	statusSnapshot, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+
+	var intercepted atomic.Bool
+	var statusChanged bool
+	var statusErr error
+	statusFinished := make(chan struct{})
+	const callbackName = "test:manage_multi_key_caller_snapshot"
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil ||
+			tx.Statement.Schema == nil ||
+			tx.Statement.Schema.Name != "Channel" {
+			return
+		}
+		loaded, ok := tx.Statement.Dest.(*model.Channel)
+		if !ok || loaded.Id != channel.Id || !intercepted.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			statusChanged, statusErr = model.UpdateMultiKeyChannelStatusIfUnchanged(
+				statusSnapshot,
+				statusSnapshot.GetTag(),
+				"key-a",
+				common.ChannelStatusAutoDisabled,
+				"quota exhausted",
+				model.MultiKeyChannelStatusUpdateOptions{PlanQuotaResetAt: 2_000_000_000},
+			)
+			close(statusFinished)
+		}()
+		<-statusFinished
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Query().Remove(callbackName))
+	})
+
+	body, err := common.Marshal(MultiKeyManageRequest{
+		ChannelId: channel.Id,
+		Action:    "disable_key",
+		KeyIndex:  common.GetPointer(1),
+	})
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Set("id", 1)
+	ctx.Set("role", common.RoleRootUser)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel/manage_multi_key", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	ManageMultiKeys(ctx)
+
+	require.NoError(t, statusErr)
+	require.True(t, statusChanged)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool `json:"success"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.False(t, response.Success)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, int64(2_000_000_060), stored.ChannelInfo.MultiKeyDisabledUntil[0])
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyDisabledUntil, 1)
+}
+
 func TestSettleTestQuotaUsesTieredBilling(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		TieredBillingSnapshot: &billingexpr.BillingSnapshot{

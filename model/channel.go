@@ -708,13 +708,68 @@ func (channel *Channel) Update() error {
 	if err != nil {
 		return err
 	}
+	return channel.UpdateIfUnchanged(expected)
+}
+
+func cloneChannelInfo(info ChannelInfo) ChannelInfo {
+	cloned := info
+	if info.MultiKeyStatusList != nil {
+		cloned.MultiKeyStatusList = make(map[int]int, len(info.MultiKeyStatusList))
+		for index, status := range info.MultiKeyStatusList {
+			cloned.MultiKeyStatusList[index] = status
+		}
+	}
+	if info.MultiKeyDisabledReason != nil {
+		cloned.MultiKeyDisabledReason = make(map[int]string, len(info.MultiKeyDisabledReason))
+		for index, reason := range info.MultiKeyDisabledReason {
+			cloned.MultiKeyDisabledReason[index] = reason
+		}
+	}
+	if info.MultiKeyDisabledTime != nil {
+		cloned.MultiKeyDisabledTime = make(map[int]int64, len(info.MultiKeyDisabledTime))
+		for index, disabledAt := range info.MultiKeyDisabledTime {
+			cloned.MultiKeyDisabledTime[index] = disabledAt
+		}
+	}
+	if info.MultiKeyDisabledUntil != nil {
+		cloned.MultiKeyDisabledUntil = make(map[int]int64, len(info.MultiKeyDisabledUntil))
+		for index, disabledUntil := range info.MultiKeyDisabledUntil {
+			cloned.MultiKeyDisabledUntil[index] = disabledUntil
+		}
+	}
+	return cloned
+}
+
+// CloneForUpdate copies the mutable channel state used to build a desired
+// snapshot without changing the caller-observed snapshot.
+func (channel *Channel) CloneForUpdate() *Channel {
+	if channel == nil {
+		return nil
+	}
+	cloned := *channel
+	cloned.ChannelInfo = cloneChannelInfo(channel.ChannelInfo)
+	cloned.Keys = append([]string(nil), channel.Keys...)
+	return &cloned
+}
+
+// UpdateIfUnchanged applies a channel edit only while the complete snapshot
+// observed by the caller remains current.
+func (channel *Channel) UpdateIfUnchanged(expected *Channel) error {
+	if channel == nil || expected == nil || channel.Id == 0 || expected.Id != channel.Id {
+		return errors.New("channel update snapshot is missing")
+	}
+	desired := *channel
+	desired.ChannelInfo = cloneChannelInfo(channel.ChannelInfo)
+	expectedSnapshot := *expected
+	expectedSnapshot.ChannelInfo = cloneChannelInfo(expected.ChannelInfo)
+
 	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
-	if channel.ChannelInfo.IsMultiKey {
+	if desired.ChannelInfo.IsMultiKey {
 		var keyStr string
-		if channel.Key != "" {
-			keyStr = channel.Key
+		if desired.Key != "" {
+			keyStr = desired.Key
 		} else {
-			keyStr = expected.Key
+			keyStr = expectedSnapshot.Key
 		}
 		// Parse the key list (supports newline separation or JSON array)
 		keys := []string{}
@@ -733,38 +788,47 @@ func (channel *Channel) Update() error {
 				keys = strings.Split(strings.Trim(keyStr, "\n"), "\n")
 			}
 		}
-		channel.ChannelInfo.MultiKeySize = len(keys)
+		desired.ChannelInfo.MultiKeySize = len(keys)
 		// Clean up status data that exceeds the new key count to prevent index out of range
-		if channel.ChannelInfo.MultiKeyStatusList != nil {
-			for idx := range channel.ChannelInfo.MultiKeyStatusList {
-				if idx >= channel.ChannelInfo.MultiKeySize {
-					delete(channel.ChannelInfo.MultiKeyStatusList, idx)
+		if desired.ChannelInfo.MultiKeyStatusList != nil {
+			for idx := range desired.ChannelInfo.MultiKeyStatusList {
+				if idx >= desired.ChannelInfo.MultiKeySize {
+					delete(desired.ChannelInfo.MultiKeyStatusList, idx)
 				}
 			}
 		}
-		if channel.ChannelInfo.MultiKeyDisabledUntil != nil {
-			for idx := range channel.ChannelInfo.MultiKeyDisabledUntil {
-				if idx >= channel.ChannelInfo.MultiKeySize {
-					delete(channel.ChannelInfo.MultiKeyDisabledUntil, idx)
+		if desired.ChannelInfo.MultiKeyDisabledUntil != nil {
+			for idx := range desired.ChannelInfo.MultiKeyDisabledUntil {
+				if idx >= desired.ChannelInfo.MultiKeySize {
+					delete(desired.ChannelInfo.MultiKeyDisabledUntil, idx)
 				}
 			}
 		}
 	}
 
 	var updated *Channel
-	return commitAndPublishChannelStatus(
-		func() error {
-			var updateErr error
-			updated, updateErr = updateChannelWithPlanQuotaDomains(channel, expected)
-			if updateErr == nil {
-				*channel = *updated
+	observeChannelStatusPublication(channelStatusPublicationBeforeWrite)
+	_, err := withChannelStatusLocks(channel.Id, func() (bool, error) {
+		var updateErr error
+		updated, updateErr = updateChannelWithPlanQuotaDomains(&desired, &expectedSnapshot)
+		if updateErr != nil {
+			return false, updateErr
+		}
+		observeChannelStatusPublication(channelStatusPublicationAfterCommit)
+		if common.MemoryCacheEnabled && updated.ChannelInfo.IsMultiKey {
+			cachedInfo, cacheErr := CacheGetChannelInfo(updated.Id)
+			if cacheErr == nil {
+				updated.ChannelInfo.MultiKeyPollingIndex = cachedInfo.MultiKeyPollingIndex
 			}
-			return updateErr
-		},
-		func() {
-			CacheUpdateChannel(updated)
-		},
-	)
+		}
+		CacheUpdateChannel(updated)
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+	*channel = *updated
+	return nil
 }
 
 func (channel *Channel) UpdateResponseTime(responseTime int64) {

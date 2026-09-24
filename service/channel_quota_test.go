@@ -1020,6 +1020,188 @@ func TestEnableChannelForHealthCheckRejectsStalePlanQuotaGeneration(t *testing.T
 	assert.False(t, abilities[1].Enabled)
 }
 
+func TestEnableChannelForHealthCheckAllowsOldGenerationManualPlanQuotaPeer(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+	autoBan := 1
+	sourceTag := "plan:support:health-manual-generation-source"
+	manualTag := "plan:support:health-manual-generation-peer"
+	peerTag := "plan:support:health-current-generation-peer"
+	const credential = "health-manual-generation-credential"
+	channels := []model.Channel{
+		{
+			Name: "health-source", Key: credential, Status: common.ChannelStatusEnabled,
+			Tag: &sourceTag, AutoBan: &autoBan, Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Name: "manual-peer", Key: credential, Status: common.ChannelStatusEnabled,
+			Tag: &manualTag, AutoBan: &autoBan, Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Name: "health-peer", Key: credential, Status: common.ChannelStatusEnabled,
+			Tag: &peerTag, AutoBan: &autoBan, Models: "gpt-4.1", Group: "default",
+		},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for index := range channels {
+		require.NoError(t, channels[index].AddAbilities(nil))
+	}
+
+	firstResetAt := time.Now().Add(-4 * time.Minute).Unix()
+	disablePlanQuotaDomain(&channels[0], "first quota event", firstResetAt)
+	var manualBefore model.Channel
+	require.NoError(t, db.First(&manualBefore, channels[1].Id).Error)
+	firstGeneration := manualBefore.GetOtherInfo()["quota_generation"]
+	require.True(t, model.UpdateChannelStatus(
+		manualBefore.Id,
+		"",
+		common.ChannelStatusManuallyDisabled,
+		"operator pause",
+	))
+	require.NoError(t, db.Model(&model.Ability{}).
+		Where("channel_id = ?", manualBefore.Id).
+		Update("enabled", true).Error)
+	require.NoError(t, db.First(&manualBefore, channels[1].Id).Error)
+	manualInfoBefore := manualBefore.GetOtherInfo()
+
+	secondResetAt := time.Now().Add(-2 * time.Minute).Unix()
+	disablePlanQuotaDomainWithCredential(
+		&channels[0],
+		credential,
+		sourceTag,
+		"fresh quota event",
+		secondResetAt,
+	)
+
+	var beforeRecovery []model.Channel
+	require.NoError(t, db.Order("id").Find(&beforeRecovery).Error)
+	require.Len(t, beforeRecovery, 3)
+	currentGeneration := beforeRecovery[0].GetOtherInfo()["quota_generation"]
+	require.NotEqual(t, firstGeneration, currentGeneration)
+	require.Equal(t, firstGeneration, beforeRecovery[1].GetOtherInfo()["quota_generation"])
+	require.Equal(t, currentGeneration, beforeRecovery[2].GetOtherInfo()["quota_generation"])
+
+	enabled := EnableChannelForHealthCheck(&beforeRecovery[0], "")
+
+	assert.Equal(t, 2, enabled)
+	var recovered []model.Channel
+	require.NoError(t, db.Order("id").Find(&recovered).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, recovered[0].Status)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, recovered[1].Status)
+	assert.Equal(t, common.ChannelStatusEnabled, recovered[2].Status)
+	manualInfo := recovered[1].GetOtherInfo()
+	assert.Equal(t, manualInfoBefore["status_reason"], manualInfo["status_reason"])
+	assert.Equal(t, manualInfoBefore["status_time"], manualInfo["status_time"])
+	for _, channel := range recovered {
+		info := channel.GetOtherInfo()
+		assert.NotContains(t, info, "quota_domain_id")
+		assert.NotContains(t, info, "quota_generation")
+		assert.NotContains(t, info, "quota_type")
+	}
+	var manualAbility model.Ability
+	require.NoError(t, db.First(&manualAbility, "channel_id = ?", recovered[1].Id).Error)
+	assert.True(t, manualAbility.Enabled)
+}
+
+func TestEnableChannelManuallyRecoversFromOldGenerationManualPlanQuotaSource(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+	autoBan := 1
+	sourceTag := "plan:support:manual-source"
+	peerTag := "plan:support:manual-source-peer"
+	independentTag := "plan:support:manual-source-independent"
+	const credential = "manual-source-credential"
+	channels := []model.Channel{
+		{
+			Name: "manual-source", Key: credential, Status: common.ChannelStatusEnabled,
+			Tag: &sourceTag, AutoBan: &autoBan, Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Name: "owned-peer", Key: credential, Status: common.ChannelStatusEnabled,
+			Tag: &peerTag, AutoBan: &autoBan, Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Name: "independent-peer", Key: credential, Status: common.ChannelStatusAutoDisabled,
+			Tag: &independentTag, AutoBan: &autoBan, Models: "gpt-4.1", Group: "default",
+		},
+	}
+	channels[2].SetOtherInfo(map[string]any{
+		"status_reason": "independent failure",
+		"status_time":   int64(123),
+	})
+	require.NoError(t, db.Create(&channels).Error)
+	for index := range channels {
+		require.NoError(t, channels[index].AddAbilities(nil))
+	}
+
+	disablePlanQuotaDomain(&channels[0], "first quota event", 2_000_000_000)
+	var manualSource model.Channel
+	require.NoError(t, db.First(&manualSource, channels[0].Id).Error)
+	firstGeneration := manualSource.GetOtherInfo()["quota_generation"]
+	require.True(t, model.UpdateChannelStatus(
+		manualSource.Id,
+		"",
+		common.ChannelStatusManuallyDisabled,
+		"operator pause",
+	))
+	require.NoError(t, db.Model(&model.Ability{}).
+		Where("channel_id IN ?", []int{channels[0].Id, channels[2].Id}).
+		Update("enabled", true).Error)
+	require.NoError(t, db.First(&manualSource, channels[0].Id).Error)
+	manualInfoBefore := manualSource.GetOtherInfo()
+	var independentBefore model.Channel
+	require.NoError(t, db.First(&independentBefore, channels[2].Id).Error)
+
+	disablePlanQuotaDomainWithCredential(
+		&channels[1],
+		credential,
+		peerTag,
+		"fresh quota event",
+		2_000_000_100,
+	)
+	var currentPeer model.Channel
+	require.NoError(t, db.First(&currentPeer, channels[1].Id).Error)
+	require.NotEqual(t, firstGeneration, currentPeer.GetOtherInfo()["quota_generation"])
+	require.NoError(t, db.First(&manualSource, channels[0].Id).Error)
+	require.Equal(t, firstGeneration, manualSource.GetOtherInfo()["quota_generation"])
+
+	assert.True(t, EnableChannel(manualSource.Id, "", manualSource.Name))
+
+	var recovered []model.Channel
+	require.NoError(t, db.Order("id").Find(&recovered).Error)
+	require.Len(t, recovered, 3)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, recovered[0].Status)
+	assert.Equal(t, common.ChannelStatusEnabled, recovered[1].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, recovered[2].Status)
+	assert.Equal(t, independentBefore.OtherInfo, recovered[2].OtherInfo)
+	manualInfo := recovered[0].GetOtherInfo()
+	assert.Equal(t, manualInfoBefore["status_reason"], manualInfo["status_reason"])
+	assert.Equal(t, manualInfoBefore["status_time"], manualInfo["status_time"])
+	for _, index := range []int{0, 1} {
+		info := recovered[index].GetOtherInfo()
+		assert.NotContains(t, info, "quota_domain_id")
+		assert.NotContains(t, info, "quota_generation")
+		assert.NotContains(t, info, "quota_type")
+	}
+	for _, channelID := range []int{recovered[0].Id, recovered[1].Id, recovered[2].Id} {
+		var ability model.Ability
+		require.NoError(t, db.First(&ability, "channel_id = ?", channelID).Error)
+		assert.True(t, ability.Enabled)
+	}
+
+	var authority model.PlanQuotaDomain
+	require.NoError(t, db.First(&authority).Error)
+	require.Equal(t, model.PlanQuotaDomainStateActive, authority.State)
+	recoveredGeneration := authority.Generation
+	require.NoError(t, model.InitializePlanQuotaDomains())
+	require.NoError(t, db.First(&authority).Error)
+	assert.Equal(t, model.PlanQuotaDomainStateActive, authority.State)
+	assert.Equal(t, recoveredGeneration, authority.Generation)
+	require.NoError(t, db.Order("id").Find(&recovered).Error)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, recovered[0].Status)
+	assert.Equal(t, common.ChannelStatusEnabled, recovered[1].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, recovered[2].Status)
+	assert.Equal(t, independentBefore.OtherInfo, recovered[2].OtherInfo)
+}
+
 func TestFreshPlanQuotaDisableWinsOverOverlappingRecovery(t *testing.T) {
 	db := setupPlanQuotaDomainTest(t)
 

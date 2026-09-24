@@ -186,7 +186,9 @@ func planQuotaDomainID(channelID int, credential string) string {
 // PlanQuotaRecoveryDomainKey returns the shared recovery owner for a marked or
 // validated legacy Plan quota failure.
 func PlanQuotaRecoveryDomainKey(channel *model.Channel) (string, bool) {
-	if channel == nil || channel.Status != common.ChannelStatusAutoDisabled {
+	if channel == nil ||
+		(channel.Status != common.ChannelStatusAutoDisabled &&
+			channel.Status != common.ChannelStatusManuallyDisabled) {
 		return "", false
 	}
 
@@ -554,6 +556,7 @@ func enablePlanQuotaDomain(recoveringChannel *model.Channel) (bool, bool) {
 	}
 
 	enabled := 0
+	recovered := false
 	if !planQuotaSnapshotMatchesCredentialMarker(current) {
 		changed, err := enableSingleKeyChannelSnapshot(current, true, nil)
 		if err != nil {
@@ -562,6 +565,7 @@ func enablePlanQuotaDomain(recoveringChannel *model.Channel) (bool, bool) {
 		}
 		if changed {
 			enabled = 1
+			recovered = true
 		}
 	} else {
 		result, err := model.RecoverPlanQuotaDomain(model.PlanQuotaDomainRecoveryRequest{
@@ -572,13 +576,14 @@ func enablePlanQuotaDomain(recoveringChannel *model.Channel) (bool, bool) {
 			return true, false
 		}
 		enabled = result.NewlyEnabled
+		recovered = result.Recovered
 	}
-	if enabled > 0 {
+	if recovered {
 		NotifyRootUser("channel_plan_quota_recovered_"+tag,
 			fmt.Sprintf("Plan 配额域「%s」已恢复", tag),
 			fmt.Sprintf("已恢复 %d 个协议渠道", enabled))
 	}
-	return true, enabled > 0
+	return true, recovered
 }
 
 func ShouldDisableChannel(err *types.NewAPIError) bool {

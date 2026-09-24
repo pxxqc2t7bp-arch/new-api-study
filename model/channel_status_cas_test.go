@@ -143,6 +143,167 @@ func TestChannelUpdateSerializesCommitThroughCachePublication(t *testing.T) {
 	assert.NotContains(t, oldRoutingIDs, channel.Id)
 }
 
+func TestChannelUpdateIfUnchangedRejectsConcurrentChannelInfo(t *testing.T) {
+	setupChannelStatusTest(t)
+	channel := Channel{
+		Name:   "caller-snapshot",
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-4.1",
+		Group:  "default",
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+		},
+	}
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	desired := *expected
+	desired.Name = "stale-name"
+
+	concurrent, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	concurrent.ChannelInfo.MultiKeyStatusList = map[int]int{
+		0: common.ChannelStatusAutoDisabled,
+	}
+	concurrent.ChannelInfo.MultiKeyDisabledUntil = map[int]int64{
+		0: 2_000_000_060,
+	}
+	require.NoError(t, DB.Model(&Channel{}).
+		Where("id = ?", channel.Id).
+		Update("channel_info", concurrent.ChannelInfo).Error)
+
+	err = desired.UpdateIfUnchanged(expected)
+
+	require.ErrorIs(t, err, errPlanQuotaDomainSnapshotChanged)
+	var stored Channel
+	require.NoError(t, DB.First(&stored, channel.Id).Error)
+	assert.Equal(t, channel.Name, stored.Name)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, int64(2_000_000_060), stored.ChannelInfo.MultiKeyDisabledUntil[0])
+}
+
+func TestChannelUpdateIfUnchangedPreservesStatusInfoWhenChangingMultiKeyMode(t *testing.T) {
+	setupChannelStatusTest(t)
+	channel := Channel{
+		Name:   "caller-mode-update",
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-4.1",
+		Group:  "default",
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:             true,
+			MultiKeySize:           2,
+			MultiKeyMode:           constant.MultiKeyModePolling,
+			MultiKeyStatusList:     map[int]int{0: common.ChannelStatusAutoDisabled},
+			MultiKeyDisabledReason: map[int]string{0: "quota exhausted"},
+			MultiKeyDisabledTime:   map[int]int64{0: 123},
+			MultiKeyDisabledUntil:  map[int]int64{0: 2_000_000_060},
+			MultiKeyRecoveryIndex:  1,
+		},
+	}
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	pollingLock := GetChannelPollingLock(channel.Id)
+	pollingLock.Lock()
+	cached.ChannelInfo.MultiKeyPollingIndex = 1
+	pollingLock.Unlock()
+	desired := *expected
+	desired.ChannelInfo.MultiKeyMode = constant.MultiKeyModeRandom
+
+	require.NoError(t, desired.UpdateIfUnchanged(expected))
+
+	var stored Channel
+	require.NoError(t, DB.First(&stored, channel.Id).Error)
+	assert.Equal(t, constant.MultiKeyModeRandom, stored.ChannelInfo.MultiKeyMode)
+	assert.Equal(t, expected.ChannelInfo.MultiKeyStatusList, stored.ChannelInfo.MultiKeyStatusList)
+	assert.Equal(t, expected.ChannelInfo.MultiKeyDisabledReason, stored.ChannelInfo.MultiKeyDisabledReason)
+	assert.Equal(t, expected.ChannelInfo.MultiKeyDisabledTime, stored.ChannelInfo.MultiKeyDisabledTime)
+	assert.Equal(t, expected.ChannelInfo.MultiKeyDisabledUntil, stored.ChannelInfo.MultiKeyDisabledUntil)
+	assert.Equal(t, expected.ChannelInfo.MultiKeyRecoveryIndex, stored.ChannelInfo.MultiKeyRecoveryIndex)
+	cached, err = CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cached.ChannelInfo.MultiKeyPollingIndex)
+	assert.Equal(t, constant.MultiKeyModeRandom, cached.ChannelInfo.MultiKeyMode)
+	assert.Equal(t, expected.ChannelInfo.MultiKeyStatusList, cached.ChannelInfo.MultiKeyStatusList)
+}
+
+func TestChannelUpdateIfUnchangedAcquiresStatusBeforePollingLock(t *testing.T) {
+	setupChannelStatusTest(t)
+	channel := Channel{
+		Name:   "canonical-lock-order",
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-4.1",
+		Group:  "default",
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+		},
+	}
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	desired := expected.CloneForUpdate()
+	desired.ChannelInfo.MultiKeyStatusList = map[int]int{
+		0: common.ChannelStatusManuallyDisabled,
+	}
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+
+	attempted := make(chan struct{})
+	var observed atomic.Bool
+	previousObserver := channelStatusPublicationObserver
+	channelStatusPublicationObserver = func(phase channelStatusPublicationPhase) {
+		if phase == channelStatusPublicationBeforeWrite && observed.CompareAndSwap(false, true) {
+			close(attempted)
+		}
+	}
+	t.Cleanup(func() {
+		channelStatusPublicationObserver = previousObserver
+	})
+
+	channelStatusLock.Lock()
+	statusLocked := true
+	t.Cleanup(func() {
+		if statusLocked {
+			channelStatusLock.Unlock()
+		}
+	})
+	result := make(chan error, 1)
+	go func() {
+		result <- desired.UpdateIfUnchanged(expected)
+	}()
+	select {
+	case <-attempted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("channel update did not reach the status lock")
+	}
+
+	pollingLock := GetChannelPollingLock(channel.Id)
+	require.True(t, pollingLock.TryLock(), "polling lock was acquired before the status lock")
+	pollingLock.Unlock()
+	channelStatusLock.Unlock()
+	statusLocked = false
+
+	select {
+	case updateErr := <-result:
+		require.NoError(t, updateErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("channel update did not complete after releasing the status lock")
+	}
+}
+
 func loadChannelStatusCASFixture(t *testing.T, channelId int) (Channel, Ability) {
 	t.Helper()
 	var channel Channel

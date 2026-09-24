@@ -1118,7 +1118,7 @@ func UpdateChannel(c *gin.Context) {
 			// 覆盖模式：直接使用新密钥（默认行为，不需要特殊处理）
 		}
 	}
-	err = channel.Update()
+	err = channel.UpdateIfUnchanged(originChannel)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -1574,9 +1574,8 @@ func ManageMultiKeys(c *gin.Context) {
 		})
 	}
 
-	lock := model.GetChannelPollingLock(channel.Id)
-	lock.Lock()
-	defer lock.Unlock()
+	expectedChannel := channel
+	channel = channel.CloneForUpdate()
 
 	switch request.Action {
 	case "get_key_status":
@@ -1728,13 +1727,12 @@ func ManageMultiKeys(c *gin.Context) {
 			}
 		}
 
-		err = channel.Update()
+		err = channel.UpdateIfUnchanged(expectedChannel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
 
-		model.InitChannelCache()
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"message": "密钥已禁用",
@@ -1775,13 +1773,12 @@ func ManageMultiKeys(c *gin.Context) {
 			}
 		}
 
-		err = channel.Update()
+		err = channel.UpdateIfUnchanged(expectedChannel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
 
-		model.InitChannelCache()
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"message": "密钥已启用",
@@ -1800,13 +1797,12 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
 		channel.ChannelInfo.MultiKeyDisabledUntil = make(map[int]int64)
 
-		err = channel.Update()
+		err = channel.UpdateIfUnchanged(expectedChannel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
 
-		model.InitChannelCache()
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"message": fmt.Sprintf("已启用 %d 个密钥", enabledCount),
@@ -1852,13 +1848,12 @@ func ManageMultiKeys(c *gin.Context) {
 			return
 		}
 
-		err = channel.Update()
+		err = channel.UpdateIfUnchanged(expectedChannel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
 
-		model.InitChannelCache()
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"message": fmt.Sprintf("已禁用 %d 个密钥", disabledCount),
@@ -1939,13 +1934,12 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
 		channel.ChannelInfo.MultiKeyDisabledUntil = newDisabledUntil
 
-		err = channel.Update()
+		err = channel.UpdateIfUnchanged(expectedChannel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
 
-		model.InitChannelCache()
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"message": "密钥已删除",
@@ -2009,13 +2003,12 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
 		channel.ChannelInfo.MultiKeyDisabledUntil = newDisabledUntil
 
-		err = channel.Update()
+		err = channel.UpdateIfUnchanged(expectedChannel)
 		if err != nil {
 			common.ApiError(c, err)
 			return
 		}
 
-		model.InitChannelCache()
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
 			"message": fmt.Sprintf("已删除 %d 个自动禁用的密钥", deletedCount),
