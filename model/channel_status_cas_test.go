@@ -871,7 +871,11 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedTracksPerKeyPlanDeadline(t *testi
 			MultiKeySize: 2,
 		},
 	}
-	channel.SetOtherInfo(map[string]any{"owner": "preserved"})
+	channel.SetOtherInfo(map[string]any{
+		"owner":          "preserved",
+		"quota_reset_at": int64(1_900_000_000),
+		"disabled_until": int64(1_900_000_060),
+	})
 	require.NoError(t, DB.Create(&channel).Error)
 	require.NoError(t, channel.AddAbilities(nil))
 

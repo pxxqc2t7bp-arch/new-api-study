@@ -202,6 +202,16 @@ func InitializePlanQuotaDomains() error {
 
 		backfill := make(map[string]planQuotaDomainBackfillState, len(domains))
 		for index := range channels {
+			if strings.HasPrefix(channels[index].GetTag(), "plan:") &&
+				channels[index].OtherInfo != "" {
+				var otherInfo map[string]any
+				if err := common.Unmarshal(
+					[]byte(channels[index].OtherInfo),
+					&otherInfo,
+				); err != nil || otherInfo == nil {
+					return errors.New("plan quota domain has malformed other info")
+				}
+			}
 			hash, member := PlanQuotaDomainMembership(&channels[index])
 			ownershipCleared, err := clearStalePlanQuotaDomainOwnership(
 				&channels[index],

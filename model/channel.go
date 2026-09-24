@@ -1553,10 +1553,15 @@ func updateMultiKeyChannelStatusIfUnchanged(
 				}
 				updated.ChannelInfo.MultiKeyDisabledUntil[keyIndex] = options.PlanQuotaResetAt + 60
 			}
-			if updated.Status == common.ChannelStatusAutoDisabled && options.PlanQuotaResetAt > 0 {
+			if options.PlanQuotaResetAt > 0 {
 				metadata := updated.GetOtherInfo()
-				metadata["quota_reset_at"] = options.PlanQuotaResetAt
-				metadata["disabled_until"] = options.PlanQuotaResetAt + 60
+				if updated.Status == common.ChannelStatusAutoDisabled && !updated.HasEnabledKey() {
+					metadata["quota_reset_at"] = options.PlanQuotaResetAt
+					metadata["disabled_until"] = options.PlanQuotaResetAt + 60
+				} else {
+					delete(metadata, "quota_reset_at")
+					delete(metadata, "disabled_until")
+				}
 				updated.SetOtherInfo(metadata)
 			}
 			if options.ClearPlanQuotaDeadline {
@@ -2050,11 +2055,17 @@ func EnableChannelByTag(tag string) error {
 }
 
 func DisableChannelByTag(tag string) error {
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Update("status", common.ChannelStatusManuallyDisabled).Error
+	channels, err := GetChannelsByTag(tag, false, true)
 	if err != nil {
 		return err
 	}
-	err = UpdateAbilityStatusByTag(tag, false)
+	_, err = mutateChannelSnapshotsWithPlanQuotaDomains(
+		channels,
+		false,
+		func(channel *Channel) {
+			channel.Status = common.ChannelStatusManuallyDisabled
+		},
+	)
 	return err
 }
 

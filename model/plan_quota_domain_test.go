@@ -446,6 +446,41 @@ func TestInitializePlanQuotaDomainsRejectsMalformedOwnership(t *testing.T) {
 	assert.Zero(t, count)
 }
 
+func TestInitializePlanQuotaDomainsRejectsMalformedOtherInfoAtomically(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	staleTag := "ordinary:test:malformed-json-stale"
+	malformedTag := "plan:test:malformed-json"
+	stale := Channel{
+		Name: "stale-owner", Key: "ordinary-credential",
+		Status: common.ChannelStatusAutoDisabled, Tag: &staleTag,
+	}
+	stale.SetOtherInfo(map[string]any{
+		"quota_domain_id":  strings.Repeat("a", 64),
+		"quota_generation": "9",
+		"quota_type":       "plan",
+	})
+	malformed := Channel{
+		Name: "malformed-json", Key: "authority-secret-malformed-json",
+		Status: common.ChannelStatusEnabled, Tag: &malformedTag,
+		OtherInfo: `{"quota_type":"plan"`,
+	}
+	require.NoError(t, db.Create(&[]Channel{stale, malformed}).Error)
+
+	err := InitializePlanQuotaDomains()
+
+	require.ErrorContains(t, err, "malformed other info")
+	var authorityCount int64
+	require.NoError(t, db.Model(&PlanQuotaDomain{}).Count(&authorityCount).Error)
+	assert.Zero(t, authorityCount)
+	var storedStale Channel
+	require.NoError(t, db.First(&storedStale, "name = ?", stale.Name).Error)
+	assert.Equal(t, stale.OtherInfo, storedStale.OtherInfo)
+	var storedMalformed Channel
+	require.NoError(t, db.First(&storedMalformed, "name = ?", malformed.Name).Error)
+	assert.Equal(t, malformed.OtherInfo, storedMalformed.OtherInfo)
+	assert.Equal(t, common.ChannelStatusEnabled, storedMalformed.Status)
+}
+
 func TestInitializePlanQuotaDomainsRejectsMixedMarkerGenerations(t *testing.T) {
 	db := setupPlanQuotaAuthorityTest(t, "")
 	tag := "plan:test:mixed-marker-generation"
@@ -2655,6 +2690,204 @@ func TestPlanQuotaDomainTagEnableCannotBypassDisabledAuthority(t *testing.T) {
 	assertPlanQuotaDomainChannelState(
 		t, db, channel.Id, common.ChannelStatusAutoDisabled, 131, 2_000_000_000,
 	)
+}
+
+func TestDisableChannelByTagRollsBackChannelAndAbilitiesOnAbilityFailure(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	tag := "plan:test:tag-disable-ability-rollback"
+	const credential = "authority-secret-tag-disable-ability"
+	first := createPlanQuotaDomainFixture(
+		t, db, credential, tag, PlanQuotaDomainStateActive, 0, 0,
+	)
+	second := Channel{
+		Name: "tag-disable-second", Key: credential, Tag: &tag,
+		Status: common.ChannelStatusEnabled, Models: "gpt-4.1", Group: "default",
+	}
+	require.NoError(t, db.Create(&second).Error)
+	require.NoError(t, second.AddAbilities(db))
+	previousMemoryCacheEnabled := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCacheEnabled
+	})
+
+	forcedErr := errors.New("forced tag disable ability failure")
+	var injected atomic.Bool
+	failAbilityWrite := func(tx *gorm.DB) {
+		if tx.Statement != nil &&
+			tx.Statement.Schema != nil &&
+			tx.Statement.Schema.Name == "Ability" &&
+			injected.CompareAndSwap(false, true) {
+			tx.AddError(forcedErr)
+		}
+	}
+	const updateCallback = "test:tag_disable_ability_update_failure"
+	const deleteCallback = "test:tag_disable_ability_delete_failure"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(updateCallback, failAbilityWrite))
+	require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register(deleteCallback, failAbilityWrite))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Update().Remove(updateCallback))
+		require.NoError(t, db.Callback().Delete().Remove(deleteCallback))
+	})
+
+	require.ErrorIs(t, DisableChannelByTag(tag), forcedErr)
+	require.True(t, injected.Load())
+
+	for _, channelID := range []int{first.Id, second.Id} {
+		stored, ability := loadChannelStatusCASFixture(t, channelID)
+		assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+		assert.True(t, ability.Enabled)
+		cached, err := CacheGetChannel(channelID)
+		require.NoError(t, err)
+		assert.Equal(t, common.ChannelStatusEnabled, cached.Status)
+	}
+	routingIDs, err := ListSatisfiedChannelIDsAtPriority(
+		first.Group,
+		first.Models,
+		first.GetPriority(),
+		nil,
+	)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []int{first.Id, second.Id}, routingIDs)
+}
+
+func TestDisableChannelByTagRollsBackUnknownCommitFailureWithoutPublication(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	var databaseSequence int
+	var databaseName string
+	var databasePath string
+	require.NoError(t, db.Raw("PRAGMA database_list").Row().Scan(
+		&databaseSequence,
+		&databaseName,
+		&databasePath,
+	))
+	require.NoError(t, db.Exec(
+		"CREATE TABLE tag_disable_commit_failure_parents (id INTEGER PRIMARY KEY)",
+	).Error)
+	require.NoError(t, db.Exec(
+		"CREATE TABLE tag_disable_commit_failure_children ("+
+			"id INTEGER PRIMARY KEY, parent_id INTEGER, "+
+			"FOREIGN KEY(parent_id) REFERENCES tag_disable_commit_failure_parents(id) "+
+			"DEFERRABLE INITIALLY DEFERRED)",
+	).Error)
+	tag := "plan:test:tag-disable-commit-rollback"
+	channel := createPlanQuotaDomainFixture(
+		t, db, "authority-secret-tag-disable-commit", tag,
+		PlanQuotaDomainStateActive, 0, 0,
+	)
+	previousMemoryCacheEnabled := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCacheEnabled
+	})
+
+	var injections atomic.Int32
+	injectCommitFailure := func(tx *gorm.DB) {
+		if tx.Statement == nil ||
+			tx.Statement.Schema == nil ||
+			tx.Statement.Schema.Name != "Ability" ||
+			!injections.CompareAndSwap(0, 1) {
+			return
+		}
+		_, err := tx.Statement.ConnPool.ExecContext(
+			tx.Statement.Context,
+			"INSERT INTO tag_disable_commit_failure_children (id, parent_id) VALUES (?, ?)",
+			1,
+			999,
+		)
+		tx.AddError(err)
+	}
+	const updateCallback = "test:tag_disable_commit_update_failure"
+	const createCallback = "test:tag_disable_commit_create_failure"
+	require.NoError(t, db.Callback().Update().After("gorm:update").Register(updateCallback, injectCommitFailure))
+	require.NoError(t, db.Callback().Create().After("gorm:create").Register(createCallback, injectCommitFailure))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Update().Remove(updateCallback))
+		require.NoError(t, db.Callback().Create().Remove(createCallback))
+	})
+
+	err := DisableChannelByTag(tag)
+	require.ErrorContains(t, err, "FOREIGN KEY")
+	assert.Equal(t, int32(1), injections.Load())
+
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusEnabled, cached.Status)
+	routingIDs, err := ListSatisfiedChannelIDsAtPriority(
+		channel.Group,
+		channel.Models,
+		channel.GetPriority(),
+		nil,
+	)
+	require.NoError(t, err)
+	assert.Contains(t, routingIDs, channel.Id)
+
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	require.NoError(t, sqlDB.Close())
+	reopened, err := gorm.Open(sqlite.Open(fmt.Sprintf(
+		"file:%s?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate",
+		databasePath,
+	)), &gorm.Config{})
+	require.NoError(t, err)
+	reopenedSQL, err := reopened.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, reopenedSQL.Close())
+	})
+	DB = reopened
+
+	stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.True(t, ability.Enabled)
+	var guardCount int64
+	require.NoError(t, reopened.Table("tag_disable_commit_failure_children").Count(&guardCount).Error)
+	assert.Zero(t, guardCount)
+}
+
+func TestDisableChannelByTagPublishesDisabledSnapshotsAndRemovesRouting(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	tag := "plan:test:tag-disable-publication"
+	const credential = "authority-secret-tag-disable-publication"
+	first := createPlanQuotaDomainFixture(
+		t, db, credential, tag, PlanQuotaDomainStateActive, 0, 0,
+	)
+	second := Channel{
+		Name: "tag-disable-publication-second", Key: credential, Tag: &tag,
+		Status: common.ChannelStatusEnabled, Models: "gpt-4.1", Group: "default",
+	}
+	second.SetOtherInfo(map[string]any{"owner": "preserved"})
+	require.NoError(t, db.Create(&second).Error)
+	require.NoError(t, second.AddAbilities(db))
+	previousMemoryCacheEnabled := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCacheEnabled
+	})
+
+	require.NoError(t, DisableChannelByTag(tag))
+
+	for _, channelID := range []int{first.Id, second.Id} {
+		stored, ability := loadChannelStatusCASFixture(t, channelID)
+		assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.Status)
+		assert.False(t, ability.Enabled)
+		cached, err := CacheGetChannel(channelID)
+		require.NoError(t, err)
+		assert.Equal(t, common.ChannelStatusManuallyDisabled, cached.Status)
+		assert.Equal(t, stored.OtherInfo, cached.OtherInfo)
+	}
+	routingIDs, err := ListSatisfiedChannelIDsAtPriority(
+		first.Group,
+		first.Models,
+		first.GetPriority(),
+		nil,
+	)
+	require.NoError(t, err)
+	assert.NotContains(t, routingIDs, first.Id)
+	assert.NotContains(t, routingIDs, second.Id)
 }
 
 func TestPlanQuotaDomainBulkEnableCannotBypassDisabledAuthority(t *testing.T) {

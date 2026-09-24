@@ -662,7 +662,7 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *te
 	require.Equal(t, 2, selected[0].Id)
 }
 
-func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesDuePartialMultiKey(t *testing.T) {
+func TestSelectChannelsForAutomaticTestPassiveRecoveryExcludesManagedPartialMultiKey(t *testing.T) {
 	setupAutomaticChannelSelectionTestDB(t)
 
 	now := time.Now().Unix()
@@ -705,7 +705,7 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesDuePartialMultiKey
 	for index, channel := range selected {
 		selectedIDs[index] = channel.Id
 	}
-	assert.Equal(t, []int{21, 23, 25}, selectedIDs)
+	assert.Equal(t, []int{21, 23}, selectedIDs)
 }
 
 func TestSelectChannelsForAutomaticTestDeduplicatesDuePlanDomain(t *testing.T) {
@@ -898,7 +898,7 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesManagedPlanQuota(t
 	for i, channel := range selected {
 		selectedIDs[i] = channel.Id
 	}
-	assert.Equal(t, []int{31, 32, 34, 35, 37}, selectedIDs)
+	assert.Equal(t, []int{31, 32, 34, 35}, selectedIDs)
 }
 
 func TestSelectChannelsForAutomaticTestAlwaysSkipsManualDisabled(t *testing.T) {
