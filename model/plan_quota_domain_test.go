@@ -494,26 +494,29 @@ func TestPlanQuotaDomainUsesExactlyOneSelectedKey(t *testing.T) {
 	require.True(t, ok)
 
 	tests := []struct {
-		name    string
-		channel Channel
-		want    bool
-		hash    string
+		name        string
+		channel     Channel
+		want        bool
+		hash        string
+		selectedKey string
 	}{
 		{
 			name: "trailing newline",
 			channel: Channel{
 				Key: "shared\n", Tag: &tag,
 			},
-			want: true,
-			hash: expectedHash,
+			want:        true,
+			hash:        expectedHash,
+			selectedKey: "shared",
 		},
 		{
 			name: "cached one-entry representation",
 			channel: Channel{
 				Key: "ignored", Keys: []string{"shared"}, Tag: &tag,
 			},
-			want: true,
-			hash: expectedHash,
+			want:        true,
+			hash:        expectedHash,
+			selectedKey: "shared",
 		},
 		{
 			name: "empty selected key",
@@ -538,6 +541,7 @@ func TestPlanQuotaDomainUsesExactlyOneSelectedKey(t *testing.T) {
 				require.True(t, valid)
 				return hash
 			}(),
+			selectedKey: "Shared",
 		},
 	}
 
@@ -546,6 +550,16 @@ func TestPlanQuotaDomainUsesExactlyOneSelectedKey(t *testing.T) {
 			hash, member := PlanQuotaDomainMembership(&testCase.channel)
 			assert.Equal(t, testCase.want, member)
 			assert.Equal(t, testCase.hash, hash)
+
+			selectedKey, selectedIndex, keyErr := testCase.channel.GetNextEnabledKey()
+			if testCase.want {
+				require.Nil(t, keyErr)
+				assert.Equal(t, testCase.selectedKey, selectedKey)
+				assert.Zero(t, selectedIndex)
+			} else {
+				require.NotNil(t, keyErr)
+				assert.Empty(t, selectedKey)
+			}
 		})
 	}
 }
@@ -1463,6 +1477,237 @@ func TestPlanQuotaDomainSingleToMultiKeyClearsSharedOwnership(t *testing.T) {
 	assert.NotContains(t, info, "quota_type")
 	assert.NotContains(t, info, "quota_reset_at")
 	assert.NotContains(t, info, "disabled_until")
+}
+
+func TestPlanQuotaDomainIdentityRotationClearsOldOwnership(t *testing.T) {
+	tests := []struct {
+		name   string
+		rotate func(t *testing.T, channel Channel)
+	}{
+		{
+			name: "individual key update into active domain",
+			rotate: func(t *testing.T, channel Channel) {
+				t.Helper()
+				channel.Key = "authority-secret-identity-active"
+				require.NoError(t, channel.Update())
+			},
+		},
+		{
+			name: "tag update out of plan domain",
+			rotate: func(t *testing.T, channel Channel) {
+				t.Helper()
+				ordinaryTag := "ordinary:test:identity-rotation"
+				require.NoError(t, EditChannelByTag(
+					channel.GetTag(),
+					&ordinaryTag,
+					nil,
+					nil,
+					nil,
+					nil,
+					nil,
+					nil,
+					nil,
+				))
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupPlanQuotaAuthorityTest(t, "")
+			oldTag := "plan:test:identity-rotation"
+			oldCredential := "authority-secret-identity-old"
+			channel := createPlanQuotaDomainFixture(
+				t,
+				db,
+				oldCredential,
+				oldTag,
+				PlanQuotaDomainStateDisabled,
+				43,
+				2_000_000_000,
+			)
+			newHash, ok := PlanQuotaDomainHash("authority-secret-identity-active")
+			require.True(t, ok)
+			require.NoError(t, db.Create(&PlanQuotaDomain{
+				CredentialHash: newHash,
+				State:          PlanQuotaDomainStateActive,
+			}).Error)
+			info := channel.GetOtherInfo()
+			info["status_reason"] = "old domain exhausted"
+			info["status_time"] = int64(12345)
+			info["unrelated"] = "keep"
+			channel.SetOtherInfo(info)
+			require.NoError(t, db.Model(&Channel{}).Where("id = ?", channel.Id).
+				Update("other_info", channel.OtherInfo).Error)
+
+			testCase.rotate(t, channel)
+
+			var stored Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+			storedInfo := stored.GetOtherInfo()
+			assert.Equal(t, "old domain exhausted", storedInfo["status_reason"])
+			assert.EqualValues(t, 12345, storedInfo["status_time"])
+			assert.Equal(t, "keep", storedInfo["unrelated"])
+			for _, field := range []string{
+				"disabled_until",
+				"quota_reset_at",
+				"quota_domain",
+				"quota_domain_id",
+				"quota_generation",
+				"quota_type",
+			} {
+				assert.NotContains(t, storedInfo, field)
+			}
+			var ability Ability
+			require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+			assert.False(t, ability.Enabled)
+		})
+	}
+}
+
+func TestPlanQuotaDomainIdentityRotationProjectsDisabledTarget(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	tag := "plan:test:identity-disabled-target"
+	oldCredential := "authority-secret-identity-disabled-old"
+	newCredential := "authority-secret-identity-disabled-new"
+	channel := createPlanQuotaDomainFixture(
+		t,
+		db,
+		oldCredential,
+		tag,
+		PlanQuotaDomainStateDisabled,
+		51,
+		2_000_000_000,
+	)
+	newHash, ok := PlanQuotaDomainHash(newCredential)
+	require.True(t, ok)
+	require.NoError(t, db.Create(&PlanQuotaDomain{
+		CredentialHash: newHash,
+		Generation:     52,
+		State:          PlanQuotaDomainStateDisabled,
+		DisabledUntil:  2_100_000_000,
+	}).Error)
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+
+	updated, changed, err := UpdateChannelCredentialIfUnchanged(expected, newCredential)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.NotNil(t, updated)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, updated.Status)
+	info := updated.GetOtherInfo()
+	assert.Equal(t, newHash, info["quota_domain_id"])
+	assert.Equal(t, "52", info["quota_generation"])
+	assert.EqualValues(t, 2_100_000_000, info["disabled_until"])
+	var ability Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+}
+
+func TestInitializePlanQuotaDomainsClearsRotatedOwnership(t *testing.T) {
+	tests := []struct {
+		name             string
+		tag              string
+		targetState      string
+		targetGeneration int64
+		targetDeadline   int64
+		wantTargetOwner  bool
+	}{
+		{
+			name:        "active target",
+			tag:         "plan:test:restart-active",
+			targetState: PlanQuotaDomainStateActive,
+		},
+		{
+			name:             "disabled target",
+			tag:              "plan:test:restart-disabled",
+			targetState:      PlanQuotaDomainStateDisabled,
+			targetGeneration: 62,
+			targetDeadline:   2_200_000_000,
+			wantTargetOwner:  true,
+		},
+		{
+			name: "nonmember target",
+			tag:  "ordinary:test:restart",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupPlanQuotaAuthorityTest(t, "")
+			oldCredential := "authority-secret-restart-old"
+			newCredential := "authority-secret-restart-new"
+			oldHash, ok := PlanQuotaDomainHash(oldCredential)
+			require.True(t, ok)
+			newHash, ok := PlanQuotaDomainHash(newCredential)
+			require.True(t, ok)
+			require.NoError(t, db.Create(&PlanQuotaDomain{
+				CredentialHash: oldHash,
+				Generation:     61,
+				State:          PlanQuotaDomainStateDisabled,
+				DisabledUntil:  2_000_000_000,
+			}).Error)
+			if testCase.targetState != "" {
+				require.NoError(t, db.Create(&PlanQuotaDomain{
+					CredentialHash: newHash,
+					Generation:     testCase.targetGeneration,
+					State:          testCase.targetState,
+					DisabledUntil:  testCase.targetDeadline,
+				}).Error)
+			}
+			channel := Channel{
+				Name: "restart-rotated", Key: newCredential, Tag: &testCase.tag,
+				Status: common.ChannelStatusAutoDisabled, Models: "gpt-4.1", Group: "default",
+			}
+			channel.SetOtherInfo(map[string]any{
+				"disabled_until":   int64(2_000_000_000),
+				"quota_domain":     "plan:test:restart-old",
+				"quota_domain_id":  oldHash,
+				"quota_generation": "61",
+				"quota_type":       "plan",
+				"status_reason":    "old domain exhausted",
+				"status_time":      int64(54321),
+				"unrelated":        "keep",
+			})
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(db))
+
+			require.NoError(t, InitializePlanQuotaDomains())
+
+			var stored Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+			info := stored.GetOtherInfo()
+			assert.Equal(t, "old domain exhausted", info["status_reason"])
+			assert.EqualValues(t, 54321, info["status_time"])
+			assert.Equal(t, "keep", info["unrelated"])
+			if testCase.wantTargetOwner {
+				assert.Equal(t, newHash, info["quota_domain_id"])
+				assert.Equal(t, "62", info["quota_generation"])
+				assert.EqualValues(t, testCase.targetDeadline, info["disabled_until"])
+				assert.Equal(t, "plan", info["quota_type"])
+			} else {
+				for _, field := range []string{
+					"disabled_until",
+					"quota_reset_at",
+					"quota_domain",
+					"quota_domain_id",
+					"quota_generation",
+					"quota_type",
+				} {
+					assert.NotContains(t, info, field)
+				}
+			}
+			var ability Ability
+			require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+			assert.False(t, ability.Enabled)
+			var oldAuthority PlanQuotaDomain
+			require.NoError(t, db.First(&oldAuthority, "credential_hash = ?", oldHash).Error)
+			assert.Equal(t, PlanQuotaDomainStateDisabled, oldAuthority.State)
+			assert.Equal(t, int64(61), oldAuthority.Generation)
+		})
+	}
 }
 
 func TestPlanQuotaDomainRecoveryIsAtomic(t *testing.T) {

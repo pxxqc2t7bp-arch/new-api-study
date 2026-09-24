@@ -408,6 +408,57 @@ func TestRelayChannelFailoverFrom429DisablesPrimary(t *testing.T) {
 	assert.Equal(t, 2, backup.callCount())
 }
 
+func TestRelayPlanQuotaTrailingNewlineUsesSelectedKeyAndDisablesPeers(t *testing.T) {
+	engine, user := setupRelayFailoverTest(t, false)
+	const credential = "ExactCasePlanKey"
+	authorization := make(chan string, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization <- r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.","type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	autoBan := 1
+	sourceTag := "plan:relay:selected-source"
+	peerTag := "plan:relay:selected-peer"
+	sourcePriority := int64(30)
+	peerPriority := int64(20)
+	source := model.Channel{
+		Id: 3311, Name: "selected-source", Type: constant.ChannelTypeOpenAI,
+		Key: credential + "\n", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, Tag: &sourceTag, AutoBan: &autoBan,
+		Models: relayFailoverModel, Group: "default", Priority: &sourcePriority,
+	}
+	peer := model.Channel{
+		Id: 3312, Name: "selected-peer", Type: constant.ChannelTypeOpenAI,
+		Key: credential, BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, Tag: &peerTag, AutoBan: &autoBan,
+		Models: "peer-only-model", Group: "default", Priority: &peerPriority,
+	}
+	require.NoError(t, source.Insert())
+	require.NoError(t, peer.Insert())
+
+	response := performRelayFailoverRequest(t, engine)
+
+	require.Equal(t, http.StatusTooManyRequests, response.Code, response.Body.String())
+	require.Len(t, authorization, 1)
+	assert.Equal(t, "Bearer "+credential, <-authorization)
+	hash, ok := model.PlanQuotaDomainHash(credential)
+	require.True(t, ok)
+	for _, channelID := range []int{source.Id, peer.Id} {
+		var stored model.Channel
+		require.NoError(t, model.DB.First(&stored, channelID).Error)
+		assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+		assert.Equal(t, hash, stored.GetOtherInfo()["quota_domain_id"])
+		var ability model.Ability
+		require.NoError(t, model.DB.First(&ability, "channel_id = ?", channelID).Error)
+		assert.False(t, ability.Enabled)
+	}
+	requireRelayRefunded(t, user.Id)
+}
+
 func TestRelayChannelFailoverFromConnectionFailure(t *testing.T) {
 	engine, _ := setupRelayFailoverTest(t, false)
 	trace := &failoverCallTrace{}

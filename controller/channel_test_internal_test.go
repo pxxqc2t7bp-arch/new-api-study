@@ -1396,7 +1396,7 @@ func testLockedTaskRetryRefreshesMultiKeyAndUsesRemainingKey(t *testing.T, memor
 	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
 }
 
-func TestProcessChannelErrorRecordsManagedFailureWhenAutomaticDisableIsOff(t *testing.T) {
+func TestProcessChannelErrorConsumesPlanQuotaWithoutMutationWhenAutomaticDisableIsOff(t *testing.T) {
 	db := setupModelListControllerTestDB(t)
 	require.NoError(t, db.AutoMigrate(&model.UpstreamManagedRoute{}))
 
@@ -1407,7 +1407,7 @@ func TestProcessChannelErrorRecordsManagedFailureWhenAutomaticDisableIsOff(t *te
 	common.AutomaticDisableChannelEnabled = false
 	constant.ErrorLogEnabled = false
 	orchestrationSetting.Enabled = true
-	orchestrationSetting.FailureThreshold = 2
+	orchestrationSetting.FailureThreshold = 1
 	orchestrationSetting.FailureWindowMinutes = 5
 	t.Cleanup(func() {
 		common.AutomaticDisableChannelEnabled = originalAutomaticDisable
@@ -1415,14 +1415,17 @@ func TestProcessChannelErrorRecordsManagedFailureWhenAutomaticDisableIsOff(t *te
 		*orchestrationSetting = originalOrchestrationSetting
 	})
 
+	tag := "plan:managed:global-disable-off"
 	channel := model.Channel{
 		Name:   "managed-plan-global-disable-off",
 		Key:    "credential",
 		Status: common.ChannelStatusEnabled,
+		Tag:    &tag,
 		Models: "gpt-3.5-turbo",
 		Group:  "default",
 	}
 	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(db))
 	route := model.UpstreamManagedRoute{
 		SourceID:        1,
 		ExternalGroupID: "managed-plan-global-disable-off",
@@ -1434,6 +1437,9 @@ func TestProcessChannelErrorRecordsManagedFailureWhenAutomaticDisableIsOff(t *te
 	require.NoError(t, db.Create(&route).Error)
 
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	service.SetRelayAsyncRunner(ctx, func(task func()) {
+		task()
+	})
 	apiError := relaytypes.NewOpenAIError(
 		errors.New("You have exceeded the monthly usage quota. It will reset at 2026-09-30 23:59:59 +0800 CST."),
 		relaytypes.ErrorCode("AccountQuotaExceeded"),
@@ -1443,15 +1449,23 @@ func TestProcessChannelErrorRecordsManagedFailureWhenAutomaticDisableIsOff(t *te
 		ChannelId:   channel.Id,
 		ChannelName: channel.Name,
 		AutoBan:     true,
-	}, "", apiError)
+	}, tag, apiError)
 
-	require.Eventually(t, func() bool {
-		var stored model.UpstreamManagedRoute
-		if err := db.First(&stored, route.ID).Error; err != nil {
-			return false
-		}
-		return stored.ConsecutiveFailures == 1
-	}, time.Second, 10*time.Millisecond)
+	var storedChannel model.Channel
+	require.NoError(t, db.First(&storedChannel, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, storedChannel.Status)
+	assert.Empty(t, storedChannel.OtherInfo)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+	var storedRoute model.UpstreamManagedRoute
+	require.NoError(t, db.First(&storedRoute, route.ID).Error)
+	assert.Equal(t, model.UpstreamRouteStateActive, storedRoute.State)
+	assert.Zero(t, storedRoute.ConsecutiveFailures)
+	assert.Zero(t, storedRoute.ConsecutiveSuccesses)
+	assert.Zero(t, storedRoute.FailureWindowStart)
+	assert.Zero(t, storedRoute.LastFailureAt)
+	assert.Empty(t, storedRoute.LastReason)
 }
 
 func TestChannelForHealthCheckCountsOnlyCommittedRecoveries(t *testing.T) {

@@ -370,11 +370,13 @@ func TestRunDueUpstreamProbeTaskKeepsFailedSiblingQuarantinedAfterRealReconcile(
 
 func TestRunDueUpstreamProbeTaskConsumesPlanQuotaOnceForActualCredential(t *testing.T) {
 	tests := []struct {
-		name     string
-		multiKey bool
-		plan     bool
-		status   int
-		body     string
+		name             string
+		multiKey         bool
+		plan             bool
+		automaticOff     bool
+		failureThreshold int
+		status           int
+		body             string
 	}{
 		{
 			name:   "single key isolates credential peers",
@@ -388,6 +390,15 @@ func TestRunDueUpstreamProbeTaskConsumesPlanQuotaOnceForActualCredential(t *test
 			multiKey: true,
 			plan:     true,
 			status:   http.StatusTooManyRequests,
+			body: `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
+				"type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`,
+		},
+		{
+			name:             "single key automatic disable off leaves channel and route unchanged",
+			plan:             true,
+			automaticOff:     true,
+			failureThreshold: 1,
+			status:           http.StatusTooManyRequests,
 			body: `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
 				"type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`,
 		},
@@ -410,12 +421,15 @@ func TestRunDueUpstreamProbeTaskConsumesPlanQuotaOnceForActualCredential(t *test
 			originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
 			originalLogConsumeEnabled := common.LogConsumeEnabled
 			common.MemoryCacheEnabled = false
-			common.AutomaticDisableChannelEnabled = true
+			common.AutomaticDisableChannelEnabled = !testCase.automaticOff
 			common.LogConsumeEnabled = false
 			setting := operation_setting.GetUpstreamOrchestrationSetting()
 			originalSetting := *setting
 			setting.Enabled = true
-			setting.FailureThreshold = 2
+			setting.FailureThreshold = testCase.failureThreshold
+			if setting.FailureThreshold == 0 {
+				setting.FailureThreshold = 2
+			}
 			setting.FailureWindowMinutes = 5
 			setting.ProbeTimeoutSeconds = 5
 			originalModelRatios := ratio_setting.ModelRatio2JSONString()
@@ -533,11 +547,32 @@ func TestRunDueUpstreamProbeTaskConsumesPlanQuotaOnceForActualCredential(t *test
 			var storedRoute model.UpstreamManagedRoute
 			require.NoError(t, db.First(&storedRoute, route.ID).Error)
 			assert.Equal(t, model.UpstreamRouteStateActive, storedRoute.State)
-			assert.Equal(t, 1, storedRoute.ConsecutiveFailures)
+			if testCase.automaticOff {
+				assert.Zero(t, storedRoute.ConsecutiveFailures)
+				assert.Zero(t, storedRoute.ConsecutiveSuccesses)
+				assert.Zero(t, storedRoute.FailureWindowStart)
+				assert.Zero(t, storedRoute.LastFailureAt)
+				assert.Empty(t, storedRoute.LastReason)
+				assert.Equal(t, route.NextProbeAt, storedRoute.NextProbeAt)
+			} else {
+				assert.Equal(t, 1, storedRoute.ConsecutiveFailures)
+			}
 
 			var stored model.Channel
 			require.NoError(t, db.First(&stored, channel.Id).Error)
 			switch {
+			case testCase.automaticOff:
+				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+				assert.Empty(t, stored.OtherInfo)
+				var storedPeer model.Channel
+				require.NoError(t, db.First(&storedPeer, peer.Id).Error)
+				assert.Equal(t, common.ChannelStatusEnabled, storedPeer.Status)
+				assert.Empty(t, storedPeer.OtherInfo)
+				for _, channelID := range []int{stored.Id, storedPeer.Id} {
+					var ability model.Ability
+					require.NoError(t, db.First(&ability, "channel_id = ?", channelID).Error)
+					assert.True(t, ability.Enabled)
+				}
 			case !testCase.plan:
 				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
 				assert.NotContains(t, stored.GetOtherInfo(), "quota_reset_at")

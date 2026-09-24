@@ -59,13 +59,24 @@ func TestRefreshCodexChannelCredentialRoutesThroughPlanQuotaAuthority(t *testing
 	require.True(t, ok)
 	require.NoError(t, db.Create(&model.PlanQuotaDomain{
 		CredentialHash: oldHash,
-		State:          model.PlanQuotaDomainStateActive,
+		Generation:     7,
+		State:          model.PlanQuotaDomainStateDisabled,
+		DisabledUntil:  2_000_000_000,
 	}).Error)
 	channel := model.Channel{
 		Type: constant.ChannelTypeCodex, Name: "codex",
-		Key: oldCredential, Tag: &tag, Status: common.ChannelStatusEnabled,
+		Key: oldCredential, Tag: &tag, Status: common.ChannelStatusAutoDisabled,
 		Models: "gpt-5", Group: "default",
 	}
+	channel.SetOtherInfo(map[string]any{
+		"disabled_until":   int64(2_000_000_000),
+		"quota_domain":     tag,
+		"quota_domain_id":  oldHash,
+		"quota_generation": "7",
+		"quota_type":       "plan",
+		"status_reason":    "old Codex quota exhausted",
+		"status_time":      int64(12345),
+	})
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, channel.AddAbilities(db))
 
@@ -83,4 +94,16 @@ func TestRefreshCodexChannelCredentialRoutesThroughPlanQuotaAuthority(t *testing
 	var authority model.PlanQuotaDomain
 	require.NoError(t, db.First(&authority, "credential_hash = ?", newHash).Error)
 	assert.Equal(t, model.PlanQuotaDomainStateActive, authority.State)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, updated.Status)
+	info := updated.GetOtherInfo()
+	assert.Equal(t, "old Codex quota exhausted", info["status_reason"])
+	assert.EqualValues(t, 12345, info["status_time"])
+	assert.NotContains(t, info, "disabled_until")
+	assert.NotContains(t, info, "quota_domain")
+	assert.NotContains(t, info, "quota_domain_id")
+	assert.NotContains(t, info, "quota_generation")
+	assert.NotContains(t, info, "quota_type")
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
 }

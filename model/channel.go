@@ -221,13 +221,17 @@ func (channel *Channel) HasEnabledKey() bool {
 }
 
 func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
-	// If not in multi-key mode, return the original key string directly.
+	keys := channel.GetKeys()
 	if !channel.ChannelInfo.IsMultiKey {
-		return channel.Key, 0, nil
+		if channel.Key == "" {
+			return "", 0, nil
+		}
+		if len(keys) != 1 || keys[0] == "" {
+			return "", 0, types.NewError(errors.New("exactly one key is required"), types.ErrorCodeChannelNoAvailableKey)
+		}
+		return keys[0], 0, nil
 	}
 
-	// Obtain all keys (split by \n)
-	keys := channel.GetKeys()
 	if len(keys) == 0 {
 		// No keys available, return error, should disable the channel
 		return "", 0, types.NewError(errors.New("no keys available"), types.ErrorCodeChannelNoAvailableKey)

@@ -514,22 +514,30 @@ func runDueUpstreamProbeTaskWithDependencies(
 		}
 
 		message := "upstream probe failed"
+		handledPlanQuota := false
 		if result.newAPIError != nil {
-			service.DisableChannelForAPIError(
-				*types.NewChannelError(
-					channel.Id,
-					channel.Type,
-					channel.Name,
-					channel.ChannelInfo.IsMultiKey,
-					common.GetContextKeyString(result.context, constant.ContextKeyChannelKey),
-					channel.GetAutoBan(),
-				),
-				common.GetContextKeyString(result.context, constant.ContextKeyChannelTag),
-				result.newAPIError,
-			)
+			handledPlanQuota = shouldPrioritizePlanQuotaDisable(result.newAPIError)
+			if handledPlanQuota && common.AutomaticDisableChannelEnabled {
+				service.DisableChannelForAPIError(
+					*types.NewChannelError(
+						channel.Id,
+						channel.Type,
+						channel.Name,
+						channel.ChannelInfo.IsMultiKey,
+						common.GetContextKeyString(result.context, constant.ContextKeyChannelKey),
+						channel.GetAutoBan(),
+					),
+					common.GetContextKeyString(result.context, constant.ContextKeyChannelTag),
+					result.newAPIError,
+				)
+			}
 			message = result.newAPIError.ErrorWithStatusCode()
 		} else if result.localErr != nil {
 			message = result.localErr.Error()
+		}
+		if handledPlanQuota && !common.AutomaticDisableChannelEnabled {
+			summary.Failed++
+			continue
 		}
 		before := route.State
 		transition, err := service.MarkManagedRouteProbeResult(&route, false, latency, message)

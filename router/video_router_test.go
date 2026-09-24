@@ -9,8 +9,10 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestGetOpenAIVideoRouteRendersJimengTask(t *testing.T) {
@@ -26,6 +28,12 @@ func TestGetOpenAIVideoRouteRendersJimengTask(t *testing.T) {
 	common.IsMasterNode = false
 	common.RedisEnabled = false
 	t.Setenv("SQL_DSN", "")
+	bootstrapDB, err := gorm.Open(sqlite.Open(common.SQLitePath), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, bootstrapDB.AutoMigrate(&model.Channel{}, &model.PlanQuotaDomain{}))
+	bootstrapSQLDB, err := bootstrapDB.DB()
+	require.NoError(t, err)
+	require.NoError(t, bootstrapSQLDB.Close())
 	require.NoError(t, model.InitDB())
 	database := model.DB
 	require.NoError(t, database.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Task{}))

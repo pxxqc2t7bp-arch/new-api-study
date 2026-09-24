@@ -514,9 +514,11 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, observ
 			))
 		}
 	}
-	handledPlanQuota := false
-	if !handledManagedUnsupported && channelError.AutoBan && shouldPrioritizePlanQuotaDisable(err) {
-		handledPlanQuota = service.DisableChannelForAPIError(channelError, observedTag, err)
+	handledPlanQuota := !handledManagedUnsupported && shouldPrioritizePlanQuotaDisable(err)
+	if handledPlanQuota &&
+		channelError.AutoBan &&
+		common.AutomaticDisableChannelEnabled {
+		service.DisableChannelForAPIError(channelError, observedTag, err)
 	}
 	if !handledManagedUnsupported && !handledPlanQuota && isManaged && channelError.AutoBan && service.ShouldRecordManagedRouteFailure(err) {
 		reason := err.ErrorWithStatusCode()
