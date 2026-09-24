@@ -535,7 +535,7 @@ func runDueUpstreamProbeTaskWithDependencies(
 		} else if result.localErr != nil {
 			message = result.localErr.Error()
 		}
-		if handledPlanQuota && !common.AutomaticDisableChannelEnabled {
+		if handledPlanQuota {
 			summary.Failed++
 			continue
 		}

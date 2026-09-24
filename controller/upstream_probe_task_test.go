@@ -379,22 +379,34 @@ func TestRunDueUpstreamProbeTaskConsumesPlanQuotaOnceForActualCredential(t *test
 		body             string
 	}{
 		{
-			name:   "single key isolates credential peers",
-			plan:   true,
-			status: http.StatusTooManyRequests,
+			name:             "single key isolates credential peers without route failure",
+			plan:             true,
+			failureThreshold: 1,
+			status:           http.StatusTooManyRequests,
 			body: `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
 				"type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`,
 		},
 		{
-			name:     "multi key isolates selected key only",
-			multiKey: true,
-			plan:     true,
-			status:   http.StatusTooManyRequests,
+			name:             "multi key isolates selected key without route failure",
+			multiKey:         true,
+			plan:             true,
+			failureThreshold: 1,
+			status:           http.StatusTooManyRequests,
 			body: `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
 				"type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`,
 		},
 		{
 			name:             "single key automatic disable off leaves channel and route unchanged",
+			plan:             true,
+			automaticOff:     true,
+			failureThreshold: 1,
+			status:           http.StatusTooManyRequests,
+			body: `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
+				"type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`,
+		},
+		{
+			name:             "multi key automatic disable off leaves channel and route unchanged",
+			multiKey:         true,
 			plan:             true,
 			automaticOff:     true,
 			failureThreshold: 1,
@@ -494,11 +506,15 @@ func TestRunDueUpstreamProbeTaskConsumesPlanQuotaOnceForActualCredential(t *test
 			key := "probe-key"
 			channelInfo := model.ChannelInfo{}
 			if testCase.multiKey {
+				multiKeyMode := constant.MultiKeyModePolling
+				if testCase.automaticOff {
+					multiKeyMode = constant.MultiKeyModeRandom
+				}
 				key = "probe-key-a\nprobe-key-b"
 				channelInfo = model.ChannelInfo{
 					IsMultiKey:   true,
 					MultiKeySize: 2,
-					MultiKeyMode: constant.MultiKeyModePolling,
+					MultiKeyMode: multiKeyMode,
 				}
 			}
 			channel := model.Channel{
@@ -514,7 +530,9 @@ func TestRunDueUpstreamProbeTaskConsumesPlanQuotaOnceForActualCredential(t *test
 				SourceID: source.ID, ExternalGroupID: group.ExternalID,
 				Platform: group.Platform, Protocol: model.UpstreamProtocolOpenAI,
 				ChannelID: channel.Id, State: model.UpstreamRouteStateActive,
-				NextProbeAt: now.Add(-time.Minute).Unix(),
+				Rank: 3, ConsecutiveSuccesses: 2,
+				LastSuccessAt: now.Add(-2 * time.Minute).Unix(),
+				NextProbeAt:   now.Add(-time.Minute).Unix(),
 			}
 			require.NoError(t, db.Create(&route).Error)
 
@@ -546,41 +564,67 @@ func TestRunDueUpstreamProbeTaskConsumesPlanQuotaOnceForActualCredential(t *test
 			assert.Equal(t, upstreamProbeSummary{Tested: 1, Failed: 1}, summary)
 			var storedRoute model.UpstreamManagedRoute
 			require.NoError(t, db.First(&storedRoute, route.ID).Error)
-			assert.Equal(t, model.UpstreamRouteStateActive, storedRoute.State)
-			if testCase.automaticOff {
-				assert.Zero(t, storedRoute.ConsecutiveFailures)
-				assert.Zero(t, storedRoute.ConsecutiveSuccesses)
-				assert.Zero(t, storedRoute.FailureWindowStart)
-				assert.Zero(t, storedRoute.LastFailureAt)
-				assert.Empty(t, storedRoute.LastReason)
-				assert.Equal(t, route.NextProbeAt, storedRoute.NextProbeAt)
+			if testCase.plan {
+				assert.Equal(t, route, storedRoute)
 			} else {
+				assert.Equal(t, model.UpstreamRouteStateActive, storedRoute.State)
 				assert.Equal(t, 1, storedRoute.ConsecutiveFailures)
+				assert.Zero(t, storedRoute.ConsecutiveSuccesses)
 			}
 
 			var stored model.Channel
 			require.NoError(t, db.First(&stored, channel.Id).Error)
+			var ability model.Ability
+			require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+			if testCase.plan && !testCase.multiKey {
+				domainHash, ok := model.PlanQuotaDomainHash(channel.Key)
+				require.True(t, ok)
+				var authority model.PlanQuotaDomain
+				require.NoError(t, db.First(&authority, "credential_hash = ?", domainHash).Error)
+				if testCase.automaticOff {
+					assert.Equal(t, model.PlanQuotaDomainStateActive, authority.State)
+				} else {
+					assert.Equal(t, model.PlanQuotaDomainStateDisabled, authority.State)
+					assert.Positive(t, authority.DisabledUntil)
+				}
+			}
 			switch {
 			case testCase.automaticOff:
 				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
 				assert.Empty(t, stored.OtherInfo)
-				var storedPeer model.Channel
-				require.NoError(t, db.First(&storedPeer, peer.Id).Error)
-				assert.Equal(t, common.ChannelStatusEnabled, storedPeer.Status)
-				assert.Empty(t, storedPeer.OtherInfo)
-				for _, channelID := range []int{stored.Id, storedPeer.Id} {
-					var ability model.Ability
-					require.NoError(t, db.First(&ability, "channel_id = ?", channelID).Error)
-					assert.True(t, ability.Enabled)
+				assert.Equal(t, channel.ChannelInfo, stored.ChannelInfo)
+				assert.True(t, ability.Enabled)
+				if !testCase.multiKey {
+					var storedPeer model.Channel
+					require.NoError(t, db.First(&storedPeer, peer.Id).Error)
+					assert.Equal(t, common.ChannelStatusEnabled, storedPeer.Status)
+					assert.Empty(t, storedPeer.OtherInfo)
+					var peerAbility model.Ability
+					require.NoError(t, db.First(&peerAbility, "channel_id = ?", peer.Id).Error)
+					assert.True(t, peerAbility.Enabled)
 				}
 			case !testCase.plan:
 				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
 				assert.NotContains(t, stored.GetOtherInfo(), "quota_reset_at")
+				assert.True(t, ability.Enabled)
 			case testCase.multiKey:
 				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
 				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
 				assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
 				assert.Positive(t, stored.ChannelInfo.MultiKeyDisabledUntil[0])
+				assert.True(t, ability.Enabled)
+				selected, selectErr := model.GetRandomSatisfiedChannel(
+					stored.Group,
+					stored.Models,
+					0,
+					nil,
+				)
+				require.NoError(t, selectErr)
+				require.NotNil(t, selected)
+				assert.Equal(t, stored.Id, selected.Id)
+				selectedKey, _, keyErr := selected.GetNextEnabledKey()
+				require.Nil(t, keyErr)
+				assert.Equal(t, "probe-key-b", selectedKey)
 			default:
 				var storedPeer model.Channel
 				require.NoError(t, db.First(&storedPeer, peer.Id).Error)
@@ -590,6 +634,10 @@ func TestRunDueUpstreamProbeTaskConsumesPlanQuotaOnceForActualCredential(t *test
 				assert.Equal(t, stored.GetOtherInfo()["quota_reset_at"], storedPeer.GetOtherInfo()["quota_reset_at"])
 				assert.NotEmpty(t, stored.GetOtherInfo()["quota_domain_id"])
 				assert.Equal(t, stored.GetOtherInfo()["quota_domain_id"], storedPeer.GetOtherInfo()["quota_domain_id"])
+				assert.False(t, ability.Enabled)
+				var peerAbility model.Ability
+				require.NoError(t, db.First(&peerAbility, "channel_id = ?", peer.Id).Error)
+				assert.False(t, peerAbility.Enabled)
 			}
 		})
 	}
