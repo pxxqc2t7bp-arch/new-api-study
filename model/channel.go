@@ -67,6 +67,7 @@ type ChannelInfo struct {
 	MultiKeyStatusList     map[int]int           `json:"multi_key_status_list"`               // key状态列表，key index -> status
 	MultiKeyDisabledReason map[int]string        `json:"multi_key_disabled_reason,omitempty"` // key禁用原因列表，key index -> reason
 	MultiKeyDisabledTime   map[int]int64         `json:"multi_key_disabled_time,omitempty"`   // key禁用时间列表，key index -> time
+	MultiKeyDisabledUntil  map[int]int64         `json:"multi_key_disabled_until,omitempty"`  // key可恢复探测时间，key index -> time
 	MultiKeyPollingIndex   int                   `json:"multi_key_polling_index"`             // 多Key模式下轮询的key索引
 	MultiKeyRecoveryIndex  int                   `json:"multi_key_recovery_index,omitempty"`  // 多Key模式下被动恢复探测游标
 	MultiKeyMode           constant.MultiKeyMode `json:"multi_key_mode"`
@@ -626,6 +627,13 @@ func (channel *Channel) Update() error {
 				}
 			}
 		}
+		if channel.ChannelInfo.MultiKeyDisabledUntil != nil {
+			for idx := range channel.ChannelInfo.MultiKeyDisabledUntil {
+				if idx >= channel.ChannelInfo.MultiKeySize {
+					delete(channel.ChannelInfo.MultiKeyDisabledUntil, idx)
+				}
+			}
+		}
 	}
 	var err error
 	err = DB.Model(channel).Updates(channel).Error
@@ -724,11 +732,19 @@ func handlerMultiKeyUpdate(channel *Channel, usingKey string, status int, reason
 			info := channel.GetOtherInfo()
 			info["status_reason"] = reason
 			info["status_time"] = common.GetTimestamp()
+			if status == common.ChannelStatusManuallyDisabled {
+				channel.ChannelInfo.MultiKeyDisabledUntil = nil
+				delete(info, "quota_reset_at")
+				delete(info, "disabled_until")
+			}
 			channel.SetOtherInfo(info)
 			return
 		}
 		if channel.ChannelInfo.MultiKeyStatusList == nil {
 			channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
+		}
+		if channel.ChannelInfo.MultiKeyDisabledUntil != nil {
+			delete(channel.ChannelInfo.MultiKeyDisabledUntil, keyIndex)
 		}
 		if status == common.ChannelStatusEnabled {
 			delete(channel.ChannelInfo.MultiKeyStatusList, keyIndex)
@@ -1200,14 +1216,25 @@ func updateMultiKeyChannelStatusIfUnchanged(
 				return nil
 			}
 			keyFound := false
-			for _, key := range current.GetKeys() {
+			keyIndex := -1
+			for index, key := range current.GetKeys() {
 				if key == usingKey {
 					keyFound = true
+					keyIndex = index
 					break
 				}
 			}
 			if !keyFound {
 				return nil
+			}
+			if managedRouteRecoveryAt != nil {
+				selectedIndex, due := current.NextDueAutoDisabledMultiKeyIndex(*managedRouteRecoveryAt)
+				if current.Status == common.ChannelStatusManuallyDisabled ||
+					current.ChannelInfo.MultiKeyStatusList[keyIndex] != common.ChannelStatusAutoDisabled ||
+					!due ||
+					selectedIndex != keyIndex {
+					return nil
+				}
 			}
 
 			updated = current
@@ -1215,10 +1242,17 @@ func updateMultiKeyChannelStatusIfUnchanged(
 			if err != nil {
 				return err
 			}
+			updated.ChannelInfo = ChannelInfo{}
 			if err := common.Unmarshal(channelInfoJSON, &updated.ChannelInfo); err != nil {
 				return err
 			}
 			handlerMultiKeyUpdate(&updated, usingKey, status, reason)
+			if options.PlanQuotaResetAt > 0 {
+				if updated.ChannelInfo.MultiKeyDisabledUntil == nil {
+					updated.ChannelInfo.MultiKeyDisabledUntil = make(map[int]int64)
+				}
+				updated.ChannelInfo.MultiKeyDisabledUntil[keyIndex] = options.PlanQuotaResetAt + 60
+			}
 			if updated.Status == common.ChannelStatusAutoDisabled && options.PlanQuotaResetAt > 0 {
 				metadata := updated.GetOtherInfo()
 				metadata["quota_reset_at"] = options.PlanQuotaResetAt
@@ -1266,13 +1300,30 @@ func updateMultiKeyChannelStatusIfUnchanged(
 	})
 }
 
-func autoDisabledMultiKeyIndexes(channel *Channel) []int {
+// DueAutoDisabledMultiKeyIndexes returns due auto-disabled keys in stable
+// disabled-time/index order. Legacy all-disabled snapshots without the typed
+// map inherit the channel-level deadline.
+func (channel *Channel) DueAutoDisabledMultiKeyIndexes(now int64) []int {
 	if channel == nil {
 		return nil
 	}
 	indexes := make([]int, 0, len(channel.GetKeys()))
+	useLegacyDeadline := channel.Status == common.ChannelStatusAutoDisabled &&
+		channel.ChannelInfo.MultiKeyDisabledUntil == nil
+	legacyDeadline := int64(0)
+	if useLegacyDeadline {
+		legacyDeadline = channel.GetDisabledUntil()
+	}
 	for index := range channel.GetKeys() {
-		if channel.ChannelInfo.MultiKeyStatusList[index] == common.ChannelStatusAutoDisabled {
+		if channel.ChannelInfo.MultiKeyStatusList[index] != common.ChannelStatusAutoDisabled {
+			continue
+		}
+		deadline, hasDeadline := channel.ChannelInfo.MultiKeyDisabledUntil[index]
+		if !hasDeadline && useLegacyDeadline {
+			deadline = legacyDeadline
+			hasDeadline = legacyDeadline > 0
+		}
+		if !hasDeadline || deadline <= now {
 			indexes = append(indexes, index)
 		}
 	}
@@ -1285,6 +1336,18 @@ func autoDisabledMultiKeyIndexes(channel *Channel) []int {
 		return indexes[i] < indexes[j]
 	})
 	return indexes
+}
+
+func (channel *Channel) NextDueAutoDisabledMultiKeyIndex(now int64) (int, bool) {
+	indexes := channel.DueAutoDisabledMultiKeyIndexes(now)
+	if len(indexes) == 0 {
+		return 0, false
+	}
+	cursor := channel.ChannelInfo.MultiKeyRecoveryIndex
+	if cursor < 0 {
+		cursor = 0
+	}
+	return indexes[cursor%len(indexes)], true
 }
 
 // AdvanceMultiKeyRecoveryCursorIfUnchanged advances only the passive recovery
@@ -1311,7 +1374,7 @@ func AdvanceMultiKeyRecoveryCursorIfUnchanged(expected *Channel, usingKey string
 				return nil
 			}
 
-			indexes := autoDisabledMultiKeyIndexes(&current)
+			indexes := current.DueAutoDisabledMultiKeyIndexes(common.GetTimestamp())
 			if len(indexes) == 0 {
 				return nil
 			}
@@ -1330,6 +1393,7 @@ func AdvanceMultiKeyRecoveryCursorIfUnchanged(expected *Channel, usingKey string
 			if err != nil {
 				return err
 			}
+			updated.ChannelInfo = ChannelInfo{}
 			if err := common.Unmarshal(channelInfoJSON, &updated.ChannelInfo); err != nil {
 				return err
 			}

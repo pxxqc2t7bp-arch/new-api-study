@@ -88,6 +88,61 @@ func TestChannelHasEnabledKey(t *testing.T) {
 	}
 }
 
+func TestChannelDueAutoDisabledMultiKeyIndexes(t *testing.T) {
+	const now int64 = 2_000
+	channel := &Channel{
+		Key:    "key-a\nkey-b\nkey-c\nkey-d",
+		Status: common.ChannelStatusEnabled,
+		ChannelInfo: ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+				2: common.ChannelStatusManuallyDisabled,
+				3: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledTime: map[int]int64{
+				0: 100,
+				1: 300,
+				2: 50,
+				3: 200,
+			},
+			MultiKeyDisabledUntil: map[int]int64{
+				0: now + 60,
+				3: now,
+			},
+			MultiKeyRecoveryIndex: 1,
+		},
+	}
+
+	assert.Equal(t, []int{3, 1}, channel.DueAutoDisabledMultiKeyIndexes(now))
+	selected, ok := channel.NextDueAutoDisabledMultiKeyIndex(now)
+	require.True(t, ok)
+	assert.Equal(t, 1, selected)
+}
+
+func TestChannelDueAutoDisabledMultiKeyIndexesUsesLegacyFinalKeyDeadline(t *testing.T) {
+	const now int64 = 2_000
+	channel := &Channel{
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusAutoDisabled,
+		ChannelInfo: ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusManuallyDisabled,
+			},
+			MultiKeyDisabledTime: map[int]int64{0: 100, 1: 50},
+		},
+	}
+	channel.SetOtherInfo(map[string]any{"disabled_until": now + 60})
+
+	assert.Empty(t, channel.DueAutoDisabledMultiKeyIndexes(now))
+
+	channel.SetOtherInfo(map[string]any{"disabled_until": now})
+	assert.Equal(t, []int{0}, channel.DueAutoDisabledMultiKeyIndexes(now))
+}
+
 func TestUpdateChannelStatusPersistsMultiKeyState(t *testing.T) {
 	setupChannelStatusTest(t)
 
@@ -114,6 +169,89 @@ func TestUpdateChannelStatusPersistsMultiKeyState(t *testing.T) {
 	assert.Equal(t, "provider rejected key", stored.ChannelInfo.MultiKeyDisabledReason[0])
 	assert.NotZero(t, stored.ChannelInfo.MultiKeyDisabledTime[0])
 	assert.Equal(t, 1, stored.ChannelInfo.MultiKeyPollingIndex)
+}
+
+func TestUpdateChannelStatusClearsMultiKeyDeadlinesForNonQuotaTransitions(t *testing.T) {
+	t.Run("ordinary key disable clears target deadline", func(t *testing.T) {
+		setupChannelStatusTest(t)
+		channel := Channel{
+			Name: "ordinary-key-disable", Key: "key-a\nkey-b",
+			Status: common.ChannelStatusEnabled,
+			ChannelInfo: ChannelInfo{
+				IsMultiKey:            true,
+				MultiKeySize:          2,
+				MultiKeyDisabledUntil: map[int]int64{0: 2_000_000_000},
+			},
+		}
+		require.NoError(t, DB.Create(&channel).Error)
+
+		require.True(t, UpdateChannelStatus(
+			channel.Id,
+			"key-a",
+			common.ChannelStatusAutoDisabled,
+			"ordinary failure",
+		))
+
+		var stored Channel
+		require.NoError(t, DB.First(&stored, channel.Id).Error)
+		assert.NotContains(t, stored.ChannelInfo.MultiKeyDisabledUntil, 0)
+		assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	})
+
+	t.Run("manual channel disable clears every deadline", func(t *testing.T) {
+		setupChannelStatusTest(t)
+		channel := Channel{
+			Name: "manual-channel-disable", Key: "key-a\nkey-b",
+			Status: common.ChannelStatusEnabled,
+			ChannelInfo: ChannelInfo{
+				IsMultiKey:            true,
+				MultiKeySize:          2,
+				MultiKeyDisabledUntil: map[int]int64{0: 2_000_000_000, 1: 2_000_000_100},
+			},
+		}
+		channel.SetOtherInfo(map[string]any{
+			"owner":          "preserved",
+			"quota_reset_at": 1_999_999_940,
+			"disabled_until": 2_000_000_000,
+		})
+		require.NoError(t, DB.Create(&channel).Error)
+
+		require.True(t, UpdateChannelStatus(
+			channel.Id,
+			"",
+			common.ChannelStatusManuallyDisabled,
+			"manual operation",
+		))
+
+		var stored Channel
+		require.NoError(t, DB.First(&stored, channel.Id).Error)
+		assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.Status)
+		assert.Empty(t, stored.ChannelInfo.MultiKeyDisabledUntil)
+		assert.Equal(t, "preserved", stored.GetOtherInfo()["owner"])
+		assert.NotContains(t, stored.GetOtherInfo(), "quota_reset_at")
+		assert.NotContains(t, stored.GetOtherInfo(), "disabled_until")
+	})
+}
+
+func TestChannelUpdateDropsOutOfRangeMultiKeyDeadlines(t *testing.T) {
+	setupChannelStatusTest(t)
+	channel := Channel{
+		Name: "multi-key-shrink", Key: "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:            true,
+			MultiKeySize:          2,
+			MultiKeyDisabledUntil: map[int]int64{0: 1_000, 1: 2_000},
+		},
+	}
+	require.NoError(t, DB.Create(&channel).Error)
+
+	channel.Key = "key-a"
+	require.NoError(t, channel.Update())
+
+	var stored Channel
+	require.NoError(t, DB.First(&stored, channel.Id).Error)
+	assert.Equal(t, map[int]int64{0: 1_000}, stored.ChannelInfo.MultiKeyDisabledUntil)
 }
 
 func TestUpdateChannelStatusSingleKeyRollsBackAbilityFailure(t *testing.T) {

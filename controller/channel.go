@@ -69,6 +69,7 @@ func clearChannelInfo(channel *model.Channel) {
 	if channel.ChannelInfo.IsMultiKey {
 		channel.ChannelInfo.MultiKeyDisabledReason = nil
 		channel.ChannelInfo.MultiKeyDisabledTime = nil
+		channel.ChannelInfo.MultiKeyDisabledUntil = nil
 	}
 }
 
@@ -1718,6 +1719,11 @@ func ManageMultiKeys(c *gin.Context) {
 		}
 
 		channel.ChannelInfo.MultiKeyStatusList[keyIndex] = 2 // disabled
+		for index := range channel.ChannelInfo.MultiKeyDisabledUntil {
+			if channel.ChannelInfo.MultiKeyStatusList[index] != common.ChannelStatusAutoDisabled {
+				delete(channel.ChannelInfo.MultiKeyDisabledUntil, index)
+			}
+		}
 
 		err = channel.Update()
 		if err != nil {
@@ -1760,6 +1766,11 @@ func ManageMultiKeys(c *gin.Context) {
 		if channel.ChannelInfo.MultiKeyDisabledReason != nil {
 			delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
 		}
+		for index := range channel.ChannelInfo.MultiKeyDisabledUntil {
+			if channel.ChannelInfo.MultiKeyStatusList[index] != common.ChannelStatusAutoDisabled {
+				delete(channel.ChannelInfo.MultiKeyDisabledUntil, index)
+			}
+		}
 
 		err = channel.Update()
 		if err != nil {
@@ -1784,6 +1795,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyStatusList = make(map[int]int)
 		channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
 		channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
+		channel.ChannelInfo.MultiKeyDisabledUntil = make(map[int]int64)
 
 		err = channel.Update()
 		if err != nil {
@@ -1821,6 +1833,11 @@ func ManageMultiKeys(c *gin.Context) {
 			if status == 1 {
 				channel.ChannelInfo.MultiKeyStatusList[i] = 2 // disabled
 				disabledCount++
+			}
+		}
+		for index := range channel.ChannelInfo.MultiKeyDisabledUntil {
+			if channel.ChannelInfo.MultiKeyStatusList[index] != common.ChannelStatusAutoDisabled {
+				delete(channel.ChannelInfo.MultiKeyDisabledUntil, index)
 			}
 		}
 
@@ -1868,6 +1885,7 @@ func ManageMultiKeys(c *gin.Context) {
 		var newStatusList = make(map[int]int)
 		var newDisabledTime = make(map[int]int64)
 		var newDisabledReason = make(map[int]string)
+		var newDisabledUntil = make(map[int]int64)
 
 		newIndex := 0
 		for i, key := range keys {
@@ -1894,6 +1912,11 @@ func ManageMultiKeys(c *gin.Context) {
 					newDisabledReason[newIndex] = r
 				}
 			}
+			if newStatusList[newIndex] == common.ChannelStatusAutoDisabled {
+				if deadline, exists := channel.ChannelInfo.MultiKeyDisabledUntil[i]; exists {
+					newDisabledUntil[newIndex] = deadline
+				}
+			}
 			newIndex++
 		}
 
@@ -1911,6 +1934,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyStatusList = newStatusList
 		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
 		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
+		channel.ChannelInfo.MultiKeyDisabledUntil = newDisabledUntil
 
 		err = channel.Update()
 		if err != nil {
@@ -1932,6 +1956,7 @@ func ManageMultiKeys(c *gin.Context) {
 		var newStatusList = make(map[int]int)
 		var newDisabledTime = make(map[int]int64)
 		var newDisabledReason = make(map[int]string)
+		var newDisabledUntil = make(map[int]int64)
 
 		newIndex := 0
 		for i, key := range keys {
@@ -1979,6 +2004,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyStatusList = newStatusList
 		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
 		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
+		channel.ChannelInfo.MultiKeyDisabledUntil = newDisabledUntil
 
 		err = channel.Update()
 		if err != nil {

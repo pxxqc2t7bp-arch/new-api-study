@@ -372,14 +372,15 @@ func notifyManagedChannelRecovered(
 // probe. Manual and internal callers that intentionally act on current state
 // should continue using EnableChannel.
 func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) int {
-	if channel == nil || channel.Status != common.ChannelStatusAutoDisabled {
+	if channel == nil {
 		return 0
 	}
 	recoveryAt := time.Now().Unix()
-	if channel.GetDisabledUntil() > recoveryAt {
-		return 0
-	}
 	if channel.ChannelInfo.IsMultiKey {
+		if channel.Status != common.ChannelStatusEnabled &&
+			channel.Status != common.ChannelStatusAutoDisabled {
+			return 0
+		}
 		changed, err := model.RecoverMultiKeyChannelStatusIfUnchanged(
 			channel,
 			channel.GetTag(),
@@ -387,7 +388,7 @@ func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) int {
 			common.ChannelStatusEnabled,
 			"",
 			model.MultiKeyChannelStatusUpdateOptions{
-				ClearPlanQuotaDeadline: true,
+				ClearPlanQuotaDeadline: channel.Status == common.ChannelStatusAutoDisabled,
 			},
 			recoveryAt,
 		)
@@ -402,6 +403,10 @@ func EnableChannelForHealthCheck(channel *model.Channel, usingKey string) int {
 		content := fmt.Sprintf("通道「%s」（#%d）已被启用", channel.Name, channel.Id)
 		NotifyRootUser(formatNotifyType(channel.Id, common.ChannelStatusEnabled), subject, content)
 		return 1
+	}
+	if channel.Status != common.ChannelStatusAutoDisabled ||
+		channel.GetDisabledUntil() > recoveryAt {
+		return 0
 	}
 	if isNonMultiKeyPlanChannel(channel) {
 		if recoveryKey, owned := PlanQuotaRecoveryDomainKey(channel); owned {

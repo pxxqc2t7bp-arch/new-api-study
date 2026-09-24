@@ -583,6 +583,68 @@ func TestUpdateMultiKeyChannelStatusIfUnchangedPreservesInMemoryPollingCursor(t 
 	assert.Equal(t, "quota exhausted", cached.ChannelInfo.MultiKeyDisabledReason[0])
 }
 
+func TestUpdateMultiKeyChannelStatusIfUnchangedTracksPerKeyPlanDeadline(t *testing.T) {
+	setupChannelStatusTest(t)
+	tag := "plan:managed:partial-deadline"
+	const resetAt int64 = 2_000_000_000
+	channel := Channel{
+		Name:   "multi-key-partial-deadline",
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		Tag:    &tag,
+		Models: "gpt-3.5-turbo",
+		Group:  "default",
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+		},
+	}
+	channel.SetOtherInfo(map[string]any{"owner": "preserved"})
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	changed, err := UpdateMultiKeyChannelStatusIfUnchanged(
+		expected,
+		tag,
+		"key-a",
+		common.ChannelStatusAutoDisabled,
+		"quota exhausted",
+		MultiKeyChannelStatusUpdateOptions{PlanQuotaResetAt: resetAt},
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	stored, ability := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, resetAt+60, stored.ChannelInfo.MultiKeyDisabledUntil[0])
+	assert.Equal(t, "preserved", stored.GetOtherInfo()["owner"])
+	assert.NotContains(t, stored.GetOtherInfo(), "quota_reset_at")
+	assert.NotContains(t, stored.GetOtherInfo(), "disabled_until")
+	assert.True(t, ability.Enabled)
+
+	expected, err = GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	require.Equal(t, map[int]int64{0: resetAt + 60}, expected.ChannelInfo.MultiKeyDisabledUntil)
+	changed, err = UpdateMultiKeyChannelStatusIfUnchanged(
+		expected,
+		tag,
+		"key-a",
+		common.ChannelStatusAutoDisabled,
+		"quota exhausted without reset",
+		MultiKeyChannelStatusUpdateOptions{ClearPlanQuotaDeadline: true},
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+
+	stored, ability = loadChannelStatusCASFixture(t, channel.Id)
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyDisabledUntil, 0)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.True(t, ability.Enabled)
+}
+
 func TestAdvanceMultiKeyRecoveryCursorIfUnchangedFencesSnapshot(t *testing.T) {
 	t.Run("advances only recovery cursor", func(t *testing.T) {
 		setupChannelStatusTest(t)

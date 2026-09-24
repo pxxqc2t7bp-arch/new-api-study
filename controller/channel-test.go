@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -943,40 +942,20 @@ type channelTestSummary struct {
 
 func buildHealthCheckProbeChannel(channel *model.Channel) (*model.Channel, string, bool) {
 	if channel == nil ||
-		channel.Status != common.ChannelStatusAutoDisabled ||
+		(channel.Status != common.ChannelStatusEnabled &&
+			channel.Status != common.ChannelStatusAutoDisabled) ||
 		!channel.ChannelInfo.IsMultiKey {
 		return channel, "", false
 	}
 
 	keys := channel.GetKeys()
-	autoDisabledIndexes := make([]int, 0, len(keys))
-	for index := range keys {
-		status, exists := channel.ChannelInfo.MultiKeyStatusList[index]
-		if !exists || status == common.ChannelStatusEnabled {
-			return channel, "", false
-		}
-		if status == common.ChannelStatusAutoDisabled {
-			autoDisabledIndexes = append(autoDisabledIndexes, index)
-		}
-	}
-	if len(autoDisabledIndexes) == 0 {
+	selectedIndex, due := channel.NextDueAutoDisabledMultiKeyIndex(time.Now().Unix())
+	if !due {
 		return channel, "", false
 	}
-	sort.Slice(autoDisabledIndexes, func(i, j int) bool {
-		leftTime := channel.ChannelInfo.MultiKeyDisabledTime[autoDisabledIndexes[i]]
-		rightTime := channel.ChannelInfo.MultiKeyDisabledTime[autoDisabledIndexes[j]]
-		if leftTime != rightTime {
-			return leftTime < rightTime
-		}
-		return autoDisabledIndexes[i] < autoDisabledIndexes[j]
-	})
-	cursor := channel.ChannelInfo.MultiKeyRecoveryIndex
-	if cursor < 0 {
-		cursor = 0
-	}
-	selectedIndex := autoDisabledIndexes[cursor%len(autoDisabledIndexes)]
 
 	probe := *channel
+	probe.Keys = append([]string(nil), channel.Keys...)
 	probe.ChannelInfo = channel.ChannelInfo
 	probe.ChannelInfo.MultiKeyStatusList = make(map[int]int, len(channel.ChannelInfo.MultiKeyStatusList))
 	for index, status := range channel.ChannelInfo.MultiKeyStatusList {
@@ -990,7 +969,20 @@ func buildHealthCheckProbeChannel(channel *model.Channel) (*model.Channel, strin
 	for index, disabledTime := range channel.ChannelInfo.MultiKeyDisabledTime {
 		probe.ChannelInfo.MultiKeyDisabledTime[index] = disabledTime
 	}
-	delete(probe.ChannelInfo.MultiKeyStatusList, selectedIndex)
+	probe.ChannelInfo.MultiKeyDisabledUntil = make(map[int]int64, len(channel.ChannelInfo.MultiKeyDisabledUntil))
+	for index, disabledUntil := range channel.ChannelInfo.MultiKeyDisabledUntil {
+		probe.ChannelInfo.MultiKeyDisabledUntil[index] = disabledUntil
+	}
+	for index := range keys {
+		if index == selectedIndex {
+			delete(probe.ChannelInfo.MultiKeyStatusList, index)
+			continue
+		}
+		status, exists := probe.ChannelInfo.MultiKeyStatusList[index]
+		if !exists || status == common.ChannelStatusEnabled {
+			probe.ChannelInfo.MultiKeyStatusList[index] = common.ChannelStatusManuallyDisabled
+		}
+	}
 	// The probe has one enabled key, so random mode selects it without persisting
 	// a polling cursor or the temporary enabled state.
 	probe.ChannelInfo.MultiKeyMode = constant.MultiKeyModeRandom
@@ -1050,7 +1042,11 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 		summary.Disabled++
 	}
 
-	if result.localErr == nil && !isChannelEnabled && service.ShouldEnableChannel(newAPIError, channel.Status) {
+	shouldRecover := !isChannelEnabled && service.ShouldEnableChannel(newAPIError, channel.Status)
+	if isolatedProbe {
+		shouldRecover = common.AutomaticEnableChannelEnabled && newAPIError == nil
+	}
+	if result.localErr == nil && shouldRecover {
 		summary.Enabled += service.EnableChannelForHealthCheck(
 			channel,
 			common.GetContextKeyString(result.context, constant.ContextKeyChannelKey),
@@ -1232,20 +1228,25 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) ([]*
 		if mode == operation_setting.ChannelTestModeAutoBanOnly && !channel.GetAutoBan() {
 			continue
 		}
-		if mode == operation_setting.ChannelTestModePassiveRecovery && channel.Status != common.ChannelStatusAutoDisabled {
-			continue
-		}
 		if mode == operation_setting.ChannelTestModePassiveRecovery {
-			if disabledUntil := channel.GetDisabledUntil(); disabledUntil > now {
-				continue
+			isMultiKeyRecovery := false
+			if channel.ChannelInfo.IsMultiKey {
+				_, isMultiKeyRecovery = channel.NextDueAutoDisabledMultiKeyIndex(now)
+				if !isMultiKeyRecovery {
+					continue
+				}
+			} else {
+				if channel.Status != common.ChannelStatusAutoDisabled {
+					continue
+				}
+				if disabledUntil := channel.GetDisabledUntil(); disabledUntil > now {
+					continue
+				}
 			}
 			recoveryKey := fmt.Sprintf("channel:%d", channel.Id)
 			sharedRecoveryKey, owned := service.PlanQuotaRecoveryDomainKey(channel)
 			if _, managed := managedChannels[channel.Id]; managed && !owned {
-				isIsolatedMultiKeyRecovery := channel.Status == common.ChannelStatusAutoDisabled &&
-					channel.ChannelInfo.IsMultiKey &&
-					!channel.HasEnabledKey()
-				if !isIsolatedMultiKeyRecovery {
+				if !isMultiKeyRecovery {
 					continue
 				}
 			}

@@ -1732,6 +1732,147 @@ func TestEnableChannelForHealthCheckRecoversOnlySelectedFinalKey(t *testing.T) {
 	assert.True(t, ability.Enabled)
 }
 
+func TestEnableChannelForHealthCheckRecoversDuePartialKey(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+	common.MemoryCacheEnabled = true
+	tag := "plan:support:partial-multi-key-health"
+	channel := model.Channel{
+		Name:   "partial-multi-key-health",
+		Key:    "key-a\nkey-b\nkey-c",
+		Status: common.ChannelStatusEnabled,
+		Tag:    &tag,
+		Models: "gpt-3.5-turbo",
+		Group:  "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:           true,
+			MultiKeySize:         3,
+			MultiKeyMode:         constant.MultiKeyModePolling,
+			MultiKeyPollingIndex: 1,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				2: common.ChannelStatusManuallyDisabled,
+			},
+			MultiKeyDisabledReason: map[int]string{0: "quota exhausted", 2: "manual"},
+			MultiKeyDisabledTime:   map[int]int64{0: 100, 2: 200},
+			MultiKeyDisabledUntil:  map[int]int64{0: time.Now().Unix()},
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	model.InitChannelCache()
+
+	cached, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	pollingLock := model.GetChannelPollingLock(channel.Id)
+	pollingLock.Lock()
+	cached.ChannelInfo.MultiKeyPollingIndex = 2
+	pollingLock.Unlock()
+
+	enabled := EnableChannelForHealthCheck(&channel, "key-a")
+
+	assert.Equal(t, 1, enabled)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 0)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.ChannelInfo.MultiKeyStatusList[2])
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyDisabledUntil, 0)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+	cached, err = model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 2, cached.ChannelInfo.MultiKeyPollingIndex)
+	assert.NotContains(t, cached.ChannelInfo.MultiKeyStatusList, 0)
+}
+
+func TestEnableChannelForHealthCheckFencesPartialMultiKeyDeadlineAndManagedRoute(t *testing.T) {
+	tests := []struct {
+		name             string
+		deadlineOffset   int64
+		routeState       string
+		routeRank        int
+		routeDetached    bool
+		manualPauseUntil int64
+		wantEnabled      int
+	}{
+		{
+			name:           "future deadline",
+			deadlineOffset: 60,
+			routeState:     model.UpstreamRouteStateActive,
+			routeRank:      1,
+		},
+		{
+			name:           "active route",
+			deadlineOffset: -1,
+			routeState:     model.UpstreamRouteStateActive,
+			routeRank:      1,
+			wantEnabled:    1,
+		},
+		{
+			name:             "paused route",
+			deadlineOffset:   -1,
+			routeState:       model.UpstreamRouteStateActive,
+			routeRank:        1,
+			manualPauseUntil: time.Now().Add(time.Hour).Unix(),
+		},
+		{
+			name:           "detached route",
+			deadlineOffset: -1,
+			routeState:     model.UpstreamRouteStateActive,
+			routeRank:      1,
+			routeDetached:  true,
+		},
+		{
+			name:           "rank zero route",
+			deadlineOffset: -1,
+			routeState:     model.UpstreamRouteStateActive,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupPlanQuotaDomainTest(t)
+			now := time.Now().Unix()
+			tag := "plan:managed:partial-fence"
+			channel := model.Channel{
+				Name: "partial-multi-key-fence", Key: "key-a\nkey-b",
+				Status: common.ChannelStatusEnabled, Tag: &tag,
+				Models: "gpt-3.5-turbo", Group: "default",
+				ChannelInfo: model.ChannelInfo{
+					IsMultiKey: true, MultiKeySize: 2,
+					MultiKeyStatusList:    map[int]int{0: common.ChannelStatusAutoDisabled},
+					MultiKeyDisabledUntil: map[int]int64{0: now + testCase.deadlineOffset},
+				},
+			}
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+			require.NoError(t, db.Create(&model.UpstreamManagedRoute{
+				SourceID: 1, ExternalGroupID: "partial-fence",
+				Platform: "plan", Protocol: model.UpstreamProtocolOpenAI,
+				ChannelID: channel.Id, State: testCase.routeState,
+				Rank: testCase.routeRank, Detached: testCase.routeDetached,
+				ManualPauseUntil: testCase.manualPauseUntil,
+			}).Error)
+
+			enabled := EnableChannelForHealthCheck(&channel, "key-a")
+
+			assert.Equal(t, testCase.wantEnabled, enabled)
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			if testCase.wantEnabled == 1 {
+				assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 0)
+			} else {
+				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+			}
+			assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+			var ability model.Ability
+			require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+			assert.True(t, ability.Enabled)
+		})
+	}
+}
+
 func TestEnableChannelForHealthCheckFencesMultiKeySnapshotIdentity(t *testing.T) {
 	tests := []struct {
 		name   string

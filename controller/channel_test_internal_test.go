@@ -68,6 +68,23 @@ func TestValidateChannelProxy(t *testing.T) {
 	}
 }
 
+func TestClearChannelInfoRemovesMultiKeyDisableMetadata(t *testing.T) {
+	channel := &model.Channel{
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:             true,
+			MultiKeyDisabledReason: map[int]string{0: "quota exhausted"},
+			MultiKeyDisabledTime:   map[int]int64{0: 100},
+			MultiKeyDisabledUntil:  map[int]int64{0: 200},
+		},
+	}
+
+	clearChannelInfo(channel)
+
+	assert.Nil(t, channel.ChannelInfo.MultiKeyDisabledReason)
+	assert.Nil(t, channel.ChannelInfo.MultiKeyDisabledTime)
+	assert.Nil(t, channel.ChannelInfo.MultiKeyDisabledUntil)
+}
+
 func TestValidateChannelRequiresNewAPIBaseURL(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -245,6 +262,124 @@ func TestDeleteChannelBatchReportsAndAuditsActualDeletedCount(t *testing.T) {
 	assert.Equal(t, float64(1), auditData.Operation.Params["count"])
 }
 
+func TestManageMultiKeysMaintainsPerKeyDeadlines(t *testing.T) {
+	tests := []struct {
+		name          string
+		action        string
+		keyIndex      *int
+		wantKey       string
+		wantDeadlines map[int]int64
+	}{
+		{
+			name:          "enable key clears deadline",
+			action:        "enable_key",
+			keyIndex:      common.GetPointer(0),
+			wantKey:       "key-a\nkey-b\nkey-c\nkey-d",
+			wantDeadlines: map[int]int64{2: 1_200},
+		},
+		{
+			name:          "manual disable clears stale deadline",
+			action:        "disable_key",
+			keyIndex:      common.GetPointer(3),
+			wantKey:       "key-a\nkey-b\nkey-c\nkey-d",
+			wantDeadlines: map[int]int64{0: 1_000, 2: 1_200},
+		},
+		{
+			name:          "enable all clears deadlines",
+			action:        "enable_all_keys",
+			wantKey:       "key-a\nkey-b\nkey-c\nkey-d",
+			wantDeadlines: map[int]int64{},
+		},
+		{
+			name:          "disable all clears non-auto deadlines",
+			action:        "disable_all_keys",
+			wantKey:       "key-a\nkey-b\nkey-c\nkey-d",
+			wantDeadlines: map[int]int64{0: 1_000, 2: 1_200},
+		},
+		{
+			name:          "delete key reindexes deadlines",
+			action:        "delete_key",
+			keyIndex:      common.GetPointer(1),
+			wantKey:       "key-a\nkey-c\nkey-d",
+			wantDeadlines: map[int]int64{0: 1_000, 1: 1_200},
+		},
+		{
+			name:          "delete auto-disabled keys drops deadlines",
+			action:        "delete_disabled_keys",
+			wantKey:       "key-b\nkey-d",
+			wantDeadlines: map[int]int64{},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			require.NoError(t, db.AutoMigrate(&model.Log{}))
+			originalMemoryCacheEnabled := common.MemoryCacheEnabled
+			common.MemoryCacheEnabled = false
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = originalMemoryCacheEnabled
+			})
+
+			channel := model.Channel{
+				Name: "managed-keys", Key: "key-a\nkey-b\nkey-c\nkey-d",
+				Status: common.ChannelStatusEnabled,
+				Models: "gpt-3.5-turbo", Group: "default",
+				ChannelInfo: model.ChannelInfo{
+					IsMultiKey: true, MultiKeySize: 4,
+					MultiKeyStatusList: map[int]int{
+						0: common.ChannelStatusAutoDisabled,
+						1: common.ChannelStatusManuallyDisabled,
+						2: common.ChannelStatusAutoDisabled,
+					},
+					MultiKeyDisabledReason: map[int]string{
+						0: "auto-a", 1: "manual-b", 2: "auto-c",
+					},
+					MultiKeyDisabledTime: map[int]int64{
+						0: 100, 1: 200, 2: 300,
+					},
+					MultiKeyDisabledUntil: map[int]int64{
+						0: 1_000,
+						1: 1_100,
+						2: 1_200,
+						3: 1_300,
+					},
+				},
+			}
+			require.NoError(t, db.Create(&channel).Error)
+
+			body, err := common.Marshal(MultiKeyManageRequest{
+				ChannelId: channel.Id,
+				Action:    testCase.action,
+				KeyIndex:  testCase.keyIndex,
+			})
+			require.NoError(t, err)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Set("id", 1)
+			ctx.Set("role", common.RoleRootUser)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel/manage_multi_key", bytes.NewReader(body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+
+			ManageMultiKeys(ctx)
+
+			var response struct {
+				Success bool `json:"success"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			require.True(t, response.Success, recorder.Body.String())
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			assert.Equal(t, testCase.wantKey, stored.Key)
+			if len(testCase.wantDeadlines) == 0 {
+				assert.Empty(t, stored.ChannelInfo.MultiKeyDisabledUntil)
+			} else {
+				assert.Equal(t, testCase.wantDeadlines, stored.ChannelInfo.MultiKeyDisabledUntil)
+			}
+		})
+	}
+}
+
 func TestSettleTestQuotaUsesTieredBilling(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
@@ -360,6 +495,52 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *te
 	require.NoError(t, err)
 	require.Len(t, selected, 1)
 	require.Equal(t, 2, selected[0].Id)
+}
+
+func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesDuePartialMultiKey(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
+	now := time.Now().Unix()
+	newPartial := func(id int, status int, disabledUntil map[int]int64) *model.Channel {
+		return &model.Channel{
+			Id:     id,
+			Key:    "key-a\nkey-b",
+			Status: status,
+			ChannelInfo: model.ChannelInfo{
+				IsMultiKey: true,
+				MultiKeyStatusList: map[int]int{
+					0: common.ChannelStatusAutoDisabled,
+				},
+				MultiKeyDisabledUntil: disabledUntil,
+			},
+		}
+	}
+	due := newPartial(21, common.ChannelStatusEnabled, map[int]int64{0: now})
+	future := newPartial(22, common.ChannelStatusEnabled, map[int]int64{0: now + 60})
+	unknown := newPartial(23, common.ChannelStatusEnabled, map[int]int64{})
+	manual := newPartial(24, common.ChannelStatusManuallyDisabled, map[int]int64{0: now})
+	managed := newPartial(25, common.ChannelStatusEnabled, map[int]int64{0: now})
+	require.NoError(t, model.DB.Create(&model.UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "partial-managed",
+		Platform:        "plan",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       managed.Id,
+		State:           model.UpstreamRouteStateActive,
+		Rank:            1,
+	}).Error)
+
+	selected, err := selectChannelsForAutomaticTest(
+		[]*model.Channel{due, future, unknown, manual, managed},
+		operation_setting.ChannelTestModePassiveRecovery,
+	)
+
+	require.NoError(t, err)
+	selectedIDs := make([]int, len(selected))
+	for index, channel := range selected {
+		selectedIDs[index] = channel.Id
+	}
+	assert.Equal(t, []int{21, 23, 25}, selectedIDs)
 }
 
 func TestSelectChannelsForAutomaticTestDeduplicatesDuePlanDomain(t *testing.T) {
@@ -552,7 +733,7 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesManagedPlanQuota(t
 	for i, channel := range selected {
 		selectedIDs[i] = channel.Id
 	}
-	assert.Equal(t, []int{31, 32, 34, 35}, selectedIDs)
+	assert.Equal(t, []int{31, 32, 34, 35, 37}, selectedIDs)
 }
 
 func TestSelectChannelsForAutomaticTestAlwaysSkipsManualDisabled(t *testing.T) {
@@ -1406,6 +1587,149 @@ func TestBuildHealthCheckProbeChannelSelectsOldestAutoDisabledKey(t *testing.T) 
 	assert.Equal(t, "key-b", wrappedKey)
 }
 
+func TestBuildHealthCheckProbeChannelIsolatesDuePartialKey(t *testing.T) {
+	now := time.Now().Unix()
+	channel := &model.Channel{
+		Id:     72,
+		Key:    "due-known\nenabled\nmanual\nfuture\ndue-unknown",
+		Status: common.ChannelStatusEnabled,
+		Keys:   []string{"due-known", "enabled", "manual", "future", "due-unknown"},
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 5,
+			MultiKeyMode: constant.MultiKeyModePolling,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				2: common.ChannelStatusManuallyDisabled,
+				3: common.ChannelStatusAutoDisabled,
+				4: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledReason: map[int]string{
+				0: "known reset",
+				2: "manual",
+				3: "future reset",
+				4: "unknown reset",
+			},
+			MultiKeyDisabledTime: map[int]int64{
+				0: 200,
+				2: 50,
+				3: 100,
+				4: 300,
+			},
+			MultiKeyDisabledUntil: map[int]int64{
+				0: now,
+				3: now + 60,
+			},
+		},
+	}
+
+	probe, selectedKey, ok := buildHealthCheckProbeChannel(channel)
+
+	require.True(t, ok)
+	assert.Equal(t, "due-known", selectedKey)
+	assert.NotContains(t, probe.ChannelInfo.MultiKeyStatusList, 0)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, probe.ChannelInfo.MultiKeyStatusList[1])
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, probe.ChannelInfo.MultiKeyStatusList[2])
+	assert.Equal(t, common.ChannelStatusAutoDisabled, probe.ChannelInfo.MultiKeyStatusList[3])
+	assert.Equal(t, common.ChannelStatusAutoDisabled, probe.ChannelInfo.MultiKeyStatusList[4])
+	assert.Equal(t, constant.MultiKeyModeRandom, probe.ChannelInfo.MultiKeyMode)
+
+	probe.Keys[0] = "mutated"
+	probe.ChannelInfo.MultiKeyStatusList[2] = common.ChannelStatusEnabled
+	probe.ChannelInfo.MultiKeyDisabledReason[0] = "mutated"
+	probe.ChannelInfo.MultiKeyDisabledTime[0] = 1
+	probe.ChannelInfo.MultiKeyDisabledUntil[0] = 1
+	assert.Equal(t, "due-known", channel.Keys[0])
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, channel.ChannelInfo.MultiKeyStatusList[2])
+	assert.Equal(t, "known reset", channel.ChannelInfo.MultiKeyDisabledReason[0])
+	assert.EqualValues(t, 200, channel.ChannelInfo.MultiKeyDisabledTime[0])
+	assert.Equal(t, now, channel.ChannelInfo.MultiKeyDisabledUntil[0])
+}
+
+func TestChannelForHealthCheckRecoversDuePartialKeyAfterIsolatedProbe(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticEnableChannelEnabled := common.AutomaticEnableChannelEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = false
+	common.LogConsumeEnabled = false
+	common.AutomaticEnableChannelEnabled = true
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-partial-key-health":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticEnableChannelEnabled = originalAutomaticEnableChannelEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "partial-key-health-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	requestKeys := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestKeys <- strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id":"chatcmpl-partial-key-health",
+			"object":"chat.completion",
+			"created":1,
+			"model":"gpt-partial-key-health",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer upstream.Close()
+
+	autoBan := 1
+	channel := model.Channel{
+		Name: "partial-key-health", Type: constant.ChannelTypeOpenAI,
+		Key: "enabled-key\nprobe-key", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, AutoBan: &autoBan,
+		Models: "gpt-partial-key-health", Group: "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true, MultiKeySize: 2,
+			MultiKeyMode:          constant.MultiKeyModePolling,
+			MultiKeyStatusList:    map[int]int{1: common.ChannelStatusAutoDisabled},
+			MultiKeyDisabledTime:  map[int]int64{1: 100},
+			MultiKeyDisabledUntil: map[int]int64{1: time.Now().Unix()},
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	summary := testChannelForHealthCheck(
+		context.Background(),
+		&channel,
+		user.Id,
+		false,
+		10_000_000,
+	)
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Succeeded: 1, Enabled: 1}, summary)
+	require.Len(t, requestKeys, 1)
+	assert.Equal(t, "probe-key", <-requestKeys)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, channel.ChannelInfo.MultiKeyStatusList[1])
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Empty(t, stored.ChannelInfo.MultiKeyStatusList)
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyDisabledUntil, 1)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+}
+
 func TestIsUpstreamProbeFailureUsesParentContextState(t *testing.T) {
 	assert.False(t, isUpstreamProbeFailure(context.Background(), nil))
 	assert.True(t, isUpstreamProbeFailure(context.Background(), errors.New("upstream rejected request")))
@@ -1633,10 +1957,6 @@ func TestChannelForHealthCheckRotatesAfterResponseTimeFailure(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		requestKeys <- key
-		if key == "key-a" {
-			timer := time.NewTimer(20 * time.Millisecond)
-			<-timer.C
-		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, `{
 			"id":"chatcmpl-slow-key-health",
@@ -1674,7 +1994,7 @@ func TestChannelForHealthCheckRotatesAfterResponseTimeFailure(t *testing.T) {
 		&channel,
 		user.Id,
 		false,
-		1,
+		-1,
 	)
 	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1}, slowSummary)
 	assert.Equal(t, "key-a", <-requestKeys)
@@ -1843,6 +2163,7 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 
 	autoBan := 1
 	tag := "plan:managed:final-key"
+	resetAt := now.Add(time.Hour).Truncate(time.Second)
 	channel := model.Channel{
 		Name: "managed-final-key", Type: constant.ChannelTypeOpenAI,
 		Key: "key-a\nkey-b", BaseURL: &upstream.URL,
@@ -1861,6 +2182,9 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 			MultiKeyDisabledTime: map[int]int64{
 				0: now.Add(-time.Hour).Unix(),
 			},
+			MultiKeyDisabledUntil: map[int]int64{
+				0: resetAt.Unix() + 60,
+			},
 		},
 	}
 	channel.SetOtherInfo(map[string]any{
@@ -1876,7 +2200,6 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 	require.NoError(t, db.Create(&route).Error)
 	model.InitChannelCache()
 
-	resetAt := now.Add(time.Hour).Truncate(time.Second)
 	apiError := relaytypes.NewOpenAIError(
 		fmt.Errorf(
 			"You have exceeded the monthly usage quota. It will reset at %s.",
@@ -1898,6 +2221,10 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 	assert.Equal(t, common.ChannelStatusAutoDisabled, disabled.Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, disabled.ChannelInfo.MultiKeyStatusList[0])
 	assert.Equal(t, common.ChannelStatusAutoDisabled, disabled.ChannelInfo.MultiKeyStatusList[1])
+	assert.Equal(t, map[int]int64{
+		0: resetAt.Unix() + 60,
+		1: resetAt.Unix() + 60,
+	}, disabled.ChannelInfo.MultiKeyDisabledUntil)
 	disabledInfo := disabled.GetOtherInfo()
 	assert.Equal(t, float64(resetAt.Unix()), disabledInfo["quota_reset_at"])
 	assert.Equal(t, resetAt.Unix()+60, disabled.GetDisabledUntil())
@@ -1922,6 +2249,7 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 	assert.Equal(t, common.ChannelStatusAutoDisabled, reconciled.Status)
 	assert.Equal(t, float64(resetAt.Unix()), reconciled.GetOtherInfo()["quota_reset_at"])
 	assert.Equal(t, resetAt.Unix()+60, reconciled.GetDisabledUntil())
+	assert.Equal(t, disabled.ChannelInfo.MultiKeyDisabledUntil, reconciled.ChannelInfo.MultiKeyDisabledUntil)
 	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
 	assert.False(t, ability.Enabled)
 	selected, err = model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
@@ -1944,9 +2272,13 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 	dueInfo := reconciled.GetOtherInfo()
 	dueInfo["disabled_until"] = now.Add(-time.Minute).Unix()
 	reconciled.SetOtherInfo(dueInfo)
+	reconciled.ChannelInfo.MultiKeyDisabledUntil[0] = now.Add(-time.Minute).Unix()
 	require.NoError(t, db.Model(&model.Channel{}).
 		Where("id = ?", channel.Id).
-		Update("other_info", reconciled.OtherInfo).Error)
+		Updates(map[string]any{
+			"other_info":   reconciled.OtherInfo,
+			"channel_info": reconciled.ChannelInfo,
+		}).Error)
 
 	var progress []string
 	probeSummary, err := runChannelTestTask(
@@ -1970,6 +2302,8 @@ func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedP
 	assert.Equal(t, common.ChannelStatusEnabled, recovered.Status)
 	assert.NotContains(t, recovered.ChannelInfo.MultiKeyStatusList, 0)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, recovered.ChannelInfo.MultiKeyStatusList[1])
+	assert.NotContains(t, recovered.ChannelInfo.MultiKeyDisabledUntil, 0)
+	assert.Equal(t, resetAt.Unix()+60, recovered.ChannelInfo.MultiKeyDisabledUntil[1])
 	recoveredInfo := recovered.GetOtherInfo()
 	assert.Equal(t, "preserved", recoveredInfo["owner"])
 	assert.NotContains(t, recoveredInfo, "quota_reset_at")
