@@ -30,7 +30,7 @@
 - Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
 - Modify: `docs/mvp/handoff.md`
 
-- [ ] **Step 1: Add authority migration and backfill RED tests**
+- [x] **Step 1: Add authority migration and backfill RED tests**
 
 Add tests that require:
 
@@ -49,7 +49,7 @@ random `schema.NamingStrategy{TablePrefix: ...}`. Assert only non-empty
 single-key Plan credentials create authority rows, disabled ownership never
 backfills as active, and no stored value contains the credential.
 
-- [ ] **Step 2: Run migration RED**
+- [x] **Step 2: Run migration RED**
 
 Run:
 
@@ -60,7 +60,7 @@ go test ./model -run '^(TestInitializePlanQuotaDomains|TestPlanQuotaDomainHonors
 Expected: build failure because the authority type and initializer do not
 exist.
 
-- [ ] **Step 3: Implement schema, hashing, and fail-closed backfill**
+- [x] **Step 3: Implement schema, hashing, and fail-closed backfill**
 
 Create `model/plan_quota_domain.go` with:
 
@@ -88,11 +88,11 @@ row disabled. Use the newest valid decimal generation and maximum known
 deadline. Malformed or conflicting ownership must remain disabled or fail the
 initializer, never become active. Return every database or commit error.
 
-- [ ] **Step 4: Verify migration GREEN**
+- [x] **Step 4: Verify migration GREEN**
 
 Run the Step 2 command. Expected: PASS.
 
-- [ ] **Step 5: Add membership-writer RED tests**
+- [x] **Step 5: Add membership-writer RED tests**
 
 Add deterministic tests for:
 
@@ -113,7 +113,7 @@ that enters a disabled authority must commit auto-disabled with matching
 and no cache routing membership. A transaction/commit error must be returned
 after one attempt.
 
-- [ ] **Step 6: Run membership RED**
+- [x] **Step 6: Run membership RED**
 
 Run:
 
@@ -124,7 +124,7 @@ go test ./model -run '^TestPlanQuotaDomain(DisableSerializes|RecoverySerializes|
 Expected: FAIL because channel identity writers do not lock persistent domain
 authority.
 
-- [ ] **Step 7: Implement the authority lock protocol for all identity writers**
+- [x] **Step 7: Implement the authority lock protocol for all identity writers**
 
 Add internal helpers that:
 
@@ -155,7 +155,7 @@ rotation API for Codex callers. An existing Plan member with missing authority
 must fail closed. An entering channel may retain a manual disable, but it may
 never commit enabled while the destination authority is disabled.
 
-- [ ] **Step 8: Verify writer GREEN**
+- [x] **Step 8: Verify writer GREEN**
 
 Run the Step 6 command plus:
 
@@ -165,7 +165,7 @@ go test ./model ./service ./controller -run 'PlanQuotaDomain|CodexCredential|Cha
 
 Expected: PASS.
 
-- [ ] **Step 9: Add atomic disable/recovery RED tests**
+- [x] **Step 9: Add atomic disable/recovery RED tests**
 
 Extend service/model tests to require:
 
@@ -183,7 +183,7 @@ abilities, and cache publish atomically. Inject channel, ability, and commit
 errors separately. A recovery error must leave the authority disabled and
 publish no partial source or peer enable.
 
-- [ ] **Step 10: Run transition RED**
+- [x] **Step 10: Run transition RED**
 
 Run:
 
@@ -194,7 +194,7 @@ go test ./model ./service -run '^TestPlanQuotaDomain(Disable|CreateAfter|Recover
 Expected: FAIL because disable enumerates before its transaction and recovery
 commits source and peers separately.
 
-- [ ] **Step 11: Move shared-domain disable and recovery into authority transactions**
+- [x] **Step 11: Move shared-domain disable and recovery into authority transactions**
 
 Expose focused model request/result types rather than leaking `*gorm.DB` into
 the service package:
@@ -235,7 +235,7 @@ Delete `planQuotaDisableMaxAttempts` and the per-member shared-domain retry.
 Do not retry transaction or commit errors. Notify and publish only from the
 committed result.
 
-- [ ] **Step 12: Verify transition GREEN and regressions**
+- [x] **Step 12: Verify transition GREEN and regressions**
 
 Run:
 
@@ -247,7 +247,7 @@ go test -race ./service -run 'PlanQuota|Managed' -count=1
 
 Expected: PASS with no warnings or partial-state observations.
 
-- [ ] **Step 13: Run real-dialect and static gates**
+- [x] **Step 13: Run real-dialect and static gates**
 
 Run:
 
@@ -267,7 +267,7 @@ MySQL and PostgreSQL cases use isolated prefixed tables and drop only those
 tables. If DSNs are unavailable, record explicit skips. Expected: all
 configured cases and static gates pass.
 
-- [ ] **Step 14: Self-review and commit**
+- [x] **Step 14: Self-review and commit**
 
 Check for raw credential disclosure, hard-coded table names, unsorted lock
 sets, cache publication before commit, retries after unknown writes, direct

@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -52,11 +54,13 @@ func setupModelListControllerTestDB(t *testing.T) *gorm.DB {
 	require.NoError(t, db.AutoMigrate(
 		&model.User{},
 		&model.Channel{},
+		&model.PlanQuotaDomain{},
 		&model.Ability{},
 		&model.Model{},
 		&model.Vendor{},
 		&model.UpstreamManagedRoute{},
 	))
+	registerPlanQuotaAuthorityFixtureHook(t, db)
 
 	t.Cleanup(func() {
 		sqlDB, err := db.DB()
@@ -66,6 +70,97 @@ func setupModelListControllerTestDB(t *testing.T) *gorm.DB {
 	})
 
 	return db
+}
+
+func registerPlanQuotaAuthorityFixtureHook(t *testing.T, db *gorm.DB) {
+	t.Helper()
+
+	callbackName := "test:seed_controller_plan_quota_authority:" +
+		strings.ReplaceAll(t.Name(), "/", "_")
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil ||
+			tx.Statement.Schema == nil ||
+			tx.Statement.Schema.Name != "Channel" {
+			return
+		}
+		var channels []*model.Channel
+		switch destination := tx.Statement.Dest.(type) {
+		case *model.Channel:
+			channels = append(channels, destination)
+		case *[]model.Channel:
+			for index := range *destination {
+				channels = append(channels, &(*destination)[index])
+			}
+		case *[]*model.Channel:
+			channels = append(channels, (*destination)...)
+		}
+		for _, channel := range channels {
+			hash, member := model.PlanQuotaDomainMembership(channel)
+			if !member {
+				continue
+			}
+			state := model.PlanQuotaDomainStateActive
+			generation := int64(0)
+			disabledUntil := int64(0)
+			info := channel.GetOtherInfo()
+			if marker, markerOK := info["quota_domain_id"].(string); markerOK && marker == hash {
+				state = model.PlanQuotaDomainStateDisabled
+				if value, ok := info["quota_generation"].(string); ok {
+					generation, _ = strconv.ParseInt(value, 10, 64)
+				}
+				disabledUntil = channel.GetDisabledUntil()
+			} else if quotaType, typeOK := info["quota_type"].(string); typeOK &&
+				quotaType == "plan" &&
+				channel.Status == common.ChannelStatusAutoDisabled {
+				state = model.PlanQuotaDomainStateDisabled
+				disabledUntil = channel.GetDisabledUntil()
+			}
+
+			authorityDB := tx.Session(&gorm.Session{NewDB: true, SkipHooks: true})
+			var current model.PlanQuotaDomain
+			query := authorityDB.Model(&model.PlanQuotaDomain{}).
+				Where("credential_hash = ?", hash).
+				Limit(1).
+				Find(&current)
+			if query.Error != nil {
+				tx.AddError(query.Error)
+				return
+			}
+			if query.RowsAffected == 0 {
+				if err := authorityDB.Create(&model.PlanQuotaDomain{
+					CredentialHash: hash,
+					Generation:     generation,
+					State:          state,
+					DisabledUntil:  disabledUntil,
+				}).Error; err != nil {
+					tx.AddError(err)
+					return
+				}
+				continue
+			}
+			if state == model.PlanQuotaDomainStateDisabled {
+				if generation < current.Generation {
+					generation = current.Generation
+				}
+				if disabledUntil < current.DisabledUntil {
+					disabledUntil = current.DisabledUntil
+				}
+				if err := authorityDB.Model(&model.PlanQuotaDomain{}).
+					Where("credential_hash = ?", hash).
+					Updates(map[string]any{
+						"generation":     generation,
+						"state":          state,
+						"disabled_until": disabledUntil,
+					}).Error; err != nil {
+					tx.AddError(err)
+					return
+				}
+			}
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Create().Remove(callbackName))
+	})
 }
 
 func initModelListColumnNames(t *testing.T) {
@@ -88,11 +183,21 @@ func initModelListColumnNames(t *testing.T) {
 	}()
 
 	common.IsMasterNode = false
-	common.SQLitePath = fmt.Sprintf("file:%s_init?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
+	common.SQLitePath = filepath.Join(t.TempDir(), "column-init.db")
 	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
 	require.NoError(t, os.Setenv("SQL_DSN", "local"))
 
+	bootstrap, err := gorm.Open(sqlite.Open(common.SQLitePath), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, bootstrap.AutoMigrate(
+		&model.Channel{},
+		&model.PlanQuotaDomain{},
+	))
 	require.NoError(t, model.InitDB())
+	bootstrapSQL, err := bootstrap.DB()
+	if err == nil {
+		_ = bootstrapSQL.Close()
+	}
 	if model.DB != nil {
 		sqlDB, err := model.DB.DB()
 		if err == nil {

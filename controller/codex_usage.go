@@ -130,10 +130,21 @@ func fetchCodexChannelWhamData(
 			}
 
 			encoded, encErr := common.Marshal(oauthKey)
-			if encErr == nil {
-				_ = model.DB.Model(&model.Channel{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error
-				model.InitChannelCache()
+			if encErr != nil {
+				common.SysError(logPrefix + " credential encoding: " + encErr.Error())
+				c.JSON(http.StatusOK, gin.H{"success": false, "message": userMessage})
+				return
 			}
+			updated, changed, updateErr := model.UpdateChannelCredentialIfUnchanged(ch, string(encoded))
+			if updateErr != nil || !changed {
+				if updateErr == nil {
+					updateErr = fmt.Errorf("codex channel changed during credential refresh")
+				}
+				common.SysError(logPrefix + " credential persistence: " + updateErr.Error())
+				c.JSON(http.StatusOK, gin.H{"success": false, "message": userMessage})
+				return
+			}
+			ch = updated
 
 			ctx2, cancel2 := context.WithTimeout(c.Request.Context(), 15*time.Second)
 			defer cancel2()

@@ -94,10 +94,7 @@ func ApplyUpstreamEnrollmentResult(deviceID string, result rootdto.UpstreamEnrol
 			if buildErr != nil {
 				return buildErr
 			}
-			if err := tx.Create(channel).Error; err != nil {
-				return err
-			}
-			if err := channel.AddAbilities(tx); err != nil {
+			if err := model.InsertChannelWithAbilities(tx, channel); err != nil {
 				return err
 			}
 			route := model.UpstreamManagedRoute{

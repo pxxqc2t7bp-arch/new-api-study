@@ -487,29 +487,17 @@ func BatchInsertChannels(channels []Channel) error {
 	if len(channels) == 0 {
 		return nil
 	}
-	tx := DB.Begin()
-	if tx.Error != nil {
-		return tx.Error
+	channelPointers := make([]*Channel, len(channels))
+	for index := range channels {
+		channelPointers[index] = &channels[index]
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
-		}
-	}()
-
-	for _, chunk := range lo.Chunk(channels, 50) {
-		if err := tx.Create(&chunk).Error; err != nil {
-			tx.Rollback()
-			return err
-		}
-		for _, channel_ := range chunk {
-			if err := channel_.AddAbilities(tx); err != nil {
-				tx.Rollback()
-				return err
-			}
-		}
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		return insertChannelsWithPlanQuotaDomains(tx, channelPointers)
+	}); err != nil {
+		return err
 	}
-	return tx.Commit().Error
+	CacheUpdateChannels(channelPointers)
+	return nil
 }
 
 func BatchDeleteChannels(ids []int) (int64, error) {
@@ -580,26 +568,33 @@ func (channel *Channel) GetStatusCodeMapping() string {
 }
 
 func (channel *Channel) Insert() error {
-	var err error
-	err = DB.Create(channel).Error
-	if err != nil {
+	if channel == nil {
+		return errors.New("channel is nil")
+	}
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		return insertChannelsWithPlanQuotaDomains(tx, []*Channel{channel})
+	}); err != nil {
 		return err
 	}
-	err = channel.AddAbilities(nil)
-	return err
+	CacheUpdateChannel(channel)
+	return nil
 }
 
 func (channel *Channel) Update() error {
+	if channel == nil || channel.Id == 0 {
+		return errors.New("channel update snapshot is missing")
+	}
+	expected, err := GetChannelById(channel.Id, true)
+	if err != nil {
+		return err
+	}
 	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
 	if channel.ChannelInfo.IsMultiKey {
 		var keyStr string
 		if channel.Key != "" {
 			keyStr = channel.Key
 		} else {
-			// If key is not provided, read the existing key from the database
-			if existing, err := GetChannelById(channel.Id, true); err == nil {
-				keyStr = existing.Key
-			}
+			keyStr = expected.Key
 		}
 		// Parse the key list (supports newline separation or JSON array)
 		keys := []string{}
@@ -635,14 +630,14 @@ func (channel *Channel) Update() error {
 			}
 		}
 	}
-	var err error
-	err = DB.Model(channel).Updates(channel).Error
+
+	updated, err := updateChannelWithPlanQuotaDomains(channel, expected)
 	if err != nil {
 		return err
 	}
-	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	err = channel.UpdateAbilities(nil)
-	return err
+	*channel = *updated
+	CacheUpdateChannel(updated)
+	return nil
 }
 
 func (channel *Channel) UpdateResponseTime(responseTime int64) {
@@ -955,6 +950,18 @@ func updateSingleKeyChannelStatusIfUnchangedLocked(
 	changed := false
 	var updated Channel
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		expectedIdentity := &Channel{
+			Id:          channelId,
+			Key:         expectedKey,
+			Tag:         common.GetPointer(expectedTag),
+			Status:      expectedStatus,
+			OtherInfo:   expectedOtherInfo,
+			ChannelInfo: ChannelInfo{},
+		}
+		allowed, err := planQuotaDomainAllowsStatus(tx, expectedIdentity, status)
+		if err != nil || !allowed {
+			return err
+		}
 		if managedRouteRecoveryAt != nil {
 			allowed, err := lockManagedRouteRecoveryFence(tx, channelId, expectedTag, *managedRouteRecoveryAt)
 			if err != nil || !allowed {
@@ -1061,6 +1068,24 @@ func UpdateSingleKeyChannelStatusesIfUnchanged(updates []SingleKeyChannelStatusU
 	return withChannelStatusesLocks(channelIDs, func() (bool, error) {
 		updatedChannels := make([]Channel, len(sortedUpdates))
 		err := DB.Transaction(func(tx *gorm.DB) error {
+			requests := make([]planQuotaCredentialLock, 0, len(sortedUpdates))
+			for _, update := range sortedUpdates {
+				if request, member := planQuotaCredentialForChannel(update.Expected, false); member {
+					requests = append(requests, request)
+				}
+			}
+			domains, err := lockPlanQuotaDomains(tx, requests)
+			if err != nil {
+				return err
+			}
+			for _, update := range sortedUpdates {
+				request, member := planQuotaCredentialForChannel(update.Expected, false)
+				if member &&
+					update.Status == common.ChannelStatusEnabled &&
+					domains[request.hash].State == PlanQuotaDomainStateDisabled {
+					return errPlanQuotaDomainInvariant
+				}
+			}
 			for index, update := range sortedUpdates {
 				var current Channel
 				if err := lockForUpdate(tx).
@@ -1609,6 +1634,10 @@ func UpdateManagedChannelIfUnchanged(expected *Channel, update ManagedChannelUpd
 		changed := false
 		var updated Channel
 		err := DB.Transaction(func(tx *gorm.DB) error {
+			allowed, err := planQuotaDomainAllowsStatus(tx, expected, update.Status)
+			if err != nil || !allowed {
+				return err
+			}
 			currentRoute, matches, err := lockManagedDecisionSnapshot(
 				tx,
 				update.ExpectedSource,
@@ -1731,11 +1760,17 @@ func MergeChannelStatusMetadata(channelId int, updates map[string]interface{}) e
 }
 
 func EnableChannelByTag(tag string) error {
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Update("status", common.ChannelStatusEnabled).Error
+	channels, err := GetChannelsByTag(tag, false, true)
 	if err != nil {
 		return err
 	}
-	err = UpdateAbilityStatusByTag(tag, true)
+	_, err = mutateChannelSnapshotsWithPlanQuotaDomains(
+		channels,
+		true,
+		func(channel *Channel) {
+			channel.Status = common.ChannelStatusEnabled
+		},
+	)
 	return err
 }
 
@@ -1749,59 +1784,41 @@ func DisableChannelByTag(tag string) error {
 }
 
 func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *string, group *string, priority *int64, weight *uint, paramOverride *string, headerOverride *string) error {
-	updateData := Channel{}
-	shouldReCreateAbilities := false
-	updatedTag := tag
-	// 如果 newTag 不为空且不等于 tag，则更新 tag
-	if newTag != nil && *newTag != tag {
-		updateData.Tag = newTag
-		updatedTag = *newTag
-	}
-	if modelMapping != nil {
-		updateData.ModelMapping = modelMapping
-	}
-	if models != nil && *models != "" {
-		shouldReCreateAbilities = true
-		updateData.Models = *models
-	}
-	if group != nil && *group != "" {
-		shouldReCreateAbilities = true
-		updateData.Group = *group
-	}
-	if priority != nil {
-		updateData.Priority = priority
-	}
-	if weight != nil {
-		updateData.Weight = weight
-	}
-	if paramOverride != nil {
-		updateData.ParamOverride = paramOverride
-	}
-	if headerOverride != nil {
-		updateData.HeaderOverride = headerOverride
-	}
-
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Updates(updateData).Error
+	channels, err := GetChannelsByTag(tag, false, true)
 	if err != nil {
 		return err
 	}
-	if shouldReCreateAbilities {
-		channels, err := GetChannelsByTag(updatedTag, false, false)
-		if err == nil {
-			for _, channel := range channels {
-				err = channel.UpdateAbilities(nil)
-				if err != nil {
-					common.SysLog(fmt.Sprintf("failed to update abilities: channel_id=%d, tag=%s, error=%v", channel.Id, channel.GetTag(), err))
-				}
+	_, err = mutateChannelSnapshotsWithPlanQuotaDomains(
+		channels,
+		false,
+		func(channel *Channel) {
+			if newTag != nil && *newTag != tag {
+				channel.Tag = newTag
 			}
-		}
-	} else {
-		err := UpdateAbilityByTag(tag, newTag, priority, weight)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+			if modelMapping != nil {
+				channel.ModelMapping = modelMapping
+			}
+			if models != nil && *models != "" {
+				channel.Models = *models
+			}
+			if group != nil && *group != "" {
+				channel.Group = *group
+			}
+			if priority != nil {
+				channel.Priority = priority
+			}
+			if weight != nil {
+				channel.Weight = weight
+			}
+			if paramOverride != nil {
+				channel.ParamOverride = paramOverride
+			}
+			if headerOverride != nil {
+				channel.HeaderOverride = headerOverride
+			}
+		},
+	)
+	return err
 }
 
 func UpdateChannelUsedQuota(id int, quota int) {
@@ -1938,7 +1955,9 @@ func (channel *Channel) GetSetting() dto.ChannelSettings {
 		if err != nil {
 			common.SysLog(fmt.Sprintf("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
 			channel.Setting = nil // 清空设置以避免后续错误
-			_ = channel.Save()    // 保存修改
+			_ = DB.Model(&Channel{}).
+				Where("id = ?", channel.Id).
+				Update("setting", nil).Error
 		}
 	}
 	return setting
@@ -1960,7 +1979,9 @@ func (channel *Channel) GetOtherSettings() dto.ChannelOtherSettings {
 		if err != nil {
 			common.SysLog(fmt.Sprintf("failed to unmarshal setting: channel_id=%d, error=%v", channel.Id, err))
 			channel.OtherSettings = "{}" // 清空设置以避免后续错误
-			_ = channel.Save()           // 保存修改
+			_ = DB.Model(&Channel{}).
+				Where("id = ?", channel.Id).
+				Update("settings", channel.OtherSettings).Error
 		}
 	}
 	return setting
@@ -2004,36 +2025,28 @@ func GetChannelsByIds(ids []int) ([]*Channel, error) {
 }
 
 func BatchSetChannelTag(ids []int, tag *string) error {
-	// 开启事务
-	tx := DB.Begin()
-	if tx.Error != nil {
-		return tx.Error
+	if len(ids) == 0 {
+		return nil
 	}
-
-	// 更新标签
-	err := tx.Model(&Channel{}).Where("id in (?)", ids).Update("tag", tag).Error
-	if err != nil {
-		tx.Rollback()
-		return err
+	uniqueIDs := make(map[int]struct{}, len(ids))
+	for _, id := range ids {
+		uniqueIDs[id] = struct{}{}
 	}
-
-	// update ability status
 	channels, err := GetChannelsByIds(ids)
 	if err != nil {
-		tx.Rollback()
 		return err
 	}
-
-	for _, channel := range channels {
-		err = channel.UpdateAbilities(tx)
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
+	if len(channels) != len(uniqueIDs) {
+		return errors.New("channel tag mutation snapshot is incomplete")
 	}
-
-	// 提交事务
-	return tx.Commit().Error
+	_, err = mutateChannelSnapshotsWithPlanQuotaDomains(
+		channels,
+		false,
+		func(channel *Channel) {
+			channel.Tag = tag
+		},
+	)
+	return err
 }
 
 // CountAllChannels returns total channels in DB

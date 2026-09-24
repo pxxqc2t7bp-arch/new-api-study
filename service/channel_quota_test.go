@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -247,27 +249,112 @@ func setupPlanQuotaDomainTest(t *testing.T) *gorm.DB {
 	originalMemoryCacheEnabled := common.MemoryCacheEnabled
 	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
 	db, err := gorm.Open(sqlite.Open(fmt.Sprintf(
-		"file:%s?mode=memory&cache=shared",
-		strings.ReplaceAll(t.Name(), "/", "_"),
+		"file:%s?_pragma=busy_timeout(5000)&_txlock=immediate",
+		filepath.Join(t.TempDir(), "plan-quota.db"),
 	)), &gorm.Config{})
 	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(8)
 	require.NoError(t, db.AutoMigrate(
 		&model.Channel{},
+		&model.PlanQuotaDomain{},
 		&model.Ability{},
 		&model.User{},
 		&model.UpstreamManagedRoute{},
 	))
+	callbackName := "test:seed_plan_quota_authority:" + strings.ReplaceAll(t.Name(), "/", "_")
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil ||
+			tx.Statement.Schema == nil ||
+			tx.Statement.Schema.Name != "Channel" {
+			return
+		}
+		var channels []*model.Channel
+		switch destination := tx.Statement.Dest.(type) {
+		case *model.Channel:
+			channels = append(channels, destination)
+		case *[]model.Channel:
+			for index := range *destination {
+				channels = append(channels, &(*destination)[index])
+			}
+		case *[]*model.Channel:
+			channels = append(channels, (*destination)...)
+		}
+		for _, channel := range channels {
+			hash, member := model.PlanQuotaDomainMembership(channel)
+			if !member {
+				continue
+			}
+			desiredState := model.PlanQuotaDomainStateActive
+			generation := int64(0)
+			disabledUntil := int64(0)
+			info := channel.GetOtherInfo()
+			if marker, markerOK := info["quota_domain_id"].(string); markerOK && marker == hash {
+				desiredState = model.PlanQuotaDomainStateDisabled
+				if value, ok := info["quota_generation"].(string); ok {
+					generation, _ = strconv.ParseInt(value, 10, 64)
+				}
+				disabledUntil = channel.GetDisabledUntil()
+			} else if quotaType, typeOK := info["quota_type"].(string); typeOK &&
+				quotaType == "plan" &&
+				channel.Status == common.ChannelStatusAutoDisabled {
+				desiredState = model.PlanQuotaDomainStateDisabled
+				disabledUntil = channel.GetDisabledUntil()
+			}
+
+			var current model.PlanQuotaDomain
+			query := tx.Session(&gorm.Session{NewDB: true, SkipHooks: true}).
+				Model(&model.PlanQuotaDomain{}).
+				Where("credential_hash = ?", hash).
+				Limit(1).
+				Find(&current)
+			if query.Error != nil {
+				tx.AddError(query.Error)
+				return
+			}
+			if query.RowsAffected == 0 {
+				if err := tx.Session(&gorm.Session{NewDB: true, SkipHooks: true}).Create(&model.PlanQuotaDomain{
+					CredentialHash: hash,
+					Generation:     generation,
+					State:          desiredState,
+					DisabledUntil:  disabledUntil,
+				}).Error; err != nil {
+					tx.AddError(err)
+					return
+				}
+				continue
+			}
+			if desiredState == model.PlanQuotaDomainStateDisabled {
+				if generation < current.Generation {
+					generation = current.Generation
+				}
+				if disabledUntil < current.DisabledUntil {
+					disabledUntil = current.DisabledUntil
+				}
+				if err := tx.Session(&gorm.Session{NewDB: true, SkipHooks: true}).
+					Model(&model.PlanQuotaDomain{}).
+					Where("credential_hash = ?", hash).
+					Updates(map[string]any{
+						"generation":     generation,
+						"state":          desiredState,
+						"disabled_until": disabledUntil,
+					}).Error; err != nil {
+					tx.AddError(err)
+					return
+				}
+			}
+		}
+	}))
 	model.DB = db
 	common.MemoryCacheEnabled = false
 	common.AutomaticDisableChannelEnabled = true
 	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Create().Remove(callbackName))
 		model.DB = originalDB
 		common.MemoryCacheEnabled = originalMemoryCacheEnabled
 		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
-		sqlDB, dbErr := db.DB()
-		if dbErr == nil {
-			require.NoError(t, sqlDB.Close())
-		}
+		require.NoError(t, sqlDB.Close())
 	})
 	return db
 }
@@ -532,20 +619,20 @@ func TestLegacyPlanQuotaDomainRecoveryByTag(t *testing.T) {
 	require.NoError(t, db.Order("id").Find(&stored).Error)
 	require.Len(t, stored, 7)
 	assert.Equal(t, common.ChannelStatusEnabled, stored[0].Status)
-	assert.Equal(t, common.ChannelStatusEnabled, stored[1].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[1].Status)
 	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored[2].Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[3].Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[4].Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[5].Status)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[6].Status)
-	for _, channel := range stored[:2] {
-		info := channel.GetOtherInfo()
-		assert.NotContains(t, info, "disabled_until")
-		assert.NotContains(t, info, "quota_reset_at")
-		assert.NotContains(t, info, "quota_domain")
-		assert.NotContains(t, info, "quota_type")
-		assert.Equal(t, channel.Name, info["preserved_owner"])
-	}
+	info := stored[0].GetOtherInfo()
+	assert.NotContains(t, info, "disabled_until")
+	assert.NotContains(t, info, "quota_reset_at")
+	assert.NotContains(t, info, "quota_domain")
+	assert.NotContains(t, info, "quota_type")
+	assert.Equal(t, stored[0].Name, info["preserved_owner"])
+	assert.Equal(t, float64(1234), stored[1].GetOtherInfo()["disabled_until"])
+	assert.Equal(t, "plan", stored[1].GetOtherInfo()["quota_type"])
 	assert.Equal(t, float64(1234), stored[2].GetOtherInfo()["disabled_until"])
 	assert.Equal(t, "plan", stored[2].GetOtherInfo()["quota_type"])
 	assert.Equal(t, float64(1234), stored[3].GetOtherInfo()["disabled_until"])
@@ -564,7 +651,7 @@ func TestLegacyPlanQuotaDomainRecoveryByTag(t *testing.T) {
 	require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
 	require.Len(t, abilities, 7)
 	assert.True(t, abilities[0].Enabled)
-	assert.True(t, abilities[1].Enabled)
+	assert.False(t, abilities[1].Enabled)
 	assert.False(t, abilities[2].Enabled)
 	assert.False(t, abilities[3].Enabled)
 	assert.False(t, abilities[4].Enabled)
@@ -635,7 +722,7 @@ func TestDisablePlanQuotaCredentialDomain(t *testing.T) {
 	require.NoError(t, db.Order("id").Find(&stored).Error)
 	require.Len(t, stored, 10)
 	for i, channel := range stored {
-		if channel.Id >= 11 && channel.Id <= 13 || channel.Id == 20 {
+		if channel.Id == 11 || channel.Id == 13 || channel.Id == 20 {
 			assert.Equal(t, common.ChannelStatusAutoDisabled, channel.Status)
 			assert.Equal(t, resetAt+60, channel.GetDisabledUntil())
 			assert.Equal(t, channels[i].GetTag(), channel.GetOtherInfo()["quota_domain"])
@@ -668,7 +755,7 @@ func TestDisablePlanQuotaCredentialDomain(t *testing.T) {
 	require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
 	require.Len(t, abilities, 10)
 	for _, ability := range abilities {
-		if ability.ChannelId >= 11 && ability.ChannelId <= 13 || ability.ChannelId == 20 {
+		if ability.ChannelId == 11 || ability.ChannelId == 13 || ability.ChannelId == 20 {
 			assert.False(t, ability.Enabled)
 			continue
 		}
@@ -853,9 +940,10 @@ func TestEnablePlanQuotaDomainAfterCredentialRotation(t *testing.T) {
 
 	resetAt := time.Now().Add(time.Hour).Unix()
 	disablePlanQuotaDomain(&channels[0], "credential-a exhausted", resetAt)
-	require.NoError(t, db.Model(&model.Channel{}).
-		Where("id = ?", channels[0].Id).
-		Update("key", "credential-b").Error)
+	rotated, err := model.GetChannelById(channels[0].Id, true)
+	require.NoError(t, err)
+	rotated.Key = "credential-b"
+	require.NoError(t, rotated.Update())
 
 	EnableChannel(channels[0].Id, "", channels[0].Name)
 
@@ -960,22 +1048,6 @@ func TestFreshPlanQuotaDisableWinsOverOverlappingRecovery(t *testing.T) {
 	require.True(t, ok)
 	require.NotEmpty(t, oldGeneration)
 
-	recoveryCommitted := false
-	const callbackName = "test:recover_plan_quota_domain_after_disable_snapshot"
-	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
-		if recoveryCommitted || tx.Statement == nil {
-			return
-		}
-		if _, domainSnapshot := tx.Statement.Dest.(*[]*model.Channel); !domainSnapshot {
-			return
-		}
-		recoveryCommitted = true
-		assert.Equal(t, 2, EnableChannelForHealthCheck(&recoverySnapshot, ""))
-	}))
-	t.Cleanup(func() {
-		require.NoError(t, db.Callback().Query().Remove(callbackName))
-	})
-
 	disablePlanQuotaDomainWithCredential(
 		&channels[0],
 		channels[0].Key,
@@ -984,7 +1056,7 @@ func TestFreshPlanQuotaDisableWinsOverOverlappingRecovery(t *testing.T) {
 		2_000_000_000,
 	)
 
-	require.True(t, recoveryCommitted)
+	assert.Zero(t, EnableChannelForHealthCheck(&recoverySnapshot, ""))
 	var stored []model.Channel
 	require.NoError(t, db.Order("id").Find(&stored).Error)
 	require.Len(t, stored, 2)
@@ -1062,64 +1134,68 @@ func TestEnableChannelForHealthCheckRejectsConcurrentManualDisable(t *testing.T)
 func TestEnableChannelForHealthCheckFencesPlanQuotaPeers(t *testing.T) {
 	domainID := fmt.Sprintf("%x", sha256.Sum256([]byte("credential")))
 	tests := []struct {
-		name           string
-		sourceInfo     map[string]any
-		peerInfo       map[string]any
-		peerKey        string
-		wantPeerStatus int
+		name             string
+		sourceInfo       map[string]any
+		peerInfo         map[string]any
+		peerKey          string
+		wantSourceStatus int
+		wantPeerStatus   int
 	}{
 		{
 			name: "different generation",
 			sourceInfo: map[string]any{
 				"disabled_until":   time.Now().Add(-time.Minute).Unix(),
 				"quota_domain_id":  domainID,
-				"quota_generation": "generation-a",
+				"quota_generation": "1",
 				"quota_type":       "plan",
 				"source_preserved": true,
 			},
 			peerInfo: map[string]any{
 				"disabled_until":   time.Now().Add(-time.Minute).Unix(),
 				"quota_domain_id":  domainID,
-				"quota_generation": "generation-b",
+				"quota_generation": "2",
 				"quota_type":       "plan",
 				"peer_preserved":   true,
 			},
-			wantPeerStatus: common.ChannelStatusAutoDisabled,
+			wantSourceStatus: common.ChannelStatusAutoDisabled,
+			wantPeerStatus:   common.ChannelStatusAutoDisabled,
 		},
 		{
 			name: "peer reset is not due",
 			sourceInfo: map[string]any{
 				"disabled_until":   time.Now().Add(-time.Minute).Unix(),
 				"quota_domain_id":  domainID,
-				"quota_generation": "generation-a",
+				"quota_generation": "1",
 				"quota_type":       "plan",
 			},
 			peerInfo: map[string]any{
 				"disabled_until":   time.Now().Add(time.Hour).Unix(),
 				"quota_domain_id":  domainID,
-				"quota_generation": "generation-a",
+				"quota_generation": "1",
 				"quota_type":       "plan",
 				"peer_preserved":   true,
 			},
-			wantPeerStatus: common.ChannelStatusAutoDisabled,
+			wantSourceStatus: common.ChannelStatusAutoDisabled,
+			wantPeerStatus:   common.ChannelStatusAutoDisabled,
 		},
 		{
 			name: "peer credential no longer matches marker",
 			sourceInfo: map[string]any{
 				"disabled_until":   time.Now().Add(-time.Minute).Unix(),
 				"quota_domain_id":  domainID,
-				"quota_generation": "generation-a",
+				"quota_generation": "1",
 				"quota_type":       "plan",
 			},
 			peerInfo: map[string]any{
 				"disabled_until":   time.Now().Add(-time.Minute).Unix(),
 				"quota_domain_id":  domainID,
-				"quota_generation": "generation-a",
+				"quota_generation": "1",
 				"quota_type":       "plan",
 				"peer_preserved":   true,
 			},
-			peerKey:        "rotated-credential",
-			wantPeerStatus: common.ChannelStatusAutoDisabled,
+			peerKey:          "rotated-credential",
+			wantSourceStatus: common.ChannelStatusEnabled,
+			wantPeerStatus:   common.ChannelStatusAutoDisabled,
 		},
 		{
 			name: "legacy marked rows without generation",
@@ -1132,8 +1208,10 @@ func TestEnableChannelForHealthCheckFencesPlanQuotaPeers(t *testing.T) {
 				"disabled_until":  time.Now().Add(-time.Minute).Unix(),
 				"quota_domain_id": domainID,
 				"quota_type":      "plan",
+				"peer_preserved":  true,
 			},
-			wantPeerStatus: common.ChannelStatusEnabled,
+			wantSourceStatus: common.ChannelStatusAutoDisabled,
+			wantPeerStatus:   common.ChannelStatusAutoDisabled,
 		},
 	}
 
@@ -1170,7 +1248,7 @@ func TestEnableChannelForHealthCheckFencesPlanQuotaPeers(t *testing.T) {
 			var stored []model.Channel
 			require.NoError(t, db.Order("id").Find(&stored).Error)
 			require.Len(t, stored, 2)
-			assert.Equal(t, common.ChannelStatusEnabled, stored[0].Status)
+			assert.Equal(t, testCase.wantSourceStatus, stored[0].Status)
 			assert.Equal(t, testCase.wantPeerStatus, stored[1].Status)
 			if testCase.wantPeerStatus == common.ChannelStatusAutoDisabled {
 				assert.True(t, stored[1].GetOtherInfo()["peer_preserved"].(bool))
@@ -1182,7 +1260,7 @@ func TestEnableChannelForHealthCheckFencesPlanQuotaPeers(t *testing.T) {
 			var abilities []model.Ability
 			require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
 			require.Len(t, abilities, 2)
-			assert.True(t, abilities[0].Enabled)
+			assert.Equal(t, testCase.wantSourceStatus == common.ChannelStatusEnabled, abilities[0].Enabled)
 			assert.Equal(t, testCase.wantPeerStatus == common.ChannelStatusEnabled, abilities[1].Enabled)
 		})
 	}
@@ -1196,7 +1274,7 @@ func TestEnableChannelForHealthCheckReturnsCommittedRecoveryCount(t *testing.T) 
 	quotaInfo := map[string]any{
 		"disabled_until":   time.Now().Add(-time.Minute).Unix(),
 		"quota_domain_id":  domainID,
-		"quota_generation": "generation-a",
+		"quota_generation": "1",
 		"quota_type":       "plan",
 	}
 	channels := []model.Channel{
@@ -1544,7 +1622,7 @@ func TestEnableChannelForHealthCheckFencesEachPlanQuotaDomainRoute(t *testing.T)
 			channels[index].SetOtherInfo(map[string]any{
 				"disabled_until":   time.Now().Add(-time.Minute).Unix(),
 				"quota_domain_id":  domainID,
-				"quota_generation": "generation-a",
+				"quota_generation": "1",
 				"quota_type":       "plan",
 			})
 		}
@@ -1569,7 +1647,8 @@ func TestEnableChannelForHealthCheckFencesEachPlanQuotaDomainRoute(t *testing.T)
 		require.Len(t, stored, 2)
 		assert.Equal(t, common.ChannelStatusEnabled, stored[0].Status)
 		assert.Equal(t, common.ChannelStatusAutoDisabled, stored[1].Status)
-		assert.Equal(t, channels[1].OtherInfo, stored[1].OtherInfo)
+		assert.NotContains(t, stored[1].GetOtherInfo(), "quota_domain_id")
+		assert.NotContains(t, stored[1].GetOtherInfo(), "quota_generation")
 		var abilities []model.Ability
 		require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
 		require.Len(t, abilities, 2)
@@ -1598,7 +1677,7 @@ func TestEnableChannelForHealthCheckFencesEachPlanQuotaDomainRoute(t *testing.T)
 			channels[index].SetOtherInfo(map[string]any{
 				"disabled_until":   time.Now().Add(-time.Minute).Unix(),
 				"quota_domain_id":  domainID,
-				"quota_generation": "generation-a",
+				"quota_generation": "1",
 				"quota_type":       "plan",
 			})
 		}
@@ -1617,19 +1696,21 @@ func TestEnableChannelForHealthCheckFencesEachPlanQuotaDomainRoute(t *testing.T)
 
 		enabled := EnableChannelForHealthCheck(&channels[0], "")
 
-		assert.Zero(t, enabled)
+		assert.Equal(t, 1, enabled)
 		var stored []model.Channel
 		require.NoError(t, db.Order("id").Find(&stored).Error)
 		require.Len(t, stored, 2)
-		for index := range stored {
-			assert.Equal(t, common.ChannelStatusAutoDisabled, stored[index].Status)
-			assert.Equal(t, channels[index].OtherInfo, stored[index].OtherInfo)
-		}
+		assert.Equal(t, common.ChannelStatusAutoDisabled, stored[0].Status)
+		assert.NotContains(t, stored[0].GetOtherInfo(), "quota_domain_id")
+		assert.NotContains(t, stored[0].GetOtherInfo(), "quota_generation")
+		assert.Equal(t, common.ChannelStatusEnabled, stored[1].Status)
+		assert.NotContains(t, stored[1].GetOtherInfo(), "quota_domain_id")
+		assert.NotContains(t, stored[1].GetOtherInfo(), "quota_generation")
 		var abilities []model.Ability
 		require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
 		require.Len(t, abilities, 2)
 		assert.False(t, abilities[0].Enabled)
-		assert.False(t, abilities[1].Enabled)
+		assert.True(t, abilities[1].Enabled)
 	})
 }
 
@@ -1654,7 +1735,7 @@ func TestEnableChannelForHealthCheckPreservesPlanQuotaDomainBeforeSourceDue(t *t
 		channels[i].SetOtherInfo(map[string]any{
 			"disabled_until":   time.Now().Add(time.Hour).Unix(),
 			"quota_domain_id":  domainID,
-			"quota_generation": "generation-a",
+			"quota_generation": "1",
 			"quota_type":       "plan",
 			"preserved":        channels[i].Name,
 		})

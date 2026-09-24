@@ -253,6 +253,12 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedRejectsStaleSnapshot(t *testing.
 		channel.SetTag("plan:original")
 		require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).
 			Update("tag", channel.Tag).Error)
+		hash, ok := PlanQuotaDomainHash(channel.Key)
+		require.True(t, ok)
+		require.NoError(t, DB.Create(&PlanQuotaDomain{
+			CredentialHash: hash,
+			State:          PlanQuotaDomainStateActive,
+		}).Error)
 		expectedOtherInfo := channel.OtherInfo
 		rotatedTag := "plan:rotated"
 		require.NoError(t, DB.Model(&Channel{}).Where("id = ?", channel.Id).

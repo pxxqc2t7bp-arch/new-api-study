@@ -257,12 +257,14 @@ number of members actually enabled, and controller accounting adds that value
 rather than counting the probe attempt. Manual `EnableChannel` uses the same
 domain transaction without the deadline gate.
 
-For rows written before `quota_domain_id` existed, recovery falls back to the
-recovering channel's tag. A markerless row qualifies for this fallback only
-when it is auto-disabled and its metadata explicitly contains
-`quota_type="plan"` plus `quota_domain` equal to its current tag. Generic
-markerless failures, malformed legacy metadata, manually disabled rows, and
-rows carrying another marker are not part of that recovery domain.
+For rows written before `quota_domain_id` existed, startup accepts legacy
+ownership only when the row is auto-disabled and its metadata explicitly
+contains `quota_type="plan"` plus `quota_domain` equal to its current tag. That
+validation marks the row's exact-credential authority disabled; recovery
+membership remains scoped to that credential, so a same-tag row with another
+credential is not recovered. Generic markerless failures, malformed legacy
+metadata, manually disabled rows, and rows carrying another marker are not
+part of that recovery domain.
 
 The same recovery-domain classifier is reused by passive test selection.
 Marked rows deduplicate by `quota_domain_id`, validated legacy rows deduplicate

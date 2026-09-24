@@ -40,6 +40,9 @@ func setupUpstreamOrchestrationTest(t *testing.T) {
 		&model.UpstreamSyncCommand{},
 		&model.Vendor{},
 		&model.Model{},
+		&model.Channel{},
+		&model.PlanQuotaDomain{},
+		&model.Ability{},
 	))
 	model.DB = db
 	t.Cleanup(func() {
@@ -267,6 +270,61 @@ func TestManagedAdvancedCustomConfigPrefersNativeProtocols(t *testing.T) {
 		assert.Equal(t, payload.MessagesPath, anthropic.Routes[0].UpstreamPath)
 		assert.Equal(t, payload.MessagesConverter, anthropic.Routes[0].Converter)
 	})
+}
+
+func TestApplyUpstreamEnrollmentResultUsesAuthorityAwareChannelInsert(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+
+	source := model.UpstreamSource{
+		Key:              model.UpstreamSourceKeyHualong,
+		Name:             "Enrollment Source",
+		ConsoleURL:       "https://api.hualong.online",
+		SelectedEndpoint: "https://api-fast.hualong.online",
+		Status:           model.UpstreamHealthOperational,
+		Enabled:          true,
+	}
+	require.NoError(t, model.DB.Create(&source).Error)
+	payload := dto.UpstreamEnrollmentCommand{
+		SourceKey:       source.Key,
+		ExternalGroupID: "group-1",
+		GroupName:       "Group 1",
+		Platform:        "openai",
+		APIBaseURL:      source.SelectedEndpoint,
+		Models:          []string{"gpt-4.1"},
+	}
+	payloadJSON, err := common.Marshal(payload)
+	require.NoError(t, err)
+	command := model.UpstreamSyncCommand{
+		CommandID: "enrollment-command",
+		DeviceID:  "device-1",
+		Type:      upstreamSyncCommandEnroll,
+		SourceKey: source.Key,
+		Payload:   string(payloadJSON),
+		Status:    model.UpstreamSyncCommandRunning,
+	}
+	require.NoError(t, model.DB.Create(&command).Error)
+
+	require.NoError(t, ApplyUpstreamEnrollmentResult("device-1", dto.UpstreamEnrollmentResult{
+		CommandID:       command.CommandID,
+		Success:         true,
+		SourceKey:       source.Key,
+		ExternalGroupID: payload.ExternalGroupID,
+		ExternalKeyID:   "external-key",
+		APIKey:          "managed-secret",
+	}))
+
+	var channels []model.Channel
+	require.NoError(t, model.DB.Order("id").Find(&channels).Error)
+	require.Len(t, channels, 2)
+	var routes int64
+	require.NoError(t, model.DB.Model(&model.UpstreamManagedRoute{}).Count(&routes).Error)
+	assert.Equal(t, int64(2), routes)
+	var abilities int64
+	require.NoError(t, model.DB.Model(&model.Ability{}).Count(&abilities).Error)
+	assert.Equal(t, int64(4), abilities)
+	var authorities int64
+	require.NoError(t, model.DB.Model(&model.PlanQuotaDomain{}).Count(&authorities).Error)
+	assert.Zero(t, authorities)
 }
 
 func TestManagedTextModelFilter(t *testing.T) {
@@ -759,12 +817,13 @@ func TestReconcileManagedUpstreamsPreservesPlanQuotaOwnership(t *testing.T) {
 		channels[i].SetOtherInfo(map[string]any{
 			"disabled_until":   now.Add(time.Hour).Unix(),
 			"quota_domain_id":  planQuotaDomainID(channels[i].Id, channels[i].Key),
-			"quota_generation": "generation",
+			"quota_generation": "1",
 			"quota_type":       "plan",
 			"preserved_owner":  channels[i].Name,
 		})
 	}
 	require.NoError(t, model.DB.Create(&channels).Error)
+	require.NoError(t, model.InitializePlanQuotaDomains())
 	for i := range channels {
 		require.NoError(t, channels[i].AddAbilities(nil))
 	}
@@ -1569,6 +1628,7 @@ func TestReconcileManagedUpstreamsPreservesConcurrentPlanQuotaDisable(t *testing
 				Models: "gpt-old", Group: "default",
 			}
 			require.NoError(t, model.DB.Create(&channel).Error)
+			require.NoError(t, model.InitializePlanQuotaDomains())
 			require.NoError(t, channel.AddAbilities(nil))
 			route := model.UpstreamManagedRoute{
 				SourceID: source.ID, ExternalGroupID: group.ExternalID,
@@ -1583,7 +1643,7 @@ func TestReconcileManagedUpstreamsPreservesConcurrentPlanQuotaDisable(t *testing
 			disabled.SetOtherInfo(map[string]any{
 				"disabled_until":   now.Add(time.Hour).Unix(),
 				"quota_domain_id":  planQuotaDomainID(channel.Id, channel.Key),
-				"quota_generation": "concurrent-generation",
+				"quota_generation": "1",
 				"quota_type":       "plan",
 				"preserved_owner":  testCase.name,
 			})
@@ -1601,6 +1661,15 @@ func TestReconcileManagedUpstreamsPreservesConcurrentPlanQuotaDisable(t *testing
 				if _, inTransaction := tx.Statement.ConnPool.(*sql.Tx); inTransaction {
 					writer = tx.Session(&gorm.Session{NewDB: true, SkipHooks: true})
 				}
+				domainHash, member := model.PlanQuotaDomainMembership(&channel)
+				require.True(t, member)
+				require.NoError(t, writer.Model(&model.PlanQuotaDomain{}).
+					Where("credential_hash = ?", domainHash).
+					Updates(map[string]any{
+						"generation":     int64(1),
+						"state":          model.PlanQuotaDomainStateDisabled,
+						"disabled_until": now.Add(time.Hour).Unix(),
+					}).Error)
 				require.NoError(t, writer.Model(&model.Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{
 					"status":     disabled.Status,
 					"other_info": disabled.OtherInfo,
