@@ -15,6 +15,7 @@ import (
 	taskdto "github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	perfmetrics "github.com/QuantumNous/new-api/pkg/perf_metrics"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/bytedance/gopkg/util/gopool"
@@ -24,6 +25,7 @@ import (
 
 type taskPollingFetchAdaptor struct {
 	mu           sync.Mutex
+	initInfo     *relaycommon.RelayInfo
 	taskIDs      []string
 	fetched      chan string
 	blockTaskID  string
@@ -34,21 +36,32 @@ type taskPollingFetchAdaptor struct {
 
 type batchPollingAdaptor struct {
 	taskPollingFetchAdaptor
-	batchCalls int
-	batchIDs   []string
-	results    map[string]*BatchTaskResult
+	batchCalls     int
+	batchIDs       []string
+	batchKeys      []string
+	batchIDsByCall [][]string
+	batchParseKeys []string
+	parseErrors    map[string]error
+	results        map[string]*BatchTaskResult
 }
 
 func (a *batchPollingAdaptor) FetchMode() string { return "batch" }
-func (a *batchPollingAdaptor) FetchBatchTasks(_ string, _ string, tasks []*model.Task, _ string) (*http.Response, error) {
+func (a *batchPollingAdaptor) FetchBatchTasks(_ string, key string, tasks []*model.Task, _ string) (*http.Response, error) {
 	a.batchCalls++
 	a.batchIDs = a.batchIDs[:0]
 	for _, task := range tasks {
 		a.batchIDs = append(a.batchIDs, task.GetUpstreamTaskID())
 	}
+	a.batchKeys = append(a.batchKeys, key)
+	a.batchIDsByCall = append(a.batchIDsByCall, append([]string(nil), a.batchIDs...))
 	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader([]byte(`{}`)))}, nil
 }
 func (a *batchPollingAdaptor) ParseBatchResult(_ []*model.Task, _ *http.Response, _ []byte) (map[string]*BatchTaskResult, error) {
+	key := a.initAPIKey()
+	a.batchParseKeys = append(a.batchParseKeys, key)
+	if err := a.parseErrors[key]; err != nil {
+		return nil, err
+	}
 	if a.results != nil {
 		return a.results, nil
 	}
@@ -59,7 +72,27 @@ func (a *batchPollingAdaptor) ParseBatchResult(_ []*model.Task, _ *http.Response
 	return results, nil
 }
 
-func (a *taskPollingFetchAdaptor) Init(_ *relaycommon.RelayInfo) {}
+func (a *taskPollingFetchAdaptor) Init(info *relaycommon.RelayInfo) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.initInfo = info
+}
+func (a *taskPollingFetchAdaptor) initAPIKey() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.initInfo == nil {
+		return ""
+	}
+	return a.initInfo.ApiKey
+}
+func (a *taskPollingFetchAdaptor) initChannelMeta() *relaycommon.ChannelMeta {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.initInfo == nil {
+		return nil
+	}
+	return a.initInfo.ChannelMeta
+}
 
 func (a *taskPollingFetchAdaptor) FetchTask(_ string, _ string, task *model.Task, _ string) (*http.Response, error) {
 	taskID := ""
@@ -223,6 +256,87 @@ func TestUpdateVideoTasksDefaultSleepWaitsBetweenTasks(t *testing.T) {
 
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Equal(t, 1, adaptor.fetchCount())
+}
+
+func TestPollingPassesExecutingChannelTypeToAdaptor(t *testing.T) {
+	truncate(t)
+	const channelID = 112
+	baseURL := "https://gateway.example"
+	gateway := &model.Channel{Id: channelID, Type: constant.ChannelTypeNewAPI, Name: "gateway", Key: "sk-gateway", Status: common.ChannelStatusEnabled, BaseURL: &baseURL}
+	gateway.SetOtherSettings(dto.ChannelOtherSettings{DisableTaskPollingSleep: true})
+	require.NoError(t, model.DB.Create(gateway).Error)
+	task := seedPollingTask(t, channelID, "task_gateway", "upstream_gateway")
+	taskChannels := map[int][]string{channelID: {task.GetUpstreamTaskID()}}
+	tasks := map[string]*model.Task{task.GetUpstreamTaskID(): task}
+
+	perTask := &taskPollingFetchAdaptor{}
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return perTask }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+	require.NoError(t, UpdateVideoTasks(context.Background(), constant.TaskPlatform("kling"), taskChannels, tasks))
+	meta := perTask.initChannelMeta()
+	require.NotNil(t, meta, "per-task polling initializes the adaptor with channel metadata")
+	assert.Equal(t, constant.ChannelTypeNewAPI, meta.ChannelType, "the adaptor derives the upstream kind from the channel type")
+	assert.Equal(t, channelID, meta.ChannelId)
+	assert.Equal(t, baseURL, meta.ChannelBaseUrl)
+
+	batch := &batchPollingAdaptor{}
+	require.NoError(t, UpdateBatchTasks(context.Background(), batch, taskChannels, tasks))
+	meta = batch.initChannelMeta()
+	require.NotNil(t, meta, "batch polling initializes the adaptor with channel metadata")
+	assert.Equal(t, constant.ChannelTypeNewAPI, meta.ChannelType)
+	assert.Equal(t, channelID, meta.ChannelId)
+	assert.Equal(t, baseURL, meta.ChannelBaseUrl)
+}
+
+func TestUpdateBatchTasksPartitionsTasksByPinnedCredential(t *testing.T) {
+	truncate(t)
+	const channelID = 113
+	seedTaskPollingChannel(t, channelID, true)
+	first := seedPollingTask(t, channelID, "task_pinned_a", "upstream_pinned_a")
+	second := seedPollingTask(t, channelID, "task_pinned_b", "upstream_pinned_b")
+	first.PrivateData.Key = "credential-a"
+	second.PrivateData.Key = "credential-b"
+
+	adaptor := &batchPollingAdaptor{}
+	require.NoError(t, UpdateBatchTasks(context.Background(), adaptor, map[int][]string{
+		channelID: {first.GetUpstreamTaskID(), second.GetUpstreamTaskID(), first.GetUpstreamTaskID()},
+	}, map[string]*model.Task{
+		first.GetUpstreamTaskID():  first,
+		second.GetUpstreamTaskID(): second,
+	}))
+
+	require.Equal(t, 2, adaptor.batchCalls)
+	assert.Equal(t, adaptor.batchKeys, adaptor.batchParseKeys, "fetch and parse must use the same effective credential for each group")
+	batches := make(map[string][]string, adaptor.batchCalls)
+	for i, key := range adaptor.batchKeys {
+		batches[key] = adaptor.batchIDsByCall[i]
+	}
+	assert.Equal(t, []string{first.GetUpstreamTaskID()}, batches[first.PrivateData.Key])
+	assert.Equal(t, []string{second.GetUpstreamTaskID()}, batches[second.PrivateData.Key])
+}
+
+func TestUpdateBatchTasksIsolatesCredentialGroupErrors(t *testing.T) {
+	truncate(t)
+	const channelID = 114
+	seedTaskPollingChannel(t, channelID, true)
+	first := seedPollingTask(t, channelID, "task_error_a", "upstream_error_a")
+	second := seedPollingTask(t, channelID, "task_error_b", "upstream_error_b")
+	first.PrivateData.Key = "credential-a"
+	second.PrivateData.Key = "credential-b"
+
+	adaptor := &batchPollingAdaptor{parseErrors: map[string]error{"credential-a": io.ErrUnexpectedEOF}}
+	require.NoError(t, UpdateBatchTasks(context.Background(), adaptor, map[int][]string{
+		channelID: {first.GetUpstreamTaskID(), second.GetUpstreamTaskID()},
+	}, map[string]*model.Task{
+		first.GetUpstreamTaskID():  first,
+		second.GetUpstreamTaskID(): second,
+	}))
+
+	assert.Equal(t, []string{"credential-a", "credential-b"}, adaptor.batchKeys)
+	assert.Equal(t, adaptor.batchKeys, adaptor.batchParseKeys, "a failed credential group must not block later groups")
+	assert.Equal(t, 1, first.PrivateData.PollFailures)
+	assert.Zero(t, second.PrivateData.PollFailures)
 }
 
 func TestDispatchPlatformUpdateUsesFetchMode(t *testing.T) {
@@ -768,11 +882,12 @@ func TestSweepTimedOutTasksHonorsRefundRolloutBoundary(t *testing.T) {
 }
 
 type scriptedPollingAdaptor struct {
-	statusCode int
-	body       []byte
-	fetchErr   error
-	parse      *relaycommon.TaskInfo
-	parseErr   error
+	statusCode  int
+	body        []byte
+	fetchErr    error
+	parse       *relaycommon.TaskInfo
+	parseErr    error
+	adjustCalls int
 }
 
 func (a *scriptedPollingAdaptor) Init(*relaycommon.RelayInfo) {}
@@ -800,7 +915,57 @@ func (a *scriptedPollingAdaptor) ParseTaskResult(*model.Task, *http.Response, []
 	return &relaycommon.TaskInfo{Status: model.TaskStatusInProgress}, nil
 }
 func (a *scriptedPollingAdaptor) AdjustBillingOnComplete(*model.Task, *relaycommon.TaskInfo) int {
+	a.adjustCalls++
 	return 0
+}
+
+func TestUpdateVideoSingleTaskCancelledUsesTerminalFinalizerExactlyOnce(t *testing.T) {
+	truncate(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.PerfMetric{}))
+
+	const userID, tokenID, channelID = 509, 509, 509
+	const initialQuota, preConsumed, tokenRemain = 10_000, 4_000, 7_000
+	seedUser(t, userID, initialQuota)
+	seedToken(t, tokenID, userID, "sk-cancel-finalizer", tokenRemain)
+
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "task_cancel_finalizer"
+	task.SubmitTime = time.Now().Add(-time.Minute).Unix()
+	task.Properties.OriginModelName = "cancel-finalizer-model"
+	task.PrivateData.UpstreamTaskID = "upstream_cancel_finalizer"
+	task.PrivateData.BillingContext.OriginModelName = task.Properties.OriginModelName
+	require.NoError(t, model.DB.Create(task).Error)
+	metricRequestCount := func() int64 {
+		metrics, err := perfmetrics.QuerySummaryAll(1, nil)
+		require.NoError(t, err)
+		for _, summary := range metrics.Models {
+			if summary.ModelName == task.Properties.OriginModelName {
+				return summary.RequestCount
+			}
+		}
+		return 0
+	}
+	metricBaseline := metricRequestCount()
+
+	var winnerTask model.Task
+	var staleTask model.Task
+	require.NoError(t, model.DB.First(&winnerTask, task.ID).Error)
+	require.NoError(t, model.DB.First(&staleTask, task.ID).Error)
+
+	adaptor := &scriptedPollingAdaptor{parse: &relaycommon.TaskInfo{Status: model.TaskStatusCancelled}}
+	ch := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Key: "channel-credential"}
+	for _, candidate := range []*model.Task{&winnerTask, &staleTask} {
+		require.NoError(t, updateVideoSingleTask(context.Background(), adaptor, ch, task.GetUpstreamTaskID(), map[string]*model.Task{
+			task.GetUpstreamTaskID(): candidate,
+		}))
+	}
+
+	assert.Equal(t, 1, adaptor.adjustCalls)
+	assert.Equal(t, initialQuota+preConsumed, getUserQuota(t, userID))
+	assert.Equal(t, tokenRemain+preConsumed, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, int64(1), countLogs(t))
+
+	assert.Equal(t, int64(1), metricRequestCount()-metricBaseline)
 }
 
 type scriptedBatchPollingAdaptor struct {

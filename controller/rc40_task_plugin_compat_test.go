@@ -210,7 +210,7 @@ func TestRC40TaskPluginAcceptedPersistenceFailureIsNonRetryable(t *testing.T) {
 	database := setupTaskSubmissionDatabase(t, true, &events)
 	const callback = "test:rc40-task-persist-failure"
 	require.NoError(t, database.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
-		if tx.Statement.Table == "tasks" {
+		if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "Task" {
 			tx.AddError(errors.New("injected task persistence failure"))
 		}
 	}))

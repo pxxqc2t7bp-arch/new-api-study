@@ -3886,7 +3886,7 @@ func TestHostAppTaskWorkerPreservesUncertainQueries(t *testing.T) {
 			if test.name == "write descriptor" {
 				source, err := os.ReadFile("../plugins/tasks/doubao/plugin.js")
 				require.NoError(t, err)
-				const query = "url: ctx.baseUrl + \"/api/v3/contents/generations/tasks/\" + ctx.taskId,\n    method: \"GET\","
+				const query = "export function buildQueryRequest(ctx) {\n  return {\n    url: apiRoot(ctx) + \"/api/v3/contents/generations/tasks/\" + ctx.taskId,\n    method: \"GET\","
 				require.Equal(t, 1, strings.Count(string(source), query))
 				sourceOverride = []string{strings.Replace(string(source), query, strings.Replace(query, `"GET"`, `"POST"`, 1), 1)}
 			}
