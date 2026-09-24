@@ -463,6 +463,29 @@ func shouldPrioritizePlanQuotaDisable(err *types.NewAPIError) bool {
 	return quotaLimited
 }
 
+func processTaskChannelError(c *gin.Context, channel *model.Channel, taskErr *taskdto.TaskError) {
+	if c == nil || channel == nil || taskErr == nil || taskErr.LocalError {
+		return
+	}
+	processChannelError(
+		c,
+		*types.NewChannelError(
+			channel.Id,
+			channel.Type,
+			channel.Name,
+			channel.ChannelInfo.IsMultiKey,
+			common.GetContextKeyString(c, constant.ContextKeyChannelKey),
+			channel.GetAutoBan(),
+		),
+		common.GetContextKeyString(c, constant.ContextKeyChannelTag),
+		types.WithOpenAIError(types.OpenAIError{
+			Message: taskErr.Message,
+			Type:    taskErr.Type,
+			Code:    taskErr.Code,
+		}, taskErr.StatusCode),
+	)
+}
+
 func processChannelError(c *gin.Context, channelError types.ChannelError, observedTag string, err *types.NewAPIError) {
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
@@ -830,17 +853,7 @@ func executeTaskSubmissionWith(
 			break
 		}
 
-		if !taskErr.LocalError {
-			processChannelError(c,
-				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
-					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
-				channel.GetTag(),
-				types.WithOpenAIError(types.OpenAIError{
-					Message: taskErr.Message,
-					Type:    taskErr.Type,
-					Code:    taskErr.Code,
-				}, taskErr.StatusCode))
-		}
+		processTaskChannelError(c, channel, taskErr)
 
 		willRetry := shouldRetryTaskRelay(c, channel.Id, taskErr, maxTaskRetries-retryParam.GetRetry())
 		diagnostics.attemptFailed(retryParam.GetRetry()+1, channel, taskErr, willRetry)

@@ -1091,6 +1091,7 @@ func TestExecuteTaskSubmissionPreservesPlanQuotaErrorForChannelIsolation(t *test
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
 	common.SetContextKey(ctx, constant.ContextKeyChannelKey, channels[0].Key)
+	common.SetContextKey(ctx, constant.ContextKeyChannelTag, channels[0].GetTag())
 	relayInfo := &relaycommon.RelayInfo{
 		OriginModelName: "task-model",
 		TaskRelayInfo: &relaycommon.TaskRelayInfo{

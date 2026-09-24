@@ -244,7 +244,9 @@ func dispatchDeferredTask(ctx context.Context, task *model.Task) (*relay.TaskSub
 	}
 	info.InitChannelMeta(c)
 	info.UpstreamModelName = task.Properties.UpstreamModelName
-	return relay.RelayDeferredTaskSubmit(c, info, task.Platform, task.Quota)
+	result, taskErr := relay.RelayDeferredTaskSubmit(c, info, task.Platform, task.Quota)
+	processTaskChannelError(c, channel, taskErr)
+	return result, taskErr
 }
 
 func deferredTaskRequestContext(
