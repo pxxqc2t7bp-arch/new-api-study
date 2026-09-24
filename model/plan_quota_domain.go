@@ -937,7 +937,8 @@ func RecoverPlanQuotaDomain(
 				}
 				domain := domains[hash]
 				sourceGeneration, sourceDeadline, valid := planQuotaRecoverySnapshot(request.Source, hash)
-				if !valid ||
+				if request.Source.Status != common.ChannelStatusAutoDisabled ||
+					!valid ||
 					domain.State != PlanQuotaDomainStateDisabled ||
 					domain.Generation != sourceGeneration ||
 					domain.DisabledUntil != sourceDeadline ||
@@ -998,6 +999,7 @@ func RecoverPlanQuotaDomain(
 					if !owned {
 						continue
 					}
+					wasAutoDisabled := channel.Status == common.ChannelStatusAutoDisabled
 					info := channel.GetOtherInfo()
 					delete(info, "disabled_until")
 					delete(info, "quota_reset_at")
@@ -1006,7 +1008,7 @@ func RecoverPlanQuotaDomain(
 					delete(info, "quota_generation")
 					delete(info, "quota_type")
 					if planQuotaRouteAllowsRecovery(channel, routes[channel.Id], request.RecoveryAt) &&
-						channel.Status == common.ChannelStatusAutoDisabled {
+						wasAutoDisabled {
 						channel.Status = common.ChannelStatusEnabled
 						info["status_reason"] = ""
 						info["status_time"] = common.GetTimestamp()
@@ -1019,9 +1021,11 @@ func RecoverPlanQuotaDomain(
 					}).Error; err != nil {
 						return err
 					}
-					if err := tx.Model(&Ability{}).Where("channel_id = ?", channel.Id).
-						Select("enabled").Update("enabled", channel.Status == common.ChannelStatusEnabled).Error; err != nil {
-						return err
+					if wasAutoDisabled {
+						if err := tx.Model(&Ability{}).Where("channel_id = ?", channel.Id).
+							Select("enabled").Update("enabled", channel.Status == common.ChannelStatusEnabled).Error; err != nil {
+							return err
+						}
 					}
 					snapshot := *channel
 					result.Channels = append(result.Channels, &snapshot)
@@ -1075,8 +1079,7 @@ func lockPlanQuotaMemberSnapshots(tx *gorm.DB, expected []Channel) ([]Channel, e
 func planQuotaRecoverySnapshot(channel *Channel, hash string) (int64, int64, bool) {
 	channelHash, member := PlanQuotaDomainMembership(channel)
 	if !member ||
-		channelHash != hash ||
-		channel.Status != common.ChannelStatusAutoDisabled {
+		channelHash != hash {
 		return 0, 0, false
 	}
 	info := channel.GetOtherInfo()

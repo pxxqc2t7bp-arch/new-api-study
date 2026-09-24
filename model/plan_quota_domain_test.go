@@ -1619,6 +1619,119 @@ func TestPlanQuotaDomainRecoveryClearsQuotaOwnerButPreservesManagedRouteDisable(
 	assert.Zero(t, managedEnabled)
 }
 
+func TestPlanQuotaDomainRecoveryClearsManualPeerOwnershipBeforeRestart(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	sourceTag := "plan:test:manual-recovery-source"
+	manualTag := "plan:test:manual-recovery-manual"
+	peerTag := "plan:test:manual-recovery-peer"
+	const credential = "authority-secret-manual-recovery"
+
+	source := createPlanQuotaDomainFixture(
+		t, db, credential, sourceTag, PlanQuotaDomainStateActive, 0, 0,
+	)
+	peers := []Channel{
+		{
+			Name: "manual", Key: credential, Tag: &manualTag,
+			Status: common.ChannelStatusEnabled, Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Name: "peer", Key: credential, Tag: &peerTag,
+			Status: common.ChannelStatusEnabled, Models: "gpt-4.1", Group: "default",
+		},
+	}
+	require.NoError(t, db.Create(&peers).Error)
+	for index := range peers {
+		require.NoError(t, peers[index].AddAbilities(db))
+	}
+
+	disabled, err := DisablePlanQuotaDomain(PlanQuotaDomainDisableRequest{
+		FailingChannelID:   source.Id,
+		ObservedCredential: credential,
+		ObservedTag:        sourceTag,
+		Reason:             "quota exhausted",
+		ResetAt:            100,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 3, disabled.NewlyDisabled)
+
+	require.True(t, UpdateChannelStatus(
+		peers[0].Id,
+		"",
+		common.ChannelStatusManuallyDisabled,
+		"operator pause",
+	))
+	require.NoError(t, db.Model(&Ability{}).
+		Where("channel_id = ?", peers[0].Id).
+		Update("enabled", true).Error)
+
+	var manualBefore Channel
+	require.NoError(t, db.First(&manualBefore, peers[0].Id).Error)
+	manualInfoBefore := manualBefore.GetOtherInfo()
+	require.Equal(t, common.ChannelStatusManuallyDisabled, manualBefore.Status)
+	require.Equal(t, "operator pause", manualInfoBefore["status_reason"])
+	require.Contains(t, manualInfoBefore, "status_time")
+	require.Contains(t, manualInfoBefore, "quota_domain_id")
+
+	snapshot, err := GetChannelById(source.Id, true)
+	require.NoError(t, err)
+	recovered, err := RecoverPlanQuotaDomain(PlanQuotaDomainRecoveryRequest{
+		Source: snapshot, RecoveryAt: 161, RequireDue: true,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2, recovered.NewlyEnabled)
+	assert.Len(t, recovered.Channels, 3)
+
+	var authority PlanQuotaDomain
+	require.NoError(t, db.First(&authority).Error)
+	require.Equal(t, PlanQuotaDomainStateActive, authority.State)
+	recoveredGeneration := authority.Generation
+
+	assertPlanQuotaDomainChannelState(
+		t, db, source.Id, common.ChannelStatusEnabled, 0, 0,
+	)
+	assertPlanQuotaDomainChannelState(
+		t, db, peers[1].Id, common.ChannelStatusEnabled, 0, 0,
+	)
+
+	assertManualState := func() {
+		t.Helper()
+
+		var manual Channel
+		require.NoError(t, db.First(&manual, peers[0].Id).Error)
+		assert.Equal(t, common.ChannelStatusManuallyDisabled, manual.Status)
+		info := manual.GetOtherInfo()
+		assert.Equal(t, manualInfoBefore["status_reason"], info["status_reason"])
+		assert.Equal(t, manualInfoBefore["status_time"], info["status_time"])
+		for _, key := range []string{
+			"disabled_until",
+			"quota_reset_at",
+			"quota_domain",
+			"quota_domain_id",
+			"quota_generation",
+			"quota_type",
+		} {
+			assert.NotContains(t, info, key)
+		}
+		var ability Ability
+		require.NoError(t, db.First(&ability, "channel_id = ?", manual.Id).Error)
+		assert.True(t, ability.Enabled)
+	}
+	assertManualState()
+
+	require.NoError(t, InitializePlanQuotaDomains())
+
+	require.NoError(t, db.First(&authority).Error)
+	assert.Equal(t, PlanQuotaDomainStateActive, authority.State)
+	assert.Equal(t, recoveredGeneration, authority.Generation)
+	assertPlanQuotaDomainChannelState(
+		t, db, source.Id, common.ChannelStatusEnabled, 0, 0,
+	)
+	assertPlanQuotaDomainChannelState(
+		t, db, peers[1].Id, common.ChannelStatusEnabled, 0, 0,
+	)
+	assertManualState()
+}
+
 func TestPlanQuotaDomainBatchTagMutationEntersDisabledAuthority(t *testing.T) {
 	db := setupPlanQuotaAuthorityTest(t, "")
 	planTag := "plan:test:batch-tag"
