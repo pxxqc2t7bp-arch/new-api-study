@@ -198,6 +198,60 @@ export function parseTaskResult() { return {status: "SUCCESS", marker: "new"}; }
 	assert.Equal(t, "new", newObject["marker"])
 }
 
+func TestRC40TaskPluginAcceptedParseFailureDoesNotRefund(t *testing.T) {
+	service.InitHttpClient()
+	withTieredBillingConfig(
+		t,
+		map[string]string{"declared-model": "tiered_expr"},
+		map[string]string{"declared-model": `tier("flat", 3)`},
+	)
+
+	events := make([]string, 0, 1)
+	setupTaskSubmissionDatabase(t, true, &events)
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"job-42"}`))
+	}))
+	defer upstream.Close()
+
+	const source = `
+export const meta = {apiVersion:1,key:"rc40-parse-refund",name:"RC40 Parse Refund",version:"1.0.0",author:{name:"Test"},models:["declared-model"],fetchMode:"per_task"};
+export function buildSubmitRequest(ctx){return {url:ctx.baseUrl+"/submit",method:"POST",body:{model:ctx.model},action:"text_to_video"}}
+export function parseSubmitResponse(){throw new Error("rc40 parse failure")}
+export function buildQueryRequest(ctx){return {url:ctx.baseUrl+"/query"}}
+export function parseTaskResult(){return {status:"SUCCESS"}}
+`
+	plugin, err := jsplugin.NewRegistry().Register(source, jsplugin.Options{})
+	require.NoError(t, err)
+
+	context := taskSubmissionTestContext()
+	context.Set("group", "default")
+	context.Set("task_request", map[string]any{"prompt": "p"})
+	context.Set(jsplugin.ContextKeyPinnedPlugin, jsplugin.PinnedPlugin{Plugin: plugin})
+	common.SetContextKey(context, constant.ContextKeyOriginalModel, "declared-model")
+	common.SetContextKey(context, constant.ContextKeyChannelBaseUrl, upstream.URL)
+	common.SetContextKey(context, constant.ContextKeyChannelId, 1)
+	common.SetContextKey(context, constant.ContextKeyChannelType, constant.ChannelTypeTaskPlugin)
+
+	billing := &taskSubmissionTestBilling{events: &events}
+	info := taskSubmissionRelayInfo(billing)
+	info.UserGroup, info.UsingGroup = "default", "default"
+	info.OriginModelName = "declared-model"
+
+	outcome, taskErr := executeTaskSubmission(context, info)
+
+	assert.EqualValues(t, 1, requests.Load())
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "plugin_submit_response_failed", taskErr.Code)
+	assert.True(t, taskErr.NoRetry)
+	assert.True(t, taskErr.ProviderAccepted)
+	assert.Empty(t, events)
+	assert.Zero(t, billing.refunds)
+}
+
 func TestRC40TaskPluginAcceptedPersistenceFailureIsNonRetryable(t *testing.T) {
 	service.InitHttpClient()
 	withTieredBillingConfig(
@@ -257,6 +311,9 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 	require.NotNil(t, taskErr)
 	assert.Equal(t, "task_insert_failed", taskErr.Code)
 	assert.True(t, taskErr.NoRetry, "an accepted provider operation must not be submitted again")
+	assert.True(t, taskErr.ProviderAccepted)
+	assert.Equal(t, []string{"reserve", "insert"}, events)
+	assert.Zero(t, billing.refunds)
 	var persisted int64
 	require.NoError(t, database.Model(&model.Task{}).Count(&persisted).Error)
 	assert.Zero(t, persisted)

@@ -139,6 +139,7 @@ func TestRC40ReasoningStreamLifecycleAndSegmentation(t *testing.T) {
 		assert.Equal(t, "calling", output[1].Content[0].Text)
 		assert.Equal(t, "round 2", output[3].Summary[0].Text)
 		assert.Equal(t, "final", output[4].Content[0].Text)
+		assert.Equal(t, "calling\nfinal", state.UsageText())
 	})
 }
 

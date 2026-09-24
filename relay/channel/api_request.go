@@ -28,6 +28,24 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+var ErrProviderRequestNotStarted = errors.New("provider request not started")
+
+type providerRequestNotStartedError struct {
+	cause error
+}
+
+func (e providerRequestNotStartedError) Error() string {
+	return e.cause.Error()
+}
+
+func (e providerRequestNotStartedError) Unwrap() error {
+	return e.cause
+}
+
+func (e providerRequestNotStartedError) Is(target error) bool {
+	return target == ErrProviderRequestNotStarted || errors.Is(e.cause, target)
+}
+
 // ApplyUpstreamBodyMetadata restores metadata that net/http cannot infer from
 // a ReplayableBody. Callers must pass the original body because NewRequest
 // hides its dynamic type behind req.Body's io.ReadCloser wrapper.
@@ -562,7 +580,9 @@ func keepUpstreamRedirectResponse(_ *http.Request, _ []*http.Request) error {
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
 	client, err := service.GetHttpClientWithProxySettings(info.ChannelSetting.Proxy, info.ChannelSetting)
 	if err != nil {
-		return nil, fmt.Errorf("new proxy http client failed: %w", err)
+		return nil, providerRequestNotStartedError{
+			cause: fmt.Errorf("new proxy http client failed: %w", err),
+		}
 	}
 	// Clients are cached and shared across channels, so override redirect
 	// behavior on a shallow copy instead of mutating the cached client. This

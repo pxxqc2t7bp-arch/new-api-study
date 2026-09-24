@@ -5,14 +5,15 @@ import (
 )
 
 type TaskError struct {
-	// NoRetry prevents duplicate upstream work after a response has been accepted.
-	NoRetry    bool   `json:"-"`
-	Code       string `json:"code"`
-	Message    string `json:"message"`
-	Data       any    `json:"data"`
-	StatusCode int    `json:"-"`
-	LocalError bool   `json:"-"`
-	Error      error  `json:"-"`
+	// NoRetry also covers unknown provider writes where acceptance is unconfirmed.
+	NoRetry          bool   `json:"-"`
+	ProviderAccepted bool   `json:"-"`
+	Code             string `json:"code"`
+	Message          string `json:"message"`
+	Data             any    `json:"data"`
+	StatusCode       int    `json:"-"`
+	LocalError       bool   `json:"-"`
+	Error            error  `json:"-"`
 }
 
 type TaskData interface {
@@ -86,9 +87,15 @@ type TaskAdminInfo struct {
 }
 
 type TaskRootInfo struct {
-	TaskPlugin     *TaskPluginRuntimeInfo `json:"task_plugin,omitempty"`
-	UpstreamTaskID string                 `json:"upstream_task_id,omitempty"`
-	NodeName       string                 `json:"node_name,omitempty"`
+	TaskPlugin                 *TaskPluginRuntimeInfo `json:"task_plugin,omitempty"`
+	UpstreamTaskID             string                 `json:"upstream_task_id,omitempty"`
+	NodeName                   string                 `json:"node_name,omitempty"`
+	ExecutionMode              string                 `json:"execution_mode"`
+	DispatchStatus             string                 `json:"dispatch_status"`
+	DispatchStartedAt          int64                  `json:"dispatch_started_at"`
+	DispatchAttempts           int                    `json:"dispatch_attempts"`
+	DispatchError              string                 `json:"dispatch_error"`
+	RequiresOperatorResolution bool                   `json:"requires_operator_resolution"`
 }
 
 type FetchReq struct {

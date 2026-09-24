@@ -791,9 +791,10 @@ func executeTaskSubmissionWith(
 	var result *relay.TaskSubmitResult
 	var taskErr *taskdto.TaskError
 	durable := false
+	providerAccepted := false
 	stage := "start"
 	defer func() {
-		if !durable && relayInfo.Billing != nil {
+		if !durable && !providerAccepted && relayInfo.Billing != nil {
 			diagnostics.refund(stage)
 			relayInfo.Billing.Refund(c)
 		}
@@ -860,9 +861,17 @@ func executeTaskSubmissionWith(
 
 		stage = "submit"
 		result, taskErr = submit(c, relayInfo)
+		if taskErr != nil && taskErr.ProviderAccepted {
+			providerAccepted = true
+		}
+		if result != nil && result.ProviderAccepted {
+			providerAccepted = true
+		}
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+			taskErr.NoRetry = providerAccepted
+			taskErr.ProviderAccepted = providerAccepted
 			break
 		}
 		if taskErr == nil {
@@ -896,28 +905,36 @@ func executeTaskSubmissionWith(
 	}
 
 	if taskErr != nil {
+		taskErr.ProviderAccepted = providerAccepted
 		diagnostics.failed(stage, "task_error", taskErr, false)
 		return nil, taskErr
 	}
 	if result == nil {
 		taskErr = service.TaskErrorWrapperLocal(errors.New("task submission returned no result"), "task_submit_failed", http.StatusInternalServerError)
+		taskErr.NoRetry = providerAccepted
+		taskErr.ProviderAccepted = providerAccepted
 		diagnostics.failed("submit", "missing_result", taskErr, false)
 		return nil, taskErr
 	}
 	if requestErr := c.Request.Context().Err(); requestErr != nil {
 		diagnostics.cancelled("before_reserve", retryParam.GetRetry()+1)
-		return nil, service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+		taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+		taskErr.NoRetry = providerAccepted
+		taskErr.ProviderAccepted = providerAccepted
+		return nil, taskErr
 	}
 
 	// Reserve any submit-time upward billing adjustment before persistence.
-	// This keeps insertion failures fully refundable while ensuring settlement
-	// after the barrier normally has a zero positive delta.
+	// Deferred local queueing remains refundable before persistence; accepted
+	// provider work does not, even if reserve or persistence subsequently fails.
 	if relayInfo.Billing != nil {
 		stage = "reserve"
 		diagnostics.reserve("reserve_start", result.Quota)
 		if reserveErr := relayInfo.Billing.Reserve(result.Quota); reserveErr != nil {
 			common.SysError("reserve adjusted task billing error: " + reserveErr.Error())
 			taskErr = service.TaskErrorWrapperLocal(errors.New("insufficient quota for adjusted task cost"), string(types.ErrorCodeInsufficientUserQuota), http.StatusForbidden)
+			taskErr.NoRetry = providerAccepted
+			taskErr.ProviderAccepted = providerAccepted
 			diagnostics.failed("reserve", "insufficient_quota", taskErr, false)
 			return nil, taskErr
 		}
@@ -925,7 +942,10 @@ func executeTaskSubmissionWith(
 	}
 	if requestErr := c.Request.Context().Err(); requestErr != nil {
 		diagnostics.cancelled("before_insert", retryParam.GetRetry()+1)
-		return nil, service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+		taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
+		taskErr.NoRetry = providerAccepted
+		taskErr.ProviderAccepted = providerAccepted
+		return nil, taskErr
 	}
 
 	stage = "insert"
@@ -1002,6 +1022,8 @@ func executeTaskSubmissionWith(
 	if insertErr := task.InsertWithContext(c.Request.Context(), insertOmits...); insertErr != nil {
 		common.SysError("insert task error: " + insertErr.Error())
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to persist task"), "task_insert_failed", http.StatusInternalServerError)
+		taskErr.NoRetry = providerAccepted
+		taskErr.ProviderAccepted = providerAccepted
 		diagnostics.failed("insert", "database_error", taskErr, false)
 		return nil, taskErr
 	}
@@ -1013,6 +1035,8 @@ func executeTaskSubmissionWith(
 	if settleErr := service.SettleBilling(c, relayInfo, result.Quota); settleErr != nil {
 		common.SysError("settle task billing error: " + settleErr.Error())
 		taskErr = service.TaskErrorWrapperLocal(errors.New("failed to settle task billing"), "task_billing_settlement_failed", http.StatusInternalServerError)
+		taskErr.NoRetry = providerAccepted
+		taskErr.ProviderAccepted = providerAccepted
 		diagnostics.failed("settle", "billing_error", taskErr, true)
 		return nil, taskErr
 	}

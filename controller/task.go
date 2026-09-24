@@ -35,6 +35,19 @@ var (
 	errTaskArtifactPlugin            = errors.New("task artifact plugin error")
 )
 
+const (
+	deferredResolutionProviderAccepted   = "provider_accepted"
+	deferredResolutionAbandonUnknown     = "abandon_unknown"
+	maxDeferredResolutionReasonBytes     = 2000
+	maxDeferredResolutionUpstreamIDBytes = 512
+)
+
+type deferredTaskResolutionRequest struct {
+	Resolution     string `json:"resolution"`
+	UpstreamTaskID string `json:"upstream_task_id"`
+	Reason         string `json:"reason"`
+}
+
 func GetTask(c *gin.Context) {
 	var task *model.Task
 	if retrieval, ok := middleware.GetAppGrantTaskRetrieval(c); ok {
@@ -69,6 +82,85 @@ func GetTask(c *gin.Context) {
 		"created_at":  createdAt,
 		"finished_at": task.FinishTime,
 	})
+}
+
+func ResolveDeferredTask(c *gin.Context) {
+	var request deferredTaskResolutionRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		writeDeferredResolutionError(c, http.StatusBadRequest, "invalid_request", "invalid deferred resolution request")
+		return
+	}
+	request.Resolution = strings.TrimSpace(request.Resolution)
+	request.UpstreamTaskID = strings.TrimSpace(request.UpstreamTaskID)
+	request.Reason = strings.TrimSpace(request.Reason)
+	if request.Reason == "" || len(request.Reason) > maxDeferredResolutionReasonBytes {
+		writeDeferredResolutionError(c, http.StatusBadRequest, "invalid_reason", "reason is required and must be at most 2000 bytes")
+		return
+	}
+	// This endpoint resolves provider outcome state only. Financial corrections
+	// use the separate audited adjustment workflow.
+	switch request.Resolution {
+	case deferredResolutionProviderAccepted:
+		if request.UpstreamTaskID == "" || len(request.UpstreamTaskID) > maxDeferredResolutionUpstreamIDBytes {
+			writeDeferredResolutionError(c, http.StatusBadRequest, "invalid_upstream_task_id", "upstream_task_id is required and must be at most 512 bytes")
+			return
+		}
+	case deferredResolutionAbandonUnknown:
+		if request.UpstreamTaskID != "" {
+			writeDeferredResolutionError(c, http.StatusBadRequest, "invalid_upstream_task_id", "upstream_task_id is only valid for provider_accepted")
+			return
+		}
+	default:
+		writeDeferredResolutionError(c, http.StatusBadRequest, "invalid_resolution", "unsupported deferred resolution")
+		return
+	}
+
+	task, exists, err := model.GetUniqueByOnlyTaskId(strings.TrimSpace(c.Param("task_id")))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if !exists || task == nil {
+		writeDeferredResolutionError(c, http.StatusNotFound, "task_not_found", "task not found")
+		return
+	}
+	now := common.GetTimestamp()
+	if !task.RequiresOperatorResolutionAt(now) {
+		writeDeferredResolutionError(c, http.StatusConflict, "invalid_task_state", "task does not require operator resolution")
+		return
+	}
+
+	providerAccepted := request.Resolution == deferredResolutionProviderAccepted
+	won, err := model.ResolveDeferredTask(
+		task,
+		providerAccepted,
+		request.UpstreamTaskID,
+		request.Reason,
+		now,
+	)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+	if !won {
+		writeDeferredResolutionError(c, http.StatusConflict, "resolution_conflict", "task resolution state changed")
+		return
+	}
+
+	recordManageAudit(c, "task.deferred_resolution", map[string]any{
+		"task_id":              task.TaskID,
+		"resolution":           request.Resolution,
+		"reason":               request.Reason,
+		"upstream_id_attached": providerAccepted,
+	})
+	common.ApiSuccess(c, gin.H{
+		"task_id":    task.TaskID,
+		"resolution": request.Resolution,
+	})
+}
+
+func writeDeferredResolutionError(c *gin.Context, status int, code, message string) {
+	c.JSON(status, gin.H{"success": false, "code": code, "message": message})
 }
 
 func GetTaskArtifacts(c *gin.Context) {
@@ -499,7 +591,16 @@ func GetAllTask(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
 	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
-	queryParams := model.SyncTaskQueryParams{Platform: constant.TaskPlatform(c.Query("platform")), TaskID: c.Query("task_id"), Status: c.Query("status"), Action: c.Query("action"), StartTimestamp: startTimestamp, EndTimestamp: endTimestamp, ChannelID: c.Query("channel_id")}
+	queryParams := model.SyncTaskQueryParams{
+		Platform:       constant.TaskPlatform(c.Query("platform")),
+		TaskID:         c.Query("task_id"),
+		Status:         c.Query("status"),
+		Action:         c.Query("action"),
+		StartTimestamp: startTimestamp,
+		EndTimestamp:   endTimestamp,
+		ChannelID:      c.Query("channel_id"),
+		DispatchStatus: c.Query("dispatch_status"),
+	}
 	items := model.TaskGetAllTasks(pageInfo.GetStartIdx(), pageInfo.GetPageSize(), queryParams)
 	pageInfo.SetTotal(int(model.TaskCountAllTasks(queryParams)))
 	pageInfo.SetItems(tasksToDto(items, true, c.GetInt("role")))
@@ -572,9 +673,21 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			}
 		}
 		if viewerRole >= common.RoleRootUser {
+			now := common.GetTimestamp()
+			requiresOperatorResolution := task.RequiresOperatorResolutionAt(now)
+			dispatchStatus := string(task.DispatchStatus)
+			if requiresOperatorResolution {
+				dispatchStatus = string(model.TaskDispatchStatusUncertain)
+			}
 			rootInfo := &dto.TaskRootInfo{
-				UpstreamTaskID: task.PrivateData.UpstreamTaskID,
-				NodeName:       task.PrivateData.NodeName,
+				UpstreamTaskID:             task.PrivateData.UpstreamTaskID,
+				NodeName:                   task.PrivateData.NodeName,
+				ExecutionMode:              task.ExecutionMode,
+				DispatchStatus:             dispatchStatus,
+				DispatchStartedAt:          task.EffectiveDispatchStartedAtAt(now),
+				DispatchAttempts:           task.DispatchAttempts,
+				DispatchError:              task.DispatchError,
+				RequiresOperatorResolution: requiresOperatorResolution,
 			}
 			if execution := task.PrivateData.Execution; execution != nil {
 				if snapshot := execution.TaskPlugin; snapshot != nil {
@@ -586,7 +699,11 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 					}
 				}
 			}
-			if rootInfo.TaskPlugin != nil || rootInfo.UpstreamTaskID != "" || rootInfo.NodeName != "" {
+			if rootInfo.TaskPlugin != nil || rootInfo.UpstreamTaskID != "" ||
+				rootInfo.NodeName != "" || rootInfo.ExecutionMode != "" ||
+				rootInfo.DispatchStatus != "" || rootInfo.DispatchStartedAt != 0 ||
+				rootInfo.DispatchAttempts != 0 || rootInfo.DispatchError != "" ||
+				rootInfo.RequiresOperatorResolution {
 				item.RootInfo = rootInfo
 			}
 		}

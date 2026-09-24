@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -9,11 +10,26 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relay/channel"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type nilResponseTaskAdaptor struct {
+	channel.TaskAdaptor
+	attempts int
+	events   *[]string
+}
+
+func (a *nilResponseTaskAdaptor) DoRequest(*gin.Context, *relaycommon.RelayInfo, io.Reader) (*http.Response, error) {
+	a.attempts++
+	*a.events = append(*a.events, "provider")
+	return nil, nil
+}
 
 func TestRC40TaskSubmitPreservesSuccessfulAndFailedUpstreamStatus(t *testing.T) {
 	service.InitHttpClient()
@@ -65,6 +81,7 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 				assert.Equal(t, "fail_to_fetch_task", taskErr.Code)
 				assert.Equal(t, testCase.status, taskErr.StatusCode)
 				assert.Equal(t, `{"id":"job-42","message":"upstream-body"}`, taskErr.Message)
+				assert.False(t, taskErr.ProviderAccepted)
 				assert.Nil(t, result)
 				return
 			}
@@ -72,6 +89,7 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 			require.NotNil(t, result)
 			assert.Equal(t, "job-42", result.UpstreamTaskID)
 			assert.JSONEq(t, `{"status":`+strconv.Itoa(testCase.status)+`}`, string(result.TaskData))
+			assert.True(t, result.ProviderAccepted)
 		})
 	}
 }
@@ -121,6 +139,48 @@ export function parseTaskResult(){return {status:"SUCCESS"}}
 			assert.Equal(t, "plugin_submit_response_failed", taskErr.Code)
 			assert.Contains(t, taskErr.Message, "rc40 parse failure")
 			assert.True(t, taskErr.NoRetry, "an accepted provider operation must not be submitted again")
+			assert.True(t, taskErr.ProviderAccepted)
 		})
 	}
+}
+
+func TestRC40DeferredEmptyResponseAfterFenceIsNonRetryable(t *testing.T) {
+	c, info := newTaskSubmitContext(t, "declared-model", "")
+	events := make([]string, 0, 2)
+	adaptor := &nilResponseTaskAdaptor{events: &events}
+
+	result, taskErr := submitDeferredTaskUpstream(
+		c,
+		info,
+		adaptor,
+		constant.TaskPlatform("test"),
+		nil,
+		123,
+		func() error {
+			events = append(events, "fence")
+			return nil
+		},
+	)
+
+	assert.Nil(t, result)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, []string{"fence", "provider"}, events)
+	assert.Equal(t, 1, adaptor.attempts)
+	assert.Equal(t, "fail_to_fetch_task", taskErr.Code)
+	assert.Equal(t, http.StatusBadGateway, taskErr.StatusCode)
+	assert.True(t, taskErr.NoRetry)
+	assert.False(t, taskErr.ProviderAccepted)
+	assert.ErrorIs(t, taskErr.Error, errTaskUpstreamEmptyResponse)
+
+	foregroundEvents := make([]string, 0, 1)
+	foregroundAdaptor := &nilResponseTaskAdaptor{events: &foregroundEvents}
+	result, taskErr = submitTaskUpstream(c, info, foregroundAdaptor, constant.TaskPlatform("test"), nil, 123)
+
+	assert.Nil(t, result)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, []string{"provider"}, foregroundEvents)
+	assert.Equal(t, 1, foregroundAdaptor.attempts)
+	assert.False(t, taskErr.NoRetry)
+	assert.False(t, taskErr.ProviderAccepted)
+	assert.ErrorIs(t, taskErr.Error, errTaskUpstreamEmptyResponse)
 }

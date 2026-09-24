@@ -132,6 +132,48 @@ func TestRC40ToolResultMediaCompatibility(t *testing.T) {
 		require.Len(t, claude.Messages, 2)
 		assert.JSONEq(t, `[{"type":"text","text":"partial"},{"type":"document","data":"opaque"}]`, claude.Messages[1].StringContent())
 	})
+
+	t.Run("Responses mixed unknown blocks retain whole historical fallback", func(t *testing.T) {
+		input, err := kitutil.Marshal([]map[string]any{
+			{"type": "function_call", "call_id": "call_mixed", "name": "lookup", "arguments": "{}"},
+			{"type": "function_call_output", "call_id": "call_mixed", "output": []any{
+				map[string]any{"type": "input_text", "text": "partial"},
+				map[string]any{"type": "input_image", "image_url": dataURL},
+				map[string]any{"type": "vendor_block", "opaque": true},
+			}},
+		})
+		require.NoError(t, err)
+		responses, err := ResponsesRequestToChatCompletionsRequest(context.Background(), &dto.OpenAIResponsesRequest{
+			Model: "gpt-test",
+			Input: input,
+		})
+		require.NoError(t, err)
+		require.Len(t, responses.Messages, 2)
+		assert.JSONEq(t, `[{"text":"partial","type":"input_text"},{"image_url":"`+dataURL+`","type":"input_image"},{"opaque":true,"type":"vendor_block"}]`, responses.Messages[1].StringContent())
+	})
+
+	t.Run("Claude mixed unknown blocks retain whole historical fallback", func(t *testing.T) {
+		maxTokens := uint(64)
+		claude, err := claudemessages.ClaudeMessagesRequestToOpenAIChat(context.Background(), dto.ClaudeRequest{
+			Model:     "claude-test",
+			MaxTokens: &maxTokens,
+			Messages: []dto.ClaudeMessage{
+				{Role: "assistant", Content: []dto.ClaudeMediaMessage{
+					{Type: "tool_use", Id: "tool_mixed", Name: "lookup", Input: map[string]any{}},
+				}},
+				{Role: "user", Content: []dto.ClaudeMediaMessage{
+					{Type: "tool_result", ToolUseId: "tool_mixed", Content: []dto.ClaudeMediaMessage{
+						{Type: "text", Text: rc40StringPointer("partial")},
+						{Type: "image", Source: &dto.ClaudeMessageSource{Type: "base64", MediaType: "image/png", Data: imageData}},
+						{Type: "document", Data: "opaque"},
+					}},
+				}},
+			},
+		}, &convmeta.Values{})
+		require.NoError(t, err)
+		require.Len(t, claude.Messages, 2)
+		assert.JSONEq(t, `[{"type":"text","text":"partial"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"`+imageData+`"}},{"type":"document","data":"opaque"}]`, claude.Messages[1].StringContent())
+	})
 }
 
 func rc40StringPointer(value string) *string {

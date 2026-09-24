@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/types"
@@ -38,8 +40,12 @@ type TaskSubmitResult struct {
 	Immediate       *relaycommon.TaskInfo
 	DeferredRequest *model.TaskDeferredRequest
 	PluginState     []byte
+	// ProviderAccepted prevents callers from retrying failures after a 2xx submit.
+	ProviderAccepted bool
 	//PerCallPrice   types.PriceData
 }
+
+var errTaskUpstreamEmptyResponse = errors.New("upstream returned an empty response")
 
 // ResolveOriginTask 处理基于已有任务的提交（remix / continuation）：
 // 查找原始任务、从中提取模型名称、将渠道锁定到原始任务的渠道
@@ -365,13 +371,15 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 }
 
 // RelayDeferredTaskSubmit rebuilds a previously validated plugin request with
-// current channel credentials. Billing and persistence are intentionally
-// excluded: the foreground request already crossed both durable barriers.
+// current channel credentials. Billing and task creation are intentionally
+// excluded. beforeProviderSubmit persists the worker's final dispatch fence
+// after local request preparation and immediately before provider I/O.
 func RelayDeferredTaskSubmit(
 	c *gin.Context,
 	info *relaycommon.RelayInfo,
 	platform constant.TaskPlatform,
 	quota int,
+	beforeProviderSubmit func() error,
 ) (*TaskSubmitResult, *dto.TaskError) {
 	info.InitChannelMeta(c)
 	resolvedPlatform, adaptor := getTaskAdaptorForRequest(c, platform)
@@ -387,7 +395,45 @@ func RelayDeferredTaskSubmit(
 	if err != nil {
 		return nil, service.TaskErrorWrapper(err, "build_request_failed", http.StatusInternalServerError)
 	}
-	return submitTaskUpstream(c, info, adaptor, resolvedPlatform, requestBody, quota)
+	return submitDeferredTaskUpstream(c, info, adaptor, resolvedPlatform, requestBody, quota, beforeProviderSubmit)
+}
+
+func submitDeferredTaskUpstream(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	adaptor channel.TaskAdaptor,
+	platform constant.TaskPlatform,
+	requestBody io.Reader,
+	quota int,
+	beforeProviderSubmit func() error,
+) (*TaskSubmitResult, *dto.TaskError) {
+	if beforeProviderSubmit == nil {
+		return nil, service.TaskErrorWrapperLocal(errors.New("deferred dispatch fence is missing"), "deferred_dispatch_fence_failed", http.StatusInternalServerError)
+	}
+	if err := beforeProviderSubmit(); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, service.TaskErrorWrapperLocal(err, "deferred_dispatch_cancelled", http.StatusRequestTimeout)
+		}
+		return nil, service.TaskErrorWrapperLocal(err, "deferred_dispatch_fence_failed", http.StatusInternalServerError)
+	}
+	if err := c.Request.Context().Err(); err != nil {
+		return nil, service.TaskErrorWrapperLocal(err, "deferred_dispatch_cancelled", http.StatusRequestTimeout)
+	}
+	result, taskErr := submitTaskUpstream(c, info, adaptor, platform, requestBody, quota)
+	if taskErr != nil {
+		if errors.Is(taskErr.Error, channel.ErrProviderRequestNotStarted) {
+			taskErr.Code = "deferred_provider_request_not_started"
+			taskErr.LocalError = true
+			taskErr.NoRetry = false
+			return result, taskErr
+		}
+		var relayErr *relaytypes.NewAPIError
+		if errors.Is(taskErr.Error, errTaskUpstreamEmptyResponse) ||
+			(errors.As(taskErr.Error, &relayErr) && relayErr.GetErrorCode() == relaytypes.ErrorCodeDoRequestFailed) {
+			taskErr.NoRetry = true
+		}
+	}
+	return result, taskErr
 }
 
 func submitTaskUpstream(
@@ -403,10 +449,12 @@ func submitTaskUpstream(
 		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
 	}
 	if resp == nil {
-		return nil, service.TaskErrorWrapperLocal(errors.New("upstream returned an empty response"), "fail_to_fetch_task", http.StatusBadGateway)
+		return nil, service.TaskErrorWrapperLocal(errTaskUpstreamEmptyResponse, "fail_to_fetch_task", http.StatusBadGateway)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	// Any 2xx is a successful submission: task APIs commonly answer 201 Created
+	// or 202 Accepted, and parseSubmitResponse receives the exact status code.
+	if resp.StatusCode/100 != 2 {
 		responseBody, _ := io.ReadAll(resp.Body)
 		return nil, service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
 	}
@@ -415,10 +463,15 @@ func submitTaskUpstream(
 	// task barrier and billing settlement.
 	parsed, taskErr := adaptor.ParseResponse(c, resp, info)
 	if taskErr != nil {
+		taskErr.NoRetry = true
+		taskErr.ProviderAccepted = true
 		return nil, taskErr
 	}
 	if parsed == nil {
-		return nil, service.TaskErrorWrapperLocal(errors.New("task adaptor returned an empty response"), "plugin_submit_response_invalid", http.StatusBadGateway)
+		taskErr = service.TaskErrorWrapperLocal(errors.New("task adaptor returned an empty response"), "plugin_submit_response_invalid", http.StatusBadGateway)
+		taskErr.NoRetry = true
+		taskErr.ProviderAccepted = true
+		return nil, taskErr
 	}
 
 	// 11. 提交后计费调整：让适配器根据上游实际返回调整 OtherRatios
@@ -451,13 +504,14 @@ func submitTaskUpstream(
 	info.PriceData.Quota = finalQuota
 
 	return &TaskSubmitResult{
-		UpstreamTaskID: parsed.UpstreamTaskID,
-		TaskData:       parsed.TaskData,
-		ClientResponse: parsed.ClientResponse,
-		Platform:       platform,
-		Quota:          finalQuota,
-		Immediate:      parsed.Immediate,
-		PluginState:    parsed.PluginState,
+		UpstreamTaskID:   parsed.UpstreamTaskID,
+		TaskData:         parsed.TaskData,
+		ClientResponse:   parsed.ClientResponse,
+		Platform:         platform,
+		Quota:            finalQuota,
+		Immediate:        parsed.Immediate,
+		PluginState:      parsed.PluginState,
+		ProviderAccepted: true,
 	}, nil
 }
 

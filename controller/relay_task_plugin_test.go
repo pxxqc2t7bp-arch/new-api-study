@@ -186,6 +186,31 @@ func TestExecuteTaskSubmissionRefundsWhenInsertFails(t *testing.T) {
 	assert.False(t, c.Writer.Written())
 }
 
+func TestExecuteTaskSubmissionAcceptedResultDoesNotRefundWhenInsertFails(t *testing.T) {
+	events := make([]string, 0, 2)
+	setupTaskSubmissionDatabase(t, false, &events)
+	billing := &taskSubmissionTestBilling{events: &events}
+	c := taskSubmissionTestContext()
+	info := taskSubmissionRelayInfo(billing)
+
+	outcome, taskErr := executeTaskSubmissionWith(c, info, func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+		return &relay.TaskSubmitResult{
+			UpstreamTaskID:   "upstream_private",
+			Platform:         constant.TaskPlatform("plugin"),
+			ProviderAccepted: true,
+		}, nil
+	})
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "task_insert_failed", taskErr.Code)
+	assert.True(t, taskErr.NoRetry)
+	assert.True(t, taskErr.ProviderAccepted)
+	assert.Equal(t, []string{"reserve", "insert"}, events)
+	assert.Zero(t, billing.refunds)
+	assert.False(t, c.Writer.Written())
+}
+
 func TestExecuteTaskSubmissionSettlementFailureStaysDurableAndWritesNothing(t *testing.T) {
 	events := make([]string, 0, 3)
 	database := setupTaskSubmissionDatabase(t, true, &events)
@@ -356,6 +381,34 @@ func TestExecuteTaskSubmissionRefundsCancellationBeforeDurableBarrier(t *testing
 	assert.Equal(t, "request_cancelled", taskErr.Code)
 	assert.Equal(t, []string{"refund"}, events)
 	assert.Equal(t, 1, billing.refunds)
+	assert.False(t, c.Writer.Written())
+}
+
+func TestExecuteTaskSubmissionAcceptedResultDoesNotRefundOnCancellation(t *testing.T) {
+	events := make([]string, 0, 1)
+	setupTaskSubmissionDatabase(t, true, &events)
+	billing := &taskSubmissionTestBilling{events: &events}
+	c := taskSubmissionTestContext()
+	requestContext, cancel := context.WithCancel(c.Request.Context())
+	c.Request = c.Request.WithContext(requestContext)
+	info := taskSubmissionRelayInfo(billing)
+
+	outcome, taskErr := executeTaskSubmissionWith(c, info, func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+		cancel()
+		return &relay.TaskSubmitResult{
+			UpstreamTaskID:   "upstream_private",
+			Platform:         constant.TaskPlatform("plugin"),
+			ProviderAccepted: true,
+		}, nil
+	})
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "request_cancelled", taskErr.Code)
+	assert.True(t, taskErr.NoRetry)
+	assert.True(t, taskErr.ProviderAccepted)
+	assert.Empty(t, events)
+	assert.Zero(t, billing.refunds)
 	assert.False(t, c.Writer.Written())
 }
 
@@ -657,6 +710,28 @@ func TestAcceptedSubmitStreamNeverRetries(t *testing.T) {
 	assert.Equal(t, service.PolicyDecision{Action: "stop", Reason: "task_accepted", Source: "system"}, decideTaskRetry(c, &dto.TaskError{StatusCode: 502, LocalError: true, NoRetry: true}, 3))
 }
 
+func TestExecuteTaskSubmissionLocalNoRetryFailureStillRefunds(t *testing.T) {
+	events := make([]string, 0, 1)
+	setupTaskSubmissionDatabase(t, true, &events)
+	billing := &taskSubmissionTestBilling{events: &events}
+	c := taskSubmissionTestContext()
+	info := taskSubmissionRelayInfo(billing)
+
+	outcome, taskErr := executeTaskSubmissionWith(c, info, func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+		localErr := service.TaskErrorWrapperLocal(errors.New("local failure"), "local_failure", http.StatusBadRequest)
+		localErr.NoRetry = true
+		return nil, localErr
+	})
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.True(t, taskErr.NoRetry)
+	assert.False(t, taskErr.ProviderAccepted)
+	assert.Equal(t, []string{"refund"}, events)
+	assert.Equal(t, 1, billing.refunds)
+	assert.False(t, c.Writer.Written())
+}
+
 // Local task rejections carry a message but no cause; the response and the
 // decision record must still be produced.
 func TestRespondTaskSubmissionErrorWithoutCause(t *testing.T) {
@@ -688,5 +763,31 @@ func TestExecuteTaskSubmissionRefundsWhenFinalReserveFails(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, taskErr.StatusCode)
 	assert.Equal(t, []string{"reserve", "refund"}, events)
 	assert.Equal(t, 1, billing.refunds)
+	assert.False(t, c.Writer.Written())
+}
+
+func TestExecuteTaskSubmissionAcceptedResultDoesNotRefundWhenFinalReserveFails(t *testing.T) {
+	events := []string{}
+	setupTaskSubmissionDatabase(t, true, &events)
+	billing := &taskSubmissionTestBilling{events: &events, reserveErr: errors.New("insufficient funds")}
+	c := taskSubmissionTestContext()
+	info := taskSubmissionRelayInfo(billing)
+
+	outcome, taskErr := executeTaskSubmissionWith(c, info, func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *dto.TaskError) {
+		return &relay.TaskSubmitResult{
+			Platform:         "plugin",
+			Quota:            600,
+			Immediate:        &relaycommon.TaskInfo{Status: "SUCCESS"},
+			ProviderAccepted: true,
+		}, nil
+	})
+
+	require.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, http.StatusForbidden, taskErr.StatusCode)
+	assert.True(t, taskErr.NoRetry)
+	assert.True(t, taskErr.ProviderAccepted)
+	assert.Equal(t, []string{"reserve"}, events)
+	assert.Zero(t, billing.refunds)
 	assert.False(t, c.Writer.Written())
 }
