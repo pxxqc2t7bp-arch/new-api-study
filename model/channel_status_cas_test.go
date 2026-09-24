@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,50 @@ import (
 	"gorm.io/gorm/clause"
 	"gorm.io/gorm/schema"
 )
+
+type channelPublicationBarrier struct {
+	firstCommitted  chan struct{}
+	secondAttempted chan struct{}
+	releaseFirst    chan struct{}
+	releaseOnce     sync.Once
+}
+
+func installChannelPublicationBarrier(t *testing.T) *channelPublicationBarrier {
+	t.Helper()
+
+	barrier := &channelPublicationBarrier{
+		firstCommitted:  make(chan struct{}),
+		secondAttempted: make(chan struct{}),
+		releaseFirst:    make(chan struct{}),
+	}
+	var writes atomic.Int32
+	var commits atomic.Int32
+	previousObserver := channelStatusPublicationObserver
+	channelStatusPublicationObserver = func(phase channelStatusPublicationPhase) {
+		switch phase {
+		case channelStatusPublicationBeforeWrite:
+			if writes.Add(1) == 2 {
+				close(barrier.secondAttempted)
+			}
+		case channelStatusPublicationAfterCommit:
+			if commits.Add(1) == 1 {
+				close(barrier.firstCommitted)
+				<-barrier.releaseFirst
+			}
+		}
+	}
+	t.Cleanup(func() {
+		barrier.Release()
+		channelStatusPublicationObserver = previousObserver
+	})
+	return barrier
+}
+
+func (barrier *channelPublicationBarrier) Release() {
+	barrier.releaseOnce.Do(func() {
+		close(barrier.releaseFirst)
+	})
+}
 
 func createSingleKeyChannelStatusCASFixture(t *testing.T, otherInfo map[string]any) Channel {
 	t.Helper()
@@ -36,6 +81,66 @@ func createSingleKeyChannelStatusCASFixture(t *testing.T, otherInfo map[string]a
 	require.NoError(t, DB.Create(&channel).Error)
 	require.NoError(t, channel.AddAbilities(nil))
 	return channel
+}
+
+func TestChannelUpdateSerializesCommitThroughCachePublication(t *testing.T) {
+	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+		"owner": "publication-order",
+	})
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+	barrier := installChannelPublicationBarrier(t)
+
+	first, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	first.Models = "gpt-publication-first"
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- first.Update()
+	}()
+	<-barrier.firstCommitted
+
+	publicationLocked := !channelStatusLock.TryLock()
+	if !publicationLocked {
+		channelStatusLock.Unlock()
+	}
+	require.True(t, publicationLocked, "the publication lock must span commit through cache publication")
+
+	second, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	second.Models = "gpt-publication-second"
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- second.Update()
+	}()
+	<-barrier.secondAttempted
+	barrier.Release()
+
+	require.NoError(t, <-firstResult)
+	require.NoError(t, <-secondResult)
+
+	var stored Channel
+	require.NoError(t, DB.First(&stored, channel.Id).Error)
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "gpt-publication-second", stored.Models)
+	assert.Equal(t, stored.Models, cached.Models)
+	routingIDs, err := ListSatisfiedChannelIDsAtPriority(
+		stored.Group,
+		stored.Models,
+		stored.GetPriority(),
+		nil,
+	)
+	require.NoError(t, err)
+	assert.Contains(t, routingIDs, channel.Id)
+	oldRoutingIDs, err := ListSatisfiedChannelIDsAtPriority(
+		stored.Group,
+		"gpt-publication-first",
+		stored.GetPriority(),
+		nil,
+	)
+	require.NoError(t, err)
+	assert.NotContains(t, oldRoutingIDs, channel.Id)
 }
 
 func loadChannelStatusCASFixture(t *testing.T, channelId int) (Channel, Ability) {

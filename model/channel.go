@@ -269,22 +269,13 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		selectedIdx := enabledIdx[rand.Intn(len(enabledIdx))]
 		return keys[selectedIdx], selectedIdx, nil
 	case constant.MultiKeyModePolling:
-		// Use channel-specific lock to ensure thread-safe polling
-
 		channelInfo, err := CacheGetChannelInfo(channel.Id)
 		if err != nil {
 			return "", 0, types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 		}
-		defer func() {
-			if common.DebugEnabled {
-				logger.LogDebug(nil, "channel %d polling index: %d", channel.Id, channel.ChannelInfo.MultiKeyPollingIndex)
-			}
-			if !common.MemoryCacheEnabled {
-				_ = channel.SaveChannelInfo()
-			} else {
-				// CacheUpdateChannel(channel)
-			}
-		}()
+		expected := *channel
+		expected.Keys = nil
+		expected.ChannelInfo = *channelInfo
 		// Start from the saved polling index and look for the next enabled key
 		start := channelInfo.MultiKeyPollingIndex
 		if start < 0 || start >= len(keys) {
@@ -294,7 +285,47 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 			idx := (start + i) % len(keys)
 			if getStatus(idx) == common.ChannelStatusEnabled {
 				// update polling index for next call (point to the next position)
-				channel.ChannelInfo.MultiKeyPollingIndex = (idx + 1) % len(keys)
+				nextPollingIndex := (idx + 1) % len(keys)
+				if !common.MemoryCacheEnabled {
+					applied, saveErr := saveChannelPollingIndexIfUnchangedLocked(
+						&expected,
+						nextPollingIndex,
+					)
+					if saveErr != nil {
+						common.SysError(fmt.Sprintf(
+							"failed to persist channel polling cursor: channel_id=%d error=%v",
+							channel.Id,
+							saveErr,
+						))
+						return "", 0, types.NewError(
+							saveErr,
+							types.ErrorCodeGetChannelFailed,
+							types.ErrOptionWithSkipRetry(),
+						)
+					}
+					if !applied {
+						staleErr := errors.New("channel changed while persisting polling cursor")
+						common.SysError(fmt.Sprintf(
+							"failed to persist channel polling cursor: channel_id=%d error=%v",
+							channel.Id,
+							staleErr,
+						))
+						return "", 0, types.NewError(
+							staleErr,
+							types.ErrorCodeGetChannelFailed,
+							types.ErrOptionWithSkipRetry(),
+						)
+					}
+				}
+				channel.ChannelInfo.MultiKeyPollingIndex = nextPollingIndex
+				if common.DebugEnabled {
+					logger.LogDebug(
+						nil,
+						"channel %d polling index: %d",
+						channel.Id,
+						channel.ChannelInfo.MultiKeyPollingIndex,
+					)
+				}
 				return keys[idx], idx, nil
 			}
 		}
@@ -307,7 +338,86 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 }
 
 func (channel *Channel) SaveChannelInfo() error {
-	return DB.Model(channel).Update("channel_info", channel.ChannelInfo).Error
+	if channel == nil || channel.Id == 0 {
+		return errors.New("channel polling snapshot is missing")
+	}
+	_, err := withChannelStatusLocks(channel.Id, func() (bool, error) {
+		return saveChannelPollingIndexFromSnapshotLocked(channel)
+	})
+	return err
+}
+
+func saveChannelPollingIndexFromSnapshotLocked(snapshot *Channel) (bool, error) {
+	if snapshot == nil || snapshot.Id == 0 || !snapshot.ChannelInfo.IsMultiKey {
+		return false, nil
+	}
+
+	applied := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var current Channel
+		if err := lockForUpdate(tx).
+			Where("id = ?", snapshot.Id).
+			First(&current).Error; err != nil {
+			return err
+		}
+		expectedSnapshot := *snapshot
+		expectedSnapshot.Keys = nil
+		expectedSnapshot.ChannelInfo.MultiKeyPollingIndex =
+			current.ChannelInfo.MultiKeyPollingIndex
+		current.Keys = nil
+		if !reflect.DeepEqual(current, expectedSnapshot) ||
+			!current.ChannelInfo.IsMultiKey {
+			return nil
+		}
+
+		applied = true
+		if current.ChannelInfo.MultiKeyPollingIndex ==
+			snapshot.ChannelInfo.MultiKeyPollingIndex {
+			return nil
+		}
+		current.ChannelInfo.MultiKeyPollingIndex =
+			snapshot.ChannelInfo.MultiKeyPollingIndex
+		return tx.Model(&Channel{}).
+			Where("id = ?", current.Id).
+			Update("channel_info", current.ChannelInfo).Error
+	})
+	return applied, err
+}
+
+func saveChannelPollingIndexIfUnchangedLocked(
+	expected *Channel,
+	pollingIndex int,
+) (bool, error) {
+	if expected == nil || expected.Id == 0 || !expected.ChannelInfo.IsMultiKey {
+		return false, nil
+	}
+
+	applied := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var current Channel
+		if err := lockForUpdate(tx).
+			Where("id = ?", expected.Id).
+			First(&current).Error; err != nil {
+			return err
+		}
+		expectedSnapshot := *expected
+		expectedSnapshot.Keys = nil
+		current.Keys = nil
+		if !reflect.DeepEqual(current, expectedSnapshot) ||
+			!current.ChannelInfo.IsMultiKey {
+			return nil
+		}
+
+		applied = true
+		if current.ChannelInfo.MultiKeyPollingIndex == pollingIndex {
+			return nil
+		}
+		current.ChannelInfo.MultiKeyPollingIndex = pollingIndex
+		return tx.Model(&Channel{}).
+			Where("id = ?", current.Id).
+			Update("channel_info", current.ChannelInfo).Error
+	})
+	return applied, err
 }
 
 func (channel *Channel) GetModels() []string {
@@ -491,13 +601,16 @@ func BatchInsertChannels(channels []Channel) error {
 	for index := range channels {
 		channelPointers[index] = &channels[index]
 	}
-	if err := DB.Transaction(func(tx *gorm.DB) error {
-		return insertChannelsWithPlanQuotaDomains(tx, channelPointers)
-	}); err != nil {
-		return err
-	}
-	CacheUpdateChannels(channelPointers)
-	return nil
+	return commitAndPublishChannelStatus(
+		func() error {
+			return DB.Transaction(func(tx *gorm.DB) error {
+				return insertChannelsWithPlanQuotaDomains(tx, channelPointers)
+			})
+		},
+		func() {
+			CacheUpdateChannels(channelPointers)
+		},
+	)
 }
 
 func BatchDeleteChannels(ids []int) (int64, error) {
@@ -571,13 +684,16 @@ func (channel *Channel) Insert() error {
 	if channel == nil {
 		return errors.New("channel is nil")
 	}
-	if err := DB.Transaction(func(tx *gorm.DB) error {
-		return insertChannelsWithPlanQuotaDomains(tx, []*Channel{channel})
-	}); err != nil {
-		return err
-	}
-	CacheUpdateChannel(channel)
-	return nil
+	return commitAndPublishChannelStatus(
+		func() error {
+			return DB.Transaction(func(tx *gorm.DB) error {
+				return insertChannelsWithPlanQuotaDomains(tx, []*Channel{channel})
+			})
+		},
+		func() {
+			CacheUpdateChannel(channel)
+		},
+	)
 }
 
 func (channel *Channel) Update() error {
@@ -631,13 +747,20 @@ func (channel *Channel) Update() error {
 		}
 	}
 
-	updated, err := updateChannelWithPlanQuotaDomains(channel, expected)
-	if err != nil {
-		return err
-	}
-	*channel = *updated
-	CacheUpdateChannel(updated)
-	return nil
+	var updated *Channel
+	return commitAndPublishChannelStatus(
+		func() error {
+			var updateErr error
+			updated, updateErr = updateChannelWithPlanQuotaDomains(channel, expected)
+			if updateErr == nil {
+				*channel = *updated
+			}
+			return updateErr
+		},
+		func() {
+			CacheUpdateChannel(updated)
+		},
+	)
 }
 
 func (channel *Channel) UpdateResponseTime(responseTime int64) {
@@ -671,6 +794,41 @@ func (channel *Channel) Delete() error {
 }
 
 var channelStatusLock sync.Mutex
+
+type channelStatusPublicationPhase uint8
+
+const (
+	channelStatusPublicationBeforeWrite channelStatusPublicationPhase = iota + 1
+	channelStatusPublicationAfterCommit
+)
+
+var channelStatusPublicationObserver func(channelStatusPublicationPhase)
+
+func observeChannelStatusPublication(phase channelStatusPublicationPhase) {
+	if channelStatusPublicationObserver != nil {
+		channelStatusPublicationObserver(phase)
+	}
+}
+
+func withChannelStatusPublicationLock(update func() error) error {
+	if common.MemoryCacheEnabled {
+		channelStatusLock.Lock()
+		defer channelStatusLock.Unlock()
+	}
+	return update()
+}
+
+func commitAndPublishChannelStatus(commit func() error, publish func()) error {
+	observeChannelStatusPublication(channelStatusPublicationBeforeWrite)
+	return withChannelStatusPublicationLock(func() error {
+		if err := commit(); err != nil {
+			return err
+		}
+		observeChannelStatusPublication(channelStatusPublicationAfterCommit)
+		publish()
+		return nil
+	})
+}
 
 // channelPollingLocks stores locks for each channel.id to ensure thread-safe polling
 var channelPollingLocks sync.Map
@@ -773,34 +931,35 @@ func withChannelStatusLocks(channelId int, update func() (bool, error)) (bool, e
 }
 
 func withChannelStatusesLocks(channelIDs []int, update func() (bool, error)) (bool, error) {
-	if common.MemoryCacheEnabled {
-		channelStatusLock.Lock()
-		defer channelStatusLock.Unlock()
-	}
-
-	// ChannelInfo stores both multi-key status and the polling cursor. Hold the
-	// same per-channel lock from the first read through persistence so neither
-	// writer can save a stale JSON snapshot over the other.
-	sortedIDs := append([]int(nil), channelIDs...)
-	sort.Ints(sortedIDs)
-	pollingLocks := make([]*sync.Mutex, 0, len(sortedIDs))
-	previousID := 0
-	for index, channelID := range sortedIDs {
-		if index > 0 && channelID == previousID {
-			continue
+	var changed bool
+	err := withChannelStatusPublicationLock(func() error {
+		// ChannelInfo stores both multi-key status and the polling cursor. Hold
+		// the same per-channel lock from the first read through publication so
+		// neither writer can save a stale JSON snapshot over the other.
+		sortedIDs := append([]int(nil), channelIDs...)
+		sort.Ints(sortedIDs)
+		pollingLocks := make([]*sync.Mutex, 0, len(sortedIDs))
+		previousID := 0
+		for index, channelID := range sortedIDs {
+			if index > 0 && channelID == previousID {
+				continue
+			}
+			pollingLock := GetChannelPollingLock(channelID)
+			pollingLock.Lock()
+			pollingLocks = append(pollingLocks, pollingLock)
+			previousID = channelID
 		}
-		pollingLock := GetChannelPollingLock(channelID)
-		pollingLock.Lock()
-		pollingLocks = append(pollingLocks, pollingLock)
-		previousID = channelID
-	}
-	defer func() {
-		for index := len(pollingLocks) - 1; index >= 0; index-- {
-			pollingLocks[index].Unlock()
-		}
-	}()
+		defer func() {
+			for index := len(pollingLocks) - 1; index >= 0; index-- {
+				pollingLocks[index].Unlock()
+			}
+		}()
 
-	return update()
+		var updateErr error
+		changed, updateErr = update()
+		return updateErr
+	})
+	return changed, err
 }
 
 func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
@@ -815,23 +974,6 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 }
 
 func updateChannelStatusLocked(channelId int, usingKey string, status int, reason string) (bool, error) {
-	if common.MemoryCacheEnabled {
-		channelCache, _ := CacheGetChannel(channelId)
-		if channelCache == nil {
-			return false, nil
-		}
-		if channelCache.ChannelInfo.IsMultiKey {
-			beforeStatus := channelCache.Status
-			// 如果是多Key模式，更新缓存中的状态
-			handlerMultiKeyUpdate(channelCache, usingKey, status, reason)
-			if beforeStatus != channelCache.Status {
-				CacheUpdateChannelStatus(channelId, channelCache.Status)
-			}
-			//CacheUpdateChannel(channelCache)
-			//return true
-		}
-	}
-
 	channel, err := GetChannelById(channelId, true)
 	if err != nil {
 		return false, nil
@@ -841,17 +983,12 @@ func updateChannelStatusLocked(channelId int, usingKey string, status int, reaso
 	}
 
 	if channel.ChannelInfo.IsMultiKey {
-		beforeStatus := channel.Status
-		handlerMultiKeyUpdate(channel, usingKey, status, reason)
-		if err := channel.saveStatusState(); err != nil {
-			return false, err
-		}
-		if beforeStatus != channel.Status {
-			if err := UpdateAbilityStatus(channelId, status == common.ChannelStatusEnabled); err != nil {
-				common.SysLog(fmt.Sprintf("failed to update ability status: channel_id=%d, error=%v", channelId, err))
-			}
-		}
-		return true, nil
+		return updateLegacyMultiKeyChannelStatusIfUnchangedLocked(
+			channel,
+			usingKey,
+			status,
+			reason,
+		)
 	}
 
 	for range channelStatusUpdateMaxAttempts {
@@ -884,6 +1021,76 @@ func updateChannelStatusLocked(channelId int, usingKey string, status int, reaso
 		}
 	}
 	return false, nil
+}
+
+func updateLegacyMultiKeyChannelStatusIfUnchangedLocked(
+	expected *Channel,
+	usingKey string,
+	status int,
+	reason string,
+) (bool, error) {
+	if expected == nil || expected.Id == 0 || !expected.ChannelInfo.IsMultiKey {
+		return false, nil
+	}
+
+	changed := false
+	var updated Channel
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var current Channel
+		if err := lockForUpdate(tx).
+			Where("id = ?", expected.Id).
+			First(&current).Error; err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(current, *expected) {
+			return nil
+		}
+
+		updated = current
+		channelInfoJSON, err := common.Marshal(current.ChannelInfo)
+		if err != nil {
+			return err
+		}
+		updated.ChannelInfo = ChannelInfo{}
+		if err := common.Unmarshal(channelInfoJSON, &updated.ChannelInfo); err != nil {
+			return err
+		}
+		handlerMultiKeyUpdate(&updated, usingKey, status, reason)
+		if updated.Status == current.Status &&
+			updated.OtherInfo == current.OtherInfo &&
+			reflect.DeepEqual(updated.ChannelInfo, current.ChannelInfo) {
+			return nil
+		}
+		if err := tx.Model(&Channel{}).
+			Where("id = ?", current.Id).
+			Updates(map[string]any{
+				"status":       updated.Status,
+				"other_info":   updated.OtherInfo,
+				"channel_info": updated.ChannelInfo,
+			}).Error; err != nil {
+			return err
+		}
+		if updated.Status != current.Status {
+			if err := tx.Model(&Ability{}).
+				Where("channel_id = ?", current.Id).
+				Select("enabled").
+				Update("enabled", updated.Status == common.ChannelStatusEnabled).Error; err != nil {
+				return err
+			}
+		}
+		changed = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if changed {
+		CacheUpdateChannelStatusSnapshots([]ChannelStatusCacheUpdate{{
+			Snapshot:          &updated,
+			UpdateChannelInfo: true,
+		}})
+	}
+	return changed, nil
 }
 
 // UpdateSingleKeyChannelStatusIfUnchanged atomically updates status-owned

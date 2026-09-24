@@ -722,7 +722,7 @@ func TestDisablePlanQuotaCredentialDomain(t *testing.T) {
 	require.NoError(t, db.Order("id").Find(&stored).Error)
 	require.Len(t, stored, 10)
 	for i, channel := range stored {
-		if channel.Id == 11 || channel.Id == 13 || channel.Id == 20 {
+		if channel.Id == 11 || channel.Id == 12 || channel.Id == 13 || channel.Id == 20 {
 			assert.Equal(t, common.ChannelStatusAutoDisabled, channel.Status)
 			assert.Equal(t, resetAt+60, channel.GetDisabledUntil())
 			assert.Equal(t, channels[i].GetTag(), channel.GetOtherInfo()["quota_domain"])
@@ -755,7 +755,8 @@ func TestDisablePlanQuotaCredentialDomain(t *testing.T) {
 	require.NoError(t, db.Order("channel_id").Find(&abilities).Error)
 	require.Len(t, abilities, 10)
 	for _, ability := range abilities {
-		if ability.ChannelId == 11 || ability.ChannelId == 13 || ability.ChannelId == 20 {
+		if ability.ChannelId == 11 || ability.ChannelId == 12 ||
+			ability.ChannelId == 13 || ability.ChannelId == 20 {
 			assert.False(t, ability.Enabled)
 			continue
 		}
@@ -1301,6 +1302,20 @@ func TestEnableChannelForHealthCheckReturnsCommittedRecoveryCount(t *testing.T) 
 
 	assert.Equal(t, 2, enabled)
 	assert.Zero(t, staleEnabled)
+}
+
+func TestPlanQuotaSnapshotMarkerUsesSelectedKey(t *testing.T) {
+	tag := "plan:support:selected-key-marker"
+	hash, ok := model.PlanQuotaDomainHash("shared")
+	require.True(t, ok)
+	channel := &model.Channel{
+		Key: "shared\n", Tag: &tag,
+	}
+	channel.SetOtherInfo(map[string]any{
+		"quota_domain_id": hash,
+	})
+
+	assert.True(t, planQuotaSnapshotMatchesCredentialMarker(channel))
 }
 
 func TestEnableChannelForHealthCheckFencesManagedSingleKeyRoute(t *testing.T) {

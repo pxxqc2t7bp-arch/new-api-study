@@ -1,0 +1,155 @@
+package controller
+
+import (
+	"bytes"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func createControllerPlanQuotaDomain(
+	t *testing.T,
+	db *gorm.DB,
+	tag string,
+	credential string,
+) []model.Channel {
+	t.Helper()
+
+	hash, ok := model.PlanQuotaDomainHash(credential)
+	require.True(t, ok)
+	const generation int64 = 71
+	const disabledUntil int64 = 2_000_000_000
+	require.NoError(t, db.Create(&model.PlanQuotaDomain{
+		CredentialHash: hash,
+		Generation:     generation,
+		State:          model.PlanQuotaDomainStateDisabled,
+		DisabledUntil:  disabledUntil,
+	}).Error)
+	channels := []model.Channel{
+		{
+			Name: "manual-domain-source", Key: credential, Tag: &tag,
+			Status: common.ChannelStatusAutoDisabled, Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Name: "manual-domain-peer", Key: credential, Tag: &tag,
+			Status: common.ChannelStatusAutoDisabled, Models: "gpt-4.1", Group: "default",
+		},
+	}
+	for index := range channels {
+		channels[index].SetOtherInfo(map[string]any{
+			"disabled_until":   disabledUntil,
+			"quota_domain":     tag,
+			"quota_domain_id":  hash,
+			"quota_generation": strconv.FormatInt(generation, 10),
+			"quota_type":       "plan",
+		})
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for index := range channels {
+		require.NoError(t, channels[index].AddAbilities(db))
+	}
+	return channels
+}
+
+func assertControllerPlanQuotaDomainEnabled(
+	t *testing.T,
+	db *gorm.DB,
+	channels []model.Channel,
+) {
+	t.Helper()
+
+	for index := range channels {
+		var stored model.Channel
+		require.NoError(t, db.First(&stored, channels[index].Id).Error)
+		assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+		assert.NotContains(t, stored.GetOtherInfo(), "quota_domain_id")
+		assert.NotContains(t, stored.GetOtherInfo(), "quota_generation")
+		var disabledAbilities int64
+		require.NoError(t, db.Model(&model.Ability{}).
+			Where("channel_id = ? AND enabled = ?", stored.Id, false).
+			Count(&disabledAbilities).Error)
+		assert.Zero(t, disabledAbilities)
+	}
+}
+
+func TestUpdateChannelStatusManuallyRecoversPlanQuotaDomain(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	previousMemoryCacheEnabled := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCacheEnabled
+	})
+	channels := createControllerPlanQuotaDomain(
+		t,
+		db,
+		"plan:test:controller-single-enable",
+		"controller-single-credential",
+	)
+
+	body := []byte(fmt.Sprintf(`{"status":%d}`, common.ChannelStatusEnabled))
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Params = gin.Params{{Key: "id", Value: strconv.Itoa(channels[0].Id)}}
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/channel/status", bytes.NewReader(body))
+	context.Request.Header.Set("Content-Type", "application/json")
+
+	UpdateChannelStatus(context)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool `json:"success"`
+		Data    bool `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.True(t, response.Success)
+	assert.True(t, response.Data)
+	assertControllerPlanQuotaDomainEnabled(t, db, channels)
+}
+
+func TestBatchUpdateChannelStatusManuallyRecoversPlanQuotaDomain(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	previousMemoryCacheEnabled := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = false
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCacheEnabled
+	})
+	channels := createControllerPlanQuotaDomain(
+		t,
+		db,
+		"plan:test:controller-batch-enable",
+		"controller-batch-credential",
+	)
+
+	body := []byte(fmt.Sprintf(
+		`{"ids":[%d],"status":%d}`,
+		channels[0].Id,
+		common.ChannelStatusEnabled,
+	))
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPost, "/api/channel/status/batch", bytes.NewReader(body))
+	context.Request.Header.Set("Content-Type", "application/json")
+
+	BatchUpdateChannelStatus(context)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool `json:"success"`
+		Data    int  `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.True(t, response.Success)
+	assert.Equal(t, 1, response.Data)
+	assertControllerPlanQuotaDomainEnabled(t, db, channels)
+}

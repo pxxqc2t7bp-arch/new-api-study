@@ -1170,9 +1170,11 @@ func UpdateChannelStatus(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
-	changed := model.UpdateChannelStatus(id, "", req.Status, "manual operation")
-	if changed {
-		model.InitChannelCache()
+	changed := false
+	if req.Status == common.ChannelStatusEnabled {
+		changed = service.EnableChannel(id, "", "")
+	} else if model.UpdateChannelStatus(id, "", req.Status, "manual operation") {
+		changed = true
 	}
 	recordManageAudit(c, "channel.status_update", map[string]interface{}{
 		"id":      id,
@@ -1194,12 +1196,13 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 	}
 	changedCount := 0
 	for _, id := range req.Ids {
-		if model.UpdateChannelStatus(id, "", req.Status, "manual batch operation") {
+		if req.Status == common.ChannelStatusEnabled {
+			if service.EnableChannel(id, "", "") {
+				changedCount++
+			}
+		} else if model.UpdateChannelStatus(id, "", req.Status, "manual batch operation") {
 			changedCount++
 		}
-	}
-	if changedCount > 0 {
-		model.InitChannelCache()
 	}
 	recordManageAudit(c, "channel.status_update_batch", map[string]interface{}{
 		"count":  changedCount,
