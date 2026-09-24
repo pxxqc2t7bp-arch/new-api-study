@@ -531,9 +531,8 @@ func runDueUpstreamProbeTaskWithDependencies(
 		summary.Failed++
 	}
 	if len(activatedChannelIDs) > 0 {
-		if _, err := reconcileManagedUpstreams(time.Now()); err != nil {
-			return summary, err
-		}
+		_, reconcileErr := reconcileManagedUpstreams(time.Now())
+		var auditErr error
 		seen := make(map[int]struct{}, len(activatedChannelIDs))
 		for _, channelID := range activatedChannelIDs {
 			if _, exists := seen[channelID]; exists {
@@ -543,7 +542,10 @@ func runDueUpstreamProbeTaskWithDependencies(
 
 			var channel model.Channel
 			if err := model.DB.First(&channel, channelID).Error; err != nil {
-				return summary, err
+				if auditErr == nil {
+					auditErr = err
+				}
+				continue
 			}
 			if channel.Status != common.ChannelStatusEnabled {
 				continue
@@ -558,10 +560,19 @@ func runDueUpstreamProbeTaskWithDependencies(
 				continue
 			}
 			if err != nil {
-				return summary, err
+				if auditErr == nil {
+					auditErr = err
+				}
+				continue
 			}
 			summary.Enabled++
 			notifyManagedChannelRecovered(&channel)
+		}
+		if reconcileErr != nil {
+			return summary, reconcileErr
+		}
+		if auditErr != nil {
+			return summary, auditErr
 		}
 	}
 	return summary, nil

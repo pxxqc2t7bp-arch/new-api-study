@@ -1530,6 +1530,137 @@ func TestUpdateManagedRouteStateIfUnchangedRollsBackAbilityFailure(t *testing.T)
 	assert.Equal(t, channel.OtherInfo, cached.OtherInfo)
 }
 
+func TestTransitionManagedRouteChannelIfUnchangedRejectsStaleRouteSnapshot(t *testing.T) {
+	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+		"owner": "before",
+	})
+	require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+	require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+	route := UpstreamManagedRoute{
+		SourceID:            1,
+		ExternalGroupID:     "transition-stale",
+		Platform:            "openai",
+		Protocol:            UpstreamProtocolOpenAI,
+		ChannelID:           channel.Id,
+		State:               UpstreamRouteStateActive,
+		Rank:                7,
+		ConsecutiveFailures: 1,
+		UpdatedAt:           1_788_319_000,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+	var expectedRoute UpstreamManagedRoute
+	require.NoError(t, DB.First(&expectedRoute, route.ID).Error)
+	desiredRoute := expectedRoute
+	desiredRoute.State = UpstreamRouteStatePaused
+	desiredRoute.Rank = 0
+	desiredRoute.ManualPauseUntil = 1_788_330_000
+	desiredRoute.LastReason = "operator pause"
+	desiredRoute.UpdatedAt = 1_788_320_000
+	require.NoError(t, DB.Model(&UpstreamManagedRoute{}).
+		Where("id = ?", route.ID).
+		Updates(map[string]any{
+			"consecutive_failures": 2,
+			"updated_at":           int64(1_788_319_001),
+		}).Error)
+
+	applied, _, err := TransitionManagedRouteChannelIfUnchanged(
+		&expectedRoute,
+		&desiredRoute,
+		ManagedRouteChannelTransition{
+			StatusIfEnabled:    common.ChannelStatusManuallyDisabled,
+			StatusReason:       "upstream orchestration manual pause",
+			StatusTime:         1_788_320_000,
+			UpdateStatusReason: true,
+		},
+	)
+
+	require.NoError(t, err)
+	assert.False(t, applied)
+	var storedRoute UpstreamManagedRoute
+	require.NoError(t, DB.First(&storedRoute, route.ID).Error)
+	assert.Equal(t, 2, storedRoute.ConsecutiveFailures)
+	assert.Equal(t, UpstreamRouteStateActive, storedRoute.State)
+	assert.Equal(t, 7, storedRoute.Rank)
+	storedChannel, storedAbility := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, common.ChannelStatusEnabled, storedChannel.Status)
+	assert.True(t, storedAbility.Enabled)
+}
+
+func TestTransitionManagedRouteChannelIfUnchangedPreservesIndependentCacheFields(t *testing.T) {
+	setupChannelStatusTest(t)
+	require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+	require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+	channel := Channel{
+		Name:   "managed-transition-cache",
+		Key:    "credential-a\ncredential-b",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-a",
+		Group:  "default",
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:            true,
+			MultiKeySize:          2,
+			MultiKeyStatusList:    map[int]int{},
+			MultiKeyPollingIndex:  0,
+			MultiKeyRecoveryIndex: 1,
+		},
+	}
+	channel.SetOtherInfo(map[string]any{
+		"quota_domain_id":  "plan-domain",
+		"quota_generation": "database-generation",
+		"quota_type":       "plan",
+	})
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	route := UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "transition-cache",
+		Platform:        "openai",
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           UpstreamRouteStateActive,
+		Rank:            7,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	newerCache := *cached
+	newerCache.ChannelInfo.MultiKeyPollingIndex = 1
+	newerInfo := newerCache.GetOtherInfo()
+	newerInfo["quota_generation"] = "newer-cache-generation"
+	newerCache.SetOtherInfo(newerInfo)
+	CacheUpdateChannel(&newerCache)
+
+	desired := route
+	desired.State = UpstreamRouteStatePaused
+	desired.Rank = 0
+	desired.LastReason = "operator pause"
+	applied, _, err := TransitionManagedRouteChannelIfUnchanged(
+		&route,
+		&desired,
+		ManagedRouteChannelTransition{
+			StatusIfEnabled:    common.ChannelStatusManuallyDisabled,
+			StatusReason:       "upstream orchestration manual pause",
+			StatusTime:         1_788_320_000,
+			UpdateStatusReason: true,
+		},
+	)
+
+	require.NoError(t, err)
+	require.True(t, applied)
+	cached, err = CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, cached.Status)
+	assert.Equal(t, 1, cached.ChannelInfo.MultiKeyPollingIndex)
+	cachedInfo := cached.GetOtherInfo()
+	assert.Equal(t, "plan-domain", cachedInfo["quota_domain_id"])
+	assert.Equal(t, "newer-cache-generation", cachedInfo["quota_generation"])
+	assert.Equal(t, "plan", cachedInfo["quota_type"])
+	assert.Equal(t, "upstream orchestration manual pause", cachedInfo["status_reason"])
+	assert.EqualValues(t, 1_788_320_000, cachedInfo["status_time"])
+}
+
 func TestUpdateManagedChannelIfUnchangedRollsBackRankAndChannelOnAbilityFailure(t *testing.T) {
 	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
 		"owner": "pending-activation",
@@ -2124,6 +2255,228 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 			storedRecovery, recoveryAbility := loadChannelStatusCASFixture(t, recoveryChannel.Id)
 			assert.Equal(t, common.ChannelStatusEnabled, storedRecovery.Status)
 			assert.True(t, recoveryAbility.Enabled)
+
+			transitionChannel := Channel{
+				Name:   "configured-database-managed-transition",
+				Key:    "transition-credential",
+				Status: common.ChannelStatusEnabled,
+				Models: "gpt-a,gpt-b",
+				Group:  "default",
+			}
+			transitionChannel.SetOtherInfo(map[string]any{
+				"quota_domain_id": "configured-transition-domain",
+				"quota_type":      "plan",
+			})
+			require.NoError(t, DB.Create(&transitionChannel).Error)
+			require.NoError(t, transitionChannel.AddAbilities(nil))
+			transitionRoute := UpstreamManagedRoute{
+				SourceID:        92,
+				ExternalGroupID: "configured-transition",
+				Platform:        "openai",
+				Protocol:        UpstreamProtocolOpenAI,
+				ChannelID:       transitionChannel.Id,
+				State:           UpstreamRouteStateActive,
+				Rank:            7,
+			}
+			require.NoError(t, DB.Create(&transitionRoute).Error)
+			require.NoError(t, DB.First(&transitionRoute, transitionRoute.ID).Error)
+			transitionDesired := transitionRoute
+			transitionDesired.State = UpstreamRouteStatePaused
+			transitionDesired.Rank = 0
+			transitionDesired.ManualPauseUntil = 1_788_330_000
+			transitionDesired.LastReason = "operator pause"
+			transitionDesired.UpdatedAt = 1_788_320_000
+
+			applied, statusChanged, err := TransitionManagedRouteChannelIfUnchanged(
+				&transitionRoute,
+				&transitionDesired,
+				ManagedRouteChannelTransition{
+					StatusIfEnabled:    common.ChannelStatusManuallyDisabled,
+					StatusReason:       "upstream orchestration manual pause",
+					StatusTime:         1_788_320_000,
+					UpdateStatusReason: true,
+				},
+			)
+			require.NoError(t, err)
+			require.True(t, applied)
+			require.True(t, statusChanged)
+			var storedTransitionRoute UpstreamManagedRoute
+			require.NoError(t, DB.First(&storedTransitionRoute, transitionRoute.ID).Error)
+			assert.Equal(t, transitionDesired, storedTransitionRoute)
+			storedTransitionChannel, transitionAbility := loadChannelStatusCASFixture(
+				t,
+				transitionChannel.Id,
+			)
+			assert.Equal(t, common.ChannelStatusManuallyDisabled, storedTransitionChannel.Status)
+			assert.Equal(t, "configured-transition-domain", storedTransitionChannel.GetOtherInfo()["quota_domain_id"])
+			assert.False(t, transitionAbility.Enabled)
+			var transitionAbilityCount int64
+			require.NoError(t, DB.Model(&Ability{}).
+				Where("channel_id = ? AND enabled = ?", transitionChannel.Id, true).
+				Count(&transitionAbilityCount).Error)
+			assert.Zero(t, transitionAbilityCount)
+
+			probeChannel := Channel{
+				Name:   "configured-database-probe-transition",
+				Key:    "probe-credential",
+				Status: common.ChannelStatusEnabled,
+				Models: "gpt-a",
+				Group:  "default",
+			}
+			probeChannel.SetOtherInfo(map[string]any{"owner": "probe"})
+			require.NoError(t, DB.Create(&probeChannel).Error)
+			require.NoError(t, probeChannel.AddAbilities(nil))
+			probeRoute := UpstreamManagedRoute{
+				SourceID:            93,
+				ExternalGroupID:     "configured-probe",
+				Platform:            "openai",
+				Protocol:            UpstreamProtocolOpenAI,
+				ChannelID:           probeChannel.Id,
+				State:               UpstreamRouteStateActive,
+				Rank:                6,
+				ConsecutiveFailures: 1,
+				FailureWindowStart:  1_788_319_900,
+			}
+			require.NoError(t, DB.Create(&probeRoute).Error)
+			require.NoError(t, DB.First(&probeRoute, probeRoute.ID).Error)
+			probeDesired := probeRoute
+			probeDesired.State = UpstreamRouteStateQuarantined
+			probeDesired.Rank = 0
+			probeDesired.ConsecutiveFailures = 2
+			probeDesired.ConsecutiveSuccesses = 0
+			probeDesired.LastProbeAt = 1_788_320_000
+			probeDesired.LastFailureAt = 1_788_320_000
+			probeDesired.LastReason = "probe failed"
+			probeDesired.UpdatedAt = 1_788_320_000
+
+			forcedProbeErr := errors.New("forced configured probe ability failure")
+			callbackName := "test:configured_probe_rollback_" + test.name
+			callbackRegistered := true
+			require.NoError(t, DB.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement != nil && tx.Statement.Table == DB.NamingStrategy.TableName("abilities") {
+					tx.AddError(forcedProbeErr)
+				}
+			}))
+			t.Cleanup(func() {
+				if callbackRegistered {
+					require.NoError(t, DB.Callback().Update().Remove(callbackName))
+				}
+			})
+			applied, _, err = UpdateManagedRouteProbeResultIfUnchanged(
+				&probeRoute,
+				&probeDesired,
+				true,
+				"probe failed",
+				1_788_320_000,
+			)
+			require.ErrorIs(t, err, forcedProbeErr)
+			assert.False(t, applied)
+			var rolledBackProbeRoute UpstreamManagedRoute
+			require.NoError(t, DB.First(&rolledBackProbeRoute, probeRoute.ID).Error)
+			assert.Equal(t, probeRoute, rolledBackProbeRoute)
+			storedProbeChannel, probeAbility := loadChannelStatusCASFixture(t, probeChannel.Id)
+			assert.Equal(t, common.ChannelStatusEnabled, storedProbeChannel.Status)
+			assert.Equal(t, probeChannel.OtherInfo, storedProbeChannel.OtherInfo)
+			assert.True(t, probeAbility.Enabled)
+			require.NoError(t, DB.Callback().Update().Remove(callbackName))
+			callbackRegistered = false
+
+			applied, statusChanged, err = UpdateManagedRouteProbeResultIfUnchanged(
+				&probeRoute,
+				&probeDesired,
+				true,
+				"probe failed",
+				1_788_320_000,
+			)
+			require.NoError(t, err)
+			require.True(t, applied)
+			require.True(t, statusChanged)
+			var storedProbeRoute UpstreamManagedRoute
+			require.NoError(t, DB.First(&storedProbeRoute, probeRoute.ID).Error)
+			assert.Equal(t, probeDesired, storedProbeRoute)
+			storedProbeChannel, probeAbility = loadChannelStatusCASFixture(t, probeChannel.Id)
+			assert.Equal(t, common.ChannelStatusAutoDisabled, storedProbeChannel.Status)
+			assert.False(t, probeAbility.Enabled)
+
+			rankSource := UpstreamSource{
+				Key:              "configured-rank-source",
+				Name:             "Configured Rank Source",
+				ConsoleURL:       "https://example.com",
+				SelectedEndpoint: "https://rank.example.com",
+				Status:           UpstreamHealthOperational,
+				Enabled:          true,
+				LastSnapshotAt:   1_788_320_000,
+			}
+			require.NoError(t, DB.Create(&rankSource).Error)
+			rankGroup := UpstreamGroup{
+				SourceID:            rankSource.ID,
+				ExternalID:          "configured-rank-group",
+				Name:                "Configured Rank Group",
+				Platform:            "openai",
+				EffectiveMultiplier: 0.25,
+				HealthStatus:        UpstreamHealthOperational,
+				Models:              `["gpt-rank"]`,
+				ObservedAt:          1_788_320_000,
+			}
+			require.NoError(t, DB.Create(&rankGroup).Error)
+			rankPriority := int64(0)
+			rankBaseURL := "https://old-rank.example.com"
+			rankChannel := Channel{
+				Name:     "configured-database-managed-rank",
+				Key:      "rank-credential",
+				Status:   common.ChannelStatusAutoDisabled,
+				Models:   "gpt-old",
+				Group:    "default",
+				Priority: &rankPriority,
+				BaseURL:  &rankBaseURL,
+			}
+			require.NoError(t, DB.Create(&rankChannel).Error)
+			require.NoError(t, rankChannel.AddAbilities(nil))
+			rankRoute := UpstreamManagedRoute{
+				SourceID:        rankSource.ID,
+				ExternalGroupID: rankGroup.ExternalID,
+				Platform:        rankGroup.Platform,
+				Protocol:        UpstreamProtocolOpenAI,
+				ChannelID:       rankChannel.Id,
+				State:           UpstreamRouteStateActive,
+			}
+			require.NoError(t, DB.Create(&rankRoute).Error)
+			require.NoError(t, DB.First(&rankSource, rankSource.ID).Error)
+			require.NoError(t, DB.First(&rankGroup, rankGroup.ID).Error)
+			require.NoError(t, DB.First(&rankRoute, rankRoute.ID).Error)
+			rankExpectedChannel, err := GetChannelById(rankChannel.Id, true)
+			require.NoError(t, err)
+			changed, err = UpdateManagedChannelIfUnchanged(
+				rankExpectedChannel,
+				ManagedChannelUpdate{
+					ExpectedSource:        &rankSource,
+					ExpectedGroup:         &rankGroup,
+					ExpectedRoute:         &rankRoute,
+					RouteID:               rankRoute.ID,
+					ExpectedRouteState:    rankRoute.State,
+					ExpectedRouteDetached: rankRoute.Detached,
+					Rank:                  1,
+					EffectiveMultiplier:   rankGroup.EffectiveMultiplier,
+					UpdatedAt:             1_788_320_000,
+					Priority:              999,
+					BaseURL:               rankSource.SelectedEndpoint,
+					Models:                "gpt-rank",
+					Status:                common.ChannelStatusEnabled,
+				},
+			)
+			require.NoError(t, err)
+			require.True(t, changed)
+			var storedRankRoute UpstreamManagedRoute
+			require.NoError(t, DB.First(&storedRankRoute, rankRoute.ID).Error)
+			assert.Equal(t, 1, storedRankRoute.Rank)
+			assert.Equal(t, rankGroup.EffectiveMultiplier, storedRankRoute.EffectiveMultiplier)
+			storedRankChannel, rankAbility := loadChannelStatusCASFixture(t, rankChannel.Id)
+			assert.Equal(t, common.ChannelStatusEnabled, storedRankChannel.Status)
+			require.NotNil(t, storedRankChannel.Priority)
+			assert.EqualValues(t, 999, *storedRankChannel.Priority)
+			assert.Equal(t, rankSource.SelectedEndpoint, *storedRankChannel.BaseURL)
+			assert.Equal(t, "gpt-rank", storedRankChannel.Models)
+			assert.True(t, rankAbility.Enabled)
 
 			source := UpstreamSource{
 				Key:        "configured-source",

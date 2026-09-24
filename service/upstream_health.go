@@ -183,14 +183,12 @@ func RecordManagedChannelFailure(channelError types.ChannelError, reason string)
 	}
 	if quarantined {
 		invalidateManagedRouteAdminInfo(channelError.ChannelId)
-		if model.UpdateChannelStatus(channelError.ChannelId, channelError.UsingKey, common.ChannelStatusAutoDisabled, reason) {
-			if err := NotifyRootBark(
-				fmt.Sprintf("%s_managed_%d", dto.NotifyTypeChannelUpdate, channelError.ChannelId),
-				fmt.Sprintf("受管通道「%s」（#%d）已隔离", channelError.ChannelName, channelError.ChannelId),
-				fmt.Sprintf("%d 分钟内连续错误达到 %d 次，已停止生产流量。原因：%s", setting.FailureWindowMinutes, setting.FailureThreshold, common.LocalLogPreview(reason)),
-			); err != nil {
-				common.SysLog("upstream Bark notification skipped: " + err.Error())
-			}
+		if err := NotifyRootBark(
+			fmt.Sprintf("%s_managed_%d", dto.NotifyTypeChannelUpdate, channelError.ChannelId),
+			fmt.Sprintf("受管通道「%s」（#%d）已隔离", channelError.ChannelName, channelError.ChannelId),
+			fmt.Sprintf("%d 分钟内连续错误达到 %d 次，已停止生产流量。原因：%s", setting.FailureWindowMinutes, setting.FailureThreshold, common.LocalLogPreview(reason)),
+		); err != nil {
+			common.SysLog("upstream Bark notification skipped: " + err.Error())
 		}
 	}
 	return true, quarantined, nil
@@ -255,16 +253,28 @@ func PauseManagedRoute(routeID int64, reason string) error {
 		return errors.New("managed route is detached")
 	}
 	until := now + int64(setting.ManualPauseHours*3600)
-	if err := model.DB.Model(&route).Updates(map[string]any{
-		"state":              model.UpstreamRouteStatePaused,
-		"rank":               0,
-		"manual_pause_until": until,
-		"last_reason":        strings.TrimSpace(reason),
-		"updated_at":         now,
-	}).Error; err != nil {
+	desired := route
+	desired.State = model.UpstreamRouteStatePaused
+	desired.Rank = 0
+	desired.ManualPauseUntil = until
+	desired.LastReason = strings.TrimSpace(reason)
+	desired.UpdatedAt = now
+	applied, _, err := model.TransitionManagedRouteChannelIfUnchanged(
+		&route,
+		&desired,
+		model.ManagedRouteChannelTransition{
+			StatusIfEnabled:    common.ChannelStatusManuallyDisabled,
+			StatusReason:       "upstream orchestration manual pause",
+			StatusTime:         now,
+			UpdateStatusReason: true,
+		},
+	)
+	if err != nil {
 		return err
 	}
-	model.UpdateChannelStatus(route.ChannelID, "", common.ChannelStatusManuallyDisabled, "upstream orchestration manual pause")
+	if !applied {
+		return errors.New("managed route changed during pause")
+	}
 	invalidateManagedRouteAdminInfo(route.ChannelID)
 	return nil
 }
@@ -278,15 +288,26 @@ func ResumeManagedRoute(routeID int64) error {
 	if route.Detached {
 		return errors.New("managed route is detached")
 	}
-	if err := model.DB.Model(&route).Updates(map[string]any{
-		"state":              model.UpstreamRouteStateShadow,
-		"rank":               0,
-		"manual_pause_until": int64(0),
-		"next_probe_at":      now,
-		"last_reason":        "",
-		"updated_at":         now,
-	}).Error; err != nil {
+	desired := route
+	desired.State = model.UpstreamRouteStateShadow
+	desired.Rank = 0
+	desired.ManualPauseUntil = 0
+	desired.NextProbeAt = now
+	desired.LastReason = ""
+	desired.UpdatedAt = now
+	applied, _, err := model.TransitionManagedRouteChannelIfUnchanged(
+		&route,
+		&desired,
+		model.ManagedRouteChannelTransition{
+			StatusIfEnabled: common.ChannelStatusAutoDisabled,
+			StatusTime:      now,
+		},
+	)
+	if err != nil {
 		return err
+	}
+	if !applied {
+		return errors.New("managed route changed during resume")
 	}
 	invalidateManagedRouteAdminInfo(route.ChannelID)
 	return nil
@@ -294,22 +315,32 @@ func ResumeManagedRoute(routeID int64) error {
 
 func DetachManagedRoute(routeID int64) error {
 	now := common.GetTimestamp()
-	result := model.DB.Model(&model.UpstreamManagedRoute{}).Where("id = ?", routeID).Updates(map[string]any{
-		"state":      model.UpstreamRouteStateDetached,
-		"rank":       0,
-		"detached":   true,
-		"updated_at": now,
-	})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected != 1 {
-		return gorm.ErrRecordNotFound
-	}
 	var route model.UpstreamManagedRoute
-	if model.DB.First(&route, routeID).Error == nil {
-		invalidateManagedRouteAdminInfo(route.ChannelID)
+	if err := model.DB.First(&route, routeID).Error; err != nil {
+		return err
 	}
+	desired := route
+	desired.State = model.UpstreamRouteStateDetached
+	desired.Rank = 0
+	desired.Detached = true
+	desired.UpdatedAt = now
+	applied, _, err := model.TransitionManagedRouteChannelIfUnchanged(
+		&route,
+		&desired,
+		model.ManagedRouteChannelTransition{
+			StatusIfEnabled:    common.ChannelStatusAutoDisabled,
+			StatusReason:       model.UpstreamRouteStateDetached,
+			StatusTime:         now,
+			UpdateStatusReason: true,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return errors.New("managed route changed during detach")
+	}
+	invalidateManagedRouteAdminInfo(route.ChannelID)
 	return nil
 }
 

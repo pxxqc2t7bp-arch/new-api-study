@@ -357,6 +357,9 @@ func desiredManagedRouteState(
 		}
 		return model.UpstreamRouteStateQuarantined, "upstream monitor red"
 	case model.UpstreamHealthOperational, model.UpstreamHealthDegraded:
+		if route.State == model.UpstreamRouteStateQuarantined {
+			return route.State, route.LastReason
+		}
 		if route.State != model.UpstreamRouteStateShadow ||
 			route.ConsecutiveSuccesses >= setting.ShadowSuccessesRequired {
 			return model.UpstreamRouteStateActive, ""

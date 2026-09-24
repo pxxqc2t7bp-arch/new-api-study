@@ -1382,73 +1382,20 @@ func DisableDetachedManagedChannelIfUnchanged(
 	if expectedRoute == nil || expectedRoute.ID == 0 || expectedRoute.ChannelID == 0 {
 		return false, errors.New("detached managed route snapshot is missing")
 	}
-
-	return withChannelStatusLocks(expectedRoute.ChannelID, func() (bool, error) {
-		applied := false
-		var updatedChannel Channel
-		transactionErr := DB.Transaction(func(tx *gorm.DB) error {
-			var currentRoute UpstreamManagedRoute
-			if err := lockForUpdate(tx).Where("id = ?", expectedRoute.ID).First(&currentRoute).Error; err != nil {
-				return err
-			}
-			if !reflect.DeepEqual(currentRoute, *expectedRoute) ||
-				!currentRoute.Detached ||
-				currentRoute.State == UpstreamRouteStateActive {
-				return nil
-			}
-
-			var currentChannel Channel
-			if err := lockForUpdate(tx).
-				Where("id = ?", currentRoute.ChannelID).
-				First(&currentChannel).Error; err != nil {
-				return err
-			}
-			updatedChannel = currentChannel
-			if updatedChannel.Status == common.ChannelStatusEnabled {
-				updatedChannel.Status = common.ChannelStatusAutoDisabled
-			}
-			info := updatedChannel.GetOtherInfo()
-			statusReason, reasonExists := info["status_reason"].(string)
-			_, timeExists := info["status_time"]
-			if updatedChannel.Status != currentChannel.Status ||
-				!reasonExists ||
-				statusReason != UpstreamRouteStateDetached ||
-				!timeExists {
-				info["status_reason"] = UpstreamRouteStateDetached
-				info["status_time"] = statusTime
-				updatedChannel.SetOtherInfo(info)
-			}
-			if updatedChannel.Status != currentChannel.Status ||
-				updatedChannel.OtherInfo != currentChannel.OtherInfo {
-				if err := tx.Model(&Channel{}).
-					Where("id = ?", updatedChannel.Id).
-					Updates(map[string]any{
-						"status":     updatedChannel.Status,
-						"other_info": updatedChannel.OtherInfo,
-					}).Error; err != nil {
-					return err
-				}
-			}
-			if err := tx.Model(&Ability{}).
-				Where("channel_id = ?", updatedChannel.Id).
-				Select("enabled").
-				Update("enabled", false).Error; err != nil {
-				return err
-			}
-			applied = true
-			return nil
-		})
-		if transactionErr != nil {
-			return false, transactionErr
-		}
-		if applied {
-			CacheUpdateManagedChannelSnapshots([]ManagedChannelCacheUpdate{{
-				Snapshot:           &updatedChannel,
-				UpdateStatusReason: true,
-			}})
-		}
-		return applied, nil
-	})
+	if !expectedRoute.Detached || expectedRoute.State == UpstreamRouteStateActive {
+		return false, nil
+	}
+	applied, _, err := TransitionManagedRouteChannelIfUnchanged(
+		expectedRoute,
+		expectedRoute,
+		ManagedRouteChannelTransition{
+			StatusIfEnabled:    common.ChannelStatusAutoDisabled,
+			StatusReason:       UpstreamRouteStateDetached,
+			StatusTime:         statusTime,
+			UpdateStatusReason: true,
+		},
+	)
+	return applied, err
 }
 
 func UpdateManagedRouteStateIfUnchanged(
@@ -1484,66 +1431,31 @@ func UpdateManagedRouteStateIfUnchanged(
 				return err
 			}
 
-			var currentChannel Channel
-			if err := lockForUpdate(tx).
-				Where("id = ?", currentRoute.ChannelID).
-				First(&currentChannel).Error; err != nil {
-				return err
-			}
-
-			if err := tx.Model(&UpstreamManagedRoute{}).
-				Where("id = ?", currentRoute.ID).
-				Updates(map[string]any{
-					"state":                desiredRoute.State,
-					"rank":                 desiredRoute.Rank,
-					"consecutive_failures": desiredRoute.ConsecutiveFailures,
-					"failure_window_start": desiredRoute.FailureWindowStart,
-					"recovery_attempts":    desiredRoute.RecoveryAttempts,
-					"next_probe_at":        desiredRoute.NextProbeAt,
-					"red_since":            desiredRoute.RedSince,
-					"last_reason":          desiredRoute.LastReason,
-					"updated_at":           desiredRoute.UpdatedAt,
-				}).Error; err != nil {
-				return err
-			}
-
-			updatedChannel = currentChannel
-			if desiredRoute.State != UpstreamRouteStateActive {
-				if updatedChannel.Status == common.ChannelStatusEnabled {
-					updatedChannel.Status = common.ChannelStatusAutoDisabled
-				}
-				info := updatedChannel.GetOtherInfo()
-				statusReason, reasonExists := info["status_reason"].(string)
-				_, timeExists := info["status_time"]
-				stateChanged := expectedRoute.State != desiredRoute.State ||
-					expectedRoute.LastReason != desiredRoute.LastReason
-				if stateChanged ||
-					updatedChannel.Status != currentChannel.Status ||
-					!reasonExists ||
-					statusReason != desiredRoute.LastReason ||
-					!timeExists {
-					info["status_reason"] = desiredRoute.LastReason
-					info["status_time"] = statusTime
-					updatedChannel.SetOtherInfo(info)
-				}
-				if updatedChannel.Status != currentChannel.Status ||
-					updatedChannel.OtherInfo != currentChannel.OtherInfo {
-					if err := tx.Model(&Channel{}).
-						Where("id = ?", currentChannel.Id).
-						Updates(map[string]any{
-							"status":     updatedChannel.Status,
-							"other_info": updatedChannel.OtherInfo,
-						}).Error; err != nil {
-						return err
-					}
-				}
-				if err := tx.Model(&Ability{}).
-					Where("channel_id = ?", currentChannel.Id).
-					Select("enabled").
-					Update("enabled", false).Error; err != nil {
+			if desiredRoute.State == UpstreamRouteStateActive {
+				if err := tx.Model(&UpstreamManagedRoute{}).
+					Where("id = ?", currentRoute.ID).
+					Updates(managedRouteTransitionUpdates(desiredRoute)).Error; err != nil {
 					return err
 				}
+				applied = true
+				return nil
 			}
+
+			channel, _, err := applyManagedRouteChannelTransition(
+				tx,
+				currentRoute,
+				desiredRoute,
+				ManagedRouteChannelTransition{
+					StatusIfEnabled:    common.ChannelStatusAutoDisabled,
+					StatusReason:       desiredRoute.LastReason,
+					StatusTime:         statusTime,
+					UpdateStatusReason: true,
+				},
+			)
+			if err != nil {
+				return err
+			}
+			updatedChannel = *channel
 			applied = true
 			return nil
 		})
