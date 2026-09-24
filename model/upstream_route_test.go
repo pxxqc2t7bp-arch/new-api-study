@@ -413,3 +413,67 @@ func TestIsolateManagedRouteModelCreatesMissingOptionWithConflictSafeInsert(t *t
 	assert.True(t, conflictSafeInsert)
 	assert.JSONEq(t, `{"source:group":["gpt-a"]}`, optionValue)
 }
+
+func TestIsolateManagedRouteModelNormalizesNullExclusionOption(t *testing.T) {
+	setupUpstreamRouteTest(t)
+	require.NoError(t, DB.AutoMigrate(
+		&UpstreamSource{},
+		&UpstreamGroup{},
+		&Channel{},
+		&Ability{},
+		&Option{},
+	))
+	source := UpstreamSource{
+		Key:        "source",
+		Name:       "Source",
+		ConsoleURL: "https://example.com",
+		Enabled:    true,
+	}
+	require.NoError(t, DB.Create(&source).Error)
+	group := UpstreamGroup{
+		SourceID:            source.ID,
+		ExternalID:          "group",
+		Name:                "Group",
+		Platform:            "openai",
+		EffectiveMultiplier: 0.1,
+		Models:              `["gpt-a"]`,
+	}
+	require.NoError(t, DB.Create(&group).Error)
+	channel := Channel{
+		Name:   "managed",
+		Key:    "credential",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-a",
+		Group:  "default",
+	}
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	route := UpstreamManagedRoute{
+		SourceID:        source.ID,
+		ExternalGroupID: group.ExternalID,
+		Platform:        group.Platform,
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           UpstreamRouteStateActive,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+	const optionKey = "test.null_managed_model_exclusions"
+	require.NoError(t, DB.Create(&Option{Key: optionKey, Value: "null"}).Error)
+
+	isolated, optionValue, err := IsolateManagedRouteModel(
+		&route,
+		"gpt-a",
+		"status_code=404",
+		1_788_320_000,
+		optionKey,
+	)
+
+	require.NoError(t, err)
+	require.True(t, isolated)
+	assert.JSONEq(t, `{"source:group":["gpt-a"]}`, optionValue)
+	var storedOption Option
+	require.NoError(t, DB.
+		Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: optionKey}).
+		First(&storedOption).Error)
+	assert.JSONEq(t, `{"source:group":["gpt-a"]}`, storedOption.Value)
+}

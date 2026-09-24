@@ -1597,6 +1597,111 @@ func TestChannelForHealthCheckProbesFinalAutoDisabledMultiKey(t *testing.T) {
 	}
 }
 
+func TestChannelForHealthCheckRotatesAfterResponseTimeFailure(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticDisableChannelEnabled := common.AutomaticDisableChannelEnabled
+	originalAutomaticEnableChannelEnabled := common.AutomaticEnableChannelEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = false
+	common.LogConsumeEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	common.AutomaticEnableChannelEnabled = true
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-slow-key-health":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableChannelEnabled
+		common.AutomaticEnableChannelEnabled = originalAutomaticEnableChannelEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "slow-key-health-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	requestKeys := make(chan string, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		requestKeys <- key
+		if key == "key-a" {
+			timer := time.NewTimer(20 * time.Millisecond)
+			<-timer.C
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id":"chatcmpl-slow-key-health",
+			"object":"chat.completion",
+			"created":1,
+			"model":"gpt-slow-key-health",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer upstream.Close()
+
+	autoBan := 1
+	channel := model.Channel{
+		Name: "slow-key-health", Type: constant.ChannelTypeOpenAI,
+		Key: "key-a\nkey-b", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusAutoDisabled, AutoBan: &autoBan,
+		Models: "gpt-slow-key-health", Group: "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledTime: map[int]int64{0: 100, 1: 200},
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	slowSummary := testChannelForHealthCheck(
+		context.Background(),
+		&channel,
+		user.Id,
+		false,
+		1,
+	)
+	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1}, slowSummary)
+	assert.Equal(t, "key-a", <-requestKeys)
+
+	var afterSlowProbe model.Channel
+	require.NoError(t, db.First(&afterSlowProbe, channel.Id).Error)
+	assert.Equal(t, 1, afterSlowProbe.ChannelInfo.MultiKeyRecoveryIndex)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, afterSlowProbe.Status)
+
+	healthySummary := testChannelForHealthCheck(
+		context.Background(),
+		&afterSlowProbe,
+		user.Id,
+		false,
+		10_000_000,
+	)
+	assert.Equal(t, channelTestSummary{Tested: 1, Succeeded: 1, Enabled: 1}, healthySummary)
+	assert.Equal(t, "key-b", <-requestKeys)
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+	assert.Equal(t, 1, stored.ChannelInfo.MultiKeyRecoveryIndex)
+}
+
 func TestChannelForHealthCheckDoesNotAdvanceRecoveryCursorWithoutUpstreamFailure(t *testing.T) {
 	tests := []struct {
 		name      string

@@ -451,6 +451,7 @@ func enablePlanQuotaDomainForHealthCheck(
 				if !candidateOwned ||
 					candidateKey != recoveryKey ||
 					channel.GetDisabledUntil() > recoveryAt ||
+					!planQuotaSnapshotMatchesCredentialMarker(channel) ||
 					!planQuotaPeerGenerationMatches(recoveringSnapshot, channel) {
 					continue
 				}

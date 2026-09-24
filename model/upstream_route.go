@@ -440,6 +440,9 @@ func IsolateManagedRouteModel(
 					return err
 				}
 			}
+			if exclusions == nil {
+				exclusions = make(map[string][]string)
+			}
 			exclusionKey := strings.ToLower(strings.TrimSpace(source.Key)) + ":" +
 				strings.TrimSpace(route.ExternalGroupID)
 			exclusionAdded := true

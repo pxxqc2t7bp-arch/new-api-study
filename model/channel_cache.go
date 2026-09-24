@@ -30,6 +30,7 @@ func InitChannelCache() {
 		rebuildTaskAliasView()
 		return
 	}
+	channelSyncLock.Lock()
 	newChannelId2channel := make(map[int]*Channel)
 	newChannel2advancedCustomConfig := make(map[int]*kitdto.AdvancedCustomConfig)
 	var channels []*Channel
@@ -78,7 +79,6 @@ func InitChannelCache() {
 		}
 	}
 
-	channelSyncLock.Lock()
 	group2model2channels = newGroup2model2channels
 	//channelsIDM = newChannelId2channel
 	for i, channel := range newChannelId2channel {

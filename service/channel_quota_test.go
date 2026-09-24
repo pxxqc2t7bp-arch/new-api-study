@@ -1065,6 +1065,7 @@ func TestEnableChannelForHealthCheckFencesPlanQuotaPeers(t *testing.T) {
 		name           string
 		sourceInfo     map[string]any
 		peerInfo       map[string]any
+		peerKey        string
 		wantPeerStatus int
 	}{
 		{
@@ -1103,6 +1104,24 @@ func TestEnableChannelForHealthCheckFencesPlanQuotaPeers(t *testing.T) {
 			wantPeerStatus: common.ChannelStatusAutoDisabled,
 		},
 		{
+			name: "peer credential no longer matches marker",
+			sourceInfo: map[string]any{
+				"disabled_until":   time.Now().Add(-time.Minute).Unix(),
+				"quota_domain_id":  domainID,
+				"quota_generation": "generation-a",
+				"quota_type":       "plan",
+			},
+			peerInfo: map[string]any{
+				"disabled_until":   time.Now().Add(-time.Minute).Unix(),
+				"quota_domain_id":  domainID,
+				"quota_generation": "generation-a",
+				"quota_type":       "plan",
+				"peer_preserved":   true,
+			},
+			peerKey:        "rotated-credential",
+			wantPeerStatus: common.ChannelStatusAutoDisabled,
+		},
+		{
 			name: "legacy marked rows without generation",
 			sourceInfo: map[string]any{
 				"disabled_until":  time.Now().Add(-time.Minute).Unix(),
@@ -1123,6 +1142,10 @@ func TestEnableChannelForHealthCheckFencesPlanQuotaPeers(t *testing.T) {
 			db := setupPlanQuotaDomainTest(t)
 			autoBan := 1
 			tag := "plan:support:peer-fence"
+			peerKey := testCase.peerKey
+			if peerKey == "" {
+				peerKey = "credential"
+			}
 			channels := []model.Channel{
 				{
 					Id: 51, Name: "source", Key: "credential",
@@ -1130,7 +1153,7 @@ func TestEnableChannelForHealthCheckFencesPlanQuotaPeers(t *testing.T) {
 					Models: "gpt-3.5-turbo", Group: "default",
 				},
 				{
-					Id: 52, Name: "peer", Key: "credential",
+					Id: 52, Name: "peer", Key: peerKey,
 					Status: common.ChannelStatusAutoDisabled, Tag: &tag, AutoBan: &autoBan,
 					Models: "gpt-3.5-turbo", Group: "default",
 				},

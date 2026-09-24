@@ -1010,19 +1010,11 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 	if ctx.Err() != nil {
 		return summary
 	}
-	if isolatedProbe && result.upstreamFailure {
-		if _, err := model.AdvanceMultiKeyRecoveryCursorIfUnchanged(channel, probeKey); err != nil {
-			common.SysError(fmt.Sprintf(
-				"failed to advance multi-key recovery cursor: channel_id=%d error=%v",
-				channel.Id,
-				err,
-			))
-		}
-	}
 
 	summary.Tested++
 
 	shouldBanChannel := false
+	probeFailed := result.upstreamFailure
 	newAPIError := result.newAPIError
 	if newAPIError != nil {
 		shouldBanChannel = service.ShouldDisableChannel(result.newAPIError)
@@ -1033,6 +1025,17 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 			err := fmt.Errorf("响应时间 %.2fs 超过阈值 %.2fs", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0)
 			newAPIError = types.NewOpenAIError(err, types.ErrorCodeChannelResponseTimeExceeded, http.StatusRequestTimeout)
 			shouldBanChannel = true
+			probeFailed = true
+		}
+	}
+
+	if isolatedProbe && probeFailed {
+		if _, err := model.AdvanceMultiKeyRecoveryCursorIfUnchanged(channel, probeKey); err != nil {
+			common.SysError(fmt.Sprintf(
+				"failed to advance multi-key recovery cursor: channel_id=%d error=%v",
+				channel.Id,
+				err,
+			))
 		}
 	}
 

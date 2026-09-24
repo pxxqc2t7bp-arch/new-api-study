@@ -868,6 +868,92 @@ func TestCacheUpdateChannelStatusRebuildsOrderedRoutingMembership(t *testing.T) 
 	assert.Equal(t, []int{channels[0].Id, channels[1].Id}, routingIDs)
 }
 
+func TestInitChannelCacheSerializesStaleRefreshWithCommittedStatusPublisher(t *testing.T) {
+	setupChannelStatusTest(t)
+	channel := Channel{
+		Name:   "stale-full-refresh",
+		Key:    "credential",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-stale-full-refresh",
+		Group:  "default",
+	}
+	require.NoError(t, DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	common.MemoryCacheEnabled = true
+	InitChannelCache()
+
+	snapshotRead := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var intercept sync.Once
+	const callbackName = "test:block_stale_full_channel_refresh"
+	require.NoError(t, DB.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil || tx.Statement.Table != "channels" {
+			return
+		}
+		if _, fullRefresh := tx.Statement.Dest.(*[]*Channel); !fullRefresh {
+			return
+		}
+		intercept.Do(func() {
+			close(snapshotRead)
+			<-releaseRefresh
+		})
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, DB.Callback().Query().Remove(callbackName))
+	})
+
+	refreshDone := make(chan struct{})
+	go func() {
+		InitChannelCache()
+		close(refreshDone)
+	}()
+	<-snapshotRead
+
+	refreshOwnsChannelLock := !channelSyncLock.TryLock()
+	if !refreshOwnsChannelLock {
+		channelSyncLock.Unlock()
+	}
+
+	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&Channel{}).Where("id = ?", channel.Id).
+			Update("status", common.ChannelStatusAutoDisabled).Error; err != nil {
+			return err
+		}
+		return tx.Model(&Ability{}).Where("channel_id = ?", channel.Id).
+			Select("enabled").Update("enabled", false).Error
+	}))
+	var committed Channel
+	require.NoError(t, DB.First(&committed, channel.Id).Error)
+	require.Equal(t, common.ChannelStatusAutoDisabled, committed.Status)
+
+	publisherDone := make(chan struct{})
+	go func() {
+		CacheUpdateChannelStatusSnapshots([]ChannelStatusCacheUpdate{{
+			Snapshot: &committed,
+		}})
+		close(publisherDone)
+	}()
+	if !refreshOwnsChannelLock {
+		<-publisherDone
+	}
+
+	close(releaseRefresh)
+	<-refreshDone
+	<-publisherDone
+
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, cached.Status)
+	routingIDs, err := ListSatisfiedChannelIDsAtPriority(
+		channel.Group,
+		channel.Models,
+		channel.GetPriority(),
+		nil,
+	)
+	require.NoError(t, err)
+	assert.NotContains(t, routingIDs, channel.Id)
+}
+
 func TestCacheUpdateChannelStatusSnapshotsPublishesRoutingDomainAtomically(t *testing.T) {
 	setupChannelStatusTest(t)
 	const (
