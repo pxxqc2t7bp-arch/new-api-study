@@ -476,7 +476,8 @@ func TestDisableAndEnablePlanQuotaDomainLifecycle(t *testing.T) {
 	assert.False(t, disabledAbilities[0].Enabled)
 	assert.False(t, disabledAbilities[1].Enabled)
 
-	EnableChannel(channels[0].Id, "", channels[0].Name)
+	_, enableErr := EnableChannel(channels[0].Id, "", channels[0].Name)
+	require.NoError(t, enableErr)
 
 	require.NoError(t, db.Order("id").Find(&stored).Error)
 	assert.Equal(t, common.ChannelStatusEnabled, stored[0].Status)
@@ -536,7 +537,8 @@ func TestEnablePlanQuotaDomainScopesRecoveryByMarker(t *testing.T) {
 	assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte("credential-b"))), otherDomainID)
 	assert.NotEqual(t, domainID, otherDomainID)
 
-	EnableChannel(channels[0].Id, "", channels[0].Name)
+	_, enableErr := EnableChannel(channels[0].Id, "", channels[0].Name)
+	require.NoError(t, enableErr)
 
 	require.NoError(t, db.Order("id").Find(&stored).Error)
 	assert.Equal(t, common.ChannelStatusEnabled, stored[0].Status)
@@ -613,7 +615,8 @@ func TestLegacyPlanQuotaDomainRecoveryByTag(t *testing.T) {
 		require.NoError(t, channels[i].AddAbilities(nil))
 	}
 
-	EnableChannel(channels[0].Id, "", channels[0].Name)
+	_, enableErr := EnableChannel(channels[0].Id, "", channels[0].Name)
+	require.NoError(t, enableErr)
 
 	var stored []model.Channel
 	require.NoError(t, db.Order("id").Find(&stored).Error)
@@ -946,7 +949,8 @@ func TestEnablePlanQuotaDomainAfterCredentialRotation(t *testing.T) {
 	rotated.Key = "credential-b"
 	require.NoError(t, rotated.Update())
 
-	EnableChannel(channels[0].Id, "", channels[0].Name)
+	_, enableErr := EnableChannel(channels[0].Id, "", channels[0].Name)
+	require.NoError(t, enableErr)
 
 	var stored []model.Channel
 	require.NoError(t, db.Order("id").Find(&stored).Error)
@@ -1163,7 +1167,9 @@ func TestEnableChannelManuallyRecoversFromOldGenerationManualPlanQuotaSource(t *
 	require.NoError(t, db.First(&manualSource, channels[0].Id).Error)
 	require.Equal(t, firstGeneration, manualSource.GetOtherInfo()["quota_generation"])
 
-	assert.True(t, EnableChannel(manualSource.Id, "", manualSource.Name))
+	changed, enableErr := EnableChannel(manualSource.Id, "", manualSource.Name)
+	require.NoError(t, enableErr)
+	assert.True(t, changed)
 
 	var recovered []model.Channel
 	require.NoError(t, db.Order("id").Find(&recovered).Error)
@@ -1233,7 +1239,9 @@ func TestEnableChannelManuallyRecoversOwnerlessDisabledAuthority(t *testing.T) {
 		require.NoError(t, channels[index].AddAbilities(db))
 	}
 
-	assert.True(t, EnableChannel(channels[0].Id, "", channels[0].Name))
+	changed, enableErr := EnableChannel(channels[0].Id, "", channels[0].Name)
+	require.NoError(t, enableErr)
+	assert.True(t, changed)
 
 	var authority model.PlanQuotaDomain
 	require.NoError(t, db.First(&authority, "credential_hash = ?", hash).Error)
@@ -1251,6 +1259,44 @@ func TestEnableChannelManuallyRecoversOwnerlessDisabledAuthority(t *testing.T) {
 	var unselectedAbility model.Ability
 	require.NoError(t, db.First(&unselectedAbility, "channel_id = ?", unselected.Id).Error)
 	assert.False(t, unselectedAbility.Enabled)
+}
+
+func TestEnableChannelPropagatesChannelLoadError(t *testing.T) {
+	setupPlanQuotaDomainTest(t)
+
+	changed, err := EnableChannel(999_999, "", "")
+
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	assert.False(t, changed)
+}
+
+func TestEnableChannelPropagatesGenericStatusUpdateError(t *testing.T) {
+	db := setupPlanQuotaDomainTest(t)
+	channel := model.Channel{
+		Name:   "generic-enable-error",
+		Key:    "generic-enable-error-credential",
+		Status: common.ChannelStatusAutoDisabled,
+		Models: "gpt-4.1",
+		Group:  "default",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(db))
+
+	forcedErr := errors.New("forced generic enable ability failure")
+	const callbackName = "test:generic_enable_ability_failure"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil && tx.Statement.Table == "abilities" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Update().Remove(callbackName))
+	})
+
+	changed, err := EnableChannel(channel.Id, "", channel.Name)
+
+	require.ErrorIs(t, err, forcedErr)
+	assert.False(t, changed)
 }
 
 func TestEnableChannelForHealthCheckCannotRecoverOwnerlessDisabledAuthority(t *testing.T) {
@@ -1744,7 +1790,8 @@ func TestEnableChannelBypassesManagedRouteRecoveryFence(t *testing.T) {
 		State:           model.UpstreamRouteStateQuarantined,
 	}).Error)
 
-	EnableChannel(channel.Id, "", channel.Name)
+	_, enableErr := EnableChannel(channel.Id, "", channel.Name)
+	require.NoError(t, enableErr)
 
 	var stored model.Channel
 	require.NoError(t, db.First(&stored, channel.Id).Error)
@@ -2384,7 +2431,8 @@ func TestEnableChannelRestoresFinalMultiKeyMemoryRouting(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, selected)
 
-	EnableChannel(channel.Id, "key-b", channel.Name)
+	_, enableErr := EnableChannel(channel.Id, "key-b", channel.Name)
+	require.NoError(t, enableErr)
 
 	selected, err = model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
 	require.NoError(t, err)
@@ -2721,7 +2769,8 @@ func TestDisableChannelPlanMultiKeyFinalKeyWithoutKnownResetClearsStaleDeadline(
 	require.Contains(t, stored.GetOtherInfo(), "quota_reset_at")
 	require.Contains(t, stored.GetOtherInfo(), "disabled_until")
 
-	EnableChannel(channel.Id, "key-b", channel.Name)
+	_, enableErr := EnableChannel(channel.Id, "key-b", channel.Name)
+	require.NoError(t, enableErr)
 	require.NoError(t, db.First(&stored, "id = ?", channel.Id).Error)
 	require.Equal(t, common.ChannelStatusEnabled, stored.Status)
 	require.Contains(t, stored.GetOtherInfo(), "quota_reset_at")

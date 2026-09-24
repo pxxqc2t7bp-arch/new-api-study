@@ -1169,7 +1169,11 @@ func UpdateChannelStatus(c *gin.Context) {
 	}
 	changed := false
 	if req.Status == common.ChannelStatusEnabled {
-		changed = service.EnableChannel(id, "", "")
+		changed, err = service.EnableChannel(id, "", "")
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
 	} else if model.UpdateChannelStatus(id, "", req.Status, "manual operation") {
 		changed = true
 	}
@@ -1194,7 +1198,12 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 	changedCount := 0
 	for _, id := range req.Ids {
 		if req.Status == common.ChannelStatusEnabled {
-			if service.EnableChannel(id, "", "") {
+			changed, err := service.EnableChannel(id, "", "")
+			if err != nil {
+				common.ApiError(c, err)
+				return
+			}
+			if changed {
 				changedCount++
 			}
 		} else if model.UpdateChannelStatus(id, "", req.Status, "manual batch operation") {

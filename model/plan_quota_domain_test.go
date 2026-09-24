@@ -657,6 +657,48 @@ func TestPlanQuotaDomainHonorsNamingStrategy(t *testing.T) {
 	assert.Equal(t, []string{prefix + "plan_quota_domains"}, tables)
 }
 
+func TestInitializePlanQuotaDomainsWhenSchemaReadyWaitsForMasterMigration(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	tag := "plan:test:replica-startup"
+	channel := Channel{
+		Name: "replica-startup", Key: "replica-startup-credential",
+		Status: common.ChannelStatusEnabled, Tag: &tag,
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, db.Migrator().DropTable(&PlanQuotaDomain{}))
+
+	var waited []int
+	err := initializePlanQuotaDomainsWhenSchemaReady(3, func(attempt int) {
+		waited = append(waited, attempt)
+		if attempt == 2 {
+			require.NoError(t, db.AutoMigrate(&PlanQuotaDomain{}))
+		}
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, []int{1, 2}, waited)
+	var domains []PlanQuotaDomain
+	require.NoError(t, db.Find(&domains).Error)
+	require.Len(t, domains, 1)
+	expectedHash, ok := PlanQuotaDomainHash(channel.Key)
+	require.True(t, ok)
+	assert.Equal(t, expectedHash, domains[0].CredentialHash)
+}
+
+func TestInitializePlanQuotaDomainsWhenSchemaReadyTimesOut(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	require.NoError(t, db.Migrator().DropTable(&PlanQuotaDomain{}))
+
+	var waited []int
+	err := initializePlanQuotaDomainsWhenSchemaReady(3, func(attempt int) {
+		waited = append(waited, attempt)
+	})
+
+	require.ErrorContains(t, err, "plan quota domain schema readiness timed out after 3 attempts")
+	assert.Equal(t, []int{1, 2}, waited)
+	assert.False(t, db.Migrator().HasTable(&PlanQuotaDomain{}))
+}
+
 func TestInitializePlanQuotaDomainsLocksExistingAuthority(t *testing.T) {
 	db := setupPlanQuotaAuthorityTest(t, "")
 	tag := "plan:test:backfill-lock"

@@ -1018,9 +1018,7 @@ func withChannelStatusesLocks(channelIDs []int, update func() (bool, error)) (bo
 }
 
 func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
-	changed, err := withChannelStatusLocks(channelId, func() (bool, error) {
-		return updateChannelStatusLocked(channelId, usingKey, status, reason)
-	})
+	changed, err := UpdateChannelStatusWithError(channelId, usingKey, status, reason)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("failed to update channel status: channel_id=%d, status=%d, error=%v", channelId, status, err))
 		return false
@@ -1028,10 +1026,16 @@ func UpdateChannelStatus(channelId int, usingKey string, status int, reason stri
 	return changed
 }
 
+func UpdateChannelStatusWithError(channelId int, usingKey string, status int, reason string) (bool, error) {
+	return withChannelStatusLocks(channelId, func() (bool, error) {
+		return updateChannelStatusLocked(channelId, usingKey, status, reason)
+	})
+}
+
 func updateChannelStatusLocked(channelId int, usingKey string, status int, reason string) (bool, error) {
 	channel, err := GetChannelById(channelId, true)
 	if err != nil {
-		return false, nil
+		return false, err
 	}
 	if channel.Status == status {
 		return false, nil

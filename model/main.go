@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -66,6 +67,11 @@ func initCol() {
 var DB *gorm.DB
 
 var LOG_DB *gorm.DB
+
+const (
+	planQuotaDomainSchemaWaitAttempts = 30
+	planQuotaDomainSchemaWaitInterval = time.Second
+)
 
 func createRootAccountIfNeed() error {
 	var user User
@@ -213,7 +219,12 @@ func InitDB() (err error) {
 		sqlDB.SetConnMaxLifetime(time.Second * time.Duration(common.GetEnvOrDefault("SQL_MAX_LIFETIME", 60)))
 
 		if !common.IsMasterNode {
-			return InitializePlanQuotaDomains()
+			return initializePlanQuotaDomainsWhenSchemaReady(
+				planQuotaDomainSchemaWaitAttempts,
+				func(_ int) {
+					time.Sleep(planQuotaDomainSchemaWaitInterval)
+				},
+			)
 		}
 		if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
 			//_, _ = sqlDB.Exec("ALTER TABLE channels MODIFY model_mapping TEXT;") // TODO: delete this line when most users have upgraded
@@ -225,6 +236,30 @@ func InitDB() (err error) {
 		common.FatalLog(err)
 	}
 	return err
+}
+
+func initializePlanQuotaDomainsWhenSchemaReady(
+	maxAttempts int,
+	waitAfterAttempt func(int),
+) error {
+	if DB == nil {
+		return errors.New("plan quota domain schema readiness requires a database")
+	}
+	if maxAttempts <= 0 {
+		return errors.New("plan quota domain schema readiness requires at least one attempt")
+	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if DB.Migrator().HasTable(&PlanQuotaDomain{}) {
+			return InitializePlanQuotaDomains()
+		}
+		if attempt < maxAttempts && waitAfterAttempt != nil {
+			waitAfterAttempt(attempt)
+		}
+	}
+	return fmt.Errorf(
+		"plan quota domain schema readiness timed out after %d attempts",
+		maxAttempts,
+	)
 }
 
 func InitLogDB() (err error) {

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -225,6 +226,93 @@ func TestBatchUpdateChannelStatusManuallyRecoversPlanQuotaDomain(t *testing.T) {
 	assert.True(t, response.Success)
 	assert.Equal(t, 1, response.Data)
 	assertControllerPlanQuotaDomainEnabled(t, db, channels)
+}
+
+func TestChannelStatusEndpointsReportPlanQuotaRecoveryFailure(t *testing.T) {
+	tests := []struct {
+		name      string
+		path      string
+		body      func(int) []byte
+		setParams func(*gin.Context, int)
+		handle    func(*gin.Context)
+	}{
+		{
+			name: "single",
+			path: "/api/channel/1/status",
+			body: func(_ int) []byte {
+				return []byte(fmt.Sprintf(`{"status":%d}`, common.ChannelStatusEnabled))
+			},
+			setParams: func(context *gin.Context, id int) {
+				context.Params = gin.Params{{Key: "id", Value: strconv.Itoa(id)}}
+			},
+			handle: UpdateChannelStatus,
+		},
+		{
+			name: "batch",
+			path: "/api/channel/status/batch",
+			body: func(id int) []byte {
+				return []byte(fmt.Sprintf(
+					`{"ids":[%d],"status":%d}`,
+					id,
+					common.ChannelStatusEnabled,
+				))
+			},
+			setParams: func(_ *gin.Context, _ int) {},
+			handle:    BatchUpdateChannelStatus,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			require.NoError(t, db.AutoMigrate(&model.Log{}))
+			channels := createControllerPlanQuotaDomain(
+				t,
+				db,
+				"plan:test:controller-recovery-failure-"+testCase.name,
+				"controller-recovery-failure-credential-"+testCase.name,
+			)
+
+			forcedErr := errors.New("forced Plan quota recovery ability failure")
+			callbackName := "test:controller_plan_recovery_failure_" + testCase.name
+			require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement != nil && tx.Statement.Table == "abilities" {
+					tx.AddError(forcedErr)
+				}
+			}))
+			t.Cleanup(func() {
+				require.NoError(t, db.Callback().Update().Remove(callbackName))
+			})
+
+			recorder := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(recorder)
+			testCase.setParams(context, channels[0].Id)
+			context.Request = httptest.NewRequest(
+				http.MethodPost,
+				testCase.path,
+				bytes.NewReader(testCase.body(channels[0].Id)),
+			)
+			context.Request.Header.Set("Content-Type", "application/json")
+
+			testCase.handle(context)
+
+			require.Equal(t, http.StatusOK, recorder.Code)
+			var response struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			assert.False(t, response.Success)
+			assert.Contains(t, response.Message, forcedErr.Error())
+
+			var authority model.PlanQuotaDomain
+			require.NoError(t, db.First(&authority).Error)
+			assert.Equal(t, model.PlanQuotaDomainStateDisabled, authority.State)
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channels[0].Id).Error)
+			assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+		})
+	}
 }
 
 func createControllerOwnerlessPlanQuotaDomain(

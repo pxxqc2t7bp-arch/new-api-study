@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -45,6 +46,71 @@ func TestUpdateAbilitiesReloadsCurrentChannelState(t *testing.T) {
 	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
 	assert.False(t, ability.Enabled)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, stale.Status)
+}
+
+func TestUpdateChannelUpstreamModelStatePreservesCachedPollingCursor(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	previousMemoryCacheEnabled := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCacheEnabled
+	})
+
+	channel := Channel{
+		Name:   "upstream-model-cache-cursor",
+		Key:    "key-a\nkey-b\nkey-c",
+		Status: common.ChannelStatusEnabled,
+		Models: "old-model",
+		Group:  "default",
+		ChannelInfo: ChannelInfo{
+			IsMultiKey:           true,
+			MultiKeySize:         3,
+			MultiKeyStatusList:   map[int]int{},
+			MultiKeyPollingIndex: 0,
+			MultiKeyMode:         constant.MultiKeyModePolling,
+		},
+		OtherSettings: `{"owner":"old-settings"}`,
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(db))
+	InitChannelCache()
+
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	newerCache := *cached
+	newerCache.ChannelInfo = cloneChannelInfo(cached.ChannelInfo)
+	newerCache.ChannelInfo.MultiKeyPollingIndex = 2
+	CacheUpdateChannel(&newerCache)
+
+	const updatedSettings = `{"owner":"upstream-refresh"}`
+	updatedModels := "new-model"
+	updated, err := UpdateChannelUpstreamModelState(
+		channel.Id,
+		updatedSettings,
+		&updatedModels,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, updated.ChannelInfo.MultiKeyPollingIndex)
+	assert.Equal(t, updatedModels, updated.Models)
+	assert.Equal(t, updatedSettings, updated.OtherSettings)
+
+	cached, err = CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 2, cached.ChannelInfo.MultiKeyPollingIndex)
+	assert.Equal(t, updatedModels, cached.Models)
+	assert.Equal(t, updatedSettings, cached.OtherSettings)
+
+	var stored Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Zero(t, stored.ChannelInfo.MultiKeyPollingIndex)
+	assert.Equal(t, updatedModels, stored.Models)
+	assert.Equal(t, updatedSettings, stored.OtherSettings)
+	var abilities []Ability
+	require.NoError(t, db.Where("channel_id = ?", channel.Id).Find(&abilities).Error)
+	require.Len(t, abilities, 1)
+	assert.Equal(t, updatedModels, abilities[0].Model)
+	assert.True(t, abilities[0].Enabled)
 }
 
 func TestFixAbilitySerializesConcurrentPlanQuotaDisable(t *testing.T) {

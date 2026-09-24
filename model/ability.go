@@ -352,6 +352,12 @@ func UpdateChannelUpstreamModelState(
 			return false, err
 		}
 		observeChannelStatusPublication(channelStatusPublicationAfterCommit)
+		if common.MemoryCacheEnabled && updated.ChannelInfo.IsMultiKey {
+			cachedInfo, cacheErr := CacheGetChannelInfo(updated.Id)
+			if cacheErr == nil {
+				updated.ChannelInfo.MultiKeyPollingIndex = cachedInfo.MultiKeyPollingIndex
+			}
+		}
 		CacheUpdateChannel(&updated)
 		return true, nil
 	})
