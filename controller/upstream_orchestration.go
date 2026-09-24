@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	notifydto "github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
@@ -514,6 +515,18 @@ func runDueUpstreamProbeTaskWithDependencies(
 
 		message := "upstream probe failed"
 		if result.newAPIError != nil {
+			service.DisableChannelForAPIError(
+				*types.NewChannelError(
+					channel.Id,
+					channel.Type,
+					channel.Name,
+					channel.ChannelInfo.IsMultiKey,
+					common.GetContextKeyString(result.context, constant.ContextKeyChannelKey),
+					channel.GetAutoBan(),
+				),
+				common.GetContextKeyString(result.context, constant.ContextKeyChannelTag),
+				result.newAPIError,
+			)
 			message = result.newAPIError.ErrorWithStatusCode()
 		} else if result.localErr != nil {
 			message = result.localErr.Error()

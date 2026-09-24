@@ -367,3 +367,195 @@ func TestRunDueUpstreamProbeTaskKeepsFailedSiblingQuarantinedAfterRealReconcile(
 	require.NoError(t, db.First(&failureAbility, "channel_id = ?", failureChannel.Id).Error)
 	assert.False(t, failureAbility.Enabled)
 }
+
+func TestRunDueUpstreamProbeTaskConsumesPlanQuotaOnceForActualCredential(t *testing.T) {
+	tests := []struct {
+		name     string
+		multiKey bool
+		plan     bool
+		status   int
+		body     string
+	}{
+		{
+			name:   "single key isolates credential peers",
+			plan:   true,
+			status: http.StatusTooManyRequests,
+			body: `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
+				"type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`,
+		},
+		{
+			name:     "multi key isolates selected key only",
+			multiKey: true,
+			plan:     true,
+			status:   http.StatusTooManyRequests,
+			body: `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
+				"type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`,
+		},
+		{
+			name:   "ordinary managed failure is counted once",
+			status: http.StatusInternalServerError,
+			body:   `{"error":{"message":"ordinary managed failure","type":"server_error","code":"server_error"}}`,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			require.NoError(t, db.AutoMigrate(
+				&model.UpstreamSource{},
+				&model.UpstreamGroup{},
+			))
+
+			originalMemoryCacheEnabled := common.MemoryCacheEnabled
+			originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+			originalLogConsumeEnabled := common.LogConsumeEnabled
+			common.MemoryCacheEnabled = false
+			common.AutomaticDisableChannelEnabled = true
+			common.LogConsumeEnabled = false
+			setting := operation_setting.GetUpstreamOrchestrationSetting()
+			originalSetting := *setting
+			setting.Enabled = true
+			setting.FailureThreshold = 2
+			setting.FailureWindowMinutes = 5
+			setting.ProbeTimeoutSeconds = 5
+			originalModelRatios := ratio_setting.ModelRatio2JSONString()
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(
+				`{"gpt-managed-plan-probe":1}`,
+			))
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = originalMemoryCacheEnabled
+				common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+				common.LogConsumeEnabled = originalLogConsumeEnabled
+				*setting = originalSetting
+				require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+			})
+
+			user := model.User{
+				Username: "managed-plan-probe-root",
+				Role:     common.RoleRootUser,
+				Status:   common.UserStatusEnabled,
+				Group:    "default",
+				Quota:    1_000_000,
+			}
+			require.NoError(t, db.Create(&user).Error)
+
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(testCase.status)
+				_, _ = fmt.Fprint(w, testCase.body)
+			}))
+			t.Cleanup(upstream.Close)
+
+			now := time.Now()
+			source := model.UpstreamSource{
+				Key:              "managed-plan-probe-source",
+				Name:             "Managed Plan probe source",
+				ConsoleURL:       "https://example.com",
+				SelectedEndpoint: upstream.URL,
+				Status:           model.UpstreamHealthOperational,
+				Enabled:          true,
+				LastSnapshotAt:   now.Unix(),
+				LastSuccessAt:    now.Unix(),
+				UpdatedAt:        now.Add(-time.Minute).Unix(),
+			}
+			require.NoError(t, db.Create(&source).Error)
+			group := model.UpstreamGroup{
+				SourceID:            source.ID,
+				ExternalID:          "managed-plan-probe-group",
+				Name:                "Managed Plan probe group",
+				Platform:            "openai",
+				EffectiveMultiplier: 0.1,
+				HealthStatus:        model.UpstreamHealthOperational,
+				Models:              `["gpt-managed-plan-probe"]`,
+				ObservedAt:          now.Unix(),
+				UpdatedAt:           now.Add(-time.Minute).Unix(),
+			}
+			require.NoError(t, db.Create(&group).Error)
+
+			autoBan := 1
+			tag := "managed:ordinary-probe"
+			if testCase.plan {
+				tag = "plan:managed:probe"
+			}
+			key := "probe-key"
+			channelInfo := model.ChannelInfo{}
+			if testCase.multiKey {
+				key = "probe-key-a\nprobe-key-b"
+				channelInfo = model.ChannelInfo{
+					IsMultiKey:   true,
+					MultiKeySize: 2,
+					MultiKeyMode: constant.MultiKeyModePolling,
+				}
+			}
+			channel := model.Channel{
+				Name: "managed-plan-probe", Type: constant.ChannelTypeOpenAI,
+				Key: key, BaseURL: &upstream.URL,
+				Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+				Models: "gpt-managed-plan-probe", Group: "default",
+				ChannelInfo: channelInfo,
+			}
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+			route := model.UpstreamManagedRoute{
+				SourceID: source.ID, ExternalGroupID: group.ExternalID,
+				Platform: group.Platform, Protocol: model.UpstreamProtocolOpenAI,
+				ChannelID: channel.Id, State: model.UpstreamRouteStateActive,
+				NextProbeAt: now.Add(-time.Minute).Unix(),
+			}
+			require.NoError(t, db.Create(&route).Error)
+
+			var peer model.Channel
+			if testCase.plan && !testCase.multiKey {
+				peerTag := "plan:managed:probe-peer"
+				peer = model.Channel{
+					Name: "managed-plan-probe-peer", Type: constant.ChannelTypeOpenAI,
+					Key: channel.Key, BaseURL: &upstream.URL,
+					Status: common.ChannelStatusEnabled, Tag: &peerTag, AutoBan: &autoBan,
+					Models: channel.Models, Group: channel.Group,
+				}
+				require.NoError(t, db.Create(&peer).Error)
+				require.NoError(t, peer.AddAbilities(nil))
+			}
+
+			summary, err := runDueUpstreamProbeTaskWithDependencies(
+				context.Background(),
+				func(time.Time) (service.UpstreamReconcileSummary, error) {
+					t.Fatal("failed probes must not reconcile managed upstreams")
+					return service.UpstreamReconcileSummary{}, nil
+				},
+				func(*model.Channel) {
+					t.Fatal("failed probes must not notify recovery")
+				},
+			)
+
+			require.NoError(t, err)
+			assert.Equal(t, upstreamProbeSummary{Tested: 1, Failed: 1}, summary)
+			var storedRoute model.UpstreamManagedRoute
+			require.NoError(t, db.First(&storedRoute, route.ID).Error)
+			assert.Equal(t, model.UpstreamRouteStateActive, storedRoute.State)
+			assert.Equal(t, 1, storedRoute.ConsecutiveFailures)
+
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			switch {
+			case !testCase.plan:
+				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+				assert.NotContains(t, stored.GetOtherInfo(), "quota_reset_at")
+			case testCase.multiKey:
+				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+				assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+				assert.Positive(t, stored.ChannelInfo.MultiKeyDisabledUntil[0])
+			default:
+				var storedPeer model.Channel
+				require.NoError(t, db.First(&storedPeer, peer.Id).Error)
+				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+				assert.Equal(t, common.ChannelStatusAutoDisabled, storedPeer.Status)
+				assert.NotZero(t, stored.GetOtherInfo()["quota_reset_at"])
+				assert.Equal(t, stored.GetOtherInfo()["quota_reset_at"], storedPeer.GetOtherInfo()["quota_reset_at"])
+				assert.NotEmpty(t, stored.GetOtherInfo()["quota_domain_id"])
+				assert.Equal(t, stored.GetOtherInfo()["quota_domain_id"], storedPeer.GetOtherInfo()["quota_domain_id"])
+			}
+		})
+	}
+}
