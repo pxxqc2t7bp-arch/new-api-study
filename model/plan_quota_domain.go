@@ -67,11 +67,11 @@ func PlanQuotaDomainMembership(channel *Channel) (string, bool) {
 }
 
 type planQuotaDomainBackfillState struct {
-	disabled             bool
-	generation           int64
-	disabledUntil        int64
-	ownedChannelIndexes  []int
-	markerGenerationMode int
+	disabled                   bool
+	generation                 int64
+	disabledUntil              int64
+	normalizableChannelIndexes []int
+	markerGenerationMode       int
 }
 
 type planQuotaBackfillOwnershipState struct {
@@ -140,7 +140,6 @@ func InitializePlanQuotaDomains() error {
 			}
 			if ownership.owned {
 				state.disabled = true
-				state.ownedChannelIndexes = append(state.ownedChannelIndexes, index)
 				if ownership.generation > state.generation {
 					state.generation = ownership.generation
 				}
@@ -158,6 +157,13 @@ func InitializePlanQuotaDomains() error {
 					}
 					state.markerGenerationMode = mode
 				}
+			}
+			if channels[index].Status == common.ChannelStatusEnabled ||
+				(channels[index].Status == common.ChannelStatusAutoDisabled && ownership.owned) {
+				state.normalizableChannelIndexes = append(
+					state.normalizableChannelIndexes,
+					index,
+				)
 			}
 			backfill[hash] = state
 		}
@@ -234,7 +240,7 @@ func InitializePlanQuotaDomains() error {
 			if !state.disabled {
 				continue
 			}
-			for _, channelIndex := range state.ownedChannelIndexes {
+			for _, channelIndex := range state.normalizableChannelIndexes {
 				channel := &channels[channelIndex]
 				channel.Status = common.ChannelStatusAutoDisabled
 				info := channel.GetOtherInfo()
