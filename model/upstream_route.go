@@ -165,6 +165,7 @@ func UpdateManagedRouteProbeResultIfUnchanged(
 				Where("id = ?", current.ID).
 				Updates(map[string]any{
 					"state":                 desired.State,
+					"rank":                  desired.Rank,
 					"consecutive_failures":  desired.ConsecutiveFailures,
 					"consecutive_successes": desired.ConsecutiveSuccesses,
 					"failure_window_start":  desired.FailureWindowStart,
@@ -447,6 +448,7 @@ func RecordUpstreamRouteFailure(channelID int, now int64, windowSeconds int64, t
 		route.LastReason = strings.TrimSpace(reason)
 		if route.ConsecutiveFailures >= threshold {
 			route.State = UpstreamRouteStateQuarantined
+			route.Rank = 0
 			route.RecoveryAttempts = 0
 			route.NextProbeAt = now
 			quarantine = true
@@ -454,6 +456,7 @@ func RecordUpstreamRouteFailure(channelID int, now int64, windowSeconds int64, t
 		route.UpdatedAt = now
 		return tx.Model(&UpstreamManagedRoute{}).Where("id = ?", route.ID).Updates(map[string]any{
 			"state":                 route.State,
+			"rank":                  route.Rank,
 			"consecutive_failures":  route.ConsecutiveFailures,
 			"consecutive_successes": 0,
 			"failure_window_start":  route.FailureWindowStart,

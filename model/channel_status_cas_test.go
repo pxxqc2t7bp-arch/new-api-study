@@ -1485,6 +1485,7 @@ func TestUpdateManagedRouteStateIfUnchangedRollsBackAbilityFailure(t *testing.T)
 	source, group := createManagedDecisionSnapshots(t, &route)
 	desired := route
 	desired.State = UpstreamRouteStateQuarantined
+	desired.Rank = 0
 	desired.LastReason = "upstream monitor red"
 	desired.RedSince = 1_788_320_000
 	desired.RecoveryAttempts = 0
@@ -1517,6 +1518,7 @@ func TestUpdateManagedRouteStateIfUnchangedRollsBackAbilityFailure(t *testing.T)
 	var storedRoute UpstreamManagedRoute
 	require.NoError(t, DB.First(&storedRoute, route.ID).Error)
 	assert.Equal(t, UpstreamRouteStateActive, storedRoute.State)
+	assert.Equal(t, 7, storedRoute.Rank)
 	assert.Equal(t, route.UpdatedAt, storedRoute.UpdatedAt)
 	stored, ability := loadChannelStatusCASFixture(t, channel.Id)
 	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
@@ -1526,6 +1528,70 @@ func TestUpdateManagedRouteStateIfUnchangedRollsBackAbilityFailure(t *testing.T)
 	require.NoError(t, cacheErr)
 	assert.Equal(t, common.ChannelStatusEnabled, cached.Status)
 	assert.Equal(t, channel.OtherInfo, cached.OtherInfo)
+}
+
+func TestUpdateManagedChannelIfUnchangedRollsBackRankAndChannelOnAbilityFailure(t *testing.T) {
+	channel := createSingleKeyChannelStatusCASFixture(t, map[string]any{
+		"owner": "pending-activation",
+	})
+	require.NoError(t, DB.AutoMigrate(&UpstreamManagedRoute{}))
+	require.NoError(t, DB.Exec("DELETE FROM upstream_managed_routes").Error)
+	require.NoError(t, DB.Model(&Channel{}).
+		Where("id = ?", channel.Id).
+		Update("status", common.ChannelStatusAutoDisabled).Error)
+	require.NoError(t, DB.Model(&Ability{}).
+		Where("channel_id = ?", channel.Id).
+		Update("enabled", false).Error)
+	route := UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "activation-rollback",
+		Platform:        "openai",
+		Protocol:        UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           UpstreamRouteStateActive,
+		Rank:            0,
+	}
+	require.NoError(t, DB.Create(&route).Error)
+	var expectedRoute UpstreamManagedRoute
+	require.NoError(t, DB.First(&expectedRoute, route.ID).Error)
+	source, group := createManagedDecisionSnapshots(t, &expectedRoute)
+	expectedChannel, expectedAbility := loadChannelStatusCASFixture(t, channel.Id)
+
+	forcedErr := errors.New("forced managed activation ability failure")
+	const callbackName = "test:fail_managed_activation_ability"
+	require.NoError(t, DB.Callback().Create().Before("gorm:create").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil && tx.Statement.Table == "abilities" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, DB.Callback().Create().Remove(callbackName))
+	})
+
+	changed, err := UpdateManagedChannelIfUnchanged(&expectedChannel, ManagedChannelUpdate{
+		ExpectedSource:        source,
+		ExpectedGroup:         group,
+		ExpectedRoute:         &expectedRoute,
+		RouteID:               expectedRoute.ID,
+		ExpectedRouteState:    expectedRoute.State,
+		ExpectedRouteDetached: expectedRoute.Detached,
+		Rank:                  1,
+		EffectiveMultiplier:   0.25,
+		UpdatedAt:             1_788_320_000,
+		Priority:              999,
+		BaseURL:               "https://api.example.com",
+		Models:                "gpt-4.1",
+		Status:                common.ChannelStatusEnabled,
+	})
+
+	require.ErrorIs(t, err, forcedErr)
+	assert.False(t, changed)
+	var storedRoute UpstreamManagedRoute
+	require.NoError(t, DB.First(&storedRoute, route.ID).Error)
+	assert.Equal(t, expectedRoute, storedRoute)
+	storedChannel, storedAbility := loadChannelStatusCASFixture(t, channel.Id)
+	assert.Equal(t, expectedChannel, storedChannel)
+	assert.Equal(t, expectedAbility, storedAbility)
 }
 
 func TestDisableDetachedManagedChannelIfUnchangedRollsBackAbilityFailure(t *testing.T) {
@@ -1723,6 +1789,7 @@ func TestRecoverSingleKeyChannelStatusIfUnchangedLocksRouteBeforeChannel(t *test
 		Protocol:        UpstreamProtocolOpenAI,
 		ChannelID:       channel.Id,
 		State:           UpstreamRouteStateActive,
+		Rank:            1,
 	}
 	require.NoError(t, DB.Create(&route).Error)
 	expected, err := GetChannelById(channel.Id, true)
@@ -2042,7 +2109,10 @@ func TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases(t *testing.T
 			assert.False(t, changed)
 			require.NoError(t, DB.Model(&UpstreamManagedRoute{}).
 				Where("id = ?", recoveryRoute.ID).
-				Update("state", UpstreamRouteStateActive).Error)
+				Updates(map[string]any{
+					"state": UpstreamRouteStateActive,
+					"rank":  1,
+				}).Error)
 			changed, err = RecoverSingleKeyChannelStatusIfUnchanged(
 				recoveryExpected,
 				common.ChannelStatusEnabled,

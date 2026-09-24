@@ -189,6 +189,10 @@ func reconcileManagedUpstreams(
 		desiredRoute := *route
 		desiredRoute.State = state
 		desiredRoute.LastReason = reason
+		if state != model.UpstreamRouteStateActive ||
+			route.State != model.UpstreamRouteStateActive {
+			desiredRoute.Rank = 0
+		}
 		if stateChanged || reasonChanged {
 			desiredRoute.UpdatedAt = now.Unix()
 		}

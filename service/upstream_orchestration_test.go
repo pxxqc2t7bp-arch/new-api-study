@@ -886,6 +886,7 @@ func TestReconcileManagedUpstreamsReturnsAndNotifiesCommittedChangesBeforeStaleE
 	var storedFirstRoute model.UpstreamManagedRoute
 	require.NoError(t, model.DB.First(&storedFirstRoute, firstRoute.ID).Error)
 	assert.Equal(t, model.UpstreamRouteStateQuarantined, storedFirstRoute.State)
+	assert.Zero(t, storedFirstRoute.Rank)
 	var storedSecondRoute model.UpstreamManagedRoute
 	require.NoError(t, model.DB.First(&storedSecondRoute, secondRoute.ID).Error)
 	assert.Equal(t, model.UpstreamRouteStateActive, storedSecondRoute.State)
@@ -1153,6 +1154,7 @@ func TestReconcileManagedUpstreamsRollsBackRouteWhenAbilityDisableFails(t *testi
 		Protocol:        model.UpstreamProtocolOpenAI,
 		ChannelID:       channel.Id,
 		State:           model.UpstreamRouteStateActive,
+		Rank:            7,
 		UpdatedAt:       now.Add(-time.Minute).Unix(),
 	}
 	require.NoError(t, model.DB.Create(&route).Error)
@@ -1175,6 +1177,7 @@ func TestReconcileManagedUpstreamsRollsBackRouteWhenAbilityDisableFails(t *testi
 	var storedRoute model.UpstreamManagedRoute
 	require.NoError(t, model.DB.First(&storedRoute, route.ID).Error)
 	assert.Equal(t, model.UpstreamRouteStateActive, storedRoute.State)
+	assert.Equal(t, 7, storedRoute.Rank)
 	assert.Equal(t, route.UpdatedAt, storedRoute.UpdatedAt)
 	var storedChannel model.Channel
 	require.NoError(t, model.DB.First(&storedChannel, channel.Id).Error)
@@ -1893,6 +1896,149 @@ func TestManagedRouteRecoveryBackoff(t *testing.T) {
 	}
 }
 
+func TestManagedRouteStateActionsClearRank(t *testing.T) {
+	tests := []struct {
+		name         string
+		initialState string
+		action       func(int64) error
+		wantState    string
+	}{
+		{
+			name:         "pause",
+			initialState: model.UpstreamRouteStateActive,
+			action: func(routeID int64) error {
+				return PauseManagedRoute(routeID, "operator pause")
+			},
+			wantState: model.UpstreamRouteStatePaused,
+		},
+		{
+			name:         "resume",
+			initialState: model.UpstreamRouteStatePaused,
+			action:       ResumeManagedRoute,
+			wantState:    model.UpstreamRouteStateShadow,
+		},
+		{
+			name:         "detach",
+			initialState: model.UpstreamRouteStateActive,
+			action:       DetachManagedRoute,
+			wantState:    model.UpstreamRouteStateDetached,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			setupUpstreamOrchestrationTest(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+			setting := operation_setting.GetUpstreamOrchestrationSetting()
+			originalSetting := *setting
+			setting.ManualPauseHours = 1
+			t.Cleanup(func() {
+				*setting = originalSetting
+			})
+
+			channel := model.Channel{
+				Name:   "rank-clear-" + testCase.name,
+				Key:    "credential",
+				Status: common.ChannelStatusEnabled,
+				Models: "gpt-4.1",
+				Group:  "default",
+			}
+			require.NoError(t, model.DB.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+			route := model.UpstreamManagedRoute{
+				SourceID:        1,
+				ExternalGroupID: "rank-clear-" + testCase.name,
+				Platform:        "openai",
+				Protocol:        model.UpstreamProtocolOpenAI,
+				ChannelID:       channel.Id,
+				State:           testCase.initialState,
+				Rank:            7,
+			}
+			require.NoError(t, model.DB.Create(&route).Error)
+
+			require.NoError(t, testCase.action(route.ID))
+
+			var stored model.UpstreamManagedRoute
+			require.NoError(t, model.DB.First(&stored, route.ID).Error)
+			assert.Equal(t, testCase.wantState, stored.State)
+			assert.Zero(t, stored.Rank)
+		})
+	}
+}
+
+func TestManagedRouteProbeQuarantineClearsRank(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	originalSetting := *setting
+	setting.Enabled = true
+	setting.FailureThreshold = 1
+	setting.FailureWindowMinutes = 5
+	t.Cleanup(func() {
+		*setting = originalSetting
+	})
+
+	channel := model.Channel{
+		Name:   "probe-quarantine-rank",
+		Key:    "credential",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-4.1",
+		Group:  "default",
+	}
+	require.NoError(t, model.DB.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	route := model.UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "probe-quarantine-rank",
+		Platform:        "openai",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           model.UpstreamRouteStateActive,
+		Rank:            7,
+	}
+	require.NoError(t, model.DB.Create(&route).Error)
+	require.NoError(t, model.DB.First(&route, route.ID).Error)
+
+	transition, err := MarkManagedRouteProbeResult(&route, false, 123, "probe failed")
+
+	require.NoError(t, err)
+	require.True(t, transition.Applied)
+	assert.Equal(t, model.UpstreamRouteStateQuarantined, transition.State)
+	var storedRoute model.UpstreamManagedRoute
+	require.NoError(t, model.DB.First(&storedRoute, route.ID).Error)
+	assert.Zero(t, storedRoute.Rank)
+	var storedChannel model.Channel
+	require.NoError(t, model.DB.First(&storedChannel, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, storedChannel.Status)
+	var ability model.Ability
+	require.NoError(t, model.DB.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+}
+
+func TestManagedRouteActiveProbeSuccessPreservesRank(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	route := model.UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "active-probe-rank",
+		Platform:        "openai",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       1002,
+		State:           model.UpstreamRouteStateActive,
+		Rank:            7,
+	}
+	require.NoError(t, model.DB.Create(&route).Error)
+	require.NoError(t, model.DB.First(&route, route.ID).Error)
+
+	transition, err := MarkManagedRouteProbeResult(&route, true, 123, "")
+
+	require.NoError(t, err)
+	require.True(t, transition.Applied)
+	assert.Equal(t, model.UpstreamRouteStateActive, transition.State)
+	var stored model.UpstreamManagedRoute
+	require.NoError(t, model.DB.First(&stored, route.ID).Error)
+	assert.Equal(t, 7, stored.Rank)
+}
+
 func TestManagedRouteProbeResultRejectsStalePauseAndDetach(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -2024,6 +2170,7 @@ func TestManagedRouteProbeQuarantineRollsBackOnAbilityFailure(t *testing.T) {
 		Protocol:            model.UpstreamProtocolOpenAI,
 		ChannelID:           channel.Id,
 		State:               model.UpstreamRouteStateActive,
+		Rank:                7,
 		ConsecutiveFailures: setting.FailureThreshold - 1,
 		FailureWindowStart:  common.GetTimestamp(),
 		UpdatedAt:           common.GetTimestamp() - 60,
@@ -2061,6 +2208,98 @@ func TestManagedRouteProbeQuarantineRollsBackOnAbilityFailure(t *testing.T) {
 	require.NoError(t, cacheErr)
 	assert.Equal(t, common.ChannelStatusEnabled, cached.Status)
 	assert.Equal(t, channel.OtherInfo, cached.OtherInfo)
+}
+
+func TestReconcileManagedUpstreamsBlocksHealthRecoveryDuringActivationWindow(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Channel{}, &model.Ability{}))
+	now := time.Unix(1_788_320_000, 0)
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	originalSetting := *setting
+	setting.Enabled = true
+	setting.AutoEnroll = false
+	setting.CandidateLimit = 5
+	setting.MaxUpstreamMultiplier = 1
+	setting.SyncIntervalHours = 4
+	setting.ShadowSuccessesRequired = 1
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4.1":1}`))
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		*setting = originalSetting
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+	})
+
+	_, _, channel, route := createPartialManagedRouteFixture(
+		t,
+		now,
+		"activation-window",
+		0.1,
+		model.UpstreamHealthOperational,
+		7,
+	)
+	require.NoError(t, model.DB.Model(&model.UpstreamManagedRoute{}).
+		Where("id = ?", route.ID).
+		Updates(map[string]any{
+			"state":                 model.UpstreamRouteStateShadow,
+			"consecutive_successes": 1,
+		}).Error)
+	require.NoError(t, model.DB.Model(&model.Channel{}).
+		Where("id = ?", channel.Id).
+		Update("status", common.ChannelStatusAutoDisabled).Error)
+	require.NoError(t, model.DB.Model(&model.Ability{}).
+		Where("channel_id = ?", channel.Id).
+		Update("enabled", false).Error)
+	var probeSnapshot model.Channel
+	require.NoError(t, model.DB.First(&probeSnapshot, channel.Id).Error)
+	model.InitChannelCache()
+
+	injected := false
+	windowRank := -1
+	recovered := -1
+	const callbackName = "test:recover_during_managed_activation_window"
+	require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if injected || tx.Statement == nil || tx.Statement.Table != "upstream_managed_routes" {
+			return
+		}
+		routes, ok := tx.Statement.Dest.(*[]model.UpstreamManagedRoute)
+		if !ok {
+			return
+		}
+		for _, current := range *routes {
+			if current.ID != route.ID || current.State != model.UpstreamRouteStateActive {
+				continue
+			}
+			injected = true
+			windowRank = current.Rank
+			recovered = EnableChannelForHealthCheck(&probeSnapshot, "")
+			return
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Callback().Query().Remove(callbackName))
+	})
+
+	summary, err := ReconcileManagedUpstreams(now)
+
+	require.NoError(t, err)
+	require.True(t, injected)
+	assert.Zero(t, windowRank)
+	assert.Zero(t, recovered)
+	assert.Equal(t, 1, summary.RoutesActivated)
+	assert.Equal(t, 1, summary.PrioritiesUpdated)
+	var storedRoute model.UpstreamManagedRoute
+	require.NoError(t, model.DB.First(&storedRoute, route.ID).Error)
+	assert.Equal(t, model.UpstreamRouteStateActive, storedRoute.State)
+	assert.Equal(t, 1, storedRoute.Rank)
+	var storedChannel model.Channel
+	require.NoError(t, model.DB.First(&storedChannel, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, storedChannel.Status)
+	var ability model.Ability
+	require.NoError(t, model.DB.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
 }
 
 func TestManagedRouteProbeActivationWaitsForFencedReconcile(t *testing.T) {
@@ -2126,6 +2365,7 @@ func TestManagedRouteProbeActivationWaitsForFencedReconcile(t *testing.T) {
 		Protocol:        model.UpstreamProtocolOpenAI,
 		ChannelID:       channel.Id,
 		State:           model.UpstreamRouteStateQuarantined,
+		Rank:            7,
 		NextProbeAt:     now.Unix(),
 		UpdatedAt:       now.Add(-time.Minute).Unix(),
 	}
@@ -2140,16 +2380,24 @@ func TestManagedRouteProbeActivationWaitsForFencedReconcile(t *testing.T) {
 	var activatedRoute model.UpstreamManagedRoute
 	require.NoError(t, model.DB.First(&activatedRoute, route.ID).Error)
 	assert.Equal(t, model.UpstreamRouteStateActive, activatedRoute.State)
+	assert.Zero(t, activatedRoute.Rank)
 	var beforeReconcile model.Channel
 	require.NoError(t, model.DB.First(&beforeReconcile, channel.Id).Error)
 	assert.Equal(t, common.ChannelStatusAutoDisabled, beforeReconcile.Status)
 	var ability model.Ability
 	require.NoError(t, model.DB.First(&ability, "channel_id = ?", channel.Id).Error)
 	assert.False(t, ability.Enabled)
+	assert.Zero(t, EnableChannelForHealthCheck(&beforeReconcile, ""))
+	require.NoError(t, model.DB.First(&beforeReconcile, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, beforeReconcile.Status)
+	require.NoError(t, model.DB.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
 
 	summary, err := ReconcileManagedUpstreams(now)
 	require.NoError(t, err)
 	assert.Equal(t, 1, summary.PrioritiesUpdated)
+	require.NoError(t, model.DB.First(&activatedRoute, route.ID).Error)
+	assert.Equal(t, 1, activatedRoute.Rank)
 	var reconciled model.Channel
 	require.NoError(t, model.DB.First(&reconciled, channel.Id).Error)
 	assert.Equal(t, common.ChannelStatusEnabled, reconciled.Status)

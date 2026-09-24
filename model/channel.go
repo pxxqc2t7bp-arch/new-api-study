@@ -1001,6 +1001,7 @@ func lockManagedRouteRecoveryFence(
 		return false, err
 	}
 	return route.State == UpstreamRouteStateActive &&
+		route.Rank > 0 &&
 		!route.Detached &&
 		route.ManualPauseUntil <= recoveryAt, nil
 }

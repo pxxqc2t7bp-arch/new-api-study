@@ -33,6 +33,7 @@ func TestRecordUpstreamRouteFailure(t *testing.T) {
 		Protocol:        UpstreamProtocolOpenAI,
 		ChannelID:       101,
 		State:           UpstreamRouteStateActive,
+		Rank:            7,
 	}
 	require.NoError(t, DB.Create(&route).Error)
 
@@ -42,12 +43,18 @@ func TestRecordUpstreamRouteFailure(t *testing.T) {
 		assert.False(t, quarantined)
 		assert.Equal(t, 1, first.ConsecutiveFailures)
 		assert.Equal(t, UpstreamRouteStateActive, first.State)
+		assert.Equal(t, 7, first.Rank)
 
 		second, quarantined, err := RecordUpstreamRouteFailure(101, 1299, 300, 2, "second")
 		require.NoError(t, err)
 		assert.True(t, quarantined)
 		assert.Equal(t, 2, second.ConsecutiveFailures)
 		assert.Equal(t, UpstreamRouteStateQuarantined, second.State)
+		assert.Zero(t, second.Rank)
+
+		var stored UpstreamManagedRoute
+		require.NoError(t, DB.First(&stored, route.ID).Error)
+		assert.Zero(t, stored.Rank)
 	})
 }
 

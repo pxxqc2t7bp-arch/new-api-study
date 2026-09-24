@@ -257,6 +257,7 @@ func PauseManagedRoute(routeID int64, reason string) error {
 	until := now + int64(setting.ManualPauseHours*3600)
 	if err := model.DB.Model(&route).Updates(map[string]any{
 		"state":              model.UpstreamRouteStatePaused,
+		"rank":               0,
 		"manual_pause_until": until,
 		"last_reason":        strings.TrimSpace(reason),
 		"updated_at":         now,
@@ -279,6 +280,7 @@ func ResumeManagedRoute(routeID int64) error {
 	}
 	if err := model.DB.Model(&route).Updates(map[string]any{
 		"state":              model.UpstreamRouteStateShadow,
+		"rank":               0,
 		"manual_pause_until": int64(0),
 		"next_probe_at":      now,
 		"last_reason":        "",
@@ -294,6 +296,7 @@ func DetachManagedRoute(routeID int64) error {
 	now := common.GetTimestamp()
 	result := model.DB.Model(&model.UpstreamManagedRoute{}).Where("id = ?", routeID).Updates(map[string]any{
 		"state":      model.UpstreamRouteStateDetached,
+		"rank":       0,
 		"detached":   true,
 		"updated_at": now,
 	})
@@ -351,6 +354,10 @@ func MarkManagedRouteProbeResult(
 		desired.LastLatencyMS = latencyMS
 		desired.LastReason = ""
 		desired.UpdatedAt = now
+		if route.State != model.UpstreamRouteStateActive ||
+			desired.State != model.UpstreamRouteStateActive {
+			desired.Rank = 0
+		}
 		applied, _, err := model.UpdateManagedRouteProbeResultIfUnchanged(
 			route,
 			&desired,
@@ -400,6 +407,9 @@ func MarkManagedRouteProbeResult(
 		if route.State == model.UpstreamRouteStateShadow {
 			desired.State = model.UpstreamRouteStateShadow
 		}
+	}
+	if desired.State != model.UpstreamRouteStateActive {
+		desired.Rank = 0
 	}
 	applied, channelDisabled, err := model.UpdateManagedRouteProbeResultIfUnchanged(
 		route,

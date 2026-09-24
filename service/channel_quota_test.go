@@ -1208,6 +1208,7 @@ func TestEnableChannelForHealthCheckFencesManagedSingleKeyRoute(t *testing.T) {
 		tag              string
 		managed          bool
 		routeState       string
+		routeRank        int
 		detached         bool
 		manualPauseUntil int64
 		wantEnabled      int
@@ -1224,28 +1225,39 @@ func TestEnableChannelForHealthCheckFencesManagedSingleKeyRoute(t *testing.T) {
 			name:        "active managed route",
 			managed:     true,
 			routeState:  model.UpstreamRouteStateActive,
+			routeRank:   1,
 			wantEnabled: 1,
+		},
+		{
+			name:       "active unselected managed route",
+			managed:    true,
+			routeState: model.UpstreamRouteStateActive,
+			routeRank:  0,
 		},
 		{
 			name:       "quarantined after probe snapshot",
 			managed:    true,
 			routeState: model.UpstreamRouteStateQuarantined,
+			routeRank:  7,
 		},
 		{
 			name:       "paused after probe snapshot",
 			managed:    true,
 			routeState: model.UpstreamRouteStatePaused,
+			routeRank:  7,
 		},
 		{
 			name:       "detached after probe snapshot",
 			managed:    true,
 			routeState: model.UpstreamRouteStateDetached,
+			routeRank:  7,
 			detached:   true,
 		},
 		{
 			name:             "manual pause remains active",
 			managed:          true,
 			routeState:       model.UpstreamRouteStateActive,
+			routeRank:        7,
 			manualPauseUntil: time.Now().Add(time.Hour).Unix(),
 		},
 	}
@@ -1280,6 +1292,7 @@ func TestEnableChannelForHealthCheckFencesManagedSingleKeyRoute(t *testing.T) {
 					Protocol:        model.UpstreamProtocolOpenAI,
 					ChannelID:       channel.Id,
 					State:           model.UpstreamRouteStateActive,
+					Rank:            testCase.routeRank,
 				}
 				require.NoError(t, db.Create(&route).Error)
 				require.NoError(t, db.Model(&model.UpstreamManagedRoute{}).
@@ -1361,6 +1374,7 @@ func TestEnableChannelForHealthCheckFencesManagedMultiKeyRoute(t *testing.T) {
 		tag         string
 		managed     bool
 		routeState  string
+		routeRank   int
 		wantEnabled int
 	}{
 		{
@@ -1375,12 +1389,20 @@ func TestEnableChannelForHealthCheckFencesManagedMultiKeyRoute(t *testing.T) {
 			name:        "active managed route",
 			managed:     true,
 			routeState:  model.UpstreamRouteStateActive,
+			routeRank:   1,
 			wantEnabled: 1,
+		},
+		{
+			name:       "active excluded managed route",
+			managed:    true,
+			routeState: model.UpstreamRouteStateActive,
+			routeRank:  0,
 		},
 		{
 			name:       "inactive managed route",
 			managed:    true,
 			routeState: model.UpstreamRouteStateQuarantined,
+			routeRank:  7,
 		},
 	}
 
@@ -1429,6 +1451,7 @@ func TestEnableChannelForHealthCheckFencesManagedMultiKeyRoute(t *testing.T) {
 					Protocol:        model.UpstreamProtocolOpenAI,
 					ChannelID:       channel.Id,
 					State:           model.UpstreamRouteStateActive,
+					Rank:            testCase.routeRank,
 				}
 				require.NoError(t, db.Create(&route).Error)
 				require.NoError(t, db.Model(&model.UpstreamManagedRoute{}).
