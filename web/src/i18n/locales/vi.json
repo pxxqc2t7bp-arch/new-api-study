@@ -6797,6 +6797,26 @@
     "Use the group set on the token. If the token has no group, use the user group. The auto group tries the configured groups from top to bottom.": "Sử dụng nhóm được đặt cho token. Nếu token chưa có nhóm, sử dụng nhóm của người dùng. Nhóm auto thử các nhóm đã cấu hình theo thứ tự từ trên xuống dưới.",
     "Users call": "Người dùng gọi",
     "Wallet pre-consume bypass threshold (USD)": "Ngưỡng ví được miễn khấu trừ trước (USD)",
-    "What do you want to change?": "Bạn muốn thay đổi gì?"
+    "What do you want to change?": "Bạn muốn thay đổi gì?",
+    "All discovered groups are routed": "Tất cả nhóm đã phát hiện đều được định tuyến",
+    "Breaker": "Bộ ngắt mạch",
+    "Cancel changes": "Hủy thay đổi",
+    "Candidates": "Số ứng viên",
+    "Comma-separated group names": "Tên nhóm được phân tách bằng dấu phẩy",
+    "Could not save policy": "Không thể lưu chính sách",
+    "Daily reconcile": "Đối soát hằng ngày",
+    "Enter a valid JSON object": "Nhập một đối tượng JSON hợp lệ",
+    "Enter at least one target group": "Nhập ít nhất một nhóm đích",
+    "Failover budget": "Thời hạn chuyển dự phòng",
+    "Groups without an active attached route": "Các nhóm không có tuyến đang hoạt động được liên kết",
+    "Model aliases (JSON)": "Bí danh mô hình (JSON)",
+    "Model exclusions (JSON)": "Loại trừ mô hình (JSON)",
+    "No models reported": "Không có mô hình nào được báo cáo",
+    "Protocol exclusions (JSON)": "Loại trừ giao thức (JSON)",
+    "Routing policy saved": "Đã lưu chính sách định tuyến",
+    "Save policy": "Lưu chính sách",
+    "Source / group": "Nguồn / nhóm",
+    "Target groups": "Nhóm đích",
+    "Unrouted groups": "Nhóm chưa được định tuyến"
   }
 }

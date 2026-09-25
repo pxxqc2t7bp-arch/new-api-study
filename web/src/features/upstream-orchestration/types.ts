@@ -35,8 +35,10 @@ export type UpstreamRoute = {
   protocol: string
   channel_id: number
   state: string
+  detached: boolean
   rank: number
   effective_multiplier: number
+  effective_models: string[] | null
   consecutive_failures: number
   consecutive_successes: number
   last_success_at?: number
@@ -66,6 +68,7 @@ export type UpstreamCommand = {
 export type UpstreamSettings = {
   enabled: boolean
   auto_enroll: boolean
+  target_groups: string[]
   candidate_limit: number
   request_attempt_limit: number
   failover_budget_seconds: number
@@ -76,7 +79,18 @@ export type UpstreamSettings = {
   sync_interval_hours: number
   daily_reconcile_time: string
   timezone: string
+  model_aliases: Record<string, string>
+  model_exclusions: Record<string, string[]>
+  protocol_model_exclusions: Record<string, string[]>
 }
+
+export type UpstreamRoutingPolicy = Pick<
+  UpstreamSettings,
+  | 'target_groups'
+  | 'model_aliases'
+  | 'model_exclusions'
+  | 'protocol_model_exclusions'
+>
 
 export type UpstreamOverview = {
   settings: UpstreamSettings

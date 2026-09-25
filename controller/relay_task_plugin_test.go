@@ -17,8 +17,10 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -515,19 +517,29 @@ func TestExecuteTaskSubmissionDisconnectAfterDurableInsertDoesNotRefund(t *testi
 // TEST_TASK_DB_DIALECT (SQLite in memory by default) and records every task
 // INSERT in events so tests can assert the reserve → insert → settle order.
 // Without migrate the task table does not exist and inserts fail.
-func setupTaskSubmissionDatabase(t *testing.T, migrate bool, events *[]string) *gorm.DB {
+func setupTaskSubmissionDatabase(t *testing.T, migrate bool, events *[]string, additionalModels ...any) *gorm.DB {
 	t.Helper()
 	previousDB := model.DB
-	var models []any
+	previousType := common.MainDatabaseType()
+	models := append([]any(nil), additionalModels...)
 	if migrate {
 		models = append(models, &model.Task{})
 	}
-	database, _ := openTaskDialectDatabase(t, models...)
+	database, dialect := openTaskDialectDatabase(t, models...)
 	require.NoError(t, database.Callback().Create().Before("gorm:create").Register("test:task-submit-order", func(*gorm.DB) {
 		*events = append(*events, "insert")
 	}))
 	model.DB = database
-	t.Cleanup(func() { model.DB = previousDB })
+	common.SetMainDatabaseType(dialect)
+	t.Cleanup(func() {
+		model.DB = previousDB
+		common.SetMainDatabaseType(previousType)
+		if common.MemoryCacheEnabled && previousDB != nil &&
+			previousDB.Migrator().HasTable(&model.Channel{}) &&
+			previousDB.Migrator().HasTable(&model.Ability{}) {
+			model.InitChannelCache()
+		}
+	})
 	return database
 }
 
@@ -554,7 +566,7 @@ func taskSubmissionRelayInfo(billing relaycommon.BillingSettler) *relaycommon.Re
 
 // Uses the real submit adaptor, expression evaluator, BillingSession, task row
 // and consume log. Set TEST_TASK_DB_DIALECT plus TEST_MYSQL_DSN or
-// TEST_POSTGRES_DSN to exercise the same contract on an external test database.
+// TEST_POSTGRES_DSN, or use the repository database-matrix runner.
 // Unique table prefixes keep the fixture isolated from all existing tables.
 // openTaskDialectDatabase opens the engine selected by TEST_TASK_DB_DIALECT
 // (default SQLite in memory; MySQL and PostgreSQL through TEST_MYSQL_DSN and
@@ -563,18 +575,33 @@ func taskSubmissionRelayInfo(billing relaycommon.BillingSettler) *relaycommon.Re
 // runs leave a record.
 func openTaskDialectDatabase(t *testing.T, models ...any) (*gorm.DB, common.DatabaseType) {
 	t.Helper()
-	dialect := common.DatabaseType(os.Getenv("TEST_TASK_DB_DIALECT"))
+	dialectName := os.Getenv("TEST_TASK_DB_DIALECT")
+	dsn := ""
+	if dialectName == "" {
+		dialectName = os.Getenv("APP_PLUGIN_TEST_DIALECT")
+		dsn = os.Getenv("APP_PLUGIN_TEST_DSN")
+	}
+	dialect := common.DatabaseType(dialectName)
 	var driver gorm.Dialector
 	switch dialect {
 	case "", common.DatabaseTypeSQLite:
 		dialect = common.DatabaseTypeSQLite
-		driver = sqlite.Open(":memory:")
+		if dsn == "" {
+			dsn = ":memory:"
+		}
+		driver = sqlite.Open(dsn)
 	case common.DatabaseTypeMySQL:
-		require.NotEmpty(t, os.Getenv("TEST_MYSQL_DSN"))
-		driver = mysql.Open(os.Getenv("TEST_MYSQL_DSN"))
+		if dsn == "" {
+			dsn = os.Getenv("TEST_MYSQL_DSN")
+		}
+		require.NotEmpty(t, dsn)
+		driver = mysql.Open(dsn)
 	case common.DatabaseTypePostgreSQL:
-		require.NotEmpty(t, os.Getenv("TEST_POSTGRES_DSN"))
-		driver = postgres.New(postgres.Config{DSN: os.Getenv("TEST_POSTGRES_DSN"), PreferSimpleProtocol: true})
+		if dsn == "" {
+			dsn = os.Getenv("TEST_POSTGRES_DSN")
+		}
+		require.NotEmpty(t, dsn)
+		driver = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
 	default:
 		t.Fatalf("unsupported test dialect %q", dialect)
 	}
@@ -701,6 +728,569 @@ export function buildQueryRequest(){throw new Error("completed submissions must 
 			info.Billing.Refund(c)
 			require.NoError(t, db.First(&updated, user.Id).Error)
 			assert.Equal(t, initial-want, updated.Quota, "terminal settlement is idempotent")
+		})
+	}
+}
+
+func TestManagedTaskHealthPersistenceFailureStopsRetry(t *testing.T) {
+	for _, failingTable := range []string{"upstream_managed_routes", "channels", "abilities"} {
+		t.Run(failingTable, func(t *testing.T) {
+			testManagedTaskHealthPersistenceFailureStopsRetry(t, failingTable)
+		})
+	}
+}
+
+func testManagedTaskHealthPersistenceFailureStopsRetry(t *testing.T, failingTable string) {
+	events := []string{}
+	database := setupTaskSubmissionDatabase(t, true, &events,
+		&model.Channel{},
+		&model.Ability{},
+		&model.UpstreamManagedRoute{},
+	)
+
+	previousRetries := common.RetryTimes
+	previousErrorLog := constant.ErrorLogEnabled
+	common.RetryTimes = 1
+	constant.ErrorLogEnabled = false
+	t.Cleanup(func() {
+		common.RetryTimes = previousRetries
+		constant.ErrorLogEnabled = previousErrorLog
+	})
+	updateUpstreamOrchestrationForTest(t, func(setting *operation_setting.UpstreamOrchestrationSetting) {
+		setting.Enabled = true
+		setting.FailureThreshold = 3
+	})
+
+	autoBan := 1
+	channel := model.Channel{
+		Name: "managed-task", Key: "fixture-key", Type: constant.ChannelTypeTaskPlugin,
+		Status: common.ChannelStatusEnabled, Group: "default", Models: "plugin-model",
+		AutoBan: &autoBan,
+	}
+	require.NoError(t, database.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(database))
+	route := model.UpstreamManagedRoute{
+		SourceID: 1, ExternalGroupID: "managed-task", Platform: "task",
+		Protocol: model.UpstreamProtocolOpenAI, ChannelID: channel.Id,
+		State: model.UpstreamRouteStateActive,
+	}
+	require.NoError(t, database.Create(&route).Error)
+
+	controlContext := taskSubmissionTestContext()
+	common.SetContextKey(controlContext, constant.ContextKeyChannelId, channel.Id)
+	common.SetContextKey(controlContext, constant.ContextKeyOriginalModel, "plugin-model")
+	controlInfo := taskSubmissionRelayInfo(nil)
+	controlInfo.LockedChannel = &channel
+	controlAttempts := 0
+	controlOutcome, controlErr := executeTaskSubmissionWith(controlContext, controlInfo, func(
+		*gin.Context,
+		*relaycommon.RelayInfo,
+	) (*relay.TaskSubmitResult, *dto.TaskError) {
+		controlAttempts++
+		return nil, service.TaskErrorWrapper(
+			errors.New("managed task upstream failed"),
+			"managed_task_upstream_failed",
+			http.StatusInternalServerError,
+		)
+	})
+	assert.Nil(t, controlOutcome)
+	require.NotNil(t, controlErr)
+	assert.Equal(t, 2, controlAttempts, "fixture must exercise a non-zero retry budget")
+	assert.False(t, common.GetContextKeyBool(controlContext, constant.ContextKeyManagedHealthPersistenceUncertain))
+	require.NoError(t, database.Model(&model.UpstreamManagedRoute{}).
+		Where("id = ?", route.ID).
+		Updates(map[string]any{
+			"state":                 model.UpstreamRouteStateActive,
+			"consecutive_failures":  0,
+			"consecutive_successes": 0,
+			"failure_window_start":  0,
+			"last_failure_at":       0,
+			"last_reason":           "",
+			"recovery_attempts":     0,
+			"next_probe_at":         0,
+		}).Error)
+	updateUpstreamOrchestrationForTest(t, func(setting *operation_setting.UpstreamOrchestrationSetting) {
+		setting.FailureThreshold = 1
+	})
+
+	injected := errors.New("injected managed task health persistence failure")
+	const callbackName = "test:managed_task_health_persistence_failure"
+	require.NoError(t, database.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table == failingTable || strings.HasSuffix(tx.Statement.Table, "_"+failingTable) {
+			tx.AddError(injected)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, database.Callback().Update().Remove(callbackName))
+	})
+
+	c := taskSubmissionTestContext()
+	common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
+	common.SetContextKey(c, constant.ContextKeyOriginalModel, "plugin-model")
+	info := taskSubmissionRelayInfo(nil)
+	info.LockedChannel = &channel
+	attempts := 0
+
+	outcome, taskErr := executeTaskSubmissionWith(c, info, func(
+		*gin.Context,
+		*relaycommon.RelayInfo,
+	) (*relay.TaskSubmitResult, *dto.TaskError) {
+		attempts++
+		return nil, service.TaskErrorWrapper(
+			errors.New("managed task upstream failed"),
+			"managed_task_upstream_failed",
+			http.StatusInternalServerError,
+		)
+	})
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, 1, attempts)
+	assert.True(t, common.GetContextKeyBool(c, constant.ContextKeyManagedHealthPersistenceUncertain))
+	var storedChannel model.Channel
+	require.NoError(t, database.First(&storedChannel, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, storedChannel.Status)
+	var storedAbility model.Ability
+	require.NoError(t, database.Where("channel_id = ?", channel.Id).First(&storedAbility).Error)
+	assert.True(t, storedAbility.Enabled)
+	var storedRoute model.UpstreamManagedRoute
+	require.NoError(t, database.First(&storedRoute, route.ID).Error)
+	assert.Equal(t, model.UpstreamRouteStateActive, storedRoute.State)
+	assert.Zero(t, storedRoute.ConsecutiveFailures)
+}
+
+func TestManagedTaskSubmissionUsesSharedFailoverBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		orchestrationEnabled bool
+		managedRoutes        bool
+		requestAttemptLimit  int
+		retryTimes           int
+		budgetSeconds        int
+		delays               []time.Duration
+		terminalAttempt      int
+		wantAttempts         int
+		wantFallbackReason   string
+	}{
+		{
+			name:                 "first attempt exhausts shared budget",
+			orchestrationEnabled: true,
+			managedRoutes:        true,
+			requestAttemptLimit:  5,
+			retryTimes:           1,
+			budgetSeconds:        1,
+			delays:               []time.Duration{1100 * time.Millisecond},
+			wantAttempts:         1,
+			wantFallbackReason:   "failover_budget_exhausted",
+		},
+		{
+			name:                 "retry remains within shared budget",
+			orchestrationEnabled: true,
+			managedRoutes:        true,
+			requestAttemptLimit:  5,
+			retryTimes:           1,
+			budgetSeconds:        2,
+			delays:               []time.Duration{0, 0},
+			terminalAttempt:      2,
+			wantAttempts:         2,
+		},
+		{
+			name:                 "all managed attempts share one deadline",
+			orchestrationEnabled: true,
+			managedRoutes:        true,
+			requestAttemptLimit:  5,
+			retryTimes:           1,
+			budgetSeconds:        1,
+			delays:               []time.Duration{600 * time.Millisecond, 600 * time.Millisecond},
+			wantAttempts:         2,
+			wantFallbackReason:   "failover_budget_exhausted",
+		},
+		{
+			name:                 "ordinary task path uses adaptive attempts",
+			orchestrationEnabled: true,
+			managedRoutes:        true,
+			requestAttemptLimit:  5,
+			retryTimes:           1,
+			budgetSeconds:        10,
+			delays:               []time.Duration{0, 0, 0},
+			wantAttempts:         3,
+		},
+		{
+			name:                 "unmanaged retry count remains compatible",
+			orchestrationEnabled: false,
+			requestAttemptLimit:  5,
+			retryTimes:           1,
+			budgetSeconds:        1,
+			delays:               []time.Duration{0, 0},
+			terminalAttempt:      2,
+			wantAttempts:         2,
+		},
+		{
+			name:                 "enabled orchestration does not expand unmanaged retries",
+			orchestrationEnabled: true,
+			requestAttemptLimit:  5,
+			retryTimes:           0,
+			budgetSeconds:        10,
+			wantAttempts:         1,
+		},
+		{
+			name:                 "managed request attempt limit caps adaptive retries",
+			orchestrationEnabled: true,
+			managedRoutes:        true,
+			requestAttemptLimit:  1,
+			retryTimes:           1,
+			budgetSeconds:        10,
+			wantAttempts:         1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []string{}
+			database := setupTaskSubmissionDatabase(t, true, &events)
+			require.NoError(t, database.AutoMigrate(
+				&model.Channel{},
+				&model.Ability{},
+				&model.UpstreamManagedRoute{},
+			))
+
+			previousMemoryCache := common.MemoryCacheEnabled
+			previousRetries := common.RetryTimes
+			previousErrorLog := constant.ErrorLogEnabled
+			common.MemoryCacheEnabled = true
+			common.RetryTimes = tc.retryTimes
+			constant.ErrorLogEnabled = false
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = previousMemoryCache
+				common.RetryTimes = previousRetries
+				constant.ErrorLogEnabled = previousErrorLog
+			})
+			updateUpstreamOrchestrationForTest(t, func(setting *operation_setting.UpstreamOrchestrationSetting) {
+				setting.Enabled = tc.orchestrationEnabled
+				setting.RequestAttemptLimit = tc.requestAttemptLimit
+				setting.FailoverBudgetSeconds = tc.budgetSeconds
+			})
+
+			for index, priority := range []int64{30, 20, 10} {
+				channel := model.Channel{
+					Name: fmt.Sprintf("managed-task-budget-%d", index), Key: "fixture-key",
+					Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled,
+					Group: "default", Models: "plugin-model", Priority: &priority,
+				}
+				require.NoError(t, database.Create(&channel).Error)
+				require.NoError(t, channel.AddAbilities(database))
+				if tc.managedRoutes {
+					require.NoError(t, database.Create(&model.UpstreamManagedRoute{
+						SourceID: int64(index + 1), ExternalGroupID: fmt.Sprintf("budget-%d", index),
+						Platform: "task", Protocol: model.UpstreamProtocolOpenAI,
+						ChannelID: channel.Id, State: model.UpstreamRouteStateActive,
+					}).Error)
+				}
+			}
+			model.InitChannelCache()
+
+			c := taskSubmissionTestContext()
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/tasks/test", strings.NewReader(`{}`))
+			info := taskSubmissionRelayInfo(nil)
+			info.LockedChannel = nil
+			info.TokenGroup = "default"
+			attempts := 0
+
+			outcome, taskErr := executeTaskSubmissionWith(c, info, func(
+				*gin.Context,
+				*relaycommon.RelayInfo,
+			) (*relay.TaskSubmitResult, *dto.TaskError) {
+				if attempts < len(tc.delays) && tc.delays[attempts] > 0 {
+					time.Sleep(tc.delays[attempts])
+				}
+				attempts++
+				if attempts == tc.terminalAttempt {
+					return nil, service.TaskErrorWrapper(
+						errors.New("managed task request rejected"),
+						"managed_task_request_rejected",
+						http.StatusBadRequest,
+					)
+				}
+				return nil, service.TaskErrorWrapper(
+					errors.New("managed task upstream failed"),
+					"managed_task_upstream_failed",
+					http.StatusBadGateway,
+				)
+			})
+
+			assert.Nil(t, outcome)
+			require.NotNil(t, taskErr)
+			assert.Equal(t, tc.wantAttempts, attempts)
+			assert.Equal(t, tc.wantFallbackReason, c.GetString("channel_fallback_reason"))
+		})
+	}
+}
+
+func TestManagedTaskProviderDispatchRetryAndRefund(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		firstError         func() *dto.TaskError
+		wantSuccess        bool
+		wantAttempts       int
+		wantRefunds        int
+		wantWriteUncertain bool
+	}{
+		{
+			name: "unknown provider write stops without refund",
+			firstError: func() *dto.TaskError {
+				taskErr := service.TaskErrorWrapper(
+					errors.New("connection reset after request dispatch"),
+					"do_request_failed",
+					http.StatusInternalServerError,
+				)
+				taskErr.NoRetry = true
+				taskErr.ProviderWriteUncertain = true
+				return taskErr
+			},
+			wantAttempts:       1,
+			wantWriteUncertain: true,
+		},
+		{
+			name: "provider request not started retries",
+			firstError: func() *dto.TaskError {
+				return service.TaskErrorWrapper(
+					channel.ErrProviderRequestNotStarted,
+					"do_request_failed",
+					http.StatusInternalServerError,
+				)
+			},
+			wantSuccess:  true,
+			wantAttempts: 2,
+		},
+		{
+			name: "explicit provider 5xx retries",
+			firstError: func() *dto.TaskError {
+				return service.TaskErrorWrapper(
+					errors.New("provider returned 502"),
+					"fail_to_fetch_task",
+					http.StatusBadGateway,
+				)
+			},
+			wantSuccess:  true,
+			wantAttempts: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []string{}
+			database := setupTaskSubmissionDatabase(t, true, &events,
+				&model.Channel{},
+				&model.Ability{},
+				&model.UpstreamManagedRoute{},
+				&model.UpstreamSource{},
+				&model.UpstreamGroup{},
+				&model.User{},
+			)
+
+			previousMemoryCache := common.MemoryCacheEnabled
+			previousRedis := common.RedisEnabled
+			previousBatchUpdate := common.BatchUpdateEnabled
+			previousLogConsume := common.LogConsumeEnabled
+			previousRetries := common.RetryTimes
+			previousErrorLog := constant.ErrorLogEnabled
+			common.MemoryCacheEnabled = true
+			common.RedisEnabled = false
+			common.BatchUpdateEnabled = false
+			common.LogConsumeEnabled = false
+			common.RetryTimes = 0
+			constant.ErrorLogEnabled = false
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = previousMemoryCache
+				common.RedisEnabled = previousRedis
+				common.BatchUpdateEnabled = previousBatchUpdate
+				common.LogConsumeEnabled = previousLogConsume
+				common.RetryTimes = previousRetries
+				constant.ErrorLogEnabled = previousErrorLog
+			})
+			updateUpstreamOrchestrationForTest(t, func(setting *operation_setting.UpstreamOrchestrationSetting) {
+				setting.Enabled = true
+				setting.FailoverBudgetSeconds = 10
+			})
+			require.NoError(t, database.Create(&model.User{
+				Id: 1, Username: "managed-dispatch-user", Status: common.UserStatusEnabled,
+			}).Error)
+
+			autoBan := 0
+			for index, priority := range []int64{20, 10} {
+				sourceID := int64(index + 1)
+				externalGroupID := fmt.Sprintf("dispatch-%d", index)
+				require.NoError(t, database.Create(&model.UpstreamSource{
+					ID: sourceID, Key: fmt.Sprintf("dispatch-source-%d", index),
+					Name: "Dispatch Source", ConsoleURL: "https://example.com",
+				}).Error)
+				require.NoError(t, database.Create(&model.UpstreamGroup{
+					SourceID: sourceID, ExternalID: externalGroupID,
+					Name: "Dispatch Group", Platform: "task",
+				}).Error)
+				channel := model.Channel{
+					Name: fmt.Sprintf("managed-dispatch-%d", index), Key: "fixture-key",
+					Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled,
+					Group: "default", Models: "plugin-model", Priority: &priority,
+					AutoBan: &autoBan,
+				}
+				require.NoError(t, database.Create(&channel).Error)
+				require.NoError(t, channel.AddAbilities(database))
+				require.NoError(t, database.Create(&model.UpstreamManagedRoute{
+					SourceID: sourceID, ExternalGroupID: externalGroupID,
+					Platform: "task", Protocol: model.UpstreamProtocolOpenAI,
+					ChannelID: channel.Id, State: model.UpstreamRouteStateActive,
+				}).Error)
+			}
+			model.InitChannelCache()
+			events = nil
+
+			c := taskSubmissionTestContext()
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/tasks/test", strings.NewReader(`{}`))
+			billing := &taskSubmissionTestBilling{events: &events}
+			info := taskSubmissionRelayInfo(billing)
+			info.LockedChannel = nil
+			info.TokenGroup = "default"
+			retryBudget := service.AdaptiveRetryTimes(&service.RetryParam{
+				Ctx: c, TokenGroup: info.TokenGroup, ModelName: info.OriginModelName,
+			})
+			require.GreaterOrEqual(t, retryBudget, 1, "fixture must provide a real retry budget")
+			attempts := 0
+
+			outcome, taskErr := executeTaskSubmissionWith(c, info, func(
+				*gin.Context,
+				*relaycommon.RelayInfo,
+			) (*relay.TaskSubmitResult, *dto.TaskError) {
+				attempts++
+				if attempts == 1 {
+					return nil, tc.firstError()
+				}
+				return &relay.TaskSubmitResult{
+					UpstreamTaskID:   "upstream-private",
+					Platform:         constant.TaskPlatform("plugin"),
+					ProviderAccepted: true,
+				}, nil
+			})
+
+			assert.Equal(t, tc.wantAttempts, attempts)
+			assert.Equal(t, tc.wantRefunds, billing.refunds)
+			if tc.wantSuccess {
+				require.Nil(t, taskErr)
+				require.NotNil(t, outcome)
+				assert.Equal(t, []string{"reserve", "insert", "settle"}, events)
+				return
+			}
+			assert.Nil(t, outcome)
+			require.NotNil(t, taskErr)
+			assert.True(t, taskErr.NoRetry)
+			assert.Equal(t, tc.wantWriteUncertain, taskErr.ProviderWriteUncertain)
+			assert.False(t, taskErr.ProviderAccepted)
+			assert.Empty(t, events)
+			policyEvents := service.RequestPolicy(c).Events()
+			require.NotEmpty(t, policyEvents)
+			assert.Equal(t, service.PolicyDecision{
+				Action: "stop", Reason: "provider_write_uncertain", Source: "system",
+			}, policyEvents[len(policyEvents)-1].Decision)
+		})
+	}
+}
+
+func TestManagedLockedTaskUsesConfiguredRetryBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		configure    func(*gin.Context, int)
+		wantAttempts int
+	}{
+		{
+			name: "same-channel pin retries",
+			configure: func(c *gin.Context, channelID int) {
+				service.GetChannelConstraints(c).AddPin(dto.ChannelPin{
+					ChannelId: channelID,
+					Source:    dto.PinSourceOriginTask,
+					Rank:      dto.PinRankOriginTask,
+					RetryMode: dto.PinRetrySameChannel,
+				})
+			},
+			wantAttempts: 2,
+		},
+		{
+			name: "single-attempt pin stays single",
+			configure: func(c *gin.Context, channelID int) {
+				service.GetChannelConstraints(c).AddPin(dto.ChannelPin{
+					ChannelId: channelID,
+					Source:    dto.PinSourceToken,
+					Rank:      dto.PinRankToken,
+					RetryMode: dto.PinRetrySingleAttempt,
+				})
+			},
+			wantAttempts: 1,
+		},
+		{
+			name: "strict session stays single",
+			configure: func(c *gin.Context, _ int) {
+				c.Set("channel_affinity_skip_retry_on_failure", true)
+				service.RequestPolicy(c).SessionModeSource = "global"
+			},
+			wantAttempts: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []string{}
+			database := setupTaskSubmissionDatabase(t, true, &events,
+				&model.Channel{},
+				&model.Ability{},
+				&model.UpstreamManagedRoute{},
+			)
+
+			previousRetries := common.RetryTimes
+			previousErrorLog := constant.ErrorLogEnabled
+			common.RetryTimes = 1
+			constant.ErrorLogEnabled = false
+			t.Cleanup(func() {
+				common.RetryTimes = previousRetries
+				constant.ErrorLogEnabled = previousErrorLog
+			})
+			updateUpstreamOrchestrationForTest(t, func(setting *operation_setting.UpstreamOrchestrationSetting) {
+				setting.Enabled = true
+				setting.FailoverBudgetSeconds = 10
+			})
+
+			autoBan := 0
+			channel := model.Channel{
+				Name: "managed-locked-task", Key: "fixture-key",
+				Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled,
+				Group: "default", Models: "plugin-model", AutoBan: &autoBan,
+			}
+			require.NoError(t, database.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(database))
+			require.NoError(t, database.Create(&model.UpstreamManagedRoute{
+				SourceID: 1, ExternalGroupID: "managed-locked-task",
+				Platform: "task", Protocol: model.UpstreamProtocolOpenAI,
+				ChannelID: channel.Id, State: model.UpstreamRouteStateActive,
+			}).Error)
+
+			c := taskSubmissionTestContext()
+			tc.configure(c, channel.Id)
+			info := taskSubmissionRelayInfo(nil)
+			info.LockedChannel = &channel
+			attempts := 0
+
+			outcome, taskErr := executeTaskSubmissionWith(c, info, func(
+				*gin.Context,
+				*relaycommon.RelayInfo,
+			) (*relay.TaskSubmitResult, *dto.TaskError) {
+				attempts++
+				return nil, service.TaskErrorWrapper(
+					errors.New("retryable provider response"),
+					"fail_to_fetch_task",
+					http.StatusBadGateway,
+				)
+			})
+
+			assert.Nil(t, outcome)
+			require.NotNil(t, taskErr)
+			assert.Equal(t, tc.wantAttempts, attempts)
+			wantChannels := make([]string, tc.wantAttempts)
+			for index := range wantChannels {
+				wantChannels[index] = fmt.Sprintf("%d", channel.Id)
+			}
+			assert.Equal(t, wantChannels, c.GetStringSlice("use_channel"))
 		})
 	}
 }

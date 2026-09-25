@@ -6797,6 +6797,26 @@
     "Use the group set on the token. If the token has no group, use the user group. The auto group tries the configured groups from top to bottom.": "Используется группа токена. Если она не задана, используется группа пользователя. Группа auto перебирает настроенные группы сверху вниз.",
     "Users call": "Пользователь вызывает",
     "Wallet pre-consume bypass threshold (USD)": "Порог кошелька без предсписания (USD)",
-    "What do you want to change?": "Что вы хотите изменить?"
+    "What do you want to change?": "Что вы хотите изменить?",
+    "All discovered groups are routed": "Все обнаруженные группы маршрутизируются",
+    "Breaker": "Автомат защиты",
+    "Cancel changes": "Отменить изменения",
+    "Candidates": "Кандидаты",
+    "Comma-separated group names": "Названия групп через запятую",
+    "Could not save policy": "Не удалось сохранить политику",
+    "Daily reconcile": "Ежедневная сверка",
+    "Enter a valid JSON object": "Введите допустимый объект JSON",
+    "Enter at least one target group": "Введите хотя бы одну целевую группу",
+    "Failover budget": "Лимит времени переключения",
+    "Groups without an active attached route": "Группы без активного подключённого маршрута",
+    "Model aliases (JSON)": "Псевдонимы моделей (JSON)",
+    "Model exclusions (JSON)": "Исключения моделей (JSON)",
+    "No models reported": "Модели не указаны",
+    "Protocol exclusions (JSON)": "Исключения протоколов (JSON)",
+    "Routing policy saved": "Политика маршрутизации сохранена",
+    "Save policy": "Сохранить политику",
+    "Source / group": "Источник / группа",
+    "Target groups": "Целевые группы",
+    "Unrouted groups": "Группы без маршрута"
   }
 }

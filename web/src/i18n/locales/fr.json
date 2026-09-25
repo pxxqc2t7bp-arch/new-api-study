@@ -6797,6 +6797,26 @@
     "Use the group set on the token. If the token has no group, use the user group. The auto group tries the configured groups from top to bottom.": "Utilisez le groupe défini sur le jeton, ou celui de l’utilisateur si aucun groupe n’est défini. Le groupe auto essaie les groupes configurés de haut en bas.",
     "Users call": "Appelé par l’utilisateur",
     "Wallet pre-consume bypass threshold (USD)": "Seuil sans pré-débit du portefeuille (USD)",
-    "What do you want to change?": "Que souhaitez-vous modifier ?"
+    "What do you want to change?": "Que souhaitez-vous modifier ?",
+    "All discovered groups are routed": "Tous les groupes découverts sont routés",
+    "Breaker": "Disjoncteur",
+    "Cancel changes": "Annuler les modifications",
+    "Candidates": "Candidats",
+    "Comma-separated group names": "Noms de groupes séparés par des virgules",
+    "Could not save policy": "Impossible d’enregistrer la stratégie",
+    "Daily reconcile": "Réconciliation quotidienne",
+    "Enter a valid JSON object": "Saisissez un objet JSON valide",
+    "Enter at least one target group": "Saisissez au moins un groupe cible",
+    "Failover budget": "Délai de basculement",
+    "Groups without an active attached route": "Groupes sans route active attachée",
+    "Model aliases (JSON)": "Alias de modèles (JSON)",
+    "Model exclusions (JSON)": "Exclusions de modèles (JSON)",
+    "No models reported": "Aucun modèle signalé",
+    "Protocol exclusions (JSON)": "Exclusions de protocoles (JSON)",
+    "Routing policy saved": "Stratégie de routage enregistrée",
+    "Save policy": "Enregistrer la stratégie",
+    "Source / group": "Source / groupe",
+    "Target groups": "Groupes cibles",
+    "Unrouted groups": "Groupes non routés"
   }
 }

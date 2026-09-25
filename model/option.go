@@ -214,11 +214,20 @@ func loadOptionsFromDatabase() {
 	}()
 	passkeyOptionMutex.Lock()
 	defer passkeyOptionMutex.Unlock()
-	options, _ := AllOption()
+	upstreamOrchestrationOptionMutex.Lock()
+	defer upstreamOrchestrationOptionMutex.Unlock()
+	options, err := AllOption()
+	if err != nil {
+		common.SysError("failed to load options: " + err.Error())
+		return
+	}
 	passkeyOptions := make(map[string]string)
 	for _, option := range options {
 		if IsPasskeyDomainOption(option.Key) {
 			passkeyOptions[option.Key] = option.Value
+			continue
+		}
+		if strings.HasPrefix(option.Key, upstreamOrchestrationOptionPrefix) {
 			continue
 		}
 		err := updateOptionMap(option.Key, option.Value)
@@ -227,6 +236,9 @@ func loadOptionsFromDatabase() {
 		}
 	}
 	applyPasskeyDomainOptions(passkeyOptions)
+	if err := reloadUpstreamOrchestrationPolicy(); err != nil {
+		common.SysError("invalid upstream orchestration policy: " + err.Error())
+	}
 }
 
 func SyncOptions(frequency int) {
@@ -260,6 +272,7 @@ const (
 	optionWritePasskey
 	optionWriteRequestPolicy
 	optionWriteAppPolicy
+	optionWriteUpstreamOrchestration
 )
 
 type protectedOptionGroup struct {
@@ -277,6 +290,11 @@ func protectedOptionGroups() []protectedOptionGroup {
 		{authority: optionWriteAppPolicy, keys: []string{
 			AppArkImportDelegationsKey, AppModelInvokePolicyKey,
 		}},
+		{authority: optionWriteUpstreamOrchestration, keys: append(
+			slices.Clone(upstreamOrchestrationPolicyOptionKeys),
+			upstreamOrchestrationStaticEgressOptionKey,
+			upstreamOrchestrationPolicyLockOptionKey,
+		)},
 		{authority: optionWriteGeneric, keys: []string{
 			operation_setting.AppExecutionGrantsEnabledOptionKey,
 			operation_setting.AppPluginEmbeddedSurfaceEnabledOptionKey,
@@ -439,6 +457,9 @@ func runOptionWriteTransaction(db *gorm.DB, transaction func(*gorm.DB) error) er
 }
 
 func UpdateOption(key string, value string) error {
+	if IsUpstreamOrchestrationPolicyOption(key) {
+		return UpdateUpstreamOrchestrationOptions(map[string]string{key: value})
+	}
 	if IsRequestPolicyOption(key) {
 		return UpdateRequestPolicyOptions(map[string]string{key: value})
 	}
@@ -469,6 +490,21 @@ func UpdateOption(key string, value string) error {
 func UpdateOptionsBulk(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
+	}
+	hasUpstreamOrchestrationPolicyOption := false
+	for key := range values {
+		if IsUpstreamOrchestrationPolicyOption(key) {
+			hasUpstreamOrchestrationPolicyOption = true
+			break
+		}
+	}
+	if hasUpstreamOrchestrationPolicyOption {
+		for key := range values {
+			if !IsUpstreamOrchestrationPolicyOption(key) {
+				return fmt.Errorf("upstream orchestration policy options cannot be combined with %s", key)
+			}
+		}
+		return UpdateUpstreamOrchestrationOptions(values)
 	}
 	for key := range values {
 		if IsPasskeyDomainOption(key) {
@@ -892,17 +928,16 @@ func handleConfigUpdate(key, value string) bool {
 	configName := parts[0]
 	configKey := parts[1]
 
-	// 获取配置对象
-	cfg := config.GlobalConfig.Get(configName)
-	if cfg == nil {
+	updated, err := config.GlobalConfig.UpdateFromMap(configName, map[string]string{
+		configKey: value,
+	})
+	if !updated {
 		return false // 未注册的配置
 	}
-
-	// 更新配置
-	configMap := map[string]string{
-		configKey: value,
+	if err != nil {
+		common.SysError("failed to update config " + configName + ": " + err.Error())
+		return true
 	}
-	config.UpdateConfigFromMap(cfg, configMap)
 
 	// 特定配置的后处理
 	if configName == "performance_setting" {

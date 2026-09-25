@@ -1,45 +1,48 @@
 import { api } from '@/lib/api'
+import { requireServerSuccess } from '@/lib/server-error-message'
 
 import type {
   ApiResponse,
   UpstreamMetric,
   UpstreamOverview,
   UpstreamPriceEvidence,
+  UpstreamRoutingPolicy,
+  UpstreamSettings,
 } from './types'
 
 export async function getUpstreamOverview() {
   const response = await api.get<ApiResponse<UpstreamOverview>>(
     '/api/upstream-orchestration/overview'
   )
-  return response.data.data
+  return requireServerSuccess(response.data).data
 }
 
 export async function getUpstreamMetrics() {
   const response = await api.get<ApiResponse<UpstreamMetric[]>>(
     '/api/upstream-orchestration/metrics?limit=500'
   )
-  return response.data.data ?? []
+  return requireServerSuccess(response.data).data ?? []
 }
 
 export async function getUpstreamPrices() {
   const response = await api.get<ApiResponse<UpstreamPriceEvidence[]>>(
     '/api/upstream-orchestration/prices?limit=200'
   )
-  return response.data.data ?? []
+  return requireServerSuccess(response.data).data ?? []
 }
 
 export async function requestUpstreamSync() {
   const response = await api.post<ApiResponse<unknown>>(
     '/api/upstream-orchestration/sync-request'
   )
-  return response.data
+  return requireServerSuccess(response.data)
 }
 
 export async function reconcileUpstreams() {
   const response = await api.post<ApiResponse<unknown>>(
     '/api/upstream-orchestration/reconcile'
   )
-  return response.data
+  return requireServerSuccess(response.data)
 }
 
 export async function createPairingCode() {
@@ -48,7 +51,7 @@ export async function createPairingCode() {
   >('/api/upstream-orchestration/devices/pairing-code', {
     device_name: 'Chrome',
   })
-  return response.data.data
+  return requireServerSuccess(response.data).data
 }
 
 export async function updateUpstreamRoute(
@@ -59,5 +62,13 @@ export async function updateUpstreamRoute(
     `/api/upstream-orchestration/routes/${routeId}/${action}`,
     {}
   )
-  return response.data
+  return requireServerSuccess(response.data)
+}
+
+export async function updateUpstreamSettings(policy: UpstreamRoutingPolicy) {
+  const response = await api.put<ApiResponse<UpstreamSettings>>(
+    '/api/upstream-orchestration/settings',
+    policy
+  )
+  return requireServerSuccess(response.data).data
 }

@@ -46,6 +46,15 @@ func (e providerRequestNotStartedError) Is(target error) bool {
 	return target == ErrProviderRequestNotStarted || errors.Is(e.cause, target)
 }
 
+// MarkProviderRequestNotStarted preserves the original error text and cause
+// while classifying failures that happen before transport I/O.
+func MarkProviderRequestNotStarted(err error) error {
+	if err == nil || errors.Is(err, ErrProviderRequestNotStarted) {
+		return err
+	}
+	return providerRequestNotStartedError{cause: err}
+}
+
 // ApplyUpstreamBodyMetadata restores metadata that net/http cannot infer from
 // a ReplayableBody. Callers must pass the original body because NewRequest
 // hides its dynamic type behind req.Body's io.ReadCloser wrapper.
@@ -658,11 +667,11 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
 	fullRequestURL, err := a.BuildRequestURL(info)
 	if err != nil {
-		return nil, err
+		return nil, MarkProviderRequestNotStarted(err)
 	}
 	req, err := newTaskAPIRequest(c, fullRequestURL, requestBody)
 	if err != nil {
-		return nil, fmt.Errorf("new request failed: %w", err)
+		return nil, MarkProviderRequestNotStarted(fmt.Errorf("new request failed: %w", err))
 	}
 	ApplyUpstreamBodyMetadata(req, requestBody)
 	// Do NOT wrap requestBody in a GetBody closure here: returning the same
@@ -676,7 +685,7 @@ func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, req
 
 	err = a.BuildRequestHeader(c, req, info)
 	if err != nil {
-		return nil, fmt.Errorf("setup request header failed: %w", err)
+		return nil, MarkProviderRequestNotStarted(fmt.Errorf("setup request header failed: %w", err))
 	}
 	if info.AppSubject != nil {
 		// A durable App claim permits one logical send. Do not let a transport

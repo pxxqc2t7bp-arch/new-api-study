@@ -5,15 +5,15 @@ import (
 )
 
 type TaskError struct {
-	// NoRetry also covers unknown provider writes where acceptance is unconfirmed.
-	NoRetry          bool   `json:"-"`
-	ProviderAccepted bool   `json:"-"`
-	Code             string `json:"code"`
-	Message          string `json:"message"`
-	Data             any    `json:"data"`
-	StatusCode       int    `json:"-"`
-	LocalError       bool   `json:"-"`
-	Error            error  `json:"-"`
+	NoRetry                bool   `json:"-"`
+	ProviderAccepted       bool   `json:"-"`
+	ProviderWriteUncertain bool   `json:"-"`
+	Code                   string `json:"code"`
+	Message                string `json:"message"`
+	Data                   any    `json:"data"`
+	StatusCode             int    `json:"-"`
+	LocalError             bool   `json:"-"`
+	Error                  error  `json:"-"`
 }
 
 type TaskData interface {

@@ -6799,6 +6799,26 @@
     "Use the group set on the token. If the token has no group, use the user group. The auto group tries the configured groups from top to bottom.": "Use the group set on the token. If the token has no group, use the user group. The auto group tries the configured groups from top to bottom.",
     "Users call": "Users call",
     "Wallet pre-consume bypass threshold (USD)": "Wallet pre-consume bypass threshold (USD)",
-    "What do you want to change?": "What do you want to change?"
+    "What do you want to change?": "What do you want to change?",
+    "All discovered groups are routed": "All discovered groups are routed",
+    "Breaker": "Breaker",
+    "Cancel changes": "Cancel changes",
+    "Candidates": "Candidates",
+    "Comma-separated group names": "Comma-separated group names",
+    "Could not save policy": "Could not save policy",
+    "Daily reconcile": "Daily reconcile",
+    "Enter a valid JSON object": "Enter a valid JSON object",
+    "Enter at least one target group": "Enter at least one target group",
+    "Failover budget": "Failover budget",
+    "Groups without an active attached route": "Groups without an active attached route",
+    "Model aliases (JSON)": "Model aliases (JSON)",
+    "Model exclusions (JSON)": "Model exclusions (JSON)",
+    "No models reported": "No models reported",
+    "Protocol exclusions (JSON)": "Protocol exclusions (JSON)",
+    "Routing policy saved": "Routing policy saved",
+    "Save policy": "Save policy",
+    "Source / group": "Source / group",
+    "Target groups": "Target groups",
+    "Unrouted groups": "Unrouted groups"
   }
 }

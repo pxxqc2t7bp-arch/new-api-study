@@ -1595,6 +1595,7 @@ func TestAppGrantProviderAssetFence(t *testing.T) {
 				return
 			}
 			require.Error(t, err)
+			assert.ErrorIs(t, err, channel.ErrProviderRequestNotStarted)
 			assert.Nil(t, response)
 			assert.Equal(t, before, sends)
 		})

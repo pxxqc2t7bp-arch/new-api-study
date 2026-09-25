@@ -480,6 +480,9 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 			Priority: &priority,
 			AutoBan:  &autoBanInt,
 		}
+		if operation_setting.GetUpstreamOrchestrationSetting().Enabled {
+			service.RecordRetryAttempt(retryParam, channel)
+		}
 		service.RequestPolicy(c).BeginAttempt(channel, info.UsingGroup)
 		return channel, nil
 	}
@@ -514,6 +517,9 @@ func retryDecision(
 	if openaiErr == nil {
 		return false, nil
 	}
+	if c != nil && common.GetContextKeyBool(c, constant.ContextKeyManagedHealthPersistenceUncertain) {
+		return false, nil
+	}
 	if c != nil && c.Writer != nil && c.Writer.Written() {
 		recoveryWriter := getStreamRecoveryWriter(c)
 		if recoveryWriter == nil ||
@@ -528,6 +534,9 @@ func retryDecision(
 	if common.GetContextKeyBool(c, constant.ContextKeyRealtimeSetupForwarded) {
 		return false, nil
 	}
+	if service.GetChannelConstraints(c).SuppressesRetry() {
+		return false, nil
+	}
 	if types.IsSkipRetryError(openaiErr) {
 		return false, nil
 	}
@@ -536,7 +545,7 @@ func retryDecision(
 		retry = retryTimes > 0 && service.ShouldRecordManagedRouteFailure(openaiErr)
 	} else if types.IsChannelError(openaiErr) {
 		retry = true
-	} else if retryTimes > 0 && !service.GetChannelConstraints(c).SuppressesRetry() {
+	} else if retryTimes > 0 {
 		code := openaiErr.StatusCode
 		switch {
 		case code >= 200 && code < 300:
@@ -792,9 +801,10 @@ func executeTaskSubmissionWith(
 	var taskErr *taskdto.TaskError
 	durable := false
 	providerAccepted := false
+	providerWriteUncertain := false
 	stage := "start"
 	defer func() {
-		if !durable && !providerAccepted && relayInfo.Billing != nil {
+		if !durable && !providerAccepted && !providerWriteUncertain && relayInfo.Billing != nil {
 			diagnostics.refund(stage)
 			relayInfo.Billing.Refund(c)
 		}
@@ -812,10 +822,22 @@ func executeTaskSubmissionWith(
 		RequestPath: c.Request.URL.Path,
 		Retry:       common.GetPointer(0),
 	}
+	orchestration := operation_setting.GetUpstreamOrchestrationSetting()
+	lockedChannel, _ := relayInfo.LockedChannel.(*model.Channel)
 	maxTaskRetries := common.RetryTimes
-	if relayInfo.RelayMode == relayconstant.RelayModeThreeDSubmit {
+	if lockedChannel == nil &&
+		(relayInfo.RelayMode == relayconstant.RelayModeThreeDSubmit ||
+			retryParam.TokenGroup == "auto") {
 		maxTaskRetries = service.AdaptiveRetryTimes(retryParam)
+	} else if lockedChannel == nil && orchestration.Enabled {
+		if managedRetries, managed := service.ManagedAdaptiveRetryTimes(
+			retryParam,
+			orchestration.RequestAttemptLimit,
+		); managed {
+			maxTaskRetries = managedRetries
+		}
 	}
+	failoverDeadline := time.Now().Add(time.Duration(orchestration.FailoverBudgetSeconds) * time.Second)
 
 	for ; retryParam.GetRetry() <= maxTaskRetries; retryParam.IncreaseRetry() {
 		stage = "select_channel"
@@ -824,10 +846,16 @@ func executeTaskSubmissionWith(
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
 			break
 		}
+		if retryParam.GetRetry() > 0 &&
+			orchestration.Enabled &&
+			time.Now().After(failoverDeadline) {
+			c.Set("channel_fallback_reason", "failover_budget_exhausted")
+			break
+		}
 		var channel *model.Channel
 
-		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
-			channel = lockedCh
+		if lockedChannel != nil {
+			channel = lockedChannel
 			policy.BeginAttempt(channel, relayInfo.UsingGroup)
 			if retryParam.GetRetry() > 0 {
 				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName); setupErr != nil {
@@ -864,14 +892,18 @@ func executeTaskSubmissionWith(
 		if taskErr != nil && taskErr.ProviderAccepted {
 			providerAccepted = true
 		}
+		if taskErr != nil && taskErr.ProviderWriteUncertain {
+			providerWriteUncertain = true
+		}
 		if result != nil && result.ProviderAccepted {
 			providerAccepted = true
 		}
 		if requestErr := c.Request.Context().Err(); requestErr != nil {
 			diagnostics.cancelled("after_submit", retryParam.GetRetry()+1)
 			taskErr = service.TaskErrorWrapperLocal(requestErr, "request_cancelled", http.StatusRequestTimeout)
-			taskErr.NoRetry = providerAccepted
+			taskErr.NoRetry = providerAccepted || providerWriteUncertain
 			taskErr.ProviderAccepted = providerAccepted
+			taskErr.ProviderWriteUncertain = providerWriteUncertain
 			break
 		}
 		if taskErr == nil {
@@ -881,8 +913,6 @@ func executeTaskSubmissionWith(
 
 		taskAPIError := taskSubmissionAPIError(taskErr)
 		relayInfo.LastError = taskAPIError
-		decision := decideTaskRetry(c, taskErr, maxTaskRetries-retryParam.GetRetry())
-		service.RecordPolicyFailure(c, channel.Id, taskAPIError, decision)
 		if !taskErr.LocalError {
 			processChannelError(c,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
@@ -890,6 +920,8 @@ func executeTaskSubmissionWith(
 				taskAPIError,
 				relayInfo)
 		}
+		decision := decideTaskRetry(c, taskErr, maxTaskRetries-retryParam.GetRetry())
+		service.RecordPolicyFailure(c, channel.Id, taskAPIError, decision)
 
 		willRetry := decision.Action == "retry"
 		diagnostics.attemptFailed(retryParam.GetRetry()+1, channel, taskErr, willRetry)
@@ -1153,6 +1185,10 @@ func decideTaskRetry(c *gin.Context, taskErr *taskdto.TaskError, retryTimes int)
 	switch {
 	case taskErr == nil:
 		stop.Reason = "request_completed"
+	case c != nil && common.GetContextKeyBool(c, constant.ContextKeyManagedHealthPersistenceUncertain):
+		stop.Reason, stop.Source = "managed_health_persistence_uncertain", "managed"
+	case taskErr.ProviderWriteUncertain:
+		stop.Reason = "provider_write_uncertain"
 	case taskErr.NoRetry:
 		stop.Reason = "task_accepted"
 	case service.ShouldSkipRetryAfterChannelAffinityFailure(c):

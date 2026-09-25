@@ -456,15 +456,15 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, bod
 	if info.AppSubject != nil {
 		if a.submit == nil || a.submit.Method != http.MethodPost ||
 			a.submit.URL != strings.TrimRight(info.ChannelBaseUrl, "/")+"/api/v3/contents/generations/tasks" {
-			return nil, fmt.Errorf("invalid App provider request")
+			return nil, channel.MarkProviderRequestNotStarted(fmt.Errorf("invalid App provider request"))
 		}
 		if body == nil {
-			return nil, fmt.Errorf("invalid App provider assets")
+			return nil, channel.MarkProviderRequestNotStarted(fmt.Errorf("invalid App provider assets"))
 		}
 		outbound, err := io.ReadAll(io.LimitReader(body, 64*1024+1))
 		if err != nil || len(outbound) > 64*1024 ||
 			service.ValidateAppProviderAssetInputs(outbound, info.AppSubject.AssetInputs, time.Now()) != nil {
-			return nil, fmt.Errorf("invalid App provider assets")
+			return nil, channel.MarkProviderRequestNotStarted(fmt.Errorf("invalid App provider assets"))
 		}
 		body = bytes.NewReader(outbound)
 	}

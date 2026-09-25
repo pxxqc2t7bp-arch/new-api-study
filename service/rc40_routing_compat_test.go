@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -22,6 +23,54 @@ func TestRC40ManagedRouteWithMultiTaskPluginBinding(t *testing.T) {
 			canonicalManagedModelName("gpt-actual", aliases),
 		})
 		assert.Equal(t, []string{"gpt-actual"}, models)
+	})
+
+	t.Run("empty alias target isolates only that model", func(t *testing.T) {
+		setupUpstreamOrchestrationTest(t)
+		now := time.Unix(1_788_320_000, 0)
+		originalModelRatios := ratio_setting.ModelRatio2JSONString()
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-4.1":1}`))
+		t.Cleanup(func() {
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		})
+		policy, err := operation_setting.NormalizeUpstreamRoutingPolicy(
+			operation_setting.UpstreamRoutingPolicy{
+				TargetGroups:            []string{"default"},
+				ModelAliases:            map[string]string{" public-model ": " "},
+				ModelExclusions:         map[string][]string{},
+				ProtocolModelExclusions: map[string][]string{},
+			},
+		)
+		require.NoError(t, err)
+
+		source := model.UpstreamSource{
+			Key: "source", Name: "Source", SelectedEndpoint: "https://api.example",
+			Status: model.UpstreamHealthOperational, Enabled: true, LastSnapshotAt: now.Unix(),
+		}
+		require.NoError(t, model.DB.Create(&source).Error)
+		group := model.UpstreamGroup{
+			SourceID: source.ID, ExternalID: "group", Name: "Group", Platform: "openai",
+			Models: `["public-model","gpt-4.1"]`, EffectiveMultiplier: 0.2,
+			HealthStatus: model.UpstreamHealthOperational, ObservedAt: now.Unix(),
+		}
+		require.NoError(t, model.DB.Create(&group).Error)
+
+		candidates, err := buildUpstreamRouteCandidates(
+			[]model.UpstreamSource{source},
+			[]model.UpstreamGroup{group},
+			now,
+			&operation_setting.UpstreamOrchestrationSetting{
+				SyncIntervalHours:     4,
+				MaxUpstreamMultiplier: 1,
+				CandidateLimit:        5,
+				ModelAliases:          policy.ModelAliases,
+				ModelExclusions:       policy.ModelExclusions,
+			},
+		)
+
+		require.NoError(t, err)
+		require.Len(t, candidates, 1)
+		assert.Equal(t, []string{"gpt-4.1"}, candidates[0].models)
 	})
 
 	t.Run("candidate set caps at five with source diversity", func(t *testing.T) {
@@ -126,10 +175,10 @@ func TestRC40ManagedRouteWithMultiTaskPluginBinding(t *testing.T) {
 			{source: source, group: groups[1], models: []string{"gpt-actual"}},
 		}
 
-		updated, err := rankManagedRoutes(now, []model.UpstreamSource{source}, groups, candidates,
+		result, err := rankManagedRoutes(now, []model.UpstreamSource{source}, groups, candidates,
 			&operation_setting.UpstreamOrchestrationSetting{SyncIntervalHours: 4})
 		require.NoError(t, err)
-		assert.Equal(t, 2, updated)
+		assert.Equal(t, 2, result.prioritiesUpdated)
 		var native, converted model.Channel
 		require.NoError(t, model.DB.First(&native, channels[0].Id).Error)
 		require.NoError(t, model.DB.First(&converted, channels[1].Id).Error)

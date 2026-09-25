@@ -3,6 +3,7 @@ package perfmetrics
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,6 +13,9 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -148,6 +152,47 @@ func TestRecordTaskResultSamplesTerminalTasks(t *testing.T) {
 		outputTokens:   5000,
 		generationMs:   100000,
 	}, merged[bucketKey{model: "video-model", group: "a"}])
+}
+
+func TestRecordCapturesRedisTargetBeforeRequestCleanup(t *testing.T) {
+	require.Eventually(t, func() bool {
+		return gopool.WorkerCount() == 0
+	}, time.Second, time.Millisecond)
+	gopool.SetCap(1)
+	t.Cleanup(func() { gopool.SetCap(math.MaxInt32) })
+
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	previousEnabled, previousRDB := common.RedisEnabled, common.RDB
+	common.RedisEnabled, common.RDB = true, client
+	t.Cleanup(func() {
+		common.RedisEnabled, common.RDB = previousEnabled, previousRDB
+	})
+
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	gopool.Go(func() {
+		close(blocked)
+		<-release
+	})
+	<-blocked
+
+	Record(Sample{Model: "request-model", Group: "request-group", Success: true})
+	persisted := make(chan struct{})
+	gopool.Go(func() { close(persisted) })
+
+	common.RedisEnabled, common.RDB = false, nil
+	close(release)
+	select {
+	case <-persisted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for asynchronous metric persistence")
+	}
+
+	keys := server.Keys()
+	require.Len(t, keys, 1)
+	assert.Equal(t, "1", server.HGet(keys[0], "req"))
 }
 
 // TEST_PERF_MYSQL_DSN / TEST_PERF_POSTGRES_DSN optionally run the aggregation

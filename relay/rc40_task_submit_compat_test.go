@@ -1,10 +1,12 @@
 package relay
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -29,6 +31,16 @@ func (a *nilResponseTaskAdaptor) DoRequest(*gin.Context, *relaycommon.RelayInfo,
 	a.attempts++
 	*a.events = append(*a.events, "provider")
 	return nil, nil
+}
+
+type requestErrorTaskAdaptor struct {
+	channel.TaskAdaptor
+	err      error
+	response *http.Response
+}
+
+func (a *requestErrorTaskAdaptor) DoRequest(*gin.Context, *relaycommon.RelayInfo, io.Reader) (*http.Response, error) {
+	return a.response, a.err
 }
 
 func TestRC40TaskSubmitPreservesSuccessfulAndFailedUpstreamStatus(t *testing.T) {
@@ -183,4 +195,66 @@ func TestRC40DeferredEmptyResponseAfterFenceIsNonRetryable(t *testing.T) {
 	assert.False(t, taskErr.NoRetry)
 	assert.False(t, taskErr.ProviderAccepted)
 	assert.ErrorIs(t, taskErr.Error, errTaskUpstreamEmptyResponse)
+}
+
+func TestRC40TaskSubmitClassifiesProviderDispatchErrors(t *testing.T) {
+	c, info := newTaskSubmitContext(t, "declared-model", "")
+
+	t.Run("unknown provider write", func(t *testing.T) {
+		upstreamErr := errors.New("connection reset after request dispatch")
+		result, taskErr := submitTaskUpstream(
+			c,
+			info,
+			&requestErrorTaskAdaptor{err: upstreamErr},
+			constant.TaskPlatform("test"),
+			nil,
+			123,
+		)
+
+		assert.Nil(t, result)
+		require.NotNil(t, taskErr)
+		assert.ErrorIs(t, taskErr.Error, upstreamErr)
+		assert.True(t, taskErr.NoRetry)
+		assert.True(t, taskErr.ProviderWriteUncertain)
+		assert.False(t, taskErr.ProviderAccepted)
+	})
+
+	t.Run("provider request not started", func(t *testing.T) {
+		result, taskErr := submitTaskUpstream(
+			c,
+			info,
+			&requestErrorTaskAdaptor{err: channel.ErrProviderRequestNotStarted},
+			constant.TaskPlatform("test"),
+			nil,
+			123,
+		)
+
+		assert.Nil(t, result)
+		require.NotNil(t, taskErr)
+		assert.ErrorIs(t, taskErr.Error, channel.ErrProviderRequestNotStarted)
+		assert.False(t, taskErr.NoRetry)
+		assert.False(t, taskErr.ProviderWriteUncertain)
+		assert.False(t, taskErr.ProviderAccepted)
+	})
+
+	t.Run("explicit provider 5xx response", func(t *testing.T) {
+		result, taskErr := submitTaskUpstream(
+			c,
+			info,
+			&requestErrorTaskAdaptor{response: &http.Response{
+				StatusCode: http.StatusBadGateway,
+				Body:       io.NopCloser(strings.NewReader(`{"error":"upstream failed"}`)),
+			}},
+			constant.TaskPlatform("test"),
+			nil,
+			123,
+		)
+
+		assert.Nil(t, result)
+		require.NotNil(t, taskErr)
+		assert.Equal(t, http.StatusBadGateway, taskErr.StatusCode)
+		assert.False(t, taskErr.NoRetry)
+		assert.False(t, taskErr.ProviderWriteUncertain)
+		assert.False(t, taskErr.ProviderAccepted)
+	})
 }

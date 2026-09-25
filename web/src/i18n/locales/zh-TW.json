@@ -6797,6 +6797,26 @@
     "Use the group set on the token. If the token has no group, use the user group. The auto group tries the configured groups from top to bottom.": "使用權杖設定的分組；權杖未設定分組時，使用使用者分組。auto 分組會依設定順序由上到下嘗試各分組。",
     "Users call": "使用者呼叫",
     "Wallet pre-consume bypass threshold (USD)": "錢包免預扣門檻（美元）",
-    "What do you want to change?": "你想修改什麼？"
+    "What do you want to change?": "你想修改什麼？",
+    "All discovered groups are routed": "所有已發現分組均已路由",
+    "Breaker": "熔斷",
+    "Cancel changes": "取消變更",
+    "Candidates": "候選數",
+    "Comma-separated group names": "使用英文逗號分隔分組名稱",
+    "Could not save policy": "無法儲存策略",
+    "Daily reconcile": "每日協調",
+    "Enter a valid JSON object": "請輸入有效的 JSON 物件",
+    "Enter at least one target group": "請至少輸入一個目標分組",
+    "Failover budget": "容錯移轉時限",
+    "Groups without an active attached route": "沒有有效已附加路由的分組",
+    "Model aliases (JSON)": "模型別名（JSON）",
+    "Model exclusions (JSON)": "模型排除項（JSON）",
+    "No models reported": "未回報模型",
+    "Protocol exclusions (JSON)": "協定排除項（JSON）",
+    "Routing policy saved": "路由策略已儲存",
+    "Save policy": "儲存策略",
+    "Source / group": "來源 / 分組",
+    "Target groups": "目標分組",
+    "Unrouted groups": "未路由分組"
   }
 }

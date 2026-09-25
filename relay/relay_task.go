@@ -446,7 +446,12 @@ func submitTaskUpstream(
 ) (*TaskSubmitResult, *dto.TaskError) {
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
-		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
+		taskErr := service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
+		if !errors.Is(err, channel.ErrProviderRequestNotStarted) {
+			taskErr.NoRetry = true
+			taskErr.ProviderWriteUncertain = true
+		}
+		return nil, taskErr
 	}
 	if resp == nil {
 		return nil, service.TaskErrorWrapperLocal(errTaskUpstreamEmptyResponse, "fail_to_fetch_task", http.StatusBadGateway)

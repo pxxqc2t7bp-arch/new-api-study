@@ -6797,6 +6797,26 @@
     "Use the group set on the token. If the token has no group, use the user group. The auto group tries the configured groups from top to bottom.": "トークンに設定されたグループを使用します。未設定の場合はユーザーのグループを使用します。auto グループは設定されたグループを上から順に試行します。",
     "Users call": "ユーザーの指定",
     "Wallet pre-consume bypass threshold (USD)": "ウォレットの事前引き落とし省略額（USD）",
-    "What do you want to change?": "何を変更しますか？"
+    "What do you want to change?": "何を変更しますか？",
+    "All discovered groups are routed": "検出されたすべてのグループにルートがあります",
+    "Breaker": "サーキットブレーカー",
+    "Cancel changes": "変更を取り消す",
+    "Candidates": "候補数",
+    "Comma-separated group names": "グループ名をカンマで区切ります",
+    "Could not save policy": "ポリシーを保存できませんでした",
+    "Daily reconcile": "日次調整",
+    "Enter a valid JSON object": "有効な JSON オブジェクトを入力してください",
+    "Enter at least one target group": "対象グループを少なくとも 1 つ入力してください",
+    "Failover budget": "フェイルオーバー制限時間",
+    "Groups without an active attached route": "有効な接続済みルートがないグループ",
+    "Model aliases (JSON)": "モデルエイリアス（JSON）",
+    "Model exclusions (JSON)": "モデル除外（JSON）",
+    "No models reported": "モデルは報告されていません",
+    "Protocol exclusions (JSON)": "プロトコル除外（JSON）",
+    "Routing policy saved": "ルーティングポリシーを保存しました",
+    "Save policy": "ポリシーを保存",
+    "Source / group": "ソース / グループ",
+    "Target groups": "対象グループ",
+    "Unrouted groups": "未ルーティンググループ"
   }
 }
