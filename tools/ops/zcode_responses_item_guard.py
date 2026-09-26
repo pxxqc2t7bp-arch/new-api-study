@@ -166,7 +166,11 @@ def _ensure_private_directory(path: Path, *, parents: bool = False) -> None:
 
 
 @contextmanager
-def _open_parent_directory(path: Path) -> Iterator[tuple[int, str]]:
+def _open_parent_directory(
+    path: Path,
+    *,
+    create_parents: bool = False,
+) -> Iterator[tuple[int, str]]:
     flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
@@ -188,11 +192,29 @@ def _open_parent_directory(path: Path) -> Iterator[tuple[int, str]]:
                 raise ValueError(
                     "path must not contain parent directory traversal"
                 )
-            next_descriptor = os.open(
-                component,
-                flags,
-                dir_fd=descriptor,
-            )
+            component_created = False
+            try:
+                next_descriptor = os.open(
+                    component,
+                    flags,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                if not create_parents:
+                    raise
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                    component_created = True
+                except FileExistsError:
+                    pass
+                next_descriptor = os.open(
+                    component,
+                    flags,
+                    dir_fd=descriptor,
+                )
+            if component_created:
+                os.fchmod(next_descriptor, 0o700)
+                os.fsync(descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
         yield descriptor, path.name
@@ -205,11 +227,6 @@ def _rename_noreplace(
     source_name: str,
     destination_dir_fd: int,
     destination_name: str,
-    *,
-    expected_source_state: Optional[
-        tuple[tuple[int, int], bytes, int]
-    ] = None,
-    source_path: Optional[Path] = None,
 ) -> None:
     """Atomically rename without replacing an existing destination."""
     libc = ctypes.CDLL(None, use_errno=True)
@@ -236,18 +253,6 @@ def _rename_noreplace(
         ctypes.c_uint,
     ]
     rename_call.restype = ctypes.c_int
-    if expected_source_state is not None:
-        observed_source_state = _observed_file_state_at(
-            source_dir_fd,
-            source_name,
-            source_path or Path(source_name),
-            "target",
-        )
-        if observed_source_state != expected_source_state:
-            raise RuntimeError(
-                "target drift detected: %s"
-                % (source_path or source_name)
-            )
     result = rename_call(
         source_dir_fd,
         source_raw,
@@ -264,6 +269,53 @@ def _rename_noreplace(
             os.strerror(error_number),
             destination_name,
         )
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        source_name,
+        destination_name,
+    )
+
+
+def _rename_exchange(
+    source_dir_fd: int,
+    source_name: str,
+    destination_dir_fd: int,
+    destination_name: str,
+) -> None:
+    """Atomically exchange two directory entries."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_raw = os.fsencode(source_name)
+    destination_raw = os.fsencode(destination_name)
+    if sys.platform == "darwin":
+        rename_call = libc.renameatx_np
+    elif sys.platform.startswith("linux"):
+        try:
+            rename_call = libc.renameat2
+        except AttributeError as exc:
+            raise RuntimeError(
+                "atomic exchange rename is unavailable"
+            ) from exc
+    else:
+        raise RuntimeError("atomic exchange rename is unavailable")
+    rename_call.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    rename_call.restype = ctypes.c_int
+    result = rename_call(
+        source_dir_fd,
+        source_raw,
+        destination_dir_fd,
+        destination_raw,
+        0x00000002,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
     raise OSError(
         error_number,
         os.strerror(error_number),
@@ -343,89 +395,140 @@ def _observed_file_state_at(
     return opened_identity, b"".join(chunks), stat.S_IMODE(after.st_mode)
 
 
-def _entry_exists_at(parent_dir_fd: int, name: str) -> bool:
-    try:
-        os.stat(name, dir_fd=parent_dir_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def _restore_displaced(
+def _sanitize_temporary_file(
     parent_dir_fd: int,
-    displaced_name: str,
-    target_name: str,
+    name: str,
+    expected_identity: tuple[int, int],
 ) -> None:
-    _rename_noreplace(
-        parent_dir_fd,
-        displaced_name,
-        parent_dir_fd,
-        target_name,
+    flags = (
+        os.O_WRONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
     )
+    descriptor = os.open(name, flags, dir_fd=parent_dir_fd)
+    try:
+        opened = os.fstat(descriptor)
+        opened_identity = (opened.st_dev, opened.st_ino)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened_identity != expected_identity
+        ):
+            raise RuntimeError(
+                "temporary file identity verification failed"
+            )
+        remaining = opened.st_size
+        zeroes = b"\0" * min(1 << 20, max(remaining, 1))
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while remaining:
+            written = os.write(
+                descriptor,
+                zeroes[: min(len(zeroes), remaining)],
+            )
+            if written <= 0:
+                raise OSError("temporary file overwrite made no progress")
+            remaining -= written
+        os.fsync(descriptor)
+        os.ftruncate(descriptor, 0)
+        os.fsync(descriptor)
+        named = os.stat(
+            name,
+            dir_fd=parent_dir_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or (named.st_dev, named.st_ino) != opened_identity
+        ):
+            raise RuntimeError(
+                "temporary file identity verification failed"
+            )
+    finally:
+        os.close(descriptor)
 
 
-def _move_target_if_matches(
+def _exchange_target_if_matches(
     parent_dir_fd: int,
+    replacement_name: str,
     target_name: str,
     path: Path,
     expected_state: tuple[tuple[int, int], bytes, int],
-) -> str:
-    before = os.stat(
+    replacement_state: tuple[tuple[int, int], bytes, int],
+) -> None:
+    observed_target_state = _observed_file_state_at(
+        parent_dir_fd,
         target_name,
-        dir_fd=parent_dir_fd,
-        follow_symlinks=False,
+        path,
+        "target",
     )
-    if not stat.S_ISREG(before.st_mode):
+    if observed_target_state != expected_state:
         raise RuntimeError("target drift detected: %s" % path)
-    displaced_name = _new_temporary_name(
-        ".%s.displaced." % target_name
-    )
-    move_error = None
-    move_traceback = None
+
+    exchange_error = None
+    exchange_traceback = None
     try:
-        _rename_noreplace(
+        _rename_exchange(
+            parent_dir_fd,
+            replacement_name,
             parent_dir_fd,
             target_name,
-            parent_dir_fd,
-            displaced_name,
-            expected_source_state=expected_state,
-            source_path=path,
         )
     except BaseException as exc:
-        move_error = exc
-        move_traceback = exc.__traceback__
+        exchange_error = exc
+        exchange_traceback = exc.__traceback__
+
     try:
         displaced_state = _observed_file_state_at(
             parent_dir_fd,
-            displaced_name,
+            replacement_name,
             path,
+            "target",
         )
     except BaseException as state_error:
-        if _entry_exists_at(parent_dir_fd, displaced_name):
-            try:
-                _restore_displaced(
-                    parent_dir_fd,
-                    displaced_name,
-                    target_name,
-                )
-            except FileExistsError:
-                pass
-        if move_error is not None:
-            raise move_error.with_traceback(move_traceback)
-        raise state_error
-    if displaced_state == expected_state and move_error is None:
-        return displaced_name
+        displaced_state = None
+        verification_error = state_error
+    else:
+        verification_error = None
+
+    if displaced_state == expected_state and exchange_error is None:
+        return
 
     try:
-        _restore_displaced(
+        committed_state = _observed_file_state_at(
             parent_dir_fd,
-            displaced_name,
             target_name,
+            path,
+            "replacement",
         )
-    except FileExistsError:
-        pass
-    if move_error is not None:
-        raise move_error.with_traceback(move_traceback)
+    except BaseException:
+        committed_state = None
+    if committed_state == replacement_state:
+        try:
+            _rename_exchange(
+                parent_dir_fd,
+                replacement_name,
+                parent_dir_fd,
+                target_name,
+            )
+            restored_replacement = _observed_file_state_at(
+                parent_dir_fd,
+                replacement_name,
+                path,
+                "replacement",
+            )
+            if restored_replacement != replacement_state:
+                raise RuntimeError(
+                    "target exchange recovery verification failed: %s"
+                    % path
+                )
+        except BaseException as recovery_error:
+            raise RuntimeError(
+                "target exchange recovery failed: %s" % path
+            ) from recovery_error
+
+    if exchange_error is not None:
+        raise exchange_error.with_traceback(exchange_traceback)
+    if verification_error is not None:
+        raise verification_error
     raise RuntimeError("target drift detected: %s" % path)
 
 
@@ -434,35 +537,112 @@ def _remove_if_matches(
     expected_state: tuple[tuple[int, int], bytes, int],
 ) -> None:
     with _open_parent_directory(path) as (parent_dir_fd, target_name):
-        displaced_name = _move_target_if_matches(
+        placeholder_descriptor, temporary_name = _create_temporary_file(
             parent_dir_fd,
-            target_name,
-            path,
-            expected_state,
+            ".%s." % target_name,
         )
+        placeholder_open = True
+        placeholder_status = os.fstat(placeholder_descriptor)
+        placeholder_identity = (
+            placeholder_status.st_dev,
+            placeholder_status.st_ino,
+        )
+        temporary_cleanup_complete = False
         try:
-            os.unlink(displaced_name, dir_fd=parent_dir_fd)
-            os.fsync(parent_dir_fd)
-        except BaseException:
-            if _entry_exists_at(parent_dir_fd, displaced_name):
+            os.fchmod(placeholder_descriptor, 0o600)
+            os.fsync(placeholder_descriptor)
+            os.close(placeholder_descriptor)
+            placeholder_open = False
+            placeholder_state = (
+                placeholder_identity,
+                b"",
+                0o600,
+            )
+            _exchange_target_if_matches(
+                parent_dir_fd,
+                temporary_name,
+                target_name,
+                path,
+                expected_state,
+                placeholder_state,
+            )
+            try:
+                os.unlink(target_name, dir_fd=parent_dir_fd)
+            except BaseException:
                 try:
-                    _restore_displaced(
+                    _rename_exchange(
                         parent_dir_fd,
-                        displaced_name,
+                        temporary_name,
+                        parent_dir_fd,
+                        target_name,
+                    )
+                finally:
+                    _sanitize_temporary_file(
+                        parent_dir_fd,
+                        temporary_name,
+                        placeholder_identity,
+                    )
+                    try:
+                        os.unlink(
+                            temporary_name,
+                            dir_fd=parent_dir_fd,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        temporary_cleanup_complete = True
+                raise
+            try:
+                os.unlink(temporary_name, dir_fd=parent_dir_fd)
+            except BaseException:
+                try:
+                    _rename_noreplace(
+                        parent_dir_fd,
+                        temporary_name,
+                        parent_dir_fd,
                         target_name,
                     )
                 except FileExistsError:
                     pass
-            raise
-        try:
-            os.stat(
-                target_name,
-                dir_fd=parent_dir_fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            return
-        raise RuntimeError("target drift detected: %s" % path)
+                else:
+                    temporary_cleanup_complete = True
+                raise
+            else:
+                temporary_cleanup_complete = True
+            os.fsync(parent_dir_fd)
+        finally:
+            if placeholder_open:
+                os.close(placeholder_descriptor)
+            if not temporary_cleanup_complete:
+                try:
+                    current_temporary = os.stat(
+                        temporary_name,
+                        dir_fd=parent_dir_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    if (
+                        stat.S_ISREG(current_temporary.st_mode)
+                        and (
+                            current_temporary.st_dev,
+                            current_temporary.st_ino,
+                        )
+                        == placeholder_identity
+                    ):
+                        _sanitize_temporary_file(
+                            parent_dir_fd,
+                            temporary_name,
+                            placeholder_identity,
+                        )
+                        try:
+                            os.unlink(
+                                temporary_name,
+                                dir_fd=parent_dir_fd,
+                            )
+                        except FileNotFoundError:
+                            pass
 
 
 def atomic_write(
@@ -491,13 +671,14 @@ def atomic_write(
             ".%s." % target_name,
         )
         descriptor_open = True
+        temporary_cleanup_complete = False
+        temporary_status = os.fstat(file_descriptor)
+        replacement_identity = (
+            temporary_status.st_dev,
+            temporary_status.st_ino,
+        )
         try:
             os.fchmod(file_descriptor, mode)
-            temporary_status = os.fstat(file_descriptor)
-            replacement_identity = (
-                temporary_status.st_dev,
-                temporary_status.st_ino,
-            )
             with os.fdopen(file_descriptor, "wb") as handle:
                 descriptor_open = False
                 handle.write(data)
@@ -512,6 +693,7 @@ def atomic_write(
                     src_dir_fd=parent_dir_fd,
                     dst_dir_fd=parent_dir_fd,
                 )
+                temporary_cleanup_complete = True
             elif expected_state is None:
                 _rename_noreplace(
                     parent_dir_fd,
@@ -519,87 +701,153 @@ def atomic_write(
                     parent_dir_fd,
                     target_name,
                 )
+                temporary_cleanup_complete = True
             else:
-                displaced_name = _move_target_if_matches(
+                replacement_state = (
+                    replacement_identity,
+                    data,
+                    mode,
+                )
+                _exchange_target_if_matches(
                     parent_dir_fd,
+                    temporary_name,
                     target_name,
                     path,
                     expected_state,
+                    replacement_state,
                 )
-                committed = False
                 try:
-                    _rename_noreplace(
-                        parent_dir_fd,
+                    os.unlink(
                         temporary_name,
-                        parent_dir_fd,
-                        target_name,
+                        dir_fd=parent_dir_fd,
                     )
-                    committed = True
-                except BaseException:
+                    temporary_cleanup_complete = True
+                except FileNotFoundError:
+                    temporary_cleanup_complete = True
+                except BaseException as cleanup_error:
+                    cleanup_errors = [cleanup_error]
                     try:
-                        target_state = _observed_file_state_at(
+                        _rename_exchange(
+                            parent_dir_fd,
+                            temporary_name,
+                            parent_dir_fd,
+                            target_name,
+                        )
+                    except BaseException as restore_error:
+                        cleanup_errors.append(restore_error)
+                    try:
+                        restored_target_state = _observed_file_state_at(
                             parent_dir_fd,
                             target_name,
                             path,
+                            "restored target",
                         )
-                    except BaseException:
-                        target_state = None
-                    if (
-                        target_state is not None
-                        and target_state[0] == replacement_identity
-                    ):
-                        committed = True
+                    except BaseException as state_error:
+                        cleanup_errors.append(state_error)
+                        restored_target_state = None
+                    try:
+                        restored_temporary_state = (
+                            _observed_file_state_at(
+                                parent_dir_fd,
+                                temporary_name,
+                                path,
+                                "replacement temporary file",
+                            )
+                        )
+                    except BaseException as state_error:
+                        cleanup_errors.append(state_error)
+                        restored_temporary_state = None
+                    restored = (
+                        restored_target_state == expected_state
+                        and restored_temporary_state
+                        == replacement_state
+                    )
+                    if not restored:
+                        cleanup_errors.append(
+                            RuntimeError(
+                                "atomic replacement recovery "
+                                "verification failed"
+                            )
+                        )
                     else:
                         try:
-                            _restore_displaced(
+                            _sanitize_temporary_file(
                                 parent_dir_fd,
-                                displaced_name,
-                                target_name,
+                                temporary_name,
+                                replacement_identity,
                             )
-                        except FileExistsError:
-                            pass
-                    raise
-                finally:
-                    if committed:
-                        try:
-                            os.unlink(
-                                displaced_name,
-                                dir_fd=parent_dir_fd,
-                            )
-                        except FileNotFoundError:
-                            pass
-                        except BaseException:
-                            replacement_displaced_name = (
-                                _move_target_if_matches(
-                                    parent_dir_fd,
-                                    target_name,
-                                    path,
-                                    (
-                                        replacement_identity,
-                                        data,
-                                        mode,
-                                    ),
+                        except BaseException as sanitize_error:
+                            cleanup_errors.append(sanitize_error)
+                        else:
+                            try:
+                                os.unlink(
+                                    temporary_name,
+                                    dir_fd=parent_dir_fd,
                                 )
-                            )
-                            _restore_displaced(
-                                parent_dir_fd,
-                                displaced_name,
-                                target_name,
-                            )
-                            os.unlink(
-                                replacement_displaced_name,
-                                dir_fd=parent_dir_fd,
-                            )
+                            except FileNotFoundError:
+                                temporary_cleanup_complete = True
+                            except BaseException as retry_error:
+                                cleanup_errors.append(retry_error)
+                                temporary_cleanup_complete = True
+                            else:
+                                temporary_cleanup_complete = True
+                        try:
                             os.fsync(parent_dir_fd)
-                            raise
+                        except BaseException as fsync_error:
+                            cleanup_errors.append(fsync_error)
+                    temporary_cleanup_complete = True
+                    fatal_error = next(
+                        (
+                            error
+                            for error in cleanup_errors
+                            if not isinstance(error, Exception)
+                        ),
+                        None,
+                    )
+                    if fatal_error is not None:
+                        raise fatal_error
+                    error_types = ", ".join(
+                        type(error).__name__
+                        for error in cleanup_errors
+                    )
+                    raise RuntimeError(
+                        "atomic replacement cleanup failed: %s"
+                        % error_types
+                    ) from cleanup_error
             os.fsync(parent_dir_fd)
         finally:
             if descriptor_open:
                 os.close(file_descriptor)
-            try:
-                os.unlink(temporary_name, dir_fd=parent_dir_fd)
-            except FileNotFoundError:
-                pass
+            if not temporary_cleanup_complete:
+                try:
+                    current_temporary = os.stat(
+                        temporary_name,
+                        dir_fd=parent_dir_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    if (
+                        stat.S_ISREG(current_temporary.st_mode)
+                        and (
+                            current_temporary.st_dev,
+                            current_temporary.st_ino,
+                        )
+                        == replacement_identity
+                    ):
+                        _sanitize_temporary_file(
+                            parent_dir_fd,
+                            temporary_name,
+                            replacement_identity,
+                        )
+                        try:
+                            os.unlink(
+                                temporary_name,
+                                dir_fd=parent_dir_fd,
+                            )
+                        except FileNotFoundError:
+                            pass
 
 
 def _write_private_file(path: Path, data: bytes) -> None:
@@ -694,88 +942,136 @@ def _transaction_lock(
     *,
     create_root: bool = True,
 ) -> Iterator[None]:
-    if create_root:
-        _ensure_private_directory(root, parents=True)
-    else:
-        try:
-            root_status = root.lstat()
-        except FileNotFoundError as exc:
-            raise RuntimeError("backup root is missing") from exc
-        if not stat.S_ISDIR(root_status.st_mode):
-            raise RuntimeError("backup root is not a directory")
-        if stat.S_IMODE(root_status.st_mode) != 0o700:
-            raise RuntimeError("backup root mode verification failed")
-    root_flags = (
+    directory_flags = (
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    root_descriptor = os.open(root, root_flags)
-    try:
-        opened_root_status = os.fstat(root_descriptor)
-        if not stat.S_ISDIR(opened_root_status.st_mode):
-            raise RuntimeError("backup root is not a directory")
-        if (
-            not create_root
-            and stat.S_IMODE(opened_root_status.st_mode) != 0o700
-        ):
-            raise RuntimeError("backup root mode verification failed")
-        try:
-            fcntl.flock(
-                root_descriptor,
-                fcntl.LOCK_EX | fcntl.LOCK_NB,
-            )
-        except BlockingIOError as exc:
-            raise RuntimeError(
-                "configuration transaction is already active"
-            ) from exc
-        try:
-            lock_directory = _transaction_lock_directory(root)
-            _ensure_private_directory(lock_directory)
-            lock_path = lock_directory / "transaction.lock"
-            flags = (
-                os.O_RDWR
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-            )
-            lock_created = False
+    with _open_parent_directory(
+        root,
+        create_parents=create_root,
+    ) as (
+        root_parent_descriptor,
+        root_name,
+    ):
+        root_created = False
+        if create_root:
             try:
-                descriptor = os.open(
-                    lock_path,
-                    flags | os.O_CREAT | os.O_EXCL,
-                    0o600,
+                os.mkdir(
+                    root_name,
+                    mode=0o700,
+                    dir_fd=root_parent_descriptor,
                 )
-                lock_created = True
+                root_created = True
             except FileExistsError:
-                descriptor = os.open(lock_path, flags)
+                pass
+        try:
+            root_descriptor = os.open(
+                root_name,
+                directory_flags,
+                dir_fd=root_parent_descriptor,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("backup root is missing") from exc
+        try:
+            opened_root_status = os.fstat(root_descriptor)
+            if not stat.S_ISDIR(opened_root_status.st_mode):
+                raise RuntimeError("backup root is not a directory")
+            if create_root:
+                os.fchmod(root_descriptor, 0o700)
+            elif stat.S_IMODE(opened_root_status.st_mode) != 0o700:
+                raise RuntimeError("backup root mode verification failed")
+            if root_created:
+                os.fsync(root_parent_descriptor)
             try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    raise RuntimeError(
-                        "transaction lock is not a regular file"
-                    )
-                os.fchmod(descriptor, 0o600)
-                if lock_created:
-                    _fsync_directory(lock_directory)
+                fcntl.flock(
+                    root_descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError as exc:
+                raise RuntimeError(
+                    "configuration transaction is already active"
+                ) from exc
+            try:
+                lock_directory_name = (
+                    _transaction_lock_directory(root).name
+                )
+                lock_directory_created = False
                 try:
-                    fcntl.flock(
-                        descriptor,
-                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    os.mkdir(
+                        lock_directory_name,
+                        mode=0o700,
+                        dir_fd=root_descriptor,
                     )
-                except BlockingIOError as exc:
-                    raise RuntimeError(
-                        "configuration transaction is already active"
-                    ) from exc
+                    lock_directory_created = True
+                except FileExistsError:
+                    pass
+                lock_directory_descriptor = os.open(
+                    lock_directory_name,
+                    directory_flags,
+                    dir_fd=root_descriptor,
+                )
                 try:
-                    yield
+                    lock_directory_status = os.fstat(
+                        lock_directory_descriptor
+                    )
+                    if not stat.S_ISDIR(lock_directory_status.st_mode):
+                        raise RuntimeError(
+                            "transaction lock directory is not a directory"
+                        )
+                    os.fchmod(lock_directory_descriptor, 0o700)
+                    if lock_directory_created:
+                        os.fsync(root_descriptor)
+                    lock_flags = (
+                        os.O_RDWR
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                    )
+                    lock_created = False
+                    try:
+                        descriptor = os.open(
+                            "transaction.lock",
+                            lock_flags | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=lock_directory_descriptor,
+                        )
+                        lock_created = True
+                    except FileExistsError:
+                        descriptor = os.open(
+                            "transaction.lock",
+                            lock_flags,
+                            dir_fd=lock_directory_descriptor,
+                        )
+                    try:
+                        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                            raise RuntimeError(
+                                "transaction lock is not a regular file"
+                            )
+                        os.fchmod(descriptor, 0o600)
+                        if lock_created:
+                            os.fsync(lock_directory_descriptor)
+                        try:
+                            fcntl.flock(
+                                descriptor,
+                                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                            )
+                        except BlockingIOError as exc:
+                            raise RuntimeError(
+                                "configuration transaction is already active"
+                            ) from exc
+                        try:
+                            yield
+                        finally:
+                            fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    finally:
+                        os.close(descriptor)
                 finally:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(lock_directory_descriptor)
             finally:
-                os.close(descriptor)
+                fcntl.flock(root_descriptor, fcntl.LOCK_UN)
         finally:
-            fcntl.flock(root_descriptor, fcntl.LOCK_UN)
-    finally:
-        os.close(root_descriptor)
+            os.close(root_descriptor)
 
 
 def create_backup(
