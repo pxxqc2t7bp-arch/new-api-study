@@ -36,6 +36,22 @@ _MISSING_FILE_STATE = object()
 _UNKNOWN_FILE_STATE = object()
 
 
+class _RestoreErrors(list[str]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fatal_error: Optional[BaseException] = None
+
+    def record(self, message: str, error: BaseException) -> None:
+        self.append(message)
+        if self.fatal_error is None and not isinstance(error, Exception):
+            self.fatal_error = error
+
+    def include(self, errors: list[str]) -> None:
+        self.extend(errors)
+        if self.fatal_error is None:
+            self.fatal_error = getattr(errors, "fatal_error", None)
+
+
 def _decode_config(raw: bytes, path: Path) -> dict[str, Any]:
     try:
         config = json.loads(raw.decode("utf-8"))
@@ -1881,14 +1897,14 @@ def _restore_and_verify(
     backup_dir: Optional[Path],
     snapshots: list[dict[str, Any]],
     output_snapshot: Optional[dict[str, Any]] = None,
-) -> list[str]:
-    errors = []
+) -> _RestoreErrors:
+    errors = _RestoreErrors()
     restored_identities = {}
     for snapshot in snapshots:
         try:
             state = _observed_file_state(snapshot["path"])
-        except BaseException:
-            errors.append("%s restore state" % snapshot["label"])
+        except BaseException as error:
+            errors.record("%s restore state" % snapshot["label"], error)
             continue
         if _matches_file_state(snapshot, state, updated=False):
             restored_identities[snapshot["label"]] = state[0]
@@ -1913,8 +1929,8 @@ def _restore_and_verify(
                 ),
                 expected_state=state,
             )
-        except BaseException:
-            errors.append("%s restore write" % snapshot["label"])
+        except BaseException as error:
+            errors.record("%s restore write" % snapshot["label"], error)
     for snapshot in snapshots:
         expected_identity = restored_identities.get(snapshot["label"])
         if expected_identity is None:
@@ -1928,45 +1944,56 @@ def _restore_and_verify(
                 errors.append("%s restore hash" % snapshot["label"])
             if mode != snapshot["mode"]:
                 errors.append("%s restore mode" % snapshot["label"])
-        except BaseException:
-            errors.append("%s restore validation" % snapshot["label"])
+        except BaseException as error:
+            errors.record(
+                "%s restore validation" % snapshot["label"],
+                error,
+            )
     if output_snapshot is not None:
-        errors.extend(_restore_output(output_snapshot))
+        errors.include(_restore_output(output_snapshot))
     return errors
 
 
-def _restore_output(snapshot: dict[str, Any]) -> list[str]:
+def _restore_output(snapshot: dict[str, Any]) -> _RestoreErrors:
+    errors = _RestoreErrors()
     path = snapshot["path"]
     if not snapshot["existed"]:
         try:
             path.lstat()
         except FileNotFoundError:
-            return []
+            return errors
         try:
             state = _observed_file_state(path, "output")
-        except BaseException:
-            return ["output restore state"]
+        except BaseException as error:
+            errors.record("output restore state", error)
+            return errors
         if not _matches_file_state(snapshot, state, updated=True):
-            return ["output third-party content"]
+            errors.append("output third-party content")
+            return errors
         try:
             _remove_if_matches(path, state)
-        except BaseException:
-            return ["output restore delete"]
+        except BaseException as error:
+            errors.record("output restore delete", error)
         try:
             path.lstat()
         except FileNotFoundError:
-            return []
+            return errors
+        except BaseException as error:
+            errors.record("output restore validation", error)
         else:
-            return ["output restore validation"]
+            errors.append("output restore validation")
+        return errors
 
     try:
         state = _observed_file_state(path, "output")
-    except BaseException:
-        return ["output restore state"]
+    except BaseException as error:
+        errors.record("output restore state", error)
+        return errors
     if _matches_file_state(snapshot, state, updated=False):
-        return []
+        return errors
     if not _matches_file_state(snapshot, state, updated=True):
-        return ["output third-party content"]
+        errors.append("output third-party content")
+        return errors
     restored_identity = []
     try:
         atomic_write(
@@ -1976,12 +2003,17 @@ def _restore_output(snapshot: dict[str, Any]) -> list[str]:
             on_replace=restored_identity.append,
             expected_state=state,
         )
+    except BaseException as error:
+        errors.record("output restore write", error)
+    if not restored_identity:
+        return errors
+    try:
         identity, restored_raw, restored_mode = _observed_file_state(
             path, "output"
         )
-    except BaseException:
-        return ["output restore write"]
-    errors = []
+    except BaseException as error:
+        errors.record("output restore validation", error)
+        return errors
     if (
         identity != restored_identity[0]
         or _sha256(restored_raw) != snapshot["original_sha256"]
@@ -2113,6 +2145,18 @@ def execute(
                 if callable(add_note):
                     add_note(failure_message)
                 raise
+            restore_fatal = getattr(
+                rollback_errors,
+                "fatal_error",
+                None,
+            )
+            if restore_fatal is not None:
+                add_note = getattr(restore_fatal, "add_note", None)
+                if callable(add_note):
+                    add_note(failure_message)
+                raise restore_fatal.with_traceback(
+                    restore_fatal.__traceback__
+                ) from exc
             raise RuntimeError(failure_message) from exc
 
     return report
@@ -2243,6 +2287,18 @@ def rollback_backup(
                 if callable(add_note):
                     add_note(failure_message)
                 raise
+            restore_fatal = getattr(
+                rollback_errors,
+                "fatal_error",
+                None,
+            )
+            if restore_fatal is not None:
+                add_note = getattr(restore_fatal, "add_note", None)
+                if callable(add_note):
+                    add_note(failure_message)
+                raise restore_fatal.with_traceback(
+                    restore_fatal.__traceback__
+                ) from exc
             raise RuntimeError(failure_message) from exc
 
     return report

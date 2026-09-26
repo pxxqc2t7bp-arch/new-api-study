@@ -3444,6 +3444,175 @@ class ConfigTransactionTest(unittest.TestCase):
                         getattr(fatal_error, "__notes__", []),
                     )
 
+    def test_restore_aggregation_accepts_mocked_list_output_errors(self):
+        with mock.patch.object(
+            guard,
+            "_restore_output",
+            return_value=["output restore write"],
+        ):
+            errors = guard._restore_and_verify(None, [], {})
+
+        self.assertEqual(errors, ["output restore write"])
+        self.assertIsNone(errors.fatal_error)
+
+    def test_apply_config_restore_fatal_is_reraised_after_best_effort(self):
+        restore_fatal = KeyboardInterrupt("injected config restore interrupt")
+        real_atomic_write = guard.atomic_write
+        restoring = False
+        restore_attempts = []
+
+        def fail_status(_line):
+            nonlocal restoring
+            restoring = True
+            raise OSError("injected apply status failure")
+
+        def interrupt_first_restore(path, data, mode, **kwargs):
+            if restoring and data in self.original_bytes:
+                restore_attempts.append(path)
+                if path == self.paths[0]:
+                    raise restore_fatal
+            return real_atomic_write(path, data, mode, **kwargs)
+
+        with mock.patch.object(
+            guard,
+            "atomic_write",
+            side_effect=interrupt_first_restore,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120046Z",
+                    status_sink=fail_status,
+                )
+
+        self.assertIs(raised.exception, restore_fatal)
+        self.assertEqual(restore_attempts, self.paths)
+        self.assertEqual(self.paths[0].read_bytes(), self.updated_bytes[0])
+        self.assertEqual(self.paths[1].read_bytes(), self.original_bytes[1])
+        if hasattr(restore_fatal, "add_note"):
+            self.assertTrue(
+                any(
+                    "v2 restore write" in note
+                    for note in getattr(restore_fatal, "__notes__", [])
+                )
+            )
+
+    def test_apply_output_restore_write_fatal_is_reraised(self):
+        output = self.root / "existing-fatal-output.json"
+        original_output = b'{"existing":"report"}\n'
+        output.write_bytes(original_output)
+        output.chmod(0o640)
+        restore_fatal = SystemExit("injected output restore write exit")
+        real_atomic_write = guard.atomic_write
+        restoring = False
+
+        def fail_status(_line):
+            nonlocal restoring
+            restoring = True
+            raise OSError("injected apply status failure")
+
+        def interrupt_output_restore(path, data, mode, **kwargs):
+            if restoring and path == output and data == original_output:
+                raise restore_fatal
+            return real_atomic_write(path, data, mode, **kwargs)
+
+        with mock.patch.object(
+            guard,
+            "atomic_write",
+            side_effect=interrupt_output_restore,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120047Z",
+                    output_path=output,
+                    status_sink=fail_status,
+                )
+
+        self.assertIs(raised.exception, restore_fatal)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+        self.assertNotEqual(output.read_bytes(), original_output)
+
+    def test_apply_output_restore_delete_fatal_is_reraised(self):
+        output = self.root / "new-fatal-output.json"
+        restore_fatal = KeyboardInterrupt(
+            "injected output restore delete interrupt"
+        )
+
+        with mock.patch.object(
+            guard,
+            "_remove_if_matches",
+            side_effect=restore_fatal,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120048Z",
+                    output_path=output,
+                    status_sink=lambda _line: (_ for _ in ()).throw(
+                        OSError("injected apply status failure")
+                    ),
+                )
+
+        self.assertIs(raised.exception, restore_fatal)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+        self.assertTrue(output.exists())
+
+    def test_apply_original_fatal_precedes_config_restore_fatal(self):
+        original_fatal = SystemExit("injected apply exit")
+        restore_fatal = KeyboardInterrupt("injected config restore interrupt")
+        real_atomic_write = guard.atomic_write
+        restoring = False
+        restore_attempts = []
+
+        def fail_status(_line):
+            nonlocal restoring
+            restoring = True
+            raise original_fatal
+
+        def interrupt_first_restore(path, data, mode, **kwargs):
+            if restoring and data in self.original_bytes:
+                restore_attempts.append(path)
+                if path == self.paths[0]:
+                    raise restore_fatal
+            return real_atomic_write(path, data, mode, **kwargs)
+
+        with mock.patch.object(
+            guard,
+            "atomic_write",
+            side_effect=interrupt_first_restore,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120049Z",
+                    status_sink=fail_status,
+                )
+
+        self.assertIs(raised.exception, original_fatal)
+        self.assertEqual(restore_attempts, self.paths)
+        if hasattr(original_fatal, "add_note"):
+            self.assertTrue(
+                any(
+                    "v2 restore write" in note
+                    for note in getattr(original_fatal, "__notes__", [])
+                )
+            )
+
     def test_output_third_party_drift_is_not_overwritten_on_rollback(self):
         output = self.root / "third-party-output.json"
         original_output = b'{"existing":"report"}\n'
@@ -4365,6 +4534,168 @@ class ConfigTransactionTest(unittest.TestCase):
                         expected_note,
                         getattr(fatal_error, "__notes__", []),
                     )
+
+    def test_rollback_config_restore_fatal_is_reraised_after_best_effort(self):
+        timestamp = "20260926T121017Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        restore_fatal = SystemExit("injected config restore exit")
+        real_atomic_write = guard.atomic_write
+        restoring = False
+        restore_attempts = []
+
+        def fail_status(_line):
+            nonlocal restoring
+            restoring = True
+            raise OSError("injected rollback status failure")
+
+        def interrupt_first_restore(path, data, mode, **kwargs):
+            if restoring and data in self.updated_bytes:
+                restore_attempts.append(path)
+                if path == self.paths[0]:
+                    raise restore_fatal
+            return real_atomic_write(path, data, mode, **kwargs)
+
+        with mock.patch.object(
+            guard,
+            "atomic_write",
+            side_effect=interrupt_first_restore,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                guard.rollback_backup(
+                    self.paths,
+                    backup_dir,
+                    status_sink=fail_status,
+                )
+
+        self.assertIs(raised.exception, restore_fatal)
+        self.assertEqual(restore_attempts, self.paths)
+        self.assertEqual(self.paths[0].read_bytes(), self.original_bytes[0])
+        self.assertEqual(self.paths[1].read_bytes(), self.updated_bytes[1])
+        if hasattr(restore_fatal, "add_note"):
+            self.assertTrue(
+                any(
+                    "v2 restore write" in note
+                    for note in getattr(restore_fatal, "__notes__", [])
+                )
+            )
+
+    def test_rollback_output_restore_write_fatal_is_reraised(self):
+        timestamp = "20260926T121018Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        output = self.root / "rollback-existing-fatal-output.json"
+        original_output = b'{"existing":"rollback-report"}\n'
+        output.write_bytes(original_output)
+        output.chmod(0o640)
+        restore_fatal = KeyboardInterrupt(
+            "injected rollback output restore interrupt"
+        )
+        real_atomic_write = guard.atomic_write
+        restoring = False
+
+        def fail_status(_line):
+            nonlocal restoring
+            restoring = True
+            raise OSError("injected rollback status failure")
+
+        def interrupt_output_restore(path, data, mode, **kwargs):
+            if restoring and path == output and data == original_output:
+                raise restore_fatal
+            return real_atomic_write(path, data, mode, **kwargs)
+
+        with mock.patch.object(
+            guard,
+            "atomic_write",
+            side_effect=interrupt_output_restore,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                guard.rollback_backup(
+                    self.paths,
+                    backup_dir,
+                    output_path=output,
+                    status_sink=fail_status,
+                )
+
+        self.assertIs(raised.exception, restore_fatal)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.updated_bytes,
+        )
+        self.assertNotEqual(output.read_bytes(), original_output)
+
+    def test_rollback_output_restore_delete_fatal_is_reraised(self):
+        timestamp = "20260926T121019Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        output = self.root / "rollback-new-fatal-output.json"
+        restore_fatal = SystemExit("injected rollback output restore exit")
+
+        with mock.patch.object(
+            guard,
+            "_remove_if_matches",
+            side_effect=restore_fatal,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                guard.rollback_backup(
+                    self.paths,
+                    backup_dir,
+                    output_path=output,
+                    status_sink=lambda _line: (_ for _ in ()).throw(
+                        OSError("injected rollback status failure")
+                    ),
+                )
+
+        self.assertIs(raised.exception, restore_fatal)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.updated_bytes,
+        )
+        self.assertTrue(output.exists())
+
+    def test_rollback_original_fatal_precedes_config_restore_fatal(self):
+        timestamp = "20260926T121020Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        original_fatal = KeyboardInterrupt("injected rollback interrupt")
+        restore_fatal = SystemExit("injected config restore exit")
+        real_atomic_write = guard.atomic_write
+        restoring = False
+        restore_attempts = []
+
+        def fail_status(_line):
+            nonlocal restoring
+            restoring = True
+            raise original_fatal
+
+        def interrupt_first_restore(path, data, mode, **kwargs):
+            if restoring and data in self.updated_bytes:
+                restore_attempts.append(path)
+                if path == self.paths[0]:
+                    raise restore_fatal
+            return real_atomic_write(path, data, mode, **kwargs)
+
+        with mock.patch.object(
+            guard,
+            "atomic_write",
+            side_effect=interrupt_first_restore,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                guard.rollback_backup(
+                    self.paths,
+                    backup_dir,
+                    status_sink=fail_status,
+                )
+
+        self.assertIs(raised.exception, original_fatal)
+        self.assertEqual(restore_attempts, self.paths)
+        if hasattr(original_fatal, "add_note"):
+            self.assertTrue(
+                any(
+                    "v2 restore write" in note
+                    for note in getattr(original_fatal, "__notes__", [])
+                )
+            )
 
     def test_rollback_output_rejects_transaction_lock_aliases(self):
         for alias_kind in ("exact", "child", "symlink", "hardlink"):
