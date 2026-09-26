@@ -34,6 +34,10 @@ SHA256_PATTERN = re.compile(r"\A[0-9a-f]{64}\Z")
 _UNCONDITIONAL_WRITE = object()
 _MISSING_FILE_STATE = object()
 _UNKNOWN_FILE_STATE = object()
+_MACOS_SYSTEM_DIRECTORY_ALIASES = {
+    "tmp": ("private", "tmp"),
+    "var": ("private", "var"),
+}
 
 
 class _RestoreErrors(list[str]):
@@ -183,6 +187,82 @@ def _ensure_private_directory(path: Path, *, parents: bool = False) -> None:
     os.chmod(path, 0o700)
 
 
+def _open_macos_system_directory_alias(
+    parent_dir_fd: int,
+    name: str,
+    flags: int,
+) -> Optional[int]:
+    target_components = _MACOS_SYSTEM_DIRECTORY_ALIASES.get(name)
+    if sys.platform != "darwin" or target_components is None:
+        return None
+
+    parent_status = os.fstat(parent_dir_fd)
+    root_status = os.stat("/", follow_symlinks=False)
+    if (
+        (parent_status.st_dev, parent_status.st_ino)
+        != (root_status.st_dev, root_status.st_ino)
+        or not stat.S_ISDIR(parent_status.st_mode)
+        or parent_status.st_uid != 0
+        or stat.S_IMODE(parent_status.st_mode) & 0o022
+    ):
+        return None
+    before = os.stat(
+        name,
+        dir_fd=parent_dir_fd,
+        follow_symlinks=False,
+    )
+    if not stat.S_ISLNK(before.st_mode) or before.st_uid != 0:
+        return None
+    if os.readlink(name, dir_fd=parent_dir_fd) != "/".join(
+        target_components
+    ):
+        return None
+    after = os.stat(
+        name,
+        dir_fd=parent_dir_fd,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISLNK(after.st_mode)
+        or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        or after.st_uid != 0
+    ):
+        raise RuntimeError("system directory alias drift detected")
+
+    descriptor = parent_dir_fd
+    try:
+        for component in target_components:
+            next_descriptor = os.open(
+                component,
+                flags,
+                dir_fd=descriptor,
+            )
+            if descriptor != parent_dir_fd:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    os.close(next_descriptor)
+                    raise
+            descriptor = next_descriptor
+        final_alias = os.stat(
+            name,
+            dir_fd=parent_dir_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISLNK(final_alias.st_mode)
+            or (final_alias.st_dev, final_alias.st_ino)
+            != (before.st_dev, before.st_ino)
+            or final_alias.st_uid != 0
+        ):
+            raise RuntimeError("system directory alias drift detected")
+        return descriptor
+    except BaseException:
+        if descriptor != parent_dir_fd:
+            os.close(descriptor)
+        raise
+
+
 @contextmanager
 def _open_parent_directory(
     path: Path,
@@ -230,9 +310,23 @@ def _open_parent_directory(
                     flags,
                     dir_fd=descriptor,
                 )
+            except OSError as error:
+                if error.errno not in (errno.ELOOP, errno.ENOTDIR):
+                    raise
+                next_descriptor = _open_macos_system_directory_alias(
+                    descriptor,
+                    component,
+                    flags,
+                )
+                if next_descriptor is None:
+                    raise
             if component_created:
-                os.fchmod(next_descriptor, 0o700)
-                os.fsync(descriptor)
+                try:
+                    os.fchmod(next_descriptor, 0o700)
+                    os.fsync(descriptor)
+                except BaseException:
+                    os.close(next_descriptor)
+                    raise
             os.close(descriptor)
             descriptor = next_descriptor
         yield descriptor, path.name
@@ -364,6 +458,30 @@ def _create_temporary_file(
         except FileExistsError:
             continue
     raise FileExistsError("unable to allocate a temporary file")
+
+
+def _discard_uninspected_temporary_file(
+    parent_dir_fd: int,
+    descriptor: int,
+    name: str,
+) -> list[BaseException]:
+    errors = []
+    try:
+        os.close(descriptor)
+    except BaseException as error:
+        errors.append(error)
+    try:
+        os.unlink(name, dir_fd=parent_dir_fd)
+    except FileNotFoundError:
+        pass
+    except BaseException as error:
+        errors.append(error)
+    else:
+        try:
+            os.fsync(parent_dir_fd)
+        except BaseException as error:
+            errors.append(error)
+    return errors
 
 
 def _observed_file_state_at(
@@ -878,8 +996,22 @@ def _remove_if_matches(
             parent_dir_fd,
             ".%s." % target_name,
         )
+        try:
+            placeholder_status = os.fstat(placeholder_descriptor)
+        except BaseException as error:
+            cleanup_errors = _discard_uninspected_temporary_file(
+                parent_dir_fd,
+                placeholder_descriptor,
+                temporary_name,
+            )
+            if cleanup_errors:
+                _raise_cleanup_errors(
+                    "target removal placeholder cleanup failed",
+                    [error] + cleanup_errors,
+                    error,
+                )
+            raise
         placeholder_open = True
-        placeholder_status = os.fstat(placeholder_descriptor)
         placeholder_identity = (
             placeholder_status.st_dev,
             placeholder_status.st_ino,
@@ -948,7 +1080,9 @@ def _remove_if_matches(
             os.fsync(parent_dir_fd)
             try:
                 os.unlink(temporary_name, dir_fd=parent_dir_fd)
-            except BaseException:
+            except BaseException as removal_error:
+                removal_traceback = removal_error.__traceback__
+                recovery_error = None
                 try:
                     _rename_noreplace(
                         parent_dir_fd,
@@ -958,14 +1092,24 @@ def _remove_if_matches(
                     )
                 except FileExistsError:
                     pass
+                except BaseException as error:
+                    recovery_error = error
                 else:
                     temporary_cleanup_complete = True
-                    os.fsync(parent_dir_fd)
-                raise
+                    try:
+                        os.fsync(parent_dir_fd)
+                    except BaseException as error:
+                        recovery_error = error
+                if not isinstance(removal_error, Exception):
+                    raise removal_error.with_traceback(removal_traceback)
+                if recovery_error is not None:
+                    raise recovery_error.with_traceback(
+                        recovery_error.__traceback__
+                    ) from removal_error
+                raise removal_error.with_traceback(removal_traceback)
             else:
                 temporary_cleanup_complete = True
                 os.fsync(parent_dir_fd)
-            os.fsync(parent_dir_fd)
         except BaseException as error:
             primary_error = error
             raise
@@ -1030,14 +1174,32 @@ def atomic_write(
             except FileNotFoundError:
                 mode = 0o600
             else:
-                mode = stat.S_IMODE(target_status.st_mode)
+                mode = (
+                    stat.S_IMODE(target_status.st_mode)
+                    if stat.S_ISREG(target_status.st_mode)
+                    else 0o600
+                )
         file_descriptor, temporary_name = _create_temporary_file(
             parent_dir_fd,
             ".%s." % target_name,
         )
+        try:
+            temporary_status = os.fstat(file_descriptor)
+        except BaseException as error:
+            cleanup_errors = _discard_uninspected_temporary_file(
+                parent_dir_fd,
+                file_descriptor,
+                temporary_name,
+            )
+            if cleanup_errors:
+                _raise_cleanup_errors(
+                    "atomic replacement temporary cleanup failed",
+                    [error] + cleanup_errors,
+                    error,
+                )
+            raise
         descriptor_open = True
         temporary_cleanup_complete = False
-        temporary_status = os.fstat(file_descriptor)
         replacement_identity = (
             temporary_status.st_dev,
             temporary_status.st_ino,
@@ -1113,10 +1275,6 @@ def atomic_write(
                             cleanup_errors.append(retry_error)
                         else:
                             temporary_cleanup_complete = True
-                            try:
-                                os.fsync(parent_dir_fd)
-                            except BaseException as fsync_error:
-                                cleanup_errors.append(fsync_error)
                     elif current_pair[1] is _MISSING_FILE_STATE:
                         temporary_cleanup_complete = True
                     else:
@@ -1162,8 +1320,6 @@ def atomic_write(
                         cleanup_errors,
                         cleanup_error,
                     )
-                else:
-                    os.fsync(parent_dir_fd)
             os.fsync(parent_dir_fd)
         except BaseException as error:
             primary_error = error

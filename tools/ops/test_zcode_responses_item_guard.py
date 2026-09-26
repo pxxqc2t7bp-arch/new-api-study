@@ -495,6 +495,46 @@ class ConfigTransactionTest(unittest.TestCase):
                     )
                 self.assertFalse(self.backup_root.exists())
 
+    def test_dry_run_writes_under_unresolved_system_temporary_path(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary_directory:
+            root = Path(temporary_directory)
+            self.assertTrue(os.fspath(root).startswith("/tmp/"))
+            paths = [
+                root / ".zcode" / "v2" / "config.json",
+                root / ".zcode" / "cli" / "config.json",
+            ]
+            for path, config, mode in zip(
+                paths,
+                self.originals,
+                self.original_modes,
+            ):
+                write_config(path, config, mode)
+            output = root / "dry-run-report.json"
+
+            environment = dict(os.environ)
+            environment["HOME"] = str(root)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    os.fspath(Path(guard.__file__)),
+                    "--output",
+                    os.fspath(output),
+                ],
+                cwd=Path(__file__).parents[2],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            report = json.loads(output.read_text(encoding="ascii"))
+            self.assertEqual(
+                [report["change"][label]["status"] for label in ("v2", "cli")],
+                ["pending", "pending"],
+            )
+
     def test_output_aliases_are_rejected_before_dry_run_or_apply(self):
         for apply in (False, True):
             for alias_kind in ("same-path", "symlink", "hardlink"):
@@ -1071,6 +1111,50 @@ class ConfigTransactionTest(unittest.TestCase):
                 0o700,
             )
 
+    def test_open_parent_closes_new_directory_after_setup_failure(self):
+        real_fchmod = guard.os.fchmod
+        real_fsync = guard.os.fsync
+        real_fstat = guard.os.fstat
+
+        for failure_stage in ("fchmod", "fsync"):
+            with self.subTest(failure_stage=failure_stage):
+                parent = self.root / ("new-parent-%s" % failure_stage)
+                created_descriptors = []
+
+                def fail_created_fchmod(file_descriptor, mode):
+                    created_descriptors.append(file_descriptor)
+                    if failure_stage == "fchmod":
+                        raise OSError("injected directory fchmod failure")
+                    return real_fchmod(file_descriptor, mode)
+
+                def fail_created_fsync(file_descriptor):
+                    if failure_stage == "fsync" and created_descriptors:
+                        raise OSError("injected directory fsync failure")
+                    return real_fsync(file_descriptor)
+
+                with mock.patch.object(
+                    guard.os,
+                    "fchmod",
+                    side_effect=fail_created_fchmod,
+                ), mock.patch.object(
+                    guard.os,
+                    "fsync",
+                    side_effect=fail_created_fsync,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "injected directory",
+                    ):
+                        with guard._open_parent_directory(
+                            parent / "child" / "output.json",
+                            create_parents=True,
+                        ):
+                            self.fail("parent open unexpectedly succeeded")
+
+                self.assertEqual(len(created_descriptors), 1)
+                with self.assertRaises(OSError):
+                    real_fstat(created_descriptors[0])
+
     def test_lock_output_cannot_replace_lock_for_concurrent_transaction(self):
         with guard._transaction_lock(self.backup_root):
             pass
@@ -1618,12 +1702,15 @@ class ConfigTransactionTest(unittest.TestCase):
         ):
             guard._remove_if_matches(output, expected_state)
 
-        unlink_positions = [
-            index for index, event in enumerate(events) if event == "unlink"
-        ]
-        self.assertEqual(len(unlink_positions), 2)
-        for position in unlink_positions:
-            self.assertEqual(events[position + 1], "dir-fsync")
+        self.assertEqual(
+            events,
+            [
+                "unlink",
+                "dir-fsync",
+                "unlink",
+                "dir-fsync",
+            ],
+        )
 
     def test_remove_restore_fsyncs_rename_before_propagating_failure(self):
         output = self.root / "remove-output.json"
@@ -1705,6 +1792,119 @@ class ConfigTransactionTest(unittest.TestCase):
             list(self.root.glob(".remove-output.json.*")),
             [],
         )
+
+    def test_remove_fatal_unlink_survives_restore_rename_failure(self):
+        real_unlink = guard.os.unlink
+
+        for fatal_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(fatal_type=fatal_type.__name__):
+                output = self.root / (
+                    "remove-rename-%s.json" % fatal_type.__name__
+                )
+                output.write_bytes(b'{"report":"safe"}\n')
+                output.chmod(0o640)
+                expected_state = guard._observed_file_state(
+                    output,
+                    "output",
+                )
+                fatal_error = fatal_type("injected temporary unlink fatal")
+                interrupted = False
+
+                def interrupt_temporary_unlink(name, *args, **kwargs):
+                    nonlocal interrupted
+                    if (
+                        kwargs.get("dir_fd") is not None
+                        and os.fspath(name) != output.name
+                        and not interrupted
+                    ):
+                        interrupted = True
+                        raise fatal_error
+                    return real_unlink(name, *args, **kwargs)
+
+                with mock.patch.object(
+                    guard.os,
+                    "unlink",
+                    side_effect=interrupt_temporary_unlink,
+                ), mock.patch.object(
+                    guard,
+                    "_rename_noreplace",
+                    side_effect=OSError("injected restore rename failure"),
+                ):
+                    with self.assertRaises(fatal_type) as raised:
+                        guard._remove_if_matches(output, expected_state)
+
+                self.assertIs(raised.exception, fatal_error)
+                self.assertTrue(interrupted)
+
+    def test_remove_fatal_unlink_survives_restore_fsync_failure(self):
+        real_unlink = guard.os.unlink
+        real_rename_noreplace = guard._rename_noreplace
+        real_fsync = guard.os.fsync
+
+        for fatal_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(fatal_type=fatal_type.__name__):
+                output = self.root / (
+                    "remove-fsync-%s.json" % fatal_type.__name__
+                )
+                original = b'{"report":"safe"}\n'
+                output.write_bytes(original)
+                output.chmod(0o640)
+                expected_state = guard._observed_file_state(
+                    output,
+                    "output",
+                )
+                parent_status = self.root.stat()
+                fatal_error = fatal_type("injected temporary unlink fatal")
+                interrupted = False
+                restored = False
+
+                def interrupt_temporary_unlink(name, *args, **kwargs):
+                    nonlocal interrupted
+                    if (
+                        kwargs.get("dir_fd") is not None
+                        and os.fspath(name) != output.name
+                        and not interrupted
+                    ):
+                        interrupted = True
+                        raise fatal_error
+                    return real_unlink(name, *args, **kwargs)
+
+                def record_restore(*args):
+                    nonlocal restored
+                    result = real_rename_noreplace(*args)
+                    restored = True
+                    return result
+
+                def fail_restore_fsync(file_descriptor):
+                    file_status = os.fstat(file_descriptor)
+                    if (
+                        restored
+                        and (file_status.st_dev, file_status.st_ino)
+                        == (parent_status.st_dev, parent_status.st_ino)
+                    ):
+                        raise OSError("injected restore fsync failure")
+                    return real_fsync(file_descriptor)
+
+                with mock.patch.object(
+                    guard.os,
+                    "unlink",
+                    side_effect=interrupt_temporary_unlink,
+                ), mock.patch.object(
+                    guard,
+                    "_rename_noreplace",
+                    side_effect=record_restore,
+                ), mock.patch.object(
+                    guard.os,
+                    "fsync",
+                    side_effect=fail_restore_fsync,
+                ):
+                    with self.assertRaises(fatal_type) as raised:
+                        guard._remove_if_matches(output, expected_state)
+
+                self.assertIs(raised.exception, fatal_error)
+                self.assertTrue(interrupted)
+                self.assertTrue(restored)
+                self.assertEqual(output.read_bytes(), original)
 
     def test_remove_if_matches_recovers_when_restore_exchange_first_fails(
         self,
@@ -2222,6 +2422,143 @@ class ConfigTransactionTest(unittest.TestCase):
             [path.read_bytes() for path in self.paths],
             self.original_bytes,
         )
+
+    def test_atomic_write_closes_and_removes_temp_when_initial_fstat_fails(
+        self,
+    ):
+        path = self.paths[0]
+        real_create_temporary_file = guard._create_temporary_file
+        real_fstat = guard.os.fstat
+        created = []
+
+        def record_temporary(parent_dir_fd, prefix):
+            result = real_create_temporary_file(parent_dir_fd, prefix)
+            created.append(result)
+            return result
+
+        def fail_temporary_fstat(file_descriptor):
+            if created and file_descriptor == created[0][0]:
+                raise OSError("injected initial temporary fstat failure")
+            return real_fstat(file_descriptor)
+
+        with mock.patch.object(
+            guard,
+            "_create_temporary_file",
+            side_effect=record_temporary,
+        ), mock.patch.object(
+            guard.os,
+            "fstat",
+            side_effect=fail_temporary_fstat,
+        ):
+            with self.assertRaisesRegex(
+                OSError,
+                "injected initial temporary fstat failure",
+            ):
+                guard.atomic_write(
+                    path,
+                    self.updated_bytes[0],
+                    self.original_modes[0],
+                )
+
+        self.assertEqual(len(created), 1)
+        with self.assertRaises(OSError):
+            real_fstat(created[0][0])
+        self.assertEqual(list(path.parent.glob(".config.json.*")), [])
+        self.assertEqual(path.read_bytes(), self.original_bytes[0])
+
+    def test_remove_closes_and_removes_placeholder_when_initial_fstat_fails(
+        self,
+    ):
+        output = self.root / "remove-fstat-output.json"
+        original = b'{"report":"safe"}\n'
+        output.write_bytes(original)
+        output.chmod(0o640)
+        expected_state = guard._observed_file_state(output, "output")
+        real_create_temporary_file = guard._create_temporary_file
+        real_fstat = guard.os.fstat
+        created = []
+
+        def record_temporary(parent_dir_fd, prefix):
+            result = real_create_temporary_file(parent_dir_fd, prefix)
+            created.append(result)
+            return result
+
+        def fail_temporary_fstat(file_descriptor):
+            if created and file_descriptor == created[0][0]:
+                raise OSError("injected initial placeholder fstat failure")
+            return real_fstat(file_descriptor)
+
+        with mock.patch.object(
+            guard,
+            "_create_temporary_file",
+            side_effect=record_temporary,
+        ), mock.patch.object(
+            guard.os,
+            "fstat",
+            side_effect=fail_temporary_fstat,
+        ):
+            with self.assertRaisesRegex(
+                OSError,
+                "injected initial placeholder fstat failure",
+            ):
+                guard._remove_if_matches(output, expected_state)
+
+        self.assertEqual(len(created), 1)
+        with self.assertRaises(OSError):
+            real_fstat(created[0][0])
+        self.assertEqual(
+            list(self.root.glob(".remove-fstat-output.json.*")),
+            [],
+        )
+        self.assertEqual(output.read_bytes(), original)
+
+    def test_atomic_write_replaces_symlink_with_private_regular_file(self):
+        target = self.root / "symlink-target.json"
+        target.write_bytes(b'{"target":"unchanged"}\n')
+        output = self.root / "symlink-output.json"
+        output.symlink_to(target)
+        updated = b'{"report":"private"}\n'
+
+        guard.atomic_write(output, updated, None)
+
+        output_status = output.lstat()
+        self.assertTrue(stat.S_ISREG(output_status.st_mode))
+        self.assertEqual(stat.S_IMODE(output_status.st_mode), 0o600)
+        self.assertEqual(output.read_bytes(), updated)
+        self.assertEqual(target.read_bytes(), b'{"target":"unchanged"}\n')
+
+    def test_atomic_write_fsyncs_replacement_directory_once(self):
+        path = self.paths[0]
+        parent_status = path.parent.stat()
+        real_fsync = guard.os.fsync
+        directory_fsyncs = 0
+
+        def record_parent_fsync(file_descriptor):
+            nonlocal directory_fsyncs
+            file_status = os.fstat(file_descriptor)
+            if (
+                file_status.st_dev,
+                file_status.st_ino,
+            ) == (
+                parent_status.st_dev,
+                parent_status.st_ino,
+            ):
+                directory_fsyncs += 1
+            return real_fsync(file_descriptor)
+
+        with mock.patch.object(
+            guard.os,
+            "fsync",
+            side_effect=record_parent_fsync,
+        ):
+            guard.atomic_write(
+                path,
+                self.updated_bytes[0],
+                self.original_modes[0],
+                expected_state=guard._observed_file_state(path),
+            )
+
+        self.assertEqual(directory_fsyncs, 1)
 
     def test_directory_fsync_baseexception_rolls_back_and_reraises(self):
         real_fsync = os.fsync
