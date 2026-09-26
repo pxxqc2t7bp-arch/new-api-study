@@ -79,6 +79,16 @@ def write_config(path, config, mode):
     path.chmod(mode)
 
 
+class FailingStdout:
+    def __init__(self, error):
+        self.error = error
+        self.write_count = 0
+
+    def write(self, value):
+        self.write_count += 1
+        raise self.error
+
+
 def assert_safe_report(test_case, report):
     serialized = json.dumps(report, ensure_ascii=False, sort_keys=True)
     lowered = serialized.lower()
@@ -530,6 +540,112 @@ class ConfigTransactionTest(unittest.TestCase):
                 (backup_dir / label / "config.json").read_bytes(),
                 original,
             )
+
+    def test_cli_apply_stdout_failure_rolls_back_both_configs_once(self):
+        failures = (
+            ("broken-pipe", BrokenPipeError("injected broken pipe")),
+            ("os-error", OSError("injected stdout failure")),
+        )
+        for index, (name, error) in enumerate(failures, start=2):
+            with self.subTest(error=name):
+                output = self.root / ("%s.json" % name)
+                timestamp = "20260926T12000%dZ" % index
+                stdout = FailingStdout(error)
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(
+                        guard,
+                        "default_config_paths",
+                        return_value=self.paths,
+                    ),
+                    mock.patch.object(
+                        guard.Path,
+                        "home",
+                        return_value=self.home,
+                    ),
+                    mock.patch.object(
+                        guard.time,
+                        "strftime",
+                        return_value=timestamp,
+                    ),
+                    mock.patch.object(guard.sys, "stdout", stdout),
+                    mock.patch.object(guard.sys, "stderr", stderr),
+                ):
+                    try:
+                        result = guard.main(
+                            ["--apply", "--output", str(output)]
+                        )
+                    except OSError as exc:
+                        self.fail(
+                            "main leaked stdout failure: %s"
+                            % type(exc).__name__
+                        )
+
+                self.assertEqual(result, 1)
+                self.assertEqual(stdout.write_count, 1)
+                self.assertEqual(
+                    stderr.getvalue(),
+                    "ERROR: change=failed\n",
+                )
+                self.assertTrue(output.is_file())
+                self.assertEqual(
+                    [sha256(path.read_bytes()) for path in self.paths],
+                    self.original_hashes,
+                )
+                self.assertEqual(
+                    [
+                        stat.S_IMODE(path.stat().st_mode)
+                        for path in self.paths
+                    ],
+                    self.original_modes,
+                )
+                backup_dir = self.backup_root / timestamp
+                self.assertTrue((backup_dir / "manifest.json").is_file())
+                for label, original in zip(
+                    ("v2", "cli"),
+                    self.original_bytes,
+                ):
+                    self.assertEqual(
+                        (backup_dir / label / "config.json").read_bytes(),
+                        original,
+                    )
+
+    def test_cli_dry_run_stdout_failure_is_caught_without_rollback(self):
+        output = self.root / "dry-run-stdout-failure.json"
+        stdout = FailingStdout(BrokenPipeError("injected broken pipe"))
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                guard,
+                "default_config_paths",
+                return_value=self.paths,
+            ),
+            mock.patch.object(guard, "_restore_and_verify") as restore,
+            mock.patch.object(guard.sys, "stdout", stdout),
+            mock.patch.object(guard.sys, "stderr", stderr),
+        ):
+            try:
+                result = guard.main(["--output", str(output)])
+            except OSError as exc:
+                self.fail(
+                    "main leaked stdout failure: %s"
+                    % type(exc).__name__
+                )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.write_count, 1)
+        self.assertEqual(stderr.getvalue(), "ERROR: change=failed\n")
+        restore.assert_not_called()
+        self.assertTrue(output.is_file())
+        self.assertEqual(
+            [sha256(path.read_bytes()) for path in self.paths],
+            self.original_hashes,
+        )
+        self.assertEqual(
+            [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
+            self.original_modes,
+        )
+        self.assertFalse(self.backup_root.exists())
 
     def test_cli_dry_run_report_failure_does_not_mutate_or_rollback(self):
         output = self.root / "dry-run-failure.json"

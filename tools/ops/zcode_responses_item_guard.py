@@ -14,7 +14,7 @@ import tempfile
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlsplit
 
 
@@ -361,6 +361,7 @@ def execute(
     backup_root: Optional[Path] = None,
     timestamp: Optional[str] = None,
     output_path: Optional[Path] = None,
+    status_sink: Optional[Callable[[str], None]] = None,
 ) -> dict[str, Any]:
     """Validate both configs, then dry-run or apply one rollback-safe update."""
     labels = _config_labels(paths)
@@ -371,6 +372,7 @@ def execute(
     if not apply or not any(snapshot["changed"] for snapshot in snapshots):
         if output_path is not None:
             _write_report(output_path, report)
+        _emit_status(report, status_sink)
         return report
 
     backup_timestamp = timestamp or time.strftime(
@@ -394,6 +396,7 @@ def execute(
             _verify_readback(snapshot)
         if output_path is not None:
             _write_report(output_path, report)
+        _emit_status(report, status_sink)
     except Exception as exc:
         rollback_errors = _restore_and_verify(backup_dir, snapshots)
         if rollback_errors:
@@ -438,27 +441,39 @@ def _encode_report(report: dict[str, Any]) -> bytes:
     ).encode("ascii")
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
-    try:
-        report = execute(
-            default_config_paths(),
-            apply=args.apply,
-            output_path=Path(args.output),
-        )
-        report_sha256 = _sha256(_encode_report(report))
-    except Exception:
-        print("ERROR: change=failed", file=sys.stderr)
-        return 1
-
+def _emit_status(
+    report: dict[str, Any],
+    status_sink: Optional[Callable[[str], None]],
+) -> None:
+    if status_sink is None:
+        return
     fields = [
-        "hash=%s" % report_sha256,
+        "hash=%s" % _sha256(_encode_report(report)),
         "provider=%s" % PROVIDER_ID,
         "header=%s:%s" % (HEADER_NAME, HEADER_VALUE),
         "change.v2=%s" % report["change"]["v2"]["status"],
         "change.cli=%s" % report["change"]["cli"]["status"],
     ]
-    print(" ".join(fields))
+    status_sink(" ".join(fields))
+
+
+def _write_stdout_line(line: str) -> None:
+    sys.stdout.write(line + "\n")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    try:
+        execute(
+            default_config_paths(),
+            apply=args.apply,
+            output_path=Path(args.output),
+            status_sink=_write_stdout_line,
+        )
+    except Exception:
+        print("ERROR: change=failed", file=sys.stderr)
+        return 1
+
     return 0
 
 
