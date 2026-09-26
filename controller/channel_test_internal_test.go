@@ -7,23 +7,30 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	taskdto "github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestGetChannelDefaultBaseURLsUsesBuiltInDefaults(t *testing.T) {
@@ -86,6 +93,23 @@ func TestValidateChannelProxy(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestClearChannelInfoRemovesMultiKeyDisableMetadata(t *testing.T) {
+	channel := &model.Channel{
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:             true,
+			MultiKeyDisabledReason: map[int]string{0: "quota exhausted"},
+			MultiKeyDisabledTime:   map[int]int64{0: 100},
+			MultiKeyDisabledUntil:  map[int]int64{0: 200},
+		},
+	}
+
+	clearChannelInfo(channel)
+
+	assert.Nil(t, channel.ChannelInfo.MultiKeyDisabledReason)
+	assert.Nil(t, channel.ChannelInfo.MultiKeyDisabledTime)
+	assert.Nil(t, channel.ChannelInfo.MultiKeyDisabledUntil)
 }
 
 func TestValidateChannelRequiresNewAPIBaseURL(t *testing.T) {
@@ -267,6 +291,289 @@ func TestDeleteChannelBatchReportsAndAuditsActualDeletedCount(t *testing.T) {
 	assert.Equal(t, float64(1), auditData.Operation.Params["count"])
 }
 
+func TestManageMultiKeysMaintainsPerKeyDeadlines(t *testing.T) {
+	tests := []struct {
+		name          string
+		action        string
+		keyIndex      *int
+		wantKey       string
+		wantDeadlines map[int]int64
+	}{
+		{
+			name:          "enable key clears deadline",
+			action:        "enable_key",
+			keyIndex:      common.GetPointer(0),
+			wantKey:       "key-a\nkey-b\nkey-c\nkey-d",
+			wantDeadlines: map[int]int64{2: 1_200},
+		},
+		{
+			name:          "manual disable clears stale deadline",
+			action:        "disable_key",
+			keyIndex:      common.GetPointer(3),
+			wantKey:       "key-a\nkey-b\nkey-c\nkey-d",
+			wantDeadlines: map[int]int64{0: 1_000, 2: 1_200},
+		},
+		{
+			name:          "enable all clears deadlines",
+			action:        "enable_all_keys",
+			wantKey:       "key-a\nkey-b\nkey-c\nkey-d",
+			wantDeadlines: map[int]int64{},
+		},
+		{
+			name:          "disable all clears non-auto deadlines",
+			action:        "disable_all_keys",
+			wantKey:       "key-a\nkey-b\nkey-c\nkey-d",
+			wantDeadlines: map[int]int64{0: 1_000, 2: 1_200},
+		},
+		{
+			name:          "delete key reindexes deadlines",
+			action:        "delete_key",
+			keyIndex:      common.GetPointer(1),
+			wantKey:       "key-a\nkey-c\nkey-d",
+			wantDeadlines: map[int]int64{0: 1_000, 1: 1_200},
+		},
+		{
+			name:          "delete auto-disabled keys drops deadlines",
+			action:        "delete_disabled_keys",
+			wantKey:       "key-b\nkey-d",
+			wantDeadlines: map[int]int64{},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			require.NoError(t, db.AutoMigrate(&model.Log{}))
+			originalMemoryCacheEnabled := common.MemoryCacheEnabled
+			common.MemoryCacheEnabled = false
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = originalMemoryCacheEnabled
+			})
+
+			channel := model.Channel{
+				Name: "managed-keys", Key: "key-a\nkey-b\nkey-c\nkey-d",
+				Status: common.ChannelStatusEnabled,
+				Models: "gpt-3.5-turbo", Group: "default",
+				ChannelInfo: model.ChannelInfo{
+					IsMultiKey: true, MultiKeySize: 4,
+					MultiKeyStatusList: map[int]int{
+						0: common.ChannelStatusAutoDisabled,
+						1: common.ChannelStatusManuallyDisabled,
+						2: common.ChannelStatusAutoDisabled,
+					},
+					MultiKeyDisabledReason: map[int]string{
+						0: "auto-a", 1: "manual-b", 2: "auto-c",
+					},
+					MultiKeyDisabledTime: map[int]int64{
+						0: 100, 1: 200, 2: 300,
+					},
+					MultiKeyDisabledUntil: map[int]int64{
+						0: 1_000,
+						1: 1_100,
+						2: 1_200,
+						3: 1_300,
+					},
+				},
+			}
+			require.NoError(t, db.Create(&channel).Error)
+
+			body, err := common.Marshal(MultiKeyManageRequest{
+				ChannelId: channel.Id,
+				Action:    testCase.action,
+				KeyIndex:  testCase.keyIndex,
+			})
+			require.NoError(t, err)
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Set("id", 1)
+			ctx.Set("role", common.RoleRootUser)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel/manage_multi_key", bytes.NewReader(body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+
+			ManageMultiKeys(ctx)
+
+			var response struct {
+				Success bool `json:"success"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			require.True(t, response.Success, recorder.Body.String())
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			assert.Equal(t, testCase.wantKey, stored.Key)
+			if len(testCase.wantDeadlines) == 0 {
+				assert.Empty(t, stored.ChannelInfo.MultiKeyDisabledUntil)
+			} else {
+				assert.Equal(t, testCase.wantDeadlines, stored.ChannelInfo.MultiKeyDisabledUntil)
+			}
+		})
+	}
+}
+
+func TestUpdateChannelRejectsConcurrentPerKeyDisableFromCallerSnapshot(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	channel := model.Channel{
+		Name:   "snapshot-before",
+		Type:   constant.ChannelTypeOpenAI,
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-4.1",
+		Group:  "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	statusSnapshot, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+
+	var intercepted atomic.Bool
+	var statusChanged bool
+	var statusErr error
+	statusFinished := make(chan struct{})
+	const callbackName = "test:update_channel_caller_snapshot"
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil ||
+			tx.Statement.Schema == nil ||
+			tx.Statement.Schema.Name != "Channel" {
+			return
+		}
+		loaded, ok := tx.Statement.Dest.(*model.Channel)
+		if !ok || loaded.Id != channel.Id || !intercepted.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			statusChanged, statusErr = model.UpdateMultiKeyChannelStatusIfUnchanged(
+				statusSnapshot,
+				statusSnapshot.GetTag(),
+				"key-a",
+				common.ChannelStatusAutoDisabled,
+				"quota exhausted",
+				model.MultiKeyChannelStatusUpdateOptions{PlanQuotaResetAt: 2_000_000_000},
+			)
+			close(statusFinished)
+		}()
+		<-statusFinished
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Query().Remove(callbackName))
+	})
+
+	body := []byte(fmt.Sprintf(
+		`{"id":%d,"type":%d,"name":"stale-request-name","models":"gpt-4.1","group":"default"}`,
+		channel.Id,
+		channel.Type,
+	))
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/channel/", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	UpdateChannel(ctx)
+
+	require.NoError(t, statusErr)
+	require.True(t, statusChanged)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool `json:"success"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.False(t, response.Success)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, channel.Name, stored.Name)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, int64(2_000_000_060), stored.ChannelInfo.MultiKeyDisabledUntil[0])
+}
+
+func TestManageMultiKeysRejectsConcurrentPerKeyDisableWithoutStaleReplay(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	channel := model.Channel{
+		Name:   "manage-snapshot",
+		Type:   constant.ChannelTypeOpenAI,
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled,
+		Models: "gpt-4.1",
+		Group:  "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	statusSnapshot, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+
+	var intercepted atomic.Bool
+	var statusChanged bool
+	var statusErr error
+	statusFinished := make(chan struct{})
+	const callbackName = "test:manage_multi_key_caller_snapshot"
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil ||
+			tx.Statement.Schema == nil ||
+			tx.Statement.Schema.Name != "Channel" {
+			return
+		}
+		loaded, ok := tx.Statement.Dest.(*model.Channel)
+		if !ok || loaded.Id != channel.Id || !intercepted.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			statusChanged, statusErr = model.UpdateMultiKeyChannelStatusIfUnchanged(
+				statusSnapshot,
+				statusSnapshot.GetTag(),
+				"key-a",
+				common.ChannelStatusAutoDisabled,
+				"quota exhausted",
+				model.MultiKeyChannelStatusUpdateOptions{PlanQuotaResetAt: 2_000_000_000},
+			)
+			close(statusFinished)
+		}()
+		<-statusFinished
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Query().Remove(callbackName))
+	})
+
+	body, err := common.Marshal(MultiKeyManageRequest{
+		ChannelId: channel.Id,
+		Action:    "disable_key",
+		KeyIndex:  common.GetPointer(1),
+	})
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Set("id", 1)
+	ctx.Set("role", common.RoleRootUser)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/channel/manage_multi_key", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	ManageMultiKeys(ctx)
+
+	require.NoError(t, statusErr)
+	require.True(t, statusChanged)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool `json:"success"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.False(t, response.Success)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, int64(2_000_000_060), stored.ChannelInfo.MultiKeyDisabledUntil[0])
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyDisabledUntil, 1)
+}
+
 func TestSettleTestQuotaUsesTieredBilling(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
@@ -343,7 +650,30 @@ func TestResolveChannelTestUserIDUsesRequestUser(t *testing.T) {
 	require.Equal(t, 2, userID)
 }
 
+func setupAutomaticChannelSelectionTestDB(t *testing.T) {
+	t.Helper()
+
+	originalDB := model.DB
+	db, err := gorm.Open(sqlite.Open(fmt.Sprintf(
+		"file:%s?mode=memory&cache=shared",
+		strings.ReplaceAll(t.Name(), "/", "_"),
+	)), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.UpstreamManagedRoute{}))
+	model.DB = db
+
+	t.Cleanup(func() {
+		model.DB = originalDB
+		sqlDB, dbErr := db.DB()
+		if dbErr == nil {
+			require.NoError(t, sqlDB.Close())
+		}
+	})
+}
+
 func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
 	future := time.Now().Add(time.Hour).Unix()
 	planTag := "plan:support:coding"
 	deferred := &model.Channel{Id: 4, Status: common.ChannelStatusAutoDisabled, Tag: &planTag}
@@ -355,38 +685,305 @@ func TestSelectChannelsForAutomaticTestPassiveRecoveryOnlyUsesAutoDisabled(t *te
 		deferred,
 	}
 
-	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModePassiveRecovery)
+	selected, err := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModePassiveRecovery)
 
+	require.NoError(t, err)
 	require.Len(t, selected, 1)
 	require.Equal(t, 2, selected[0].Id)
 }
 
+func TestSelectChannelsForAutomaticTestPassiveRecoveryExcludesManagedPartialMultiKey(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
+	now := time.Now().Unix()
+	newPartial := func(id int, status int, disabledUntil map[int]int64) *model.Channel {
+		return &model.Channel{
+			Id:     id,
+			Key:    "key-a\nkey-b",
+			Status: status,
+			ChannelInfo: model.ChannelInfo{
+				IsMultiKey: true,
+				MultiKeyStatusList: map[int]int{
+					0: common.ChannelStatusAutoDisabled,
+				},
+				MultiKeyDisabledUntil: disabledUntil,
+			},
+		}
+	}
+	due := newPartial(21, common.ChannelStatusEnabled, map[int]int64{0: now})
+	future := newPartial(22, common.ChannelStatusEnabled, map[int]int64{0: now + 60})
+	unknown := newPartial(23, common.ChannelStatusEnabled, map[int]int64{})
+	manual := newPartial(24, common.ChannelStatusManuallyDisabled, map[int]int64{0: now})
+	managed := newPartial(25, common.ChannelStatusEnabled, map[int]int64{0: now})
+	require.NoError(t, model.DB.Create(&model.UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "partial-managed",
+		Platform:        "plan",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       managed.Id,
+		State:           model.UpstreamRouteStateActive,
+		Rank:            1,
+	}).Error)
+
+	selected, err := selectChannelsForAutomaticTest(
+		[]*model.Channel{due, future, unknown, manual, managed},
+		operation_setting.ChannelTestModePassiveRecovery,
+	)
+
+	require.NoError(t, err)
+	selectedIDs := make([]int, len(selected))
+	for index, channel := range selected {
+		selectedIDs[index] = channel.Id
+	}
+	assert.Equal(t, []int{21, 23}, selectedIDs)
+}
+
 func TestSelectChannelsForAutomaticTestDeduplicatesDuePlanDomain(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
 	past := time.Now().Add(-time.Minute).Unix()
 	codingTag := "plan:support:coding"
 	analysisTag := "plan:support:analysis"
 	ordinaryTag := "provider:support"
 	first := &model.Channel{Id: 11, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
-	first.SetOtherInfo(map[string]any{"disabled_until": past})
-	second := &model.Channel{Id: 12, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
-	second.SetOtherInfo(map[string]any{"disabled_until": past})
-	otherPlan := &model.Channel{Id: 13, Status: common.ChannelStatusAutoDisabled, Tag: &analysisTag}
-	otherPlan.SetOtherInfo(map[string]any{"disabled_until": past})
-	ordinary := &model.Channel{Id: 14, Status: common.ChannelStatusAutoDisabled, Tag: &ordinaryTag}
+	first.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-a"})
+	sameMarkedDomain := &model.Channel{Id: 12, Status: common.ChannelStatusAutoDisabled, Tag: &analysisTag}
+	sameMarkedDomain.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-a"})
+	differentMarkedDomain := &model.Channel{Id: 13, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
+	differentMarkedDomain.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-b"})
+	legacyFirst := &model.Channel{Id: 14, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
+	legacyFirst.SetOtherInfo(map[string]any{
+		"disabled_until": past,
+		"quota_domain":   codingTag,
+		"quota_type":     "plan",
+	})
+	legacySecond := &model.Channel{Id: 15, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
+	legacySecond.SetOtherInfo(map[string]any{
+		"disabled_until": past,
+		"quota_domain":   codingTag,
+		"quota_type":     "plan",
+	})
+	genericFirst := &model.Channel{Id: 16, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
+	genericFirst.SetOtherInfo(map[string]any{"disabled_until": past, "status_reason": "authentication failed"})
+	genericSecond := &model.Channel{Id: 17, Status: common.ChannelStatusAutoDisabled, Tag: &codingTag}
+	genericSecond.SetOtherInfo(map[string]any{"disabled_until": past, "status_reason": "transport failed"})
+	ordinary := &model.Channel{Id: 18, Status: common.ChannelStatusAutoDisabled, Tag: &ordinaryTag}
 	ordinary.SetOtherInfo(map[string]any{"disabled_until": past})
 
-	selected := selectChannelsForAutomaticTest(
-		[]*model.Channel{first, second, otherPlan, ordinary},
+	selected, err := selectChannelsForAutomaticTest(
+		[]*model.Channel{
+			first,
+			sameMarkedDomain,
+			differentMarkedDomain,
+			legacyFirst,
+			legacySecond,
+			genericFirst,
+			genericSecond,
+			ordinary,
+		},
 		operation_setting.ChannelTestModePassiveRecovery,
 	)
 
-	require.Len(t, selected, 3)
-	assert.Equal(t, 11, selected[0].Id)
-	assert.Equal(t, 13, selected[1].Id)
-	assert.Equal(t, 14, selected[2].Id)
+	require.NoError(t, err)
+	selectedIDs := make([]int, len(selected))
+	for i, channel := range selected {
+		selectedIDs[i] = channel.Id
+	}
+	assert.Equal(t, []int{11, 13, 14, 16, 17, 18}, selectedIDs)
+}
+
+func TestSelectChannelsForAutomaticTestPassiveRecoveryUsesOldestDomainPeer(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
+	past := time.Now().Add(-time.Minute).Unix()
+	tag := "plan:support:fairness"
+	recent := &model.Channel{Id: 11, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 200}
+	recent.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-a"})
+	older := &model.Channel{Id: 12, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 100}
+	older.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-a"})
+	higherIDTie := &model.Channel{Id: 15, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 50}
+	higherIDTie.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-b"})
+	lowerIDTie := &model.Channel{Id: 14, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 50}
+	lowerIDTie.SetOtherInfo(map[string]any{"disabled_until": past, "quota_domain_id": "domain-b"})
+	genericFirst := &model.Channel{Id: 16, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 300}
+	genericFirst.SetOtherInfo(map[string]any{"disabled_until": past, "status_reason": "authentication failed"})
+	genericSecond := &model.Channel{Id: 17, Status: common.ChannelStatusAutoDisabled, Tag: &tag, TestTime: 400}
+	genericSecond.SetOtherInfo(map[string]any{"disabled_until": past, "status_reason": "transport failed"})
+
+	selected, err := selectChannelsForAutomaticTest(
+		[]*model.Channel{
+			recent,
+			older,
+			higherIDTie,
+			lowerIDTie,
+			genericFirst,
+			genericSecond,
+		},
+		operation_setting.ChannelTestModePassiveRecovery,
+	)
+
+	require.NoError(t, err)
+	selectedIDs := make([]int, len(selected))
+	for i, channel := range selected {
+		selectedIDs[i] = channel.Id
+	}
+	assert.Equal(t, []int{12, 14, 16, 17}, selectedIDs)
+}
+
+func TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesManagedPlanQuota(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
+	past := time.Now().Add(-time.Minute).Unix()
+	future := time.Now().Add(time.Hour).Unix()
+	markedTag := "plan:managed:marked"
+	legacyTag := "plan:managed:legacy"
+	ordinaryTag := "provider:managed"
+	multiKeyTag := "plan:managed:multi-key"
+	marked := &model.Channel{Id: 31, Status: common.ChannelStatusAutoDisabled, Tag: &markedTag}
+	marked.SetOtherInfo(map[string]any{
+		"disabled_until":  past,
+		"quota_domain_id": "managed-domain",
+	})
+	legacy := &model.Channel{Id: 32, Status: common.ChannelStatusAutoDisabled, Tag: &legacyTag}
+	legacy.SetOtherInfo(map[string]any{
+		"disabled_until": past,
+		"quota_domain":   legacyTag,
+		"quota_type":     "plan",
+	})
+	ordinary := &model.Channel{Id: 33, Status: common.ChannelStatusAutoDisabled, Tag: &ordinaryTag}
+	ordinary.SetOtherInfo(map[string]any{
+		"disabled_until": past,
+		"status_reason":  "ordinary managed failure",
+	})
+	allDisabledFirst := &model.Channel{
+		Id:     34,
+		Key:    "shared-key-a\nshared-key-b",
+		Status: common.ChannelStatusAutoDisabled,
+		Tag:    &multiKeyTag,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+			},
+		},
+	}
+	allDisabledFirst.SetOtherInfo(map[string]any{"disabled_until": past})
+	allDisabledSecond := &model.Channel{
+		Id:          35,
+		Key:         allDisabledFirst.Key,
+		Status:      common.ChannelStatusAutoDisabled,
+		Tag:         &multiKeyTag,
+		ChannelInfo: allDisabledFirst.ChannelInfo,
+	}
+	allDisabledSecond.SetOtherInfo(map[string]any{"disabled_until": past})
+	notDue := &model.Channel{
+		Id:          36,
+		Key:         allDisabledFirst.Key,
+		Status:      common.ChannelStatusAutoDisabled,
+		Tag:         &multiKeyTag,
+		ChannelInfo: allDisabledFirst.ChannelInfo,
+	}
+	notDue.SetOtherInfo(map[string]any{"disabled_until": future})
+	hasEnabledKey := &model.Channel{
+		Id:     37,
+		Key:    allDisabledFirst.Key,
+		Status: common.ChannelStatusAutoDisabled,
+		Tag:    &multiKeyTag,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+			},
+		},
+	}
+	hasEnabledKey.SetOtherInfo(map[string]any{"disabled_until": past})
+	managed := []*model.Channel{
+		marked,
+		legacy,
+		ordinary,
+		allDisabledFirst,
+		allDisabledSecond,
+		notDue,
+		hasEnabledKey,
+	}
+	for i, channel := range managed {
+		require.NoError(t, model.DB.Create(&model.UpstreamManagedRoute{
+			SourceID:        int64(i + 1),
+			ExternalGroupID: fmt.Sprintf("managed-%d", channel.Id),
+			Platform:        "plan",
+			Protocol:        "openai",
+			ChannelID:       channel.Id,
+			State:           model.UpstreamRouteStateActive,
+		}).Error)
+	}
+
+	selected, err := selectChannelsForAutomaticTest(
+		managed,
+		operation_setting.ChannelTestModePassiveRecovery,
+	)
+
+	require.NoError(t, err)
+	selectedIDs := make([]int, len(selected))
+	for i, channel := range selected {
+		selectedIDs[i] = channel.Id
+	}
+	assert.Equal(t, []int{31, 32, 34, 35}, selectedIDs)
+}
+
+func TestSelectChannelsForAutomaticTestManagedFinalKeyUsesChannelDeadline(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
+	now := time.Now().Unix()
+	tag := "plan:managed:final-key-deadline"
+	channel := &model.Channel{
+		Id:     41,
+		Key:    "key-a\nkey-b",
+		Status: common.ChannelStatusAutoDisabled,
+		Tag:    &tag,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledUntil: map[int]int64{
+				0: now - 60,
+				1: now + 3_600,
+			},
+		},
+	}
+	channel.SetOtherInfo(map[string]any{"disabled_until": now + 3_600})
+	require.NoError(t, model.DB.Create(&model.UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "final-key-deadline",
+		Platform:        "plan",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           model.UpstreamRouteStateActive,
+		Rank:            1,
+	}).Error)
+
+	selected, err := selectChannelsForAutomaticTest(
+		[]*model.Channel{channel},
+		operation_setting.ChannelTestModePassiveRecovery,
+	)
+	require.NoError(t, err)
+	assert.Empty(t, selected)
+
+	channel.SetOtherInfo(map[string]any{"disabled_until": now - 1})
+	selected, err = selectChannelsForAutomaticTest(
+		[]*model.Channel{channel},
+		operation_setting.ChannelTestModePassiveRecovery,
+	)
+	require.NoError(t, err)
+	require.Len(t, selected, 1)
+	assert.Equal(t, channel.Id, selected[0].Id)
 }
 
 func TestSelectChannelsForAutomaticTestAlwaysSkipsManualDisabled(t *testing.T) {
+	setupAutomaticChannelSelectionTestDB(t)
+
 	autoBanEnabled := 1
 	manual := &model.Channel{
 		Id:      21,
@@ -400,10 +997,88 @@ func TestSelectChannelsForAutomaticTestAlwaysSkipsManualDisabled(t *testing.T) {
 		operation_setting.ChannelTestModePassiveRecovery,
 	} {
 		t.Run(mode, func(t *testing.T) {
-			selected := selectChannelsForAutomaticTest([]*model.Channel{manual}, mode)
+			selected, err := selectChannelsForAutomaticTest([]*model.Channel{manual}, mode)
+			require.NoError(t, err)
 			assert.Empty(t, selected)
 		})
 	}
+}
+
+func TestRunChannelTestTaskFailsClosedWhenManagedRouteQueryFails(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = false
+	common.LogConsumeEnabled = false
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-fail-closed":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "passive-fail-closed-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id":"chatcmpl-fail-closed",
+			"object":"chat.completion",
+			"created":1,
+			"model":"gpt-fail-closed",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer upstream.Close()
+
+	channel := model.Channel{
+		Name: "ordinary-managed-unknown", Type: constant.ChannelTypeOpenAI,
+		Key: "credential", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusAutoDisabled,
+		Models: "gpt-fail-closed", Group: "default",
+	}
+	channel.SetOtherInfo(map[string]any{
+		"disabled_until": time.Now().Add(-time.Minute).Unix(),
+		"status_reason":  "ordinary failure",
+	})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	forcedErr := errors.New("forced managed route query failure")
+	const callbackName = "test:fail_managed_route_query"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil && tx.Statement.Table == "upstream_managed_routes" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Query().Remove(callbackName))
+	})
+
+	summary, err := runChannelTestTask(
+		context.Background(),
+		operation_setting.ChannelTestModePassiveRecovery,
+		false,
+		nil,
+	)
+
+	require.ErrorIs(t, err, forcedErr)
+	assert.Zero(t, summary.Tested)
+	assert.Zero(t, requests.Load())
 }
 
 func TestNormalizeChannelTestEndpointUsesAdvancedCustomRoute(t *testing.T) {
@@ -434,6 +1109,2420 @@ func TestShouldRetryStopsAfterResponseWasWritten(t *testing.T) {
 	assert.False(t, shouldRetry(ctx, upstreamError, 3))
 }
 
+func TestShouldPrioritizePlanQuotaDisableForManagedChannel(t *testing.T) {
+	planQuotaError := relaytypes.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota. It will reset at 2026-09-30 23:59:59 +0800 CST."),
+		relaytypes.ErrorCode("AccountQuotaExceeded"),
+		http.StatusTooManyRequests,
+	)
+	remainingTokensError := relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+		Message: "You have 7 weighted tokens left",
+		Type:    "account_quota-exceeded",
+	}, http.StatusTooManyRequests)
+	wrongStatusError := relaytypes.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota."),
+		relaytypes.ErrorCode("AccountQuotaExceeded"),
+		http.StatusBadRequest,
+	)
+	wrongSemanticsError := relaytypes.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota."),
+		relaytypes.ErrorCode("rate_limit_exceeded"),
+		http.StatusTooManyRequests,
+	)
+	ordinaryManagedError := relaytypes.NewOpenAIError(
+		errors.New("upstream unavailable"),
+		relaytypes.ErrorCodeBadResponseStatusCode,
+		http.StatusBadGateway,
+	)
+
+	assert.True(t, shouldPrioritizePlanQuotaDisable(planQuotaError))
+	assert.True(t, shouldPrioritizePlanQuotaDisable(remainingTokensError))
+	assert.False(t, shouldPrioritizePlanQuotaDisable(wrongStatusError))
+	assert.False(t, shouldPrioritizePlanQuotaDisable(wrongSemanticsError))
+	assert.False(t, shouldPrioritizePlanQuotaDisable(ordinaryManagedError))
+	assert.False(t, shouldPrioritizePlanQuotaDisable(nil))
+}
+
+func TestInitialSelectedChannelPlanQuotaDisablesSharedCredentialDomain(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	common.MemoryCacheEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+	})
+
+	autoBan := 1
+	sourceTag := "plan:initial:source"
+	peerTag := "plan:initial:peer"
+	channels := []model.Channel{
+		{
+			Name: "initial-source", Key: "shared-initial-credential",
+			Status: common.ChannelStatusEnabled, Tag: &sourceTag, AutoBan: &autoBan,
+			Models: "initial-model", Group: "default",
+		},
+		{
+			Name: "initial-peer", Key: "shared-initial-credential",
+			Status: common.ChannelStatusEnabled, Tag: &peerTag, AutoBan: &autoBan,
+			Models: "initial-model", Group: "default",
+		},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	require.Nil(t, middleware.SetupContextForSelectedChannel(ctx, &channels[0], "initial-model"))
+	selected, channelErr := getChannel(ctx, &relaycommon.RelayInfo{
+		OriginModelName: "initial-model",
+	}, &service.RetryParam{})
+	require.Nil(t, channelErr)
+	require.NotNil(t, selected)
+	assert.Equal(t, sourceTag, selected.GetTag())
+	assert.False(t, selected.ChannelInfo.IsMultiKey)
+
+	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+	processChannelError(
+		ctx,
+		*relaytypes.NewChannelError(
+			selected.Id,
+			selected.Type,
+			selected.Name,
+			selected.ChannelInfo.IsMultiKey,
+			common.GetContextKeyString(ctx, constant.ContextKeyChannelKey),
+			selected.GetAutoBan(),
+		),
+		selected.GetTag(),
+		relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+			Message: quotaMessage,
+			Type:    "AccountQuotaExceeded",
+			Code:    "AccountQuotaExceeded",
+		}, http.StatusTooManyRequests),
+	)
+
+	var stored []model.Channel
+	require.NoError(t, db.Order("id").Find(&stored).Error)
+	require.Len(t, stored, 2)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[0].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored[1].Status)
+	assert.NotEmpty(t, stored[0].GetOtherInfo()["quota_domain_id"])
+	assert.Equal(t, stored[0].GetOtherInfo()["quota_domain_id"], stored[1].GetOtherInfo()["quota_domain_id"])
+}
+
+func TestInitialSelectedTaskMultiKeyPlanQuotaDisablesOnlyPrimaryKey(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	originalRetryTimes := common.RetryTimes
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	common.RetryTimes = 0
+	common.MemoryCacheEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	t.Cleanup(func() {
+		common.RetryTimes = originalRetryTimes
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+	})
+
+	autoBan := 1
+	tag := "plan:initial:multi-key"
+	channel := model.Channel{
+		Name: "initial-multi-key", Key: "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "initial-task-model", Group: "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
+	require.Nil(t, middleware.SetupContextForSelectedChannel(ctx, &channel, "initial-task-model"))
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "initial-task-model",
+		TaskRelayInfo:   &relaycommon.TaskRelayInfo{},
+	}
+	selected, channelErr := getChannel(ctx, relayInfo, &service.RetryParam{})
+	require.Nil(t, channelErr)
+	require.NotNil(t, selected)
+	assert.Equal(t, tag, selected.GetTag())
+	assert.True(t, selected.ChannelInfo.IsMultiKey)
+
+	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+	submitCount := 0
+	outcome, taskErr := executeTaskSubmissionWith(
+		ctx,
+		relayInfo,
+		func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError) {
+			submitCount++
+			return nil, &taskdto.TaskError{
+				Code:       "AccountQuotaExceeded",
+				Message:    quotaMessage,
+				StatusCode: http.StatusTooManyRequests,
+				Error:      errors.New(quotaMessage),
+			}
+		},
+	)
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, 1, submitCount)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+}
+
+func TestExecuteTaskSubmissionPreservesPlanQuotaErrorForChannelIsolation(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	originalRetryTimes := common.RetryTimes
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	originalDisableKeywords := operation_setting.AutomaticDisableKeywords
+	originalDisableStatusCodes := operation_setting.AutomaticDisableStatusCodeRanges
+	common.RetryTimes = 0
+	common.MemoryCacheEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	operation_setting.AutomaticDisableKeywords = []string{"unrelated"}
+	operation_setting.AutomaticDisableStatusCodeRanges = nil
+	t.Cleanup(func() {
+		common.RetryTimes = originalRetryTimes
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		operation_setting.AutomaticDisableKeywords = originalDisableKeywords
+		operation_setting.AutomaticDisableStatusCodeRanges = originalDisableStatusCodes
+	})
+
+	autoBan := 1
+	submitTag := "plan:task:submit"
+	peerTag := "plan:task:peer"
+	channels := []model.Channel{
+		{
+			Name: "task-submit-source", Key: "shared-task-credential",
+			Status: common.ChannelStatusEnabled, Tag: &submitTag, AutoBan: &autoBan,
+			Models: "task-model", Group: "default",
+		},
+		{
+			Name: "task-submit-peer", Key: "shared-task-credential",
+			Status: common.ChannelStatusEnabled, Tag: &peerTag, AutoBan: &autoBan,
+			Models: "task-model", Group: "default",
+		},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
+	common.SetContextKey(ctx, constant.ContextKeyChannelKey, channels[0].Key)
+	common.SetContextKey(ctx, constant.ContextKeyChannelTag, channels[0].GetTag())
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "task-model",
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{
+			LockedChannel: &channels[0],
+		},
+	}
+	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+
+	outcome, taskErr := executeTaskSubmissionWith(
+		ctx,
+		relayInfo,
+		func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError) {
+			return nil, service.TaskErrorFromAPIError(relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+				Message: quotaMessage,
+				Type:    "AccountQuotaExceeded",
+				Code:    "other_error",
+			}, http.StatusTooManyRequests))
+		},
+	)
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "other_error", taskErr.Code)
+	encoded, err := common.Marshal(taskErr)
+	require.NoError(t, err)
+	var response map[string]any
+	require.NoError(t, common.Unmarshal(encoded, &response))
+	assert.Equal(t, "AccountQuotaExceeded", response["type"])
+	var storedChannels []model.Channel
+	require.NoError(t, db.Order("id").Find(&storedChannels).Error)
+	require.Len(t, storedChannels, 2)
+	firstInfo := storedChannels[0].GetOtherInfo()
+	secondInfo := storedChannels[1].GetOtherInfo()
+	assert.Equal(t, common.ChannelStatusAutoDisabled, storedChannels[0].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, storedChannels[1].Status)
+	assert.NotEmpty(t, firstInfo["quota_generation"])
+	assert.Equal(t, firstInfo["quota_generation"], secondInfo["quota_generation"])
+}
+
+func TestExecuteTaskSubmissionDoesNotClassifyOrdinary429AsPlanQuota(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	originalRetryTimes := common.RetryTimes
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	originalDisableKeywords := operation_setting.AutomaticDisableKeywords
+	originalDisableStatusCodes := operation_setting.AutomaticDisableStatusCodeRanges
+	common.RetryTimes = 0
+	common.MemoryCacheEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	operation_setting.AutomaticDisableKeywords = []string{"unrelated"}
+	operation_setting.AutomaticDisableStatusCodeRanges = nil
+	t.Cleanup(func() {
+		common.RetryTimes = originalRetryTimes
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		operation_setting.AutomaticDisableKeywords = originalDisableKeywords
+		operation_setting.AutomaticDisableStatusCodeRanges = originalDisableStatusCodes
+	})
+
+	autoBan := 1
+	tag := "plan:task:ordinary-429"
+	channel := model.Channel{
+		Name: "task-ordinary-429", Key: "ordinary-credential",
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "task-model", Group: "default",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
+	common.SetContextKey(ctx, constant.ContextKeyChannelKey, channel.Key)
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "task-model",
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{
+			LockedChannel: &channel,
+		},
+	}
+	const quotaLikeMessage = "You have exceeded the monthly usage quota."
+	ordinaryTaskErr := service.TaskErrorWrapper(
+		errors.New(quotaLikeMessage),
+		"rate_limit_exceeded",
+		http.StatusTooManyRequests,
+	)
+	encoded, err := common.Marshal(ordinaryTaskErr)
+	require.NoError(t, err)
+	var response map[string]any
+	require.NoError(t, common.Unmarshal(encoded, &response))
+	assert.NotContains(t, response, "type")
+
+	outcome, taskErr := executeTaskSubmissionWith(
+		ctx,
+		relayInfo,
+		func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError) {
+			return nil, ordinaryTaskErr
+		},
+	)
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, "rate_limit_exceeded", taskErr.Code)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.NotContains(t, stored.GetOtherInfo(), "quota_domain_id")
+}
+
+func TestLockedTaskRetryStopsAfterSingleKeyPlanQuotaDisable(t *testing.T) {
+	for _, memoryCacheEnabled := range []bool{false, true} {
+		name := "without memory cache"
+		if memoryCacheEnabled {
+			name = "with memory cache"
+		}
+		t.Run(name, func(t *testing.T) {
+			testLockedTaskRetryStopsAfterSingleKeyPlanQuotaDisable(t, memoryCacheEnabled)
+		})
+	}
+}
+
+func testLockedTaskRetryStopsAfterSingleKeyPlanQuotaDisable(t *testing.T, memoryCacheEnabled bool) {
+	db := setupModelListControllerTestDB(t)
+
+	originalRetryTimes := common.RetryTimes
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	common.RetryTimes = 1
+	common.MemoryCacheEnabled = memoryCacheEnabled
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	t.Cleanup(func() {
+		common.RetryTimes = originalRetryTimes
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+	})
+
+	autoBan := 1
+	tag := "plan:locked:single"
+	channel := model.Channel{
+		Name: "locked-single", Key: "single-key",
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "locked-task-model", Group: "default",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	if memoryCacheEnabled {
+		model.InitChannelCache()
+	}
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
+	require.Nil(t, middleware.SetupContextForSelectedChannel(ctx, &channel, "locked-task-model"))
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "locked-task-model",
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{
+			LockedChannel: &channel,
+		},
+	}
+	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+	submitCount := 0
+
+	outcome, taskErr := executeTaskSubmissionWith(
+		ctx,
+		relayInfo,
+		func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError) {
+			submitCount++
+			return nil, service.TaskErrorFromAPIError(relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+				Message: quotaMessage,
+				Type:    "AccountQuotaExceeded",
+				Code:    "other_error",
+			}, http.StatusTooManyRequests))
+		},
+	)
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, 1, submitCount)
+	assert.True(t, taskErr.LocalError)
+	assert.Equal(t, "setup_locked_channel_disabled", taskErr.Code)
+	assert.Contains(t, taskErr.Message, "disabled")
+	refreshed, ok := relayInfo.LockedChannel.(*model.Channel)
+	require.True(t, ok)
+	if memoryCacheEnabled {
+		cachedChannel, err := model.CacheGetChannel(channel.Id)
+		require.NoError(t, err)
+		assert.NotSame(t, cachedChannel, refreshed)
+	}
+	assert.Equal(t, common.ChannelStatusAutoDisabled, refreshed.Status)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+}
+
+func TestLockedTaskRetryStopsWhenPlanQuotaDisablePersistenceFails(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	originalRetryTimes := common.RetryTimes
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	common.RetryTimes = 1
+	common.MemoryCacheEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	t.Cleanup(func() {
+		common.RetryTimes = originalRetryTimes
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+	})
+
+	autoBan := 1
+	tag := "plan:locked:persistence-failure"
+	channel := model.Channel{
+		Name: "locked-persistence-failure", Key: "locked-persistence-key",
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "locked-persistence-model", Group: "default",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	forcedErr := errors.New("forced Plan quota ability persistence failure")
+	const callbackName = "test:locked_task_plan_quota_persistence_failure"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil &&
+			tx.Statement.Schema != nil &&
+			tx.Statement.Schema.Name == "Ability" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Update().Remove(callbackName))
+	})
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
+	require.Nil(t, middleware.SetupContextForSelectedChannel(ctx, &channel, "locked-persistence-model"))
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "locked-persistence-model",
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{
+			LockedChannel: &channel,
+		},
+	}
+	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+	submitCount := 0
+
+	outcome, taskErr := executeTaskSubmissionWith(
+		ctx,
+		relayInfo,
+		func(*gin.Context, *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError) {
+			submitCount++
+			return nil, service.TaskErrorFromAPIError(relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+				Message: quotaMessage,
+				Type:    "AccountQuotaExceeded",
+				Code:    "AccountQuotaExceeded",
+			}, http.StatusTooManyRequests))
+		},
+	)
+
+	assert.Nil(t, outcome)
+	require.NotNil(t, taskErr)
+	assert.Equal(t, 1, submitCount)
+	assert.True(t, taskErr.LocalError)
+	assert.Equal(t, string(relaytypes.ErrorCodeUpdateDataError), taskErr.Code)
+	assert.ErrorIs(t, taskErr.Error, forcedErr)
+	require.NotNil(t, relayInfo.LastError)
+	assert.Equal(t, relaytypes.ErrorCodeUpdateDataError, relayInfo.LastError.GetErrorCode())
+	assert.True(t, relaytypes.IsSkipRetryError(relayInfo.LastError))
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.NotContains(t, stored.GetOtherInfo(), "quota_domain_id")
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+	hash, ok := model.PlanQuotaDomainHash(channel.Key)
+	require.True(t, ok)
+	var authority model.PlanQuotaDomain
+	require.NoError(t, db.First(&authority, "credential_hash = ?", hash).Error)
+	assert.Equal(t, model.PlanQuotaDomainStateActive, authority.State)
+}
+
+func TestLockedTaskRetryRefreshesMultiKeyAndUsesRemainingKey(t *testing.T) {
+	for _, memoryCacheEnabled := range []bool{false, true} {
+		name := "without memory cache"
+		if memoryCacheEnabled {
+			name = "with memory cache"
+		}
+		t.Run(name, func(t *testing.T) {
+			testLockedTaskRetryRefreshesMultiKeyAndUsesRemainingKey(t, memoryCacheEnabled)
+		})
+	}
+}
+
+func testLockedTaskRetryRefreshesMultiKeyAndUsesRemainingKey(t *testing.T, memoryCacheEnabled bool) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.Task{}))
+
+	originalRetryTimes := common.RetryTimes
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	common.RetryTimes = 1
+	common.MemoryCacheEnabled = memoryCacheEnabled
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	common.LogConsumeEnabled = false
+	t.Cleanup(func() {
+		common.RetryTimes = originalRetryTimes
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+	})
+
+	autoBan := 1
+	tag := "plan:locked:multi"
+	channel := model.Channel{
+		Name: "locked-multi", Key: "key-a\nkey-b",
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "locked-task-model", Group: "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	if memoryCacheEnabled {
+		model.InitChannelCache()
+	}
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/video/generations", strings.NewReader(`{}`))
+	require.Nil(t, middleware.SetupContextForSelectedChannel(ctx, &channel, "locked-task-model"))
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "locked-task-model",
+		TaskRelayInfo: &relaycommon.TaskRelayInfo{
+			PublicTaskID:  "task_locked_multi",
+			LockedChannel: &channel,
+		},
+	}
+	const quotaMessage = "You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC."
+	usedKeys := make([]string, 0, 2)
+
+	outcome, taskErr := executeTaskSubmissionWith(
+		ctx,
+		relayInfo,
+		func(c *gin.Context, info *relaycommon.RelayInfo) (*relay.TaskSubmitResult, *taskdto.TaskError) {
+			info.InitChannelMeta(c)
+			usingKey := common.GetContextKeyString(c, constant.ContextKeyChannelKey)
+			usedKeys = append(usedKeys, usingKey)
+			if usingKey == "key-a" {
+				return nil, service.TaskErrorFromAPIError(relaytypes.WithOpenAIError(relaytypes.OpenAIError{
+					Message: quotaMessage,
+					Type:    "AccountQuotaExceeded",
+					Code:    "other_error",
+				}, http.StatusTooManyRequests))
+			}
+			return &relay.TaskSubmitResult{
+				UpstreamTaskID: "upstream-locked-multi",
+				Platform:       constant.TaskPlatform("test"),
+			}, nil
+		},
+	)
+
+	require.Nil(t, taskErr)
+	require.NotNil(t, outcome)
+	assert.Equal(t, []string{"key-a", "key-b"}, usedKeys)
+	refreshed, ok := relayInfo.LockedChannel.(*model.Channel)
+	require.True(t, ok)
+	if memoryCacheEnabled {
+		cachedChannel, err := model.CacheGetChannel(channel.Id)
+		require.NoError(t, err)
+		assert.NotSame(t, cachedChannel, refreshed)
+	}
+	assert.NotSame(t, &channel, refreshed)
+	assert.Equal(t, common.ChannelStatusEnabled, refreshed.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, refreshed.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, refreshed.ChannelInfo.MultiKeyStatusList, 1)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+}
+
+func TestProcessChannelErrorConsumesPlanQuotaWithoutMutationWhenAutomaticDisableIsOff(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.UpstreamManagedRoute{}))
+
+	originalAutomaticDisable := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	orchestrationSetting := operation_setting.GetUpstreamOrchestrationSetting()
+	originalOrchestrationSetting := *orchestrationSetting
+	common.AutomaticDisableChannelEnabled = false
+	constant.ErrorLogEnabled = false
+	orchestrationSetting.Enabled = true
+	orchestrationSetting.FailureThreshold = 1
+	orchestrationSetting.FailureWindowMinutes = 5
+	t.Cleanup(func() {
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisable
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		*orchestrationSetting = originalOrchestrationSetting
+	})
+
+	tag := "plan:managed:global-disable-off"
+	channel := model.Channel{
+		Name:   "managed-plan-global-disable-off",
+		Key:    "credential",
+		Status: common.ChannelStatusEnabled,
+		Tag:    &tag,
+		Models: "gpt-3.5-turbo",
+		Group:  "default",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(db))
+	route := model.UpstreamManagedRoute{
+		SourceID:        1,
+		ExternalGroupID: "managed-plan-global-disable-off",
+		Platform:        "openai",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       channel.Id,
+		State:           model.UpstreamRouteStateActive,
+	}
+	require.NoError(t, db.Create(&route).Error)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	service.SetRelayAsyncRunner(ctx, func(task func()) {
+		task()
+	})
+	apiError := relaytypes.NewOpenAIError(
+		errors.New("You have exceeded the monthly usage quota. It will reset at 2026-09-30 23:59:59 +0800 CST."),
+		relaytypes.ErrorCode("AccountQuotaExceeded"),
+		http.StatusTooManyRequests,
+	)
+	processChannelError(ctx, relaytypes.ChannelError{
+		ChannelId:   channel.Id,
+		ChannelName: channel.Name,
+		AutoBan:     true,
+	}, tag, apiError)
+
+	var storedChannel model.Channel
+	require.NoError(t, db.First(&storedChannel, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, storedChannel.Status)
+	assert.Empty(t, storedChannel.OtherInfo)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+	var storedRoute model.UpstreamManagedRoute
+	require.NoError(t, db.First(&storedRoute, route.ID).Error)
+	assert.Equal(t, model.UpstreamRouteStateActive, storedRoute.State)
+	assert.Zero(t, storedRoute.ConsecutiveFailures)
+	assert.Zero(t, storedRoute.ConsecutiveSuccesses)
+	assert.Zero(t, storedRoute.FailureWindowStart)
+	assert.Zero(t, storedRoute.LastFailureAt)
+	assert.Empty(t, storedRoute.LastReason)
+}
+
+func TestChannelForHealthCheckCountsOnlyCommittedRecoveries(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticEnableChannelEnabled := common.AutomaticEnableChannelEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = false
+	common.LogConsumeEnabled = false
+	common.AutomaticEnableChannelEnabled = true
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-health-recovery":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticEnableChannelEnabled = originalAutomaticEnableChannelEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "health-recovery-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id":"chatcmpl-health",
+			"object":"chat.completion",
+			"created":1,
+			"model":"gpt-health-recovery",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer upstream.Close()
+
+	autoBan := 1
+	tag := "plan:support:health-count"
+	quotaInfo := map[string]any{
+		"disabled_until": time.Now().Add(-time.Minute).Unix(),
+		"quota_domain":   tag,
+		"quota_type":     "plan",
+	}
+	channels := []model.Channel{
+		{
+			Name: "health-source", Type: constant.ChannelTypeOpenAI, Key: "credential",
+			BaseURL: &upstream.URL, Status: common.ChannelStatusAutoDisabled,
+			Tag: &tag, AutoBan: &autoBan, Models: "gpt-health-recovery", Group: "default",
+		},
+		{
+			Name: "health-peer", Type: constant.ChannelTypeOpenAI, Key: "credential",
+			BaseURL: &upstream.URL, Status: common.ChannelStatusAutoDisabled,
+			Tag: &tag, AutoBan: &autoBan, Models: "gpt-health-recovery", Group: "default",
+		},
+	}
+	channels[0].SetOtherInfo(quotaInfo)
+	channels[1].SetOtherInfo(quotaInfo)
+	require.NoError(t, db.Create(&channels).Error)
+	for i := range channels {
+		require.NoError(t, channels[i].AddAbilities(nil))
+	}
+
+	summary := testChannelForHealthCheck(context.Background(), &channels[0], user.Id, false, 10_000_000)
+	staleSummary := testChannelForHealthCheck(context.Background(), &channels[0], user.Id, false, 10_000_000)
+
+	assert.Equal(t, 2, summary.Enabled)
+	assert.Zero(t, staleSummary.Enabled)
+}
+
+func TestChannelForHealthCheckDoesNotCountRolledBackPlanQuotaDisable(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticDisableChannelEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = false
+	common.LogConsumeEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-health-disable-rollback":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableChannelEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "health-disable-rollback-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{
+			"error":{
+				"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
+				"type":"AccountQuotaExceeded",
+				"code":"AccountQuotaExceeded"
+			}
+		}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	autoBan := 1
+	tag := "plan:health:disable-rollback"
+	channel := model.Channel{
+		Name: "health-disable-rollback", Type: constant.ChannelTypeOpenAI,
+		Key: "health-disable-rollback-key", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "gpt-health-disable-rollback", Group: "default",
+	}
+	channel.SetOtherInfo(map[string]any{"owner": "before"})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	forcedErr := errors.New("forced health-check Plan quota ability failure")
+	const callbackName = "test:health_check_plan_quota_disable_rollback"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil &&
+			tx.Statement.Schema != nil &&
+			tx.Statement.Schema.Name == "Ability" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Update().Remove(callbackName))
+	})
+
+	summary := testChannelForHealthCheck(
+		context.Background(),
+		&channel,
+		user.Id,
+		true,
+		10_000_000,
+	)
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1}, summary)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, channel.OtherInfo, stored.OtherInfo)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+	hash, ok := model.PlanQuotaDomainHash(channel.Key)
+	require.True(t, ok)
+	var authority model.PlanQuotaDomain
+	require.NoError(t, db.First(&authority, "credential_hash = ?", hash).Error)
+	assert.Equal(t, model.PlanQuotaDomainStateActive, authority.State)
+}
+
+func runHealthDisableOutcome(
+	t *testing.T,
+	testName string,
+	key string,
+	tag string,
+	channelInfo model.ChannelInfo,
+	statusCode int,
+	responseBody string,
+	beforeResponse func(*gorm.DB, model.Channel) error,
+) (channelTestSummary, model.Channel, model.Ability) {
+	t.Helper()
+
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticDisableChannelEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = false
+	common.LogConsumeEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	modelName := "gpt-health-disable-" + testName
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(
+		fmt.Sprintf(`{"%s":1}`, modelName),
+	))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableChannelEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "health-disable-" + testName + "-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	autoBan := 1
+	channel := model.Channel{
+		Name: "health-disable-" + testName, Type: constant.ChannelTypeOpenAI,
+		Key: key, Status: common.ChannelStatusEnabled,
+		Tag: &tag, AutoBan: &autoBan,
+		Models: modelName, Group: "default",
+		ChannelInfo: channelInfo,
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	if channelInfo.IsMultiKey {
+		require.NoError(t, db.Model(&model.Channel{}).
+			Where("id = ?", channel.Id).
+			Update("channel_info", channelInfo).Error)
+		require.NoError(t, db.First(&channel, channel.Id).Error)
+		require.Equal(t, channelInfo, channel.ChannelInfo)
+	}
+
+	mutationErrors := make(chan error, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if beforeResponse != nil {
+			mutationErrors <- beforeResponse(db, channel)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(statusCode)
+		_, _ = fmt.Fprint(w, responseBody)
+	}))
+	t.Cleanup(upstream.Close)
+	channel.BaseURL = &upstream.URL
+	require.NoError(t, db.Model(&model.Channel{}).
+		Where("id = ?", channel.Id).
+		Update("base_url", upstream.URL).Error)
+
+	summary := testChannelForHealthCheck(
+		context.Background(),
+		&channel,
+		user.Id,
+		true,
+		10_000_000,
+	)
+	if beforeResponse != nil {
+		require.NoError(t, <-mutationErrors)
+	}
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	return summary, stored, ability
+}
+
+func runPlanQuotaHealthDisableOutcome(
+	t *testing.T,
+	testName string,
+	key string,
+	channelInfo model.ChannelInfo,
+	beforeResponse func(*gorm.DB, model.Channel) error,
+) (channelTestSummary, model.Channel, model.Ability) {
+	t.Helper()
+	return runHealthDisableOutcome(
+		t,
+		testName,
+		key,
+		"plan:health:disable-"+testName,
+		channelInfo,
+		http.StatusTooManyRequests,
+		`{
+			"error":{
+				"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
+				"type":"AccountQuotaExceeded",
+				"code":"AccountQuotaExceeded"
+			}
+		}`,
+		beforeResponse,
+	)
+}
+
+func TestChannelForHealthCheckCountsCommittedEmptyCredentialPlanQuotaDisable(t *testing.T) {
+	summary, stored, ability := runPlanQuotaHealthDisableOutcome(
+		t,
+		"empty-credential",
+		"",
+		model.ChannelInfo{},
+		nil,
+	)
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1, Disabled: 1}, summary)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	assert.False(t, ability.Enabled)
+}
+
+func TestChannelForHealthCheckCountsCommittedFinalMultiKeyPlanQuotaDisable(t *testing.T) {
+	summary, stored, ability := runPlanQuotaHealthDisableOutcome(
+		t,
+		"final-multi-key",
+		"final-key\nalready-disabled",
+		model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+		},
+		func(db *gorm.DB, channel model.Channel) error {
+			channel.ChannelInfo.MultiKeyStatusList = map[int]int{
+				1: common.ChannelStatusAutoDisabled,
+			}
+			return db.Model(&model.Channel{}).
+				Where("id = ?", channel.Id).
+				Update("channel_info", channel.ChannelInfo).Error
+		},
+	)
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1, Disabled: 1}, summary)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[1])
+	assert.False(t, ability.Enabled)
+}
+
+func TestChannelForHealthCheckDoesNotCountConcurrentUnrelatedDisable(t *testing.T) {
+	summary, stored, ability := runPlanQuotaHealthDisableOutcome(
+		t,
+		"concurrent-unrelated",
+		"concurrent-unrelated-key",
+		model.ChannelInfo{},
+		func(db *gorm.DB, channel model.Channel) error {
+			return db.Model(&model.Channel{}).
+				Where("id = ?", channel.Id).
+				Update("status", common.ChannelStatusAutoDisabled).Error
+		},
+	)
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1}, summary)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	assert.NotContains(t, stored.GetOtherInfo(), "quota_domain_id")
+	assert.True(t, ability.Enabled)
+}
+
+func runGenericHealthDisableOutcome(
+	t *testing.T,
+	testName string,
+	beforeResponse func(*gorm.DB, model.Channel) error,
+) (channelTestSummary, model.Channel, model.Ability) {
+	t.Helper()
+	originalDisableKeywords := operation_setting.AutomaticDisableKeywords
+	originalDisableStatusCodes := operation_setting.AutomaticDisableStatusCodeRanges
+	operation_setting.AutomaticDisableKeywords = []string{"generic health disable"}
+	operation_setting.AutomaticDisableStatusCodeRanges = nil
+	t.Cleanup(func() {
+		operation_setting.AutomaticDisableKeywords = originalDisableKeywords
+		operation_setting.AutomaticDisableStatusCodeRanges = originalDisableStatusCodes
+	})
+	return runHealthDisableOutcome(
+		t,
+		"generic-"+testName,
+		"generic-health-key",
+		"provider:generic-health",
+		model.ChannelInfo{},
+		http.StatusBadRequest,
+		`{
+			"error":{
+				"message":"generic health disable",
+				"type":"upstream_error",
+				"code":"invalid_request"
+			}
+		}`,
+		beforeResponse,
+	)
+}
+
+func TestChannelForHealthCheckCountsCommittedGenericDisable(t *testing.T) {
+	summary, stored, ability := runGenericHealthDisableOutcome(t, "committed", nil)
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1, Disabled: 1}, summary)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	assert.False(t, ability.Enabled)
+}
+
+func TestChannelForHealthCheckDoesNotCountRolledBackGenericDisable(t *testing.T) {
+	updateReached := make(chan struct{}, 1)
+	const callbackName = "test:health_check_generic_disable_rollback"
+	summary, stored, ability := runGenericHealthDisableOutcome(
+		t,
+		"rollback",
+		func(db *gorm.DB, _ model.Channel) error {
+			require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement != nil &&
+					tx.Statement.Schema != nil &&
+					tx.Statement.Schema.Name == "Ability" {
+					select {
+					case updateReached <- struct{}{}:
+					default:
+					}
+					tx.AddError(errors.New("forced generic health-check ability failure"))
+				}
+			}))
+			t.Cleanup(func() {
+				require.NoError(t, db.Callback().Update().Remove(callbackName))
+			})
+			return nil
+		},
+	)
+	select {
+	case <-updateReached:
+	case <-time.After(time.Second):
+		t.Fatal("generic disable did not reach the injected ability failure")
+	}
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1}, summary)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.True(t, ability.Enabled)
+}
+
+func TestChannelForHealthCheckDoesNotCountConcurrentGenericDisable(t *testing.T) {
+	summary, stored, ability := runGenericHealthDisableOutcome(
+		t,
+		"concurrent-noop",
+		func(db *gorm.DB, channel model.Channel) error {
+			return db.Model(&model.Channel{}).
+				Where("id = ?", channel.Id).
+				Update("status", common.ChannelStatusAutoDisabled).Error
+		},
+	)
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1}, summary)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	assert.True(t, ability.Enabled)
+}
+
+func TestChannelForHealthCheckDoesNotCountManagedGenericFailure(t *testing.T) {
+	orchestration := operation_setting.GetUpstreamOrchestrationSetting()
+	originalOrchestration := *orchestration
+	orchestration.Enabled = true
+	orchestration.FailureThreshold = 3
+	originalDisableKeywords := operation_setting.AutomaticDisableKeywords
+	originalDisableStatusCodes := operation_setting.AutomaticDisableStatusCodeRanges
+	operation_setting.AutomaticDisableKeywords = nil
+	operation_setting.AutomaticDisableStatusCodeRanges = []operation_setting.StatusCodeRange{{
+		Start: http.StatusUnauthorized,
+		End:   http.StatusUnauthorized,
+	}}
+	t.Cleanup(func() {
+		*orchestration = originalOrchestration
+		operation_setting.AutomaticDisableKeywords = originalDisableKeywords
+		operation_setting.AutomaticDisableStatusCodeRanges = originalDisableStatusCodes
+	})
+
+	var database *gorm.DB
+	var routeID int64
+	summary, stored, ability := runHealthDisableOutcome(
+		t,
+		"managed-threshold",
+		"generic-health-key",
+		"provider:generic-health",
+		model.ChannelInfo{},
+		http.StatusUnauthorized,
+		`{
+			"error":{
+				"message":"managed generic health failure",
+				"type":"upstream_error",
+				"code":"invalid_api_key"
+			}
+		}`,
+		func(db *gorm.DB, channel model.Channel) error {
+			route := model.UpstreamManagedRoute{
+				SourceID:        1,
+				ExternalGroupID: "generic-health-managed",
+				Platform:        "openai",
+				Protocol:        model.UpstreamProtocolOpenAI,
+				ChannelID:       channel.Id,
+				State:           model.UpstreamRouteStateActive,
+			}
+			if err := db.Create(&route).Error; err != nil {
+				return err
+			}
+			database = db
+			routeID = route.ID
+			return nil
+		},
+	)
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1}, summary)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.True(t, ability.Enabled)
+	require.Eventually(t, func() bool {
+		var route model.UpstreamManagedRoute
+		return database.First(&route, routeID).Error == nil &&
+			route.ConsecutiveFailures == 1
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestChannelForHealthCheckCountsCommittedSingleKeyPlanQuotaDisableWithTrailingNewline(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticDisableChannelEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = false
+	common.LogConsumeEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-health-disable-newline":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableChannelEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "health-disable-newline-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	requestKeys := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestKeys <- strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{
+			"error":{
+				"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
+				"type":"AccountQuotaExceeded",
+				"code":"AccountQuotaExceeded"
+			}
+		}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	autoBan := 1
+	tag := "plan:health:disable-newline"
+	channel := model.Channel{
+		Name: "health-disable-newline", Type: constant.ChannelTypeOpenAI,
+		Key: "health-disable-newline-key\n", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "gpt-health-disable-newline", Group: "default",
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	summary := testChannelForHealthCheck(
+		context.Background(),
+		&channel,
+		user.Id,
+		true,
+		10_000_000,
+	)
+
+	require.Len(t, requestKeys, 1)
+	assert.Equal(t, "health-disable-newline-key", <-requestKeys)
+	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1, Disabled: 1}, summary)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+}
+
+func TestChannelForHealthCheckDoesNotCountPartialPlanQuotaDisableAsDisabledChannel(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticDisableChannelEnabled := common.AutomaticDisableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = false
+	common.LogConsumeEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-health-partial-disable":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableChannelEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "health-partial-disable-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	requestKeys := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestKeys <- strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{
+			"error":{
+				"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
+				"type":"AccountQuotaExceeded",
+				"code":"AccountQuotaExceeded"
+			}
+		}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	autoBan := 1
+	tag := "plan:health:partial-disable"
+	channel := model.Channel{
+		Name: "health-partial-disable", Type: constant.ChannelTypeOpenAI,
+		Key: "quota-key\nenabled-key", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "gpt-health-partial-disable", Group: "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	summary := testChannelForHealthCheck(
+		context.Background(),
+		&channel,
+		user.Id,
+		true,
+		10_000_000,
+	)
+
+	require.Len(t, requestKeys, 1)
+	assert.Equal(t, "quota-key", <-requestKeys)
+	assert.Equal(t, 1, summary.Tested)
+	assert.Equal(t, 1, summary.Failed)
+	assert.Zero(t, summary.Disabled)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+}
+
+func TestChannelForHealthCheckDoesNotCountStalePlanQuotaDisable(t *testing.T) {
+	tests := []struct {
+		name         string
+		key          string
+		rotatedKey   string
+		rotateTag    bool
+		channelInfo  model.ChannelInfo
+		assertStored func(*testing.T, model.Channel)
+	}{
+		{
+			name:       "single-key identity rotates",
+			key:        "stale-single-key",
+			rotatedKey: "rotated-single-key",
+			rotateTag:  true,
+			assertStored: func(t *testing.T, stored model.Channel) {
+				t.Helper()
+				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+				assert.Empty(t, stored.ChannelInfo.MultiKeyStatusList)
+				assert.Empty(t, stored.OtherInfo)
+			},
+		},
+		{
+			name:       "partial multi-key credential rotates while channel stays enabled",
+			key:        "stale-multi-key\nenabled-peer-key",
+			rotatedKey: "rotated-multi-key\nenabled-peer-key",
+			channelInfo: model.ChannelInfo{
+				IsMultiKey:   true,
+				MultiKeySize: 2,
+				MultiKeyStatusList: map[int]int{
+					1: common.ChannelStatusManuallyDisabled,
+				},
+			},
+			assertStored: func(t *testing.T, stored model.Channel) {
+				t.Helper()
+				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+				assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 0)
+				assert.Equal(t, common.ChannelStatusManuallyDisabled, stored.ChannelInfo.MultiKeyStatusList[1])
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			originalMemoryCacheEnabled := common.MemoryCacheEnabled
+			originalLogConsumeEnabled := common.LogConsumeEnabled
+			originalAutomaticDisableChannelEnabled := common.AutomaticDisableChannelEnabled
+			originalErrorLogEnabled := constant.ErrorLogEnabled
+			originalModelRatios := ratio_setting.ModelRatio2JSONString()
+			originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+			common.MemoryCacheEnabled = false
+			common.LogConsumeEnabled = false
+			common.AutomaticDisableChannelEnabled = true
+			constant.ErrorLogEnabled = false
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-health-stale-plan":1}`))
+			require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = originalMemoryCacheEnabled
+				common.LogConsumeEnabled = originalLogConsumeEnabled
+				common.AutomaticDisableChannelEnabled = originalAutomaticDisableChannelEnabled
+				constant.ErrorLogEnabled = originalErrorLogEnabled
+				require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+				require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+			})
+
+			user := model.User{
+				Username: "health-stale-plan-root",
+				Role:     common.RoleRootUser,
+				Status:   common.UserStatusEnabled,
+				Group:    "default",
+				Quota:    1_000_000,
+			}
+			require.NoError(t, db.Create(&user).Error)
+
+			autoBan := 1
+			tag := "plan:health:stale-identity"
+			channel := model.Channel{
+				Name: "health-stale-plan", Type: constant.ChannelTypeOpenAI,
+				Key: testCase.key, Status: common.ChannelStatusEnabled,
+				Tag: &tag, AutoBan: &autoBan,
+				Models: "gpt-health-stale-plan", Group: "default",
+				ChannelInfo: testCase.channelInfo,
+			}
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+
+			requestKeys := make(chan string, 1)
+			mutationErrors := make(chan error, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				requestKeys <- strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+				updates := map[string]any{"key": testCase.rotatedKey}
+				if testCase.rotateTag {
+					updates["tag"] = "plan:health:rotated-identity"
+				}
+				mutationErrors <- db.Model(&model.Channel{}).
+					Where("id = ?", channel.Id).
+					Updates(updates).Error
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = fmt.Fprint(w, `{
+					"error":{
+						"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
+						"type":"AccountQuotaExceeded",
+						"code":"AccountQuotaExceeded"
+					}
+				}`)
+			}))
+			t.Cleanup(upstream.Close)
+			channel.BaseURL = &upstream.URL
+			require.NoError(t, db.Model(&model.Channel{}).
+				Where("id = ?", channel.Id).
+				Update("base_url", upstream.URL).Error)
+
+			summary := testChannelForHealthCheck(
+				context.Background(),
+				&channel,
+				user.Id,
+				true,
+				10_000_000,
+			)
+
+			require.NoError(t, <-mutationErrors)
+			require.Len(t, requestKeys, 1)
+			assert.Equal(t, strings.Split(testCase.key, "\n")[0], <-requestKeys)
+			assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1}, summary)
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			assert.Equal(t, testCase.rotatedKey, stored.Key)
+			if testCase.rotateTag {
+				assert.Equal(t, "plan:health:rotated-identity", stored.GetTag())
+			}
+			testCase.assertStored(t, stored)
+		})
+	}
+}
+
+func TestBuildHealthCheckProbeChannelSelectsOldestAutoDisabledKey(t *testing.T) {
+	channel := &model.Channel{
+		Id:     71,
+		Key:    "key-a\nkey-b\nkey-c\nkey-d",
+		Status: common.ChannelStatusAutoDisabled,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 4,
+			MultiKeyMode: constant.MultiKeyModePolling,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+				2: common.ChannelStatusManuallyDisabled,
+				3: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledReason: map[int]string{
+				0: "newer",
+				1: "oldest lower index",
+				2: "manual",
+				3: "oldest higher index",
+			},
+			MultiKeyDisabledTime: map[int]int64{
+				0: 200,
+				1: 100,
+				2: 50,
+				3: 100,
+			},
+		},
+	}
+
+	probe, selectedKey, ok := buildHealthCheckProbeChannel(channel)
+
+	require.True(t, ok)
+	require.NotSame(t, channel, probe)
+	assert.Equal(t, "key-b", selectedKey)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, probe.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, probe.ChannelInfo.MultiKeyStatusList, 1)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, probe.ChannelInfo.MultiKeyStatusList[2])
+	assert.Equal(t, common.ChannelStatusAutoDisabled, probe.ChannelInfo.MultiKeyStatusList[3])
+
+	probe.ChannelInfo.MultiKeyStatusList[0] = common.ChannelStatusEnabled
+	probe.ChannelInfo.MultiKeyDisabledReason[0] = "probe mutation"
+	probe.ChannelInfo.MultiKeyDisabledTime[0] = 1
+	assert.Equal(t, common.ChannelStatusAutoDisabled, channel.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, "newer", channel.ChannelInfo.MultiKeyDisabledReason[0])
+	assert.EqualValues(t, 200, channel.ChannelInfo.MultiKeyDisabledTime[0])
+	assert.Equal(t, constant.MultiKeyModePolling, channel.ChannelInfo.MultiKeyMode)
+
+	_, nextKey, ok := buildHealthCheckProbeChannel(channel)
+	require.True(t, ok)
+	assert.Equal(t, "key-b", nextKey)
+}
+
+func TestBuildHealthCheckProbeChannelIsolatesDuePartialKey(t *testing.T) {
+	now := time.Now().Unix()
+	channel := &model.Channel{
+		Id:     72,
+		Key:    "due-known\nenabled\nmanual\nfuture\ndue-unknown",
+		Status: common.ChannelStatusEnabled,
+		Keys:   []string{"due-known", "enabled", "manual", "future", "due-unknown"},
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 5,
+			MultiKeyMode: constant.MultiKeyModePolling,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				2: common.ChannelStatusManuallyDisabled,
+				3: common.ChannelStatusAutoDisabled,
+				4: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledReason: map[int]string{
+				0: "known reset",
+				2: "manual",
+				3: "future reset",
+				4: "unknown reset",
+			},
+			MultiKeyDisabledTime: map[int]int64{
+				0: 200,
+				2: 50,
+				3: 100,
+				4: 300,
+			},
+			MultiKeyDisabledUntil: map[int]int64{
+				0: now,
+				3: now + 60,
+			},
+		},
+	}
+
+	probe, selectedKey, ok := buildHealthCheckProbeChannel(channel)
+
+	require.True(t, ok)
+	assert.Equal(t, "due-known", selectedKey)
+	assert.NotContains(t, probe.ChannelInfo.MultiKeyStatusList, 0)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, probe.ChannelInfo.MultiKeyStatusList[1])
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, probe.ChannelInfo.MultiKeyStatusList[2])
+	assert.Equal(t, common.ChannelStatusAutoDisabled, probe.ChannelInfo.MultiKeyStatusList[3])
+	assert.Equal(t, common.ChannelStatusAutoDisabled, probe.ChannelInfo.MultiKeyStatusList[4])
+	assert.Equal(t, constant.MultiKeyModeRandom, probe.ChannelInfo.MultiKeyMode)
+
+	probe.Keys[0] = "mutated"
+	probe.ChannelInfo.MultiKeyStatusList[2] = common.ChannelStatusEnabled
+	probe.ChannelInfo.MultiKeyDisabledReason[0] = "mutated"
+	probe.ChannelInfo.MultiKeyDisabledTime[0] = 1
+	probe.ChannelInfo.MultiKeyDisabledUntil[0] = 1
+	assert.Equal(t, "due-known", channel.Keys[0])
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, channel.ChannelInfo.MultiKeyStatusList[2])
+	assert.Equal(t, "known reset", channel.ChannelInfo.MultiKeyDisabledReason[0])
+	assert.EqualValues(t, 200, channel.ChannelInfo.MultiKeyDisabledTime[0])
+	assert.Equal(t, now, channel.ChannelInfo.MultiKeyDisabledUntil[0])
+}
+
+func TestChannelForHealthCheckRecoversDuePartialKeyAfterIsolatedProbe(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticEnableChannelEnabled := common.AutomaticEnableChannelEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = false
+	common.LogConsumeEnabled = false
+	common.AutomaticEnableChannelEnabled = true
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-partial-key-health":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticEnableChannelEnabled = originalAutomaticEnableChannelEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "partial-key-health-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	requestKeys := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestKeys <- strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id":"chatcmpl-partial-key-health",
+			"object":"chat.completion",
+			"created":1,
+			"model":"gpt-partial-key-health",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer upstream.Close()
+
+	autoBan := 1
+	channel := model.Channel{
+		Name: "partial-key-health", Type: constant.ChannelTypeOpenAI,
+		Key: "enabled-key\nprobe-key", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, AutoBan: &autoBan,
+		Models: "gpt-partial-key-health", Group: "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true, MultiKeySize: 2,
+			MultiKeyMode:          constant.MultiKeyModePolling,
+			MultiKeyStatusList:    map[int]int{1: common.ChannelStatusAutoDisabled},
+			MultiKeyDisabledTime:  map[int]int64{1: 100},
+			MultiKeyDisabledUntil: map[int]int64{1: time.Now().Unix()},
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+
+	summary := testChannelForHealthCheck(
+		context.Background(),
+		&channel,
+		user.Id,
+		false,
+		10_000_000,
+	)
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Succeeded: 1, Enabled: 1}, summary)
+	require.Len(t, requestKeys, 1)
+	assert.Equal(t, "probe-key", <-requestKeys)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, channel.ChannelInfo.MultiKeyStatusList[1])
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.Empty(t, stored.ChannelInfo.MultiKeyStatusList)
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyDisabledUntil, 1)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+}
+
+func TestChannelForHealthCheckFailedPartialKeyProbeDoesNotPersistDisableState(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticDisableChannelEnabled := common.AutomaticDisableChannelEnabled
+	originalAutomaticEnableChannelEnabled := common.AutomaticEnableChannelEnabled
+	originalErrorLogEnabled := constant.ErrorLogEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = true
+	common.LogConsumeEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	common.AutomaticEnableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-partial-key-failed-probe":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableChannelEnabled
+		common.AutomaticEnableChannelEnabled = originalAutomaticEnableChannelEnabled
+		constant.ErrorLogEnabled = originalErrorLogEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "partial-key-failed-probe-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	requestKeys := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestKeys <- strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{
+			"error":{
+				"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.",
+				"type":"AccountQuotaExceeded",
+				"code":"AccountQuotaExceeded"
+			}
+		}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	autoBan := 1
+	tag := "plan:health:partial-key-failed-probe"
+	channel := model.Channel{
+		Name: "partial-key-failed-probe", Type: constant.ChannelTypeOpenAI,
+		Key: "enabled-key\nprobe-key", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "gpt-partial-key-failed-probe", Group: "default",
+		TestTime: 123456789, ResponseTime: 4321,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true, MultiKeySize: 2,
+			MultiKeyMode:           constant.MultiKeyModePolling,
+			MultiKeyPollingIndex:   1,
+			MultiKeyStatusList:     map[int]int{1: common.ChannelStatusAutoDisabled},
+			MultiKeyDisabledReason: map[int]string{1: "original reason"},
+			MultiKeyDisabledTime:   map[int]int64{1: 123456},
+			MultiKeyDisabledUntil:  map[int]int64{1: time.Now().Add(-time.Minute).Unix()},
+		},
+	}
+	channel.SetOtherInfo(map[string]any{"owner": "before"})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	model.InitChannelCache()
+
+	var beforeProbe model.Channel
+	require.NoError(t, db.First(&beforeProbe, channel.Id).Error)
+	var beforeAbility model.Ability
+	require.NoError(t, db.First(&beforeAbility, "channel_id = ?", channel.Id).Error)
+	cachedBefore, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	beforeCache := cachedBefore.CloneForUpdate()
+
+	summary := testChannelForHealthCheck(
+		context.Background(),
+		&channel,
+		user.Id,
+		true,
+		10_000_000,
+	)
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1}, summary)
+	require.Len(t, requestKeys, 1)
+	assert.Equal(t, "probe-key", <-requestKeys)
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, beforeProbe.Status, stored.Status)
+	assert.Equal(t, beforeProbe.ChannelInfo, stored.ChannelInfo)
+	assert.Equal(t, beforeProbe.OtherInfo, stored.OtherInfo)
+	assert.Equal(t, beforeProbe.ResponseTime, stored.ResponseTime)
+	assert.Equal(t, beforeProbe.TestTime, stored.TestTime)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.Equal(t, beforeAbility, ability)
+	cached, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, *beforeCache, *cached)
+}
+
+func TestChannelForHealthCheckLocalOnlyIsolatedProbeFailureDoesNotPersistState(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	common.MemoryCacheEnabled = true
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+	})
+
+	channel := model.Channel{
+		Name: "unsupported-isolated-probe", Type: constant.ChannelTypeTaskPlugin,
+		Key:    "enabled-key\nprobe-key",
+		Status: common.ChannelStatusEnabled,
+		Models: "unsupported-task-plugin", Group: "default",
+		TestTime: 123456789, ResponseTime: 4321,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey: true, MultiKeySize: 2,
+			MultiKeyMode:           constant.MultiKeyModePolling,
+			MultiKeyPollingIndex:   1,
+			MultiKeyStatusList:     map[int]int{1: common.ChannelStatusAutoDisabled},
+			MultiKeyDisabledReason: map[int]string{1: "original reason"},
+			MultiKeyDisabledTime:   map[int]int64{1: 123456},
+			MultiKeyDisabledUntil:  map[int]int64{1: time.Now().Add(-time.Minute).Unix()},
+		},
+	}
+	channel.SetOtherInfo(map[string]any{"owner": "before"})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	model.InitChannelCache()
+
+	probe, selectedKey, isolatedProbe := buildHealthCheckProbeChannel(&channel)
+	require.True(t, isolatedProbe)
+	assert.Equal(t, "probe-key", selectedKey)
+	probeResult := testChannel(context.Background(), probe, 0, "", "", false)
+	require.Error(t, probeResult.localErr)
+	assert.Nil(t, probeResult.newAPIError)
+
+	var beforeProbe model.Channel
+	require.NoError(t, db.First(&beforeProbe, channel.Id).Error)
+	var beforeAbility model.Ability
+	require.NoError(t, db.First(&beforeAbility, "channel_id = ?", channel.Id).Error)
+	cachedBefore, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	beforeCache := cachedBefore.CloneForUpdate()
+
+	testChannelForHealthCheck(
+		context.Background(),
+		&channel,
+		0,
+		true,
+		10_000_000,
+	)
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, beforeProbe.Status, stored.Status)
+	assert.Equal(t, beforeProbe.ChannelInfo, stored.ChannelInfo)
+	assert.Equal(t, beforeProbe.OtherInfo, stored.OtherInfo)
+	assert.Equal(t, beforeProbe.ResponseTime, stored.ResponseTime)
+	assert.Equal(t, beforeProbe.TestTime, stored.TestTime)
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.Equal(t, beforeAbility, ability)
+	cached, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, beforeCache.Status, cached.Status)
+	assert.Equal(t, beforeCache.ChannelInfo, cached.ChannelInfo)
+	assert.Equal(t, beforeCache.OtherInfo, cached.OtherInfo)
+	assert.Equal(t, beforeCache.ResponseTime, cached.ResponseTime)
+	assert.Equal(t, beforeCache.TestTime, cached.TestTime)
+}
+
+func TestChannelForHealthCheckProbesFinalAutoDisabledMultiKey(t *testing.T) {
+	for _, testCase := range []struct {
+		name          string
+		upstreamOK    bool
+		wantSucceeded int
+		wantFailed    int
+		wantEnabled   int
+	}{
+		{
+			name:          "failed probe preserves every key",
+			wantFailed:    1,
+			wantEnabled:   0,
+			wantSucceeded: 0,
+		},
+		{
+			name:          "successful probe recovers selected key",
+			upstreamOK:    true,
+			wantSucceeded: 1,
+			wantEnabled:   1,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			originalMemoryCacheEnabled := common.MemoryCacheEnabled
+			originalLogConsumeEnabled := common.LogConsumeEnabled
+			originalAutomaticEnableChannelEnabled := common.AutomaticEnableChannelEnabled
+			originalModelRatios := ratio_setting.ModelRatio2JSONString()
+			originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+			common.MemoryCacheEnabled = true
+			common.LogConsumeEnabled = false
+			common.AutomaticEnableChannelEnabled = true
+			require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-final-key-health":1}`))
+			require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+			t.Cleanup(func() {
+				common.MemoryCacheEnabled = originalMemoryCacheEnabled
+				common.LogConsumeEnabled = originalLogConsumeEnabled
+				common.AutomaticEnableChannelEnabled = originalAutomaticEnableChannelEnabled
+				require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+				require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+			})
+
+			user := model.User{
+				Username: "final-key-health-root",
+				Role:     common.RoleRootUser,
+				Status:   common.UserStatusEnabled,
+				Group:    "default",
+				Quota:    1_000_000,
+			}
+			require.NoError(t, db.Create(&user).Error)
+
+			requestKeys := make(chan string, 4)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestKeys <- strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+				w.Header().Set("Content-Type", "application/json")
+				if !testCase.upstreamOK {
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = fmt.Fprint(w, `{"error":{"message":"probe failed","type":"upstream_error"}}`)
+					return
+				}
+				_, _ = fmt.Fprint(w, `{
+					"id":"chatcmpl-final-key-health",
+					"object":"chat.completion",
+					"created":1,
+					"model":"gpt-final-key-health",
+					"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+					"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+				}`)
+			}))
+			defer upstream.Close()
+
+			autoBan := 1
+			channel := model.Channel{
+				Name: "final-key-health", Type: constant.ChannelTypeOpenAI,
+				Key: "key-a\nkey-b\nkey-c", BaseURL: &upstream.URL,
+				Status: common.ChannelStatusAutoDisabled, AutoBan: &autoBan,
+				Models: "gpt-final-key-health", Group: "default",
+				TestTime: 123456789, ResponseTime: 4321,
+				ChannelInfo: model.ChannelInfo{
+					IsMultiKey:   true,
+					MultiKeySize: 3,
+					MultiKeyMode: constant.MultiKeyModePolling,
+					MultiKeyStatusList: map[int]int{
+						0: common.ChannelStatusAutoDisabled,
+						1: common.ChannelStatusAutoDisabled,
+						2: common.ChannelStatusAutoDisabled,
+					},
+					MultiKeyDisabledReason: map[int]string{
+						0: "newest",
+						1: "oldest lower index",
+						2: "oldest higher index",
+					},
+					MultiKeyDisabledTime: map[int]int64{
+						0: 300,
+						1: 100,
+						2: 100,
+					},
+				},
+			}
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(nil))
+			model.InitChannelCache()
+			var beforeProbe model.Channel
+			require.NoError(t, db.First(&beforeProbe, channel.Id).Error)
+			cachedBefore, err := model.CacheGetChannel(channel.Id)
+			require.NoError(t, err)
+			cachedBefore = cachedBefore.CloneForUpdate()
+
+			summary := testChannelForHealthCheck(
+				context.Background(),
+				&channel,
+				user.Id,
+				false,
+				10_000_000,
+			)
+
+			assert.Equal(t, 1, summary.Tested)
+			assert.Equal(t, testCase.wantSucceeded, summary.Succeeded)
+			assert.Equal(t, testCase.wantFailed, summary.Failed)
+			assert.Equal(t, testCase.wantEnabled, summary.Enabled)
+			require.Len(t, requestKeys, 1)
+			assert.Equal(t, "key-b", <-requestKeys)
+
+			assert.Equal(t, common.ChannelStatusAutoDisabled, channel.Status)
+			assert.Equal(t, map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+				2: common.ChannelStatusAutoDisabled,
+			}, channel.ChannelInfo.MultiKeyStatusList)
+			assert.Equal(t, constant.MultiKeyModePolling, channel.ChannelInfo.MultiKeyMode)
+
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			var ability model.Ability
+			require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+			if testCase.upstreamOK {
+				assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[0])
+				assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 1)
+				assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[2])
+				assert.NotEqual(t, beforeProbe.ResponseTime, stored.ResponseTime)
+				assert.Greater(t, stored.TestTime, beforeProbe.TestTime)
+				assert.True(t, ability.Enabled)
+				return
+			}
+			assert.Equal(t, beforeProbe.Status, stored.Status)
+			assert.Equal(t, beforeProbe.ChannelInfo, stored.ChannelInfo)
+			assert.Equal(t, beforeProbe.OtherInfo, stored.OtherInfo)
+			assert.Equal(t, beforeProbe.ResponseTime, stored.ResponseTime)
+			assert.Equal(t, beforeProbe.TestTime, stored.TestTime)
+			assert.False(t, ability.Enabled)
+			cached, err := model.CacheGetChannel(channel.Id)
+			require.NoError(t, err)
+			assert.Equal(t, cachedBefore.Status, cached.Status)
+			assert.Equal(t, cachedBefore.ChannelInfo, cached.ChannelInfo)
+
+			secondSummary := testChannelForHealthCheck(
+				context.Background(),
+				&stored,
+				user.Id,
+				false,
+				10_000_000,
+			)
+			assert.Equal(t, 1, secondSummary.Tested)
+			assert.Equal(t, 1, secondSummary.Failed)
+			assert.Zero(t, secondSummary.Enabled)
+			require.Len(t, requestKeys, 1)
+			assert.Equal(t, "key-b", <-requestKeys)
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			assert.Equal(t, beforeProbe.Status, stored.Status)
+			assert.Equal(t, beforeProbe.ChannelInfo, stored.ChannelInfo)
+			assert.Equal(t, beforeProbe.ResponseTime, stored.ResponseTime)
+			assert.Equal(t, beforeProbe.TestTime, stored.TestTime)
+			cached, err = model.CacheGetChannel(channel.Id)
+			require.NoError(t, err)
+			assert.Equal(t, cachedBefore.Status, cached.Status)
+			assert.Equal(t, cachedBefore.ChannelInfo, cached.ChannelInfo)
+		})
+	}
+}
+
+func TestChannelForHealthCheckDoesNotPersistStateAfterResponseTimeFailure(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticDisableChannelEnabled := common.AutomaticDisableChannelEnabled
+	originalAutomaticEnableChannelEnabled := common.AutomaticEnableChannelEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	common.MemoryCacheEnabled = true
+	common.LogConsumeEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	common.AutomaticEnableChannelEnabled = true
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-slow-key-health":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableChannelEnabled
+		common.AutomaticEnableChannelEnabled = originalAutomaticEnableChannelEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "slow-key-health-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	requestKeys := make(chan string, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		requestKeys <- key
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id":"chatcmpl-slow-key-health",
+			"object":"chat.completion",
+			"created":1,
+			"model":"gpt-slow-key-health",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer upstream.Close()
+
+	autoBan := 1
+	channel := model.Channel{
+		Name: "slow-key-health", Type: constant.ChannelTypeOpenAI,
+		Key: "key-a\nkey-b", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusAutoDisabled, AutoBan: &autoBan,
+		Models: "gpt-slow-key-health", Group: "default",
+		TestTime: 123456789, ResponseTime: 4321,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledTime: map[int]int64{0: 100, 1: 200},
+		},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	model.InitChannelCache()
+	var beforeProbe model.Channel
+	require.NoError(t, db.First(&beforeProbe, channel.Id).Error)
+	cachedBefore, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	cachedBefore = cachedBefore.CloneForUpdate()
+
+	slowSummary := testChannelForHealthCheck(
+		context.Background(),
+		&channel,
+		user.Id,
+		false,
+		-1,
+	)
+	assert.Equal(t, channelTestSummary{Tested: 1, Failed: 1}, slowSummary)
+	assert.Equal(t, "key-a", <-requestKeys)
+
+	var afterSlowProbe model.Channel
+	require.NoError(t, db.First(&afterSlowProbe, channel.Id).Error)
+	assert.Equal(t, beforeProbe.Status, afterSlowProbe.Status)
+	assert.Equal(t, beforeProbe.ChannelInfo, afterSlowProbe.ChannelInfo)
+	assert.Equal(t, beforeProbe.OtherInfo, afterSlowProbe.OtherInfo)
+	assert.Equal(t, beforeProbe.ResponseTime, afterSlowProbe.ResponseTime)
+	assert.Equal(t, beforeProbe.TestTime, afterSlowProbe.TestTime)
+	cached, err := model.CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	assert.Equal(t, cachedBefore.Status, cached.Status)
+	assert.Equal(t, cachedBefore.ChannelInfo, cached.ChannelInfo)
+
+	healthySummary := testChannelForHealthCheck(
+		context.Background(),
+		&afterSlowProbe,
+		user.Id,
+		false,
+		10_000_000,
+	)
+	assert.Equal(t, channelTestSummary{Tested: 1, Succeeded: 1, Enabled: 1}, healthySummary)
+	assert.Equal(t, "key-a", <-requestKeys)
+
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.NotContains(t, stored.ChannelInfo.MultiKeyStatusList, 0)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, stored.ChannelInfo.MultiKeyStatusList[1])
+	assert.NotEqual(t, beforeProbe.ResponseTime, stored.ResponseTime)
+	assert.Greater(t, stored.TestTime, beforeProbe.TestTime)
+}
+
+func TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedProbe(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(
+		&model.UpstreamSource{},
+		&model.UpstreamGroup{},
+		&model.UpstreamManagedRoute{},
+	))
+
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticDisableChannelEnabled := common.AutomaticDisableChannelEnabled
+	originalAutomaticEnableChannelEnabled := common.AutomaticEnableChannelEnabled
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	orchestrationSetting := operation_setting.GetUpstreamOrchestrationSetting()
+	originalOrchestrationSetting := *orchestrationSetting
+	common.MemoryCacheEnabled = true
+	common.LogConsumeEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	common.AutomaticEnableChannelEnabled = true
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"gpt-managed-final-key":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	orchestrationSetting.Enabled = true
+	orchestrationSetting.AutoEnroll = false
+	orchestrationSetting.CandidateLimit = 5
+	orchestrationSetting.MaxUpstreamMultiplier = 1
+	orchestrationSetting.SyncIntervalHours = 4
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticDisableChannelEnabled = originalAutomaticDisableChannelEnabled
+		common.AutomaticEnableChannelEnabled = originalAutomaticEnableChannelEnabled
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+		*orchestrationSetting = originalOrchestrationSetting
+	})
+
+	user := model.User{
+		Username: "managed-final-key-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	requestKeys := make(chan string, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestKeys <- strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id":"chatcmpl-managed-final-key",
+			"object":"chat.completion",
+			"created":1,
+			"model":"gpt-managed-final-key",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer upstream.Close()
+
+	now := time.Now()
+	source := model.UpstreamSource{
+		Key:              "managed-final-key-source",
+		Name:             "Managed Final Key Source",
+		ConsoleURL:       "https://example.com",
+		SelectedEndpoint: upstream.URL,
+		Status:           model.UpstreamHealthOperational,
+		Enabled:          true,
+		LastSnapshotAt:   now.Unix(),
+		LastSuccessAt:    now.Unix(),
+	}
+	require.NoError(t, db.Create(&source).Error)
+	group := model.UpstreamGroup{
+		SourceID:            source.ID,
+		ExternalID:          "managed-final-key-group",
+		Name:                "Managed Final Key Group",
+		Platform:            "openai",
+		EffectiveMultiplier: 0.1,
+		HealthStatus:        model.UpstreamHealthOperational,
+		Models:              `["gpt-managed-final-key"]`,
+		ObservedAt:          now.Unix(),
+	}
+	require.NoError(t, db.Create(&group).Error)
+
+	autoBan := 1
+	tag := "plan:managed:final-key"
+	resetAt := now.Add(time.Hour).Truncate(time.Second)
+	channel := model.Channel{
+		Name: "managed-final-key", Type: constant.ChannelTypeOpenAI,
+		Key: "key-a\nkey-b", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "gpt-managed-final-key", Group: "default",
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledReason: map[int]string{
+				0: "previous structured quota failure",
+			},
+			MultiKeyDisabledTime: map[int]int64{
+				0: now.Add(-time.Hour).Unix(),
+			},
+			MultiKeyDisabledUntil: map[int]int64{
+				0: resetAt.Unix() + 60,
+			},
+		},
+	}
+	channel.SetOtherInfo(map[string]any{
+		"owner": "preserved",
+	})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	route := model.UpstreamManagedRoute{
+		SourceID: source.ID, ExternalGroupID: group.ExternalID,
+		Platform: group.Platform, Protocol: model.UpstreamProtocolOpenAI,
+		ChannelID: channel.Id, State: model.UpstreamRouteStateActive,
+	}
+	require.NoError(t, db.Create(&route).Error)
+	model.InitChannelCache()
+
+	apiError := relaytypes.NewOpenAIError(
+		fmt.Errorf(
+			"You have exceeded the monthly usage quota. It will reset at %s.",
+			resetAt.Format("2006-01-02 15:04:05 -0700 MST"),
+		),
+		relaytypes.ErrorCode("AccountQuotaExceeded"),
+		http.StatusTooManyRequests,
+	)
+	disableResult, disableErr := service.DisableChannelForAPIError(relaytypes.ChannelError{
+		ChannelId:   channel.Id,
+		ChannelName: channel.Name,
+		IsMultiKey:  true,
+		AutoBan:     true,
+		UsingKey:    "key-b",
+	}, tag, apiError)
+	require.NoError(t, disableErr)
+	require.True(t, disableResult.Handled)
+	require.True(t, disableResult.ChannelDisabled)
+
+	var disabled model.Channel
+	require.NoError(t, db.First(&disabled, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, disabled.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, disabled.ChannelInfo.MultiKeyStatusList[0])
+	assert.Equal(t, common.ChannelStatusAutoDisabled, disabled.ChannelInfo.MultiKeyStatusList[1])
+	assert.Equal(t, map[int]int64{
+		0: resetAt.Unix() + 60,
+		1: resetAt.Unix() + 60,
+	}, disabled.ChannelInfo.MultiKeyDisabledUntil)
+	disabledInfo := disabled.GetOtherInfo()
+	assert.Equal(t, float64(resetAt.Unix()), disabledInfo["quota_reset_at"])
+	assert.Equal(t, resetAt.Unix()+60, disabled.GetDisabledUntil())
+	assert.Equal(t, "preserved", disabledInfo["owner"])
+	assert.NotContains(t, disabledInfo, "quota_domain")
+	assert.NotContains(t, disabledInfo, "quota_domain_id")
+	assert.NotContains(t, disabledInfo, "quota_generation")
+	assert.NotContains(t, disabledInfo, "quota_type")
+	var ability model.Ability
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+	selected, err := model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
+	require.NoError(t, err)
+	assert.Nil(t, selected)
+
+	summary, err := service.ReconcileManagedUpstreams(now)
+	require.NoError(t, err)
+	assert.Equal(t, 1, summary.PrioritiesUpdated)
+
+	var reconciled model.Channel
+	require.NoError(t, db.First(&reconciled, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, reconciled.Status)
+	assert.Equal(t, float64(resetAt.Unix()), reconciled.GetOtherInfo()["quota_reset_at"])
+	assert.Equal(t, resetAt.Unix()+60, reconciled.GetDisabledUntil())
+	assert.Equal(t, disabled.ChannelInfo.MultiKeyDisabledUntil, reconciled.ChannelInfo.MultiKeyDisabledUntil)
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.False(t, ability.Enabled)
+	selected, err = model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
+	require.NoError(t, err)
+	assert.Nil(t, selected)
+
+	_, sharedOwner := service.PlanQuotaRecoveryDomainKey(&reconciled)
+	assert.False(t, sharedOwner)
+
+	notDueSummary, err := runChannelTestTask(
+		context.Background(),
+		operation_setting.ChannelTestModePassiveRecovery,
+		false,
+		nil,
+	)
+	require.NoError(t, err)
+	assert.Zero(t, notDueSummary.Tested)
+	assert.Empty(t, requestKeys)
+
+	dueInfo := reconciled.GetOtherInfo()
+	dueInfo["disabled_until"] = now.Add(-time.Minute).Unix()
+	reconciled.SetOtherInfo(dueInfo)
+	reconciled.ChannelInfo.MultiKeyDisabledUntil[0] = now.Add(-time.Minute).Unix()
+	require.NoError(t, db.Model(&model.Channel{}).
+		Where("id = ?", channel.Id).
+		Updates(map[string]any{
+			"other_info":   reconciled.OtherInfo,
+			"channel_info": reconciled.ChannelInfo,
+		}).Error)
+
+	var progress []string
+	probeSummary, err := runChannelTestTask(
+		context.Background(),
+		operation_setting.ChannelTestModePassiveRecovery,
+		false,
+		func(processed, total int) {
+			progress = append(progress, fmt.Sprintf("%d/%d", processed, total))
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, probeSummary.Tested)
+	assert.Equal(t, 1, probeSummary.Succeeded)
+	assert.Equal(t, 1, probeSummary.Enabled)
+	assert.Equal(t, []string{"0/1", "1/1"}, progress)
+	require.Len(t, requestKeys, 1)
+	assert.Equal(t, "key-a", <-requestKeys)
+
+	var recovered model.Channel
+	require.NoError(t, db.First(&recovered, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, recovered.Status)
+	assert.NotContains(t, recovered.ChannelInfo.MultiKeyStatusList, 0)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, recovered.ChannelInfo.MultiKeyStatusList[1])
+	assert.NotContains(t, recovered.ChannelInfo.MultiKeyDisabledUntil, 0)
+	assert.Equal(t, resetAt.Unix()+60, recovered.ChannelInfo.MultiKeyDisabledUntil[1])
+	recoveredInfo := recovered.GetOtherInfo()
+	assert.Equal(t, "preserved", recoveredInfo["owner"])
+	assert.NotContains(t, recoveredInfo, "quota_reset_at")
+	assert.NotContains(t, recoveredInfo, "disabled_until")
+	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+	assert.True(t, ability.Enabled)
+	selected, err = model.GetRandomSatisfiedChannel("default", channel.Models, 0, nil)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, channel.Id, selected.Id)
+	selectedKey, _, keyErr := selected.GetNextEnabledKey()
+	require.Nil(t, keyErr)
+	assert.Equal(t, "key-a", selectedKey)
+}
+
 func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T) {
 	channels := []*model.Channel{
 		{Id: 1, Status: common.ChannelStatusEnabled},
@@ -441,8 +3530,9 @@ func TestSelectChannelsForAutomaticTestScheduledSkipsManualDisabled(t *testing.T
 		{Id: 3, Status: common.ChannelStatusManuallyDisabled},
 	}
 
-	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeScheduledAll)
+	selected, err := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeScheduledAll)
 
+	require.NoError(t, err)
 	require.Len(t, selected, 2)
 	require.Equal(t, 1, selected[0].Id)
 	require.Equal(t, 2, selected[1].Id)
@@ -459,8 +3549,9 @@ func TestSelectChannelsForAutomaticTestAutoBanOnlyUsesEligibleChannels(t *testin
 		{Id: 5, Status: common.ChannelStatusEnabled},
 	}
 
-	selected := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeAutoBanOnly)
+	selected, err := selectChannelsForAutomaticTest(channels, operation_setting.ChannelTestModeAutoBanOnly)
 
+	require.NoError(t, err)
 	require.Len(t, selected, 2)
 	require.Equal(t, 1, selected[0].Id)
 	require.Equal(t, 3, selected[1].Id)

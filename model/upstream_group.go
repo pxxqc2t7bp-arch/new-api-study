@@ -45,10 +45,6 @@ type UpstreamGroup struct {
 	UpdatedAt           int64    `json:"updated_at" gorm:"bigint;index"`
 }
 
-func (UpstreamGroup) TableName() string {
-	return "upstream_groups"
-}
-
 func (group *UpstreamGroup) BeforeCreate(_ *gorm.DB) error {
 	now := common.GetTimestamp()
 	group.ExternalID = strings.TrimSpace(group.ExternalID)

@@ -158,6 +158,7 @@ func ResetStatusCode(newApiErr *types.NewAPIError, statusCodeMappingStr string) 
 		if !ok {
 			return
 		}
+		newApiErr.RecordOriginalStatusCode(newApiErr.StatusCode)
 		newApiErr.StatusCode = intCode
 	}
 }
@@ -205,12 +206,14 @@ func TaskErrorWrapper(err error, code string, statusCode int) *taskdto.TaskError
 		//text = "请求上游地址失败"
 		text = common.MaskSensitiveInfo(text)
 	}
+	var apiErr *types.NewAPIError
 	//避免暴露内部错误
 	taskError := &taskdto.TaskError{
 		Code:       code,
 		Message:    text,
 		StatusCode: statusCode,
 		Error:      err,
+		NoRetry:    errors.As(err, &apiErr) && types.IsSkipRetryError(apiErr),
 	}
 
 	return taskError
@@ -221,10 +224,38 @@ func TaskErrorFromAPIError(apiErr *types.NewAPIError) *taskdto.TaskError {
 	if apiErr == nil {
 		return nil
 	}
+	code := strings.TrimSpace(string(apiErr.GetErrorCode()))
+	errType := ""
+	var openAIError *types.OpenAIError
+	switch relayErr := apiErr.RelayError.(type) {
+	case types.OpenAIError:
+		openAIError = &relayErr
+	case *types.OpenAIError:
+		openAIError = relayErr
+	}
+	if openAIError != nil {
+		errType = strings.TrimSpace(openAIError.Type)
+		if openAIError.Code != nil {
+			code = strings.TrimSpace(fmt.Sprint(openAIError.Code))
+		}
+	}
+	if errType != "" {
+		switch code {
+		case "", "unknown", "unknown_error":
+			code = errType
+		}
+	}
+	message := apiErr.Error()
+	underlyingErr := apiErr.Err
+	if underlyingErr == nil {
+		underlyingErr = errors.New(message)
+	}
 	return &taskdto.TaskError{
-		Code:       string(apiErr.GetErrorCode()),
-		Message:    apiErr.Err.Error(),
+		Code:       code,
+		Type:       errType,
+		Message:    message,
 		StatusCode: apiErr.StatusCode,
-		Error:      apiErr.Err,
+		Error:      underlyingErr,
+		NoRetry:    types.IsSkipRetryError(apiErr),
 	}
 }

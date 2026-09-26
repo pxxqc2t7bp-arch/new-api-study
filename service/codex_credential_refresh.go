@@ -28,6 +28,8 @@ type CodexOAuthKey struct {
 	Expired     string `json:"expired,omitempty"`
 }
 
+var refreshCodexOAuthTokenForCredential = RefreshCodexOAuthTokenWithProxy
+
 func parseCodexOAuthKey(raw string) (*CodexOAuthKey, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, errors.New("codex channel: empty oauth key")
@@ -62,7 +64,7 @@ func RefreshCodexChannelCredential(ctx context.Context, channelID int, opts Code
 	refreshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	res, err := RefreshCodexOAuthTokenWithProxy(refreshCtx, oauthKey.RefreshToken, ch.GetSetting().Proxy)
+	res, err := refreshCodexOAuthTokenForCredential(refreshCtx, oauthKey.RefreshToken, ch.GetSetting().Proxy)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -91,13 +93,17 @@ func RefreshCodexChannelCredential(ctx context.Context, channelID int, opts Code
 		return nil, nil, err
 	}
 
-	if err := model.DB.Model(&model.Channel{}).Where("id = ?", ch.Id).Update("key", string(encoded)).Error; err != nil {
+	updated, changed, err := model.UpdateChannelCredentialIfUnchanged(ch, string(encoded))
+	if err != nil {
 		return nil, nil, err
+	}
+	if !changed {
+		return nil, nil, errors.New("codex channel changed during credential refresh")
 	}
 
 	if opts.ResetCaches {
 		model.InitChannelCache()
 	}
 
-	return oauthKey, ch, nil
+	return oauthKey, updated, nil
 }

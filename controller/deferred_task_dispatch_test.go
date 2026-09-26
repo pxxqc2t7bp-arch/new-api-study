@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	pluginruntime "github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -159,6 +161,354 @@ func TestDeferredTaskErrorRetryable(t *testing.T) {
 			assert.Equal(t, tc.expected, deferredTaskErrorRetryable(tc.taskErr))
 		})
 	}
+}
+
+type deferredPlanQuotaDispatchFixture struct {
+	database *gorm.DB
+	user     model.User
+	token    model.Token
+	channel  model.Channel
+	task     model.Task
+}
+
+func newDeferredPlanQuotaDispatchFixture(
+	t *testing.T,
+	channelKey string,
+	channelInfo model.ChannelInfo,
+	upstreamURL string,
+	tag string,
+) deferredPlanQuotaDispatchFixture {
+	t.Helper()
+
+	database := setupModelListControllerTestDB(t)
+	require.NoError(t, database.AutoMigrate(
+		&model.Token{},
+		&model.Task{},
+		&model.Log{},
+		&model.SystemTask{},
+		&model.SystemTaskLock{},
+	))
+
+	previousMemoryCache := common.MemoryCacheEnabled
+	previousRedisEnabled := common.RedisEnabled
+	previousBatchUpdateEnabled := common.BatchUpdateEnabled
+	previousAutomaticDisableEnabled := common.AutomaticDisableChannelEnabled
+	previousErrorLogEnabled := constant.ErrorLogEnabled
+	common.MemoryCacheEnabled = false
+	common.RedisEnabled = false
+	common.BatchUpdateEnabled = false
+	common.AutomaticDisableChannelEnabled = true
+	constant.ErrorLogEnabled = false
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = previousMemoryCache
+		common.RedisEnabled = previousRedisEnabled
+		common.BatchUpdateEnabled = previousBatchUpdateEnabled
+		common.AutomaticDisableChannelEnabled = previousAutomaticDisableEnabled
+		constant.ErrorLogEnabled = previousErrorLogEnabled
+	})
+
+	user := model.User{
+		Username:  "deferred-plan-user",
+		Role:      common.RoleRootUser,
+		Group:     "default",
+		Status:    common.UserStatusEnabled,
+		Quota:     900,
+		UsedQuota: 100,
+	}
+	require.NoError(t, database.Create(&user).Error)
+	token := model.Token{
+		UserId:      user.Id,
+		Key:         "deferred-plan-token",
+		Status:      common.TokenStatusEnabled,
+		ExpiredTime: -1,
+		RemainQuota: 900,
+		UsedQuota:   100,
+	}
+	require.NoError(t, database.Create(&token).Error)
+	autoBan := 1
+	channel := model.Channel{
+		Type:        constant.ChannelTypeKling,
+		Name:        "deferred-plan-channel",
+		Key:         channelKey,
+		BaseURL:     &upstreamURL,
+		Status:      common.ChannelStatusEnabled,
+		Models:      "kling-v1",
+		Group:       "default",
+		UsedQuota:   100,
+		AutoBan:     &autoBan,
+		Tag:         &tag,
+		ChannelInfo: channelInfo,
+	}
+	require.NoError(t, database.Create(&channel).Error)
+
+	task := model.Task{
+		TaskID:         "task_deferred_plan",
+		Platform:       constant.TaskPlatform("kling"),
+		UserId:         user.Id,
+		Group:          "default",
+		ChannelId:      channel.Id,
+		Action:         constant.TaskActionTextToVideo,
+		Status:         model.TaskStatusNotStart,
+		Progress:       "0%",
+		Quota:          100,
+		SubmitTime:     common.GetTimestamp(),
+		ExecutionMode:  model.TaskExecutionModeDeferred,
+		DispatchStatus: model.TaskDispatchStatusPending,
+		Properties: model.Properties{
+			OriginModelName:   "kling-v1",
+			UpstreamModelName: "kling-v1",
+		},
+		PrivateData: model.TaskPrivateData{
+			TokenId: token.Id,
+			Execution: &model.TaskExecutionSnapshot{
+				TaskPlugin: &model.TaskPluginSnapshot{Key: "kling", Version: "1.0.0"},
+			},
+			DeferredRequest: &model.TaskDeferredRequest{
+				Path:        "/v1/responses",
+				Method:      http.MethodPost,
+				Headers:     map[string]string{"Content-Type": "application/json"},
+				RouteBody:   json.RawMessage(`{"kind":"json","value":{"model":"kling-v1"}}`),
+				RequestBody: json.RawMessage(`{"model":"kling-v1","prompt":"a lighthouse","duration":5}`),
+			},
+			BillingContext: &model.TaskBillingContext{
+				OriginModelName: "kling-v1",
+				GroupRatio:      1,
+				PerCallBilling:  true,
+			},
+		},
+	}
+	require.NoError(t, database.Create(&task).Error)
+
+	return deferredPlanQuotaDispatchFixture{
+		database: database,
+		user:     user,
+		token:    token,
+		channel:  channel,
+		task:     task,
+	}
+}
+
+func runDeferredDispatcherOnce(t *testing.T, runnerID string) deferredTaskDispatchSummary {
+	t.Helper()
+
+	systemTask, err := model.CreateSystemTask(model.SystemTaskTypeDeferredDispatch, nil, nil)
+	require.NoError(t, err)
+	claimedTask, claimed, err := model.ClaimSystemTask(
+		systemTask.ID,
+		model.SystemTaskTypeDeferredDispatch,
+		runnerID,
+		common.GetTimestamp()+60,
+	)
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	deferredTaskDispatchHandler{}.Run(context.Background(), claimedTask, runnerID)
+
+	storedTask, err := model.GetSystemTaskByTaskID(systemTask.TaskID)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	require.Equal(t, model.SystemTaskStatusSucceeded, storedTask.Status)
+	var summary deferredTaskDispatchSummary
+	require.NoError(t, common.UnmarshalJsonStr(storedTask.Result, &summary))
+	return summary
+}
+
+func countDeferredTaskRefunds(t *testing.T, database *gorm.DB, taskID string) int64 {
+	t.Helper()
+
+	var count int64
+	require.NoError(t, database.Model(&model.Log{}).
+		Where("type = ? AND other LIKE ?", model.LogTypeRefund, "%"+taskID+"%").
+		Count(&count).Error)
+	return count
+}
+
+func TestDeferredDispatcherPlanQuotaPersistenceFailureIsNotRequeued(t *testing.T) {
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.","type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	fixture := newDeferredPlanQuotaDispatchFixture(
+		t,
+		"sk-deferred-persistence-failure",
+		model.ChannelInfo{},
+		upstream.URL,
+		"plan:deferred:persistence-failure",
+	)
+	forcedErr := errors.New("forced deferred Plan quota persistence failure")
+	const callbackName = "test:deferred_plan_quota_persistence_failure"
+	require.NoError(t, fixture.database.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil &&
+			tx.Statement.Schema != nil &&
+			tx.Statement.Schema.Name == "Ability" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, fixture.database.Callback().Update().Remove(callbackName))
+	})
+
+	result, taskErr := dispatchDeferredTask(context.Background(), &fixture.task)
+	assert.Nil(t, result)
+	require.NotNil(t, taskErr)
+	assert.True(t, taskErr.LocalError)
+	assert.Equal(t, string(relaytypes.ErrorCodeUpdateDataError), taskErr.Code)
+	assert.ErrorIs(t, taskErr.Error, forcedErr)
+	assert.True(t, taskErr.NoRetry)
+
+	summary := runDeferredDispatcherOnce(t, "deferred-persistence-failure")
+	assert.Equal(t, deferredTaskDispatchSummary{Found: 1, Claimed: 1, Failed: 1}, summary)
+
+	var failedTask model.Task
+	require.NoError(t, fixture.database.First(&failedTask, fixture.task.ID).Error)
+	assert.Equal(t, model.TaskDispatchStatusFailed, failedTask.DispatchStatus)
+	assert.Equal(t, 1, failedTask.DispatchAttempts)
+	assert.Equal(t, 2, upstreamCalls)
+
+	assert.Equal(t, deferredTaskDispatchSummary{}, runDeferredDispatcherOnce(t, "deferred-persistence-failure-recheck"))
+	assert.Equal(t, 2, upstreamCalls)
+}
+
+func TestDeferredDispatcherSingleKeyPlanQuotaRequeuesThenFailsAndRefundsOnce(t *testing.T) {
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.","type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	fixture := newDeferredPlanQuotaDispatchFixture(
+		t,
+		"sk-deferred-single",
+		model.ChannelInfo{},
+		upstream.URL,
+		"plan:deferred:single",
+	)
+	peerTag := "plan:deferred:single-peer"
+	peer := model.Channel{
+		Type:      constant.ChannelTypeKling,
+		Name:      "deferred-plan-peer",
+		Key:       fixture.channel.Key,
+		BaseURL:   &upstream.URL,
+		Status:    common.ChannelStatusEnabled,
+		Models:    "kling-v1",
+		Group:     "default",
+		UsedQuota: 100,
+		AutoBan:   fixture.channel.AutoBan,
+		Tag:       &peerTag,
+	}
+	require.NoError(t, fixture.database.Create(&peer).Error)
+
+	firstSummary := runDeferredDispatcherOnce(t, "deferred-single-first")
+	assert.Equal(t, deferredTaskDispatchSummary{Found: 1, Claimed: 1, Requeued: 1}, firstSummary)
+
+	var firstTask model.Task
+	require.NoError(t, fixture.database.First(&firstTask, fixture.task.ID).Error)
+	assert.Equal(t, model.TaskDispatchStatusPending, firstTask.DispatchStatus)
+	assert.Equal(t, 1, firstTask.DispatchAttempts)
+	assert.Equal(t, 100, firstTask.Quota)
+	var firstChannels []model.Channel
+	require.NoError(t, fixture.database.Order("id").Find(&firstChannels).Error)
+	require.Len(t, firstChannels, 2)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, firstChannels[0].Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, firstChannels[1].Status)
+	assert.Zero(t, countDeferredTaskRefunds(t, fixture.database, fixture.task.TaskID))
+
+	secondSummary := runDeferredDispatcherOnce(t, "deferred-single-second")
+	assert.Equal(t, deferredTaskDispatchSummary{Found: 1, Claimed: 1, Failed: 1}, secondSummary)
+
+	var failedTask model.Task
+	require.NoError(t, fixture.database.First(&failedTask, fixture.task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusFailure), failedTask.Status)
+	assert.Equal(t, model.TaskDispatchStatusFailed, failedTask.DispatchStatus)
+	assert.Equal(t, 2, failedTask.DispatchAttempts)
+	assert.Zero(t, failedTask.Quota)
+	assert.Equal(t, 1, upstreamCalls)
+	var refundedUser model.User
+	require.NoError(t, fixture.database.First(&refundedUser, fixture.user.Id).Error)
+	assert.Equal(t, 1_000, refundedUser.Quota)
+	assert.Zero(t, refundedUser.UsedQuota)
+	var refundedToken model.Token
+	require.NoError(t, fixture.database.First(&refundedToken, fixture.token.Id).Error)
+	assert.Equal(t, 1_000, refundedToken.RemainQuota)
+	assert.Zero(t, refundedToken.UsedQuota)
+	assert.Equal(t, int64(1), countDeferredTaskRefunds(t, fixture.database, fixture.task.TaskID))
+
+	thirdSummary := runDeferredDispatcherOnce(t, "deferred-single-third")
+	assert.Equal(t, deferredTaskDispatchSummary{}, thirdSummary)
+	require.NoError(t, fixture.database.First(&refundedUser, fixture.user.Id).Error)
+	assert.Equal(t, 1_000, refundedUser.Quota)
+	assert.Equal(t, int64(1), countDeferredTaskRefunds(t, fixture.database, fixture.task.TaskID))
+}
+
+func TestDeferredDispatcherMultiKeyPlanQuotaUsesRemainingKeyWithoutRefund(t *testing.T) {
+	usedKeys := make([]string, 0, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Header.Get("Authorization") {
+		case "Bearer sk-deferred-a":
+			usedKeys = append(usedKeys, "first")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.","type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`)
+		case "Bearer sk-deferred-b":
+			usedKeys = append(usedKeys, "second")
+			_, _ = io.WriteString(w, `{"code":0,"data":{"task_id":"upstream-deferred-plan"}}`)
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"message":"unexpected credential","type":"authentication_error","code":"invalid_api_key"}}`)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	fixture := newDeferredPlanQuotaDispatchFixture(
+		t,
+		"sk-deferred-a\nsk-deferred-b",
+		model.ChannelInfo{IsMultiKey: true, MultiKeySize: 2},
+		upstream.URL,
+		"plan:deferred:multi",
+	)
+
+	firstSummary := runDeferredDispatcherOnce(t, "deferred-multi-first")
+	assert.Equal(t, deferredTaskDispatchSummary{Found: 1, Claimed: 1, Requeued: 1}, firstSummary)
+
+	var firstTask model.Task
+	require.NoError(t, fixture.database.First(&firstTask, fixture.task.ID).Error)
+	assert.Equal(t, model.TaskDispatchStatusPending, firstTask.DispatchStatus)
+	assert.Equal(t, 1, firstTask.DispatchAttempts)
+	assert.Equal(t, 100, firstTask.Quota)
+	var firstChannel model.Channel
+	require.NoError(t, fixture.database.First(&firstChannel, fixture.channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, firstChannel.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, firstChannel.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, firstChannel.ChannelInfo.MultiKeyStatusList, 1)
+	assert.Zero(t, countDeferredTaskRefunds(t, fixture.database, fixture.task.TaskID))
+
+	secondSummary := runDeferredDispatcherOnce(t, "deferred-multi-second")
+	assert.Equal(t, deferredTaskDispatchSummary{Found: 1, Claimed: 1, Dispatched: 1}, secondSummary)
+
+	var completedTask model.Task
+	require.NoError(t, fixture.database.First(&completedTask, fixture.task.ID).Error)
+	assert.Equal(t, model.TaskStatus(model.TaskStatusSubmitted), completedTask.Status)
+	assert.Equal(t, model.TaskDispatchStatusDispatched, completedTask.DispatchStatus)
+	assert.Equal(t, 2, completedTask.DispatchAttempts)
+	assert.Equal(t, 100, completedTask.Quota)
+	assert.Equal(t, []string{"first", "second"}, usedKeys)
+	var unrefundedUser model.User
+	require.NoError(t, fixture.database.First(&unrefundedUser, fixture.user.Id).Error)
+	assert.Equal(t, 900, unrefundedUser.Quota)
+	assert.Equal(t, 100, unrefundedUser.UsedQuota)
+	var unrefundedToken model.Token
+	require.NoError(t, fixture.database.First(&unrefundedToken, fixture.token.Id).Error)
+	assert.Equal(t, 900, unrefundedToken.RemainQuota)
+	assert.Equal(t, 100, unrefundedToken.UsedQuota)
+	assert.Zero(t, countDeferredTaskRefunds(t, fixture.database, fixture.task.TaskID))
 }
 
 func TestDeferredSubmissionPersistsBeforeCallingUpstream(t *testing.T) {

@@ -67,6 +67,12 @@ func taskAliasViewFresh(view *taskAliasView, generation uint64) bool {
 	return view != nil && view.generation == generation && time.Now().Before(view.expiresAt)
 }
 
+func invalidateTaskAliasView() {
+	taskAliasRebuildMu.Lock()
+	defer taskAliasRebuildMu.Unlock()
+	taskAliasViewPtr.Store(nil)
+}
+
 func rebuildTaskAliasView() {
 	taskAliasRebuildMu.Lock()
 	defer taskAliasRebuildMu.Unlock()

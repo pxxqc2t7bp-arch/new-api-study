@@ -407,8 +407,8 @@ func submitTaskUpstream(
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		responseBody, _ := io.ReadAll(resp.Body)
-		return nil, service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
+		apiErr := service.RelayErrorHandler(c.Request.Context(), resp, false)
+		return nil, service.TaskErrorFromAPIError(apiErr)
 	}
 
 	// 10. Parse only. The controller presents the response after the durable

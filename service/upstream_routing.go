@@ -14,8 +14,6 @@ import (
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
-
-	"gorm.io/gorm"
 )
 
 type UpstreamReconcileSummary struct {
@@ -68,6 +66,13 @@ func PrepareManagedUpstreamShadows(now time.Time) (UpstreamReconcileSummary, err
 }
 
 func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) {
+	return reconcileManagedUpstreams(now, NotifyRootBark)
+}
+
+func reconcileManagedUpstreams(
+	now time.Time,
+	notifyRouteChanges func(string, string, string) error,
+) (UpstreamReconcileSummary, error) {
 	var summary UpstreamReconcileSummary
 	setting := operation_setting.GetUpstreamOrchestrationSetting()
 	if !setting.Enabled {
@@ -88,6 +93,18 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 	summary.SourcesChecked = len(sources)
 	summary.GroupsChecked = len(groups)
 	var routeChanges []string
+	defer func() {
+		if len(routeChanges) == 0 || notifyRouteChanges == nil {
+			return
+		}
+		if err := notifyRouteChanges(
+			"channel_update_upstream_reconcile",
+			"New API 上游线路状态变化",
+			strings.Join(routeChanges, "\n"),
+		); err != nil {
+			common.SysLog("upstream Bark notification skipped: " + err.Error())
+		}
+	}()
 
 	sourceByID := make(map[int64]model.UpstreamSource, len(sources))
 	for index := range sources {
@@ -105,9 +122,12 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 				}
 			}
 			if low != source.LowBalanceAlerted {
-				_ = model.DB.Model(&model.UpstreamSource{}).Where("id = ?", source.ID).
-					Updates(map[string]any{"low_balance_alerted": low, "updated_at": now.Unix()}).Error
+				if err := model.DB.Model(&model.UpstreamSource{}).Where("id = ?", source.ID).
+					Updates(map[string]any{"low_balance_alerted": low, "updated_at": now.Unix()}).Error; err != nil {
+					return summary, err
+				}
 				source.LowBalanceAlerted = low
+				source.UpdatedAt = now.Unix()
 				sources[index] = source
 			}
 		}
@@ -129,6 +149,23 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 	for i := range routes {
 		route := &routes[i]
 		if route.Detached {
+			channelBefore, channelBeforeErr := model.GetChannelById(route.ChannelID, true)
+			applied, disableErr := model.DisableDetachedManagedChannelIfUnchanged(
+				route,
+				now.Unix(),
+			)
+			if disableErr != nil {
+				return summary, disableErr
+			}
+			if !applied {
+				return summary, fmt.Errorf(
+					"detached managed route changed during reconciliation: route_id=%d",
+					route.ID,
+				)
+			}
+			if channelBeforeErr == nil && channelBefore.Status == common.ChannelStatusEnabled {
+				CloseActiveWebSocketsForChannel(route.ChannelID, ChannelDisabledCloseReason)
+			}
 			continue
 		}
 		source, sourceExists := sourceByID[route.SourceID]
@@ -148,59 +185,93 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 				reason = "outside managed candidate limit"
 			}
 		}
-		if state == route.State {
+		stateChanged := state != route.State
+		reasonChanged := reason != route.LastReason
+		if !stateChanged && !reasonChanged && state == model.UpstreamRouteStateActive {
 			continue
 		}
-		updates := map[string]any{
-			"state":       state,
-			"last_reason": reason,
-			"updated_at":  now.Unix(),
+		desiredRoute := *route
+		desiredRoute.State = state
+		desiredRoute.LastReason = reason
+		if state != model.UpstreamRouteStateActive ||
+			route.State != model.UpstreamRouteStateActive {
+			desiredRoute.Rank = 0
 		}
-		if state == model.UpstreamRouteStateQuarantined {
+		if stateChanged || reasonChanged {
+			desiredRoute.UpdatedAt = now.Unix()
+		}
+		if stateChanged && state == model.UpstreamRouteStateQuarantined {
 			if route.RedSince == 0 {
-				updates["red_since"] = now.Unix()
+				desiredRoute.RedSince = now.Unix()
 			}
-			updates["recovery_attempts"] = 0
-			updates["next_probe_at"] = now.Unix()
-			summary.RoutesQuarantined++
+			desiredRoute.RecoveryAttempts = 0
+			desiredRoute.NextProbeAt = now.Unix()
 		}
-		if state == model.UpstreamRouteStateLongRed {
-			updates["next_probe_at"] = int64(0)
-			summary.RoutesLongRed++
+		if stateChanged && state == model.UpstreamRouteStateLongRed {
+			desiredRoute.NextProbeAt = 0
 		}
-		if state == model.UpstreamRouteStateRetained {
-			updates["rank"] = 0
-			updates["next_probe_at"] = int64(0)
-			summary.RoutesRetained++
+		if stateChanged && state == model.UpstreamRouteStateRetained {
+			desiredRoute.Rank = 0
+			desiredRoute.NextProbeAt = 0
 		}
-		if state == model.UpstreamRouteStateShadow && route.State == model.UpstreamRouteStateRetained {
-			updates["next_probe_at"] = now.Unix()
+		if stateChanged &&
+			state == model.UpstreamRouteStateShadow &&
+			route.State == model.UpstreamRouteStateRetained {
+			desiredRoute.NextProbeAt = now.Unix()
 		}
-		if state == model.UpstreamRouteStateActive {
-			updates["red_since"] = int64(0)
-			updates["recovery_attempts"] = 0
-			updates["next_probe_at"] = int64(0)
-			updates["consecutive_failures"] = 0
-			updates["failure_window_start"] = int64(0)
-			summary.RoutesActivated++
+		if stateChanged && state == model.UpstreamRouteStateActive {
+			desiredRoute.RedSince = 0
+			desiredRoute.RecoveryAttempts = 0
+			desiredRoute.NextProbeAt = 0
+			desiredRoute.ConsecutiveFailures = 0
+			desiredRoute.FailureWindowStart = 0
 		}
-		if err := model.DB.Model(route).Updates(updates).Error; err != nil {
+		channelWasEnabled := false
+		if state != model.UpstreamRouteStateActive {
+			channelBefore, channelErr := model.GetChannelById(route.ChannelID, true)
+			channelWasEnabled = channelErr == nil &&
+				channelBefore.Status == common.ChannelStatusEnabled
+		}
+		applied, err := model.UpdateManagedRouteStateIfUnchanged(
+			&source,
+			&group,
+			route,
+			&desiredRoute,
+			now.Unix(),
+		)
+		if err != nil {
 			return summary, err
 		}
-		routeChanges = append(routeChanges, fmt.Sprintf(
-			"#%d %s/%s: %s -> %s",
-			route.ChannelID,
-			source.Key,
-			group.Name,
-			route.State,
-			state,
-		))
-		if state == model.UpstreamRouteStateActive {
-			updateManagedChannelStatus(route.ChannelID, "", common.ChannelStatusEnabled, "")
-		} else {
-			updateManagedChannelStatus(route.ChannelID, "", common.ChannelStatusAutoDisabled, reason)
+		if !applied {
+			return summary, fmt.Errorf(
+				"managed route decision changed during reconciliation: route_id=%d",
+				route.ID,
+			)
 		}
-		route.State = state
+		if channelWasEnabled {
+			CloseActiveWebSocketsForChannel(route.ChannelID, ChannelDisabledCloseReason)
+		}
+		if stateChanged {
+			switch state {
+			case model.UpstreamRouteStateQuarantined:
+				summary.RoutesQuarantined++
+			case model.UpstreamRouteStateLongRed:
+				summary.RoutesLongRed++
+			case model.UpstreamRouteStateRetained:
+				summary.RoutesRetained++
+			case model.UpstreamRouteStateActive:
+				summary.RoutesActivated++
+			}
+			routeChanges = append(routeChanges, fmt.Sprintf(
+				"#%d %s/%s: %s -> %s",
+				route.ChannelID,
+				source.Key,
+				group.Name,
+				route.State,
+				state,
+			))
+		}
+		*route = desiredRoute
 	}
 
 	if setting.AutoEnroll {
@@ -211,23 +282,24 @@ func ReconcileManagedUpstreams(now time.Time) (UpstreamReconcileSummary, error) 
 		summary.EnrollmentQueued = queued
 	}
 	updated, err := rankManagedRoutes(now, sources, groups, candidates, setting)
+	summary.PrioritiesUpdated = updated
 	if err != nil {
 		return summary, err
 	}
-	summary.PrioritiesUpdated = updated
-	if updated > 0 {
-		model.InitChannelCache()
-	}
-	if len(routeChanges) > 0 {
-		if err := NotifyRootBark(
-			"channel_update_upstream_reconcile",
-			"New API 上游线路状态变化",
-			strings.Join(routeChanges, "\n"),
-		); err != nil {
-			common.SysLog("upstream Bark notification skipped: " + err.Error())
-		}
-	}
 	return summary, nil
+}
+
+func preserveManagedPlanQuotaOwnership(channel *model.Channel, desiredStatus int) bool {
+	if desiredStatus != common.ChannelStatusEnabled {
+		return false
+	}
+	if channel != nil &&
+		channel.ChannelInfo.IsMultiKey &&
+		!channel.HasEnabledKey() {
+		return true
+	}
+	_, owned := PlanQuotaRecoveryDomainKey(channel)
+	return owned
 }
 
 func managedCandidateSelectionEvaluable(
@@ -264,7 +336,11 @@ func desiredManagedRouteState(
 		return model.UpstreamRouteStateDetached, "detached"
 	}
 	if route.ManualPauseUntil > now.Unix() {
-		return model.UpstreamRouteStatePaused, "manual pause"
+		reason := strings.TrimSpace(route.LastReason)
+		if reason == "" {
+			reason = "manual pause"
+		}
+		return model.UpstreamRouteStatePaused, reason
 	}
 	if route.State == model.UpstreamRouteStatePaused {
 		route.State = model.UpstreamRouteStateShadow
@@ -294,6 +370,9 @@ func desiredManagedRouteState(
 		}
 		return model.UpstreamRouteStateQuarantined, "upstream monitor red"
 	case model.UpstreamHealthOperational, model.UpstreamHealthDegraded:
+		if route.State == model.UpstreamRouteStateQuarantined {
+			return route.State, route.LastReason
+		}
 		if route.State != model.UpstreamRouteStateShadow ||
 			route.ConsecutiveSuccesses >= setting.ShadowSuccessesRequired {
 			return model.UpstreamRouteStateActive, ""
@@ -628,36 +707,49 @@ func rankManagedRoutes(
 			status = common.ChannelStatusEnabled
 		}
 		selectedEndpoint := source.SelectedEndpoint
-		result := model.DB.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Model(&model.UpstreamManagedRoute{}).Where("id = ?", route.ID).Updates(map[string]any{
-				"rank":                 rank,
-				"effective_multiplier": group.EffectiveMultiplier,
-				"updated_at":           now.Unix(),
-			}).Error; err != nil {
-				return err
+		applied := false
+		for range 3 {
+			channel, err := model.GetChannelById(route.ChannelID, true)
+			if err != nil {
+				return updated, err
 			}
-			var channel model.Channel
-			if err := tx.Where("id = ?", route.ChannelID).First(&channel).Error; err != nil {
-				return err
+			desiredStatus := status
+			if preserveManagedPlanQuotaOwnership(channel, desiredStatus) {
+				desiredStatus = channel.Status
 			}
-			channel.Priority = &priority
-			channel.BaseURL = &selectedEndpoint
-			channel.Status = status
+			if route.State != model.UpstreamRouteStateActive &&
+				channel.Status != common.ChannelStatusEnabled {
+				desiredStatus = channel.Status
+			}
+			models := channel.Models
 			if groupSelected {
-				channel.Models = strings.Join(routeModels, ",")
+				models = strings.Join(routeModels, ",")
 			}
-			if err := tx.Model(&model.Channel{}).Where("id = ?", route.ChannelID).Updates(map[string]any{
-				"priority": priority,
-				"base_url": selectedEndpoint,
-				"models":   channel.Models,
-				"status":   status,
-			}).Error; err != nil {
-				return err
+			changed, err := model.UpdateManagedChannelIfUnchanged(channel, model.ManagedChannelUpdate{
+				ExpectedSource:        &source,
+				ExpectedGroup:         &group,
+				ExpectedRoute:         route,
+				RouteID:               route.ID,
+				ExpectedRouteState:    route.State,
+				ExpectedRouteDetached: route.Detached,
+				Rank:                  rank,
+				EffectiveMultiplier:   group.EffectiveMultiplier,
+				UpdatedAt:             now.Unix(),
+				Priority:              priority,
+				BaseURL:               selectedEndpoint,
+				Models:                models,
+				Status:                desiredStatus,
+			})
+			if err != nil {
+				return updated, err
 			}
-			return channel.UpdateAbilities(tx)
-		})
-		if result != nil {
-			return updated, result
+			if changed {
+				applied = true
+				break
+			}
+		}
+		if !applied {
+			return updated, fmt.Errorf("managed channel changed during reconciliation: channel_id=%d", route.ChannelID)
 		}
 		if selected && route.State == model.UpstreamRouteStateActive {
 			updated++

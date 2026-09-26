@@ -92,3 +92,39 @@ func TestJSONColumnScannersAcceptStringAndBytes(t *testing.T) {
 		})
 	}
 }
+
+func TestChannelInfoMultiKeyDisabledUntilJSONCompatibility(t *testing.T) {
+	original := ChannelInfo{
+		IsMultiKey: true,
+		MultiKeyDisabledUntil: map[int]int64{
+			0: 2_000_000_060,
+			2: 2_000_000_120,
+		},
+	}
+
+	value, err := original.Value()
+	require.NoError(t, err)
+	assert.JSONEq(t, `{
+		"is_multi_key": true,
+		"multi_key_size": 0,
+		"multi_key_status_list": null,
+		"multi_key_disabled_until": {
+			"0": 2000000060,
+			"2": 2000000120
+		},
+		"multi_key_polling_index": 0,
+		"multi_key_mode": ""
+	}`, value.(string))
+
+	var roundTripped ChannelInfo
+	require.NoError(t, roundTripped.Scan(value))
+	assert.Equal(t, original.MultiKeyDisabledUntil, roundTripped.MultiKeyDisabledUntil)
+
+	var legacy ChannelInfo
+	require.NoError(t, legacy.Scan(`{
+		"is_multi_key": true,
+		"multi_key_size": 2,
+		"multi_key_status_list": {"0": 3}
+	}`))
+	assert.Nil(t, legacy.MultiKeyDisabledUntil)
+}

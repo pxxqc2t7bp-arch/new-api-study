@@ -1,0 +1,1133 @@
+# Final Plan Quota Recovery Races Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Close the remaining credential-rotation, stale-recovery, legacy-writer, passive-fairness, managed-route, and pre-probe snapshot races in Plan quota isolation without a schema change.
+
+**Architecture:** Extend the existing row-locked single-key CAS to compare the snapshot's credential and tag in addition to status and raw metadata. Reuse an internal lock-aware transaction primitive from quota ownership writes, legacy single-key status updates, and health-check recovery; stamp every Plan disable event with a string generation; select the oldest passive recovery candidate per shared domain; and admit validated managed Plan quota owners to passive recovery without changing ordinary managed handling.
+
+**Tech Stack:** Go, GORM transactions and row locking, SQLite deterministic regression tests, optional MySQL/PostgreSQL integration tests, testify
+
+---
+
+### Task 1: Fence Credential and Tag Rotation
+
+**Files:**
+- Modify: `model/channel_status_cas_test.go`
+- Modify: `model/channel.go`
+- Modify: `service/channel.go`
+
+- [x] **Step 1: Add stale-key and stale-tag tests**
+
+Call the wished-for CAS with the snapshot's `Key` and `GetTag()` and mutate each
+identity field separately before the call. Assert `changed=false` and that
+channel status, raw metadata, and ability state remain unchanged.
+
+- [x] **Step 2: Run focused RED**
+
+Run:
+
+```bash
+go test ./model -run '^TestUpdateSingleKeyChannelStatusIfUnchanged' -count=1
+```
+
+Expected: build failure because the CAS does not yet accept expected key and
+tag values.
+
+- [x] **Step 3: Extend the locked CAS**
+
+Change the API to accept:
+
+```go
+expectedKey string
+expectedTag string
+```
+
+Compare `current.Key` and `current.GetTag()` while the row is locked, alongside
+the existing single-key, status, and raw `other_info` checks. Pass exact
+snapshot values from every service and test call site. Do not write either
+identity value or expose the credential in metadata or logs.
+
+- [x] **Step 4: Run focused GREEN**
+
+Run the focused model test and the Plan quota service tests. Expected: PASS.
+
+### Task 2: Fence Stale Recovery with a Disable Generation
+
+**Files:**
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/channel.go`
+
+- [x] **Step 1: Add a deterministic stale-recovery interleaving test**
+
+Disable a channel once, retain the resulting recovery snapshot, issue a second
+disable event against the already-owned auto-disabled channel with the same
+reason and reset time, then attempt the stale recovery CAS. Assert the second
+event changed a string `quota_generation`, the stale CAS returns no change,
+and status plus ability remain disabled.
+
+- [x] **Step 2: Run focused RED**
+
+Run:
+
+```bash
+go test ./service -run '^TestFreshPlanQuotaDisableFencesStaleRecoverySnapshot$' -count=1
+```
+
+Expected: FAIL because repeated disables currently reproduce identical
+metadata and the stale recovery succeeds.
+
+- [x] **Step 3: Stamp every disable event**
+
+Generate one decimal `UnixNano` string per `disablePlanQuotaDomain` call and
+write it as `quota_generation` on every eligible channel, including channels
+already auto-disabled by the same domain. Remove it with the other quota
+ownership fields during recovery.
+
+- [x] **Step 4: Run focused GREEN**
+
+Run the new regression and all Plan quota service tests. Expected: PASS.
+
+### Task 3: Make Legacy Single-Key Status Writes Transactional
+
+**Files:**
+- Modify: `model/channel_status_test.go`
+- Modify: `model/channel.go`
+
+- [x] **Step 1: Add rollback and interleaving regressions**
+
+Force the ability update to fail and assert `UpdateChannelStatus` returns
+false while database channel status, metadata, ability state, and cache remain
+unchanged. Add a deterministic simulated competing transactional writer
+between the legacy channel write and ability write; assert the final channel
+status and ability state cannot diverge.
+
+- [x] **Step 2: Run focused RED**
+
+Run:
+
+```bash
+go test ./model -run '^TestUpdateChannelStatusSingleKey' -count=1
+```
+
+Expected: FAIL because the channel write commits before the deferred ability
+write and the cache is changed before persistence.
+
+- [x] **Step 3: Factor lock and transaction internals**
+
+Create a shared internal lock wrapper and a lock-assuming single-key CAS
+transaction. Keep `UpdateSingleKeyChannelStatusIfUnchanged` as the public
+snapshot API. Route non-multi-key `UpdateChannelStatus` through a bounded
+snapshot/retry loop that builds reason/time metadata and calls the same
+transaction. Update cache status only after commit. Keep the existing
+multi-key mutation and persistence behavior.
+
+- [x] **Step 4: Run focused GREEN and race coverage**
+
+Run:
+
+```bash
+go test ./model -run '^(TestUpdateChannelStatusSingleKey|TestUpdateSingleKeyChannelStatusIfUnchanged)' -count=1
+go test -race ./model -run '^(TestUpdateChannelStatusSingleKey|TestUpdateSingleKeyChannelStatusIfUnchanged)' -count=1
+```
+
+Expected: PASS.
+
+### Task 4: Select the Oldest Passive Recovery Candidate
+
+**Files:**
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `controller/channel-test.go`
+
+- [x] **Step 1: Add the fairness regression**
+
+Provide two due channels in the same marked domain with the most recently
+tested channel first. Give the peer an older `TestTime` and assert the peer is
+selected. Cover equal `TestTime` values with the lower ID as the deterministic
+winner while unrelated failures remain individually selected.
+
+- [x] **Step 2: Run focused RED**
+
+Run:
+
+```bash
+go test ./controller -run '^TestSelectChannelsForAutomaticTest.*Recovery' -count=1
+```
+
+Expected: FAIL because the current implementation keeps the first domain
+representative.
+
+- [x] **Step 3: Choose by age per recovery key**
+
+For passive recovery only, collect one candidate per shared recovery key and
+replace it when a candidate has an older `TestTime`, or the same `TestTime`
+and a lower ID. Continue assigning every non-owned auto-disabled row a unique
+channel key.
+
+- [x] **Step 4: Run focused GREEN**
+
+Run the focused controller selection tests. Expected: PASS.
+
+### Task 5: Prioritize Managed Plan Domain Isolation
+
+**Files:**
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/channel.go`
+- Modify: `controller/relay.go`
+
+- [x] **Step 1: Add a managed-route fixture regression**
+
+Enable upstream orchestration with a failure threshold above one, create a
+managed route for a single-key Plan channel and a peer sharing its credential,
+then call the public disable path with a recognized Plan quota error. Assert
+both channels are auto-disabled with the same non-secret domain marker and
+generation, both abilities are disabled, and managed threshold handling did
+not suppress domain isolation.
+
+- [x] **Step 2: Run focused RED**
+
+Run:
+
+```bash
+go test ./service -run '^TestDisableChannelManagedPlanQuotaIsolatesCredentialDomain$' -count=1
+```
+
+Expected: FAIL because managed failure recording returns before Plan quota
+classification.
+
+- [x] **Step 3: Reorder service and controller decisions**
+
+In `DisableChannel`, load/classify a recognized non-multi-key Plan quota domain
+before calling `RecordManagedChannelFailure`. In `processChannelError`, send a
+recognized non-multi-key Plan quota error to `DisableChannel` before the
+managed failure branch. Leave managed unsupported-model isolation first and
+leave ordinary managed errors on their existing threshold path.
+
+- [x] **Step 4: Run focused GREEN**
+
+Run the managed Plan regression plus existing managed unsupported-model and
+failure-threshold tests. Expected: PASS.
+
+### Task 6: Documentation and Final Verification
+
+**Files:**
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-monthly-plan-quota-isolation.md`
+- Modify: `docs/superpowers/plans/2026-09-23-atomic-channel-quota-ownership.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: Update the design and plans**
+
+Document identity-fenced CAS, exact string disable generations, transactional
+legacy single-key updates, oldest-first passive recovery, managed Plan
+precedence, no schema change, and the rule that raw credentials never enter
+quota metadata or logs.
+
+- [x] **Step 2: Format and run all requested checks**
+
+```bash
+gofmt -w model/channel.go model/channel_status_cas_test.go model/channel_status_test.go service/channel.go service/channel_quota_test.go controller/channel-test.go controller/channel_test_internal_test.go controller/relay.go
+go test ./model ./service ./controller -count=1
+go test -race ./model -run '^(TestUpdateChannelStatusSingleKey|TestUpdateSingleKeyChannelStatusIfUnchanged)' -count=1
+go test -race ./service -run 'PlanQuota' -count=1
+go test -race ./controller -run '^TestSelectChannelsForAutomaticTest.*Recovery' -count=1
+go vet ./model ./service ./controller
+git diff --check
+```
+
+- [x] **Step 3: Run optional real-dialect CAS tests when configured**
+
+```bash
+TEST_MYSQL_DSN='...' TEST_POSTGRES_DSN='...' \
+  go test ./model -run '^TestUpdateSingleKeyChannelStatusIfUnchangedConfiguredDatabases$' -count=1 -v
+```
+
+Record skips when the DSNs are unavailable.
+
+- [x] **Step 4: Review and commit**
+
+Review the cumulative diff for scope, credential disclosure, and schema
+changes, then commit all final-review changes:
+
+```bash
+git commit -m "fix(channel): close plan quota recovery races"
+```
+
+### Task 7: Bind Recovery to the Pre-Probe Snapshot
+
+**Files:**
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/channel.go`
+- Modify: `controller/channel-test.go`
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: Add production service-path stale-probe regressions**
+
+Call a wished-for exported health-check recovery API with a Plan quota source
+snapshot captured before a second disable generation and before a concurrent
+manual disable. Assert source and peers remain disabled, their ability rows
+remain disabled, and the newer owner metadata is unchanged.
+
+- [x] **Step 2: Verify focused RED**
+
+Run:
+
+```bash
+go test ./service -run '^TestEnableChannelForHealthCheckRejects(StalePlanQuotaGeneration|ConcurrentManualDisable)$' -count=1
+```
+
+Observed: build failure because `EnableChannelForHealthCheck` did not exist.
+
+- [x] **Step 3: Add snapshot-aware recovery and wire the controller**
+
+Add `EnableChannelForHealthCheck(snapshot, usingKey)`. For a non-multi-key Plan
+quota owner, derive the domain from the pre-probe snapshot and CAS the source
+using its exact key, tag, status, and raw `other_info`. Abort without generic
+enablement when the source CAS does not commit. After it commits, load current
+same-domain peers and recover each through its own CAS. If the source
+snapshot's credential does not match its marker, recover only the source.
+Keep `EnableChannel` unchanged for manual and internal callers. Pass the
+original channel snapshot from `testChannelForHealthCheck`.
+
+- [x] **Step 4: Verify snapshot recovery GREEN**
+
+Run the focused stale-probe tests and the broader `PlanQuota|MonthlyPlanQuota`
+service subset. Expected and observed: PASS.
+
+- [x] **Step 5: Add managed passive-selection RED**
+
+Create managed-route fixtures for a due marked Plan quota row, a due validated
+legacy Plan quota row, and a due ordinary auto-disabled row. Assert the two
+validated Plan rows are selected and the ordinary managed row is excluded.
+
+Run:
+
+```bash
+go test ./controller -run '^TestSelectChannelsForAutomaticTestPassiveRecoveryIncludesManagedPlanQuota$' -count=1
+```
+
+Observed: FAIL with an empty selected set.
+
+- [x] **Step 6: Admit only validated managed Plan owners**
+
+In passive selection, classify quota ownership before applying the managed
+exclusion. Keep excluding managed rows without a valid shared Plan recovery
+key, while allowing marked or validated legacy Plan quota rows after
+`disabled_until`. Preserve existing domain deduplication and oldest-first
+selection.
+
+- [x] **Step 7: Verify managed-selection GREEN**
+
+Run the passive recovery selection tests plus managed unsupported-model,
+ordinary failure-classification, and managed Plan isolation tests. Expected
+and observed: PASS.
+
+- [x] **Step 8: Run final gates and commit**
+
+```bash
+gofmt -w service/channel.go service/channel_quota_test.go \
+  controller/channel-test.go controller/channel_test_internal_test.go
+go test ./service ./controller ./model -count=1
+go test -race ./service -run '^(TestEnableChannelForHealthCheck|TestEnablePlanQuotaDomainAfterCredentialRotation|TestDisableChannelManagedPlanQuota)' -count=1
+go test -race ./controller -run '^TestSelectChannelsForAutomaticTest.*Recovery' -count=1
+go vet ./service ./controller ./model
+git diff --check
+git commit -m "fix(channel): bind quota recovery to probe snapshot"
+```
+
+### Task 8: Require Structured Plan Quota Evidence
+
+**Files:**
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/channel.go`
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `controller/relay.go`
+
+- [x] **Step 1: Add classifier RED coverage**
+
+Cover HTTP 429 plus normalized `AccountQuotaExceeded` from
+`NewAPIError.GetErrorCode()` or available OpenAI code/type fields and
+recognized monthly, weekly, 5-hour, or remaining weighted-token evidence.
+Include `WithClaudeError` coverage. Reject ordinary 429s, wrong status, wrong
+code/type, and matching semantics without quota evidence.
+
+Observed RED:
+
+```text
+undefined: ClassifyPlanQuotaError
+```
+
+- [x] **Step 2: Add the service classifier**
+
+Keep `ParsePlanQuotaReset` as the message parser, but permit the Plan-domain
+path only through `ClassifyPlanQuotaError`. Leave configured generic status and
+keyword disables unchanged.
+
+- [x] **Step 3: Use the classifier in controller precedence**
+
+Replace text-only managed prioritization with the service classifier. Keep
+managed unsupported-model isolation first.
+
+### Task 9: Bind Disable to the Observed Request Identity
+
+**Files:**
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/channel.go`
+- Modify: `controller/relay.go`
+
+- [x] **Step 1: Add the credential-rotation RED regression**
+
+Send the failing request with a Plan tag and credential A, rotate both source
+tag and key to an ordinary/B identity, and assert that current Plan A peers are
+isolated while the rotated source and B peers remain enabled.
+
+Observed RED:
+
+```text
+undefined: DisableChannelForAPIError
+```
+
+- [x] **Step 2: Add the structured disable entry**
+
+`DisableChannelForAPIError` carries the classified reset,
+`ChannelError.UsingKey`, and selected channel snapshot tag into domain
+selection. The request-time tag decides Plan eligibility; current rows are
+matched exactly and written through the existing identity/status/metadata CAS.
+Empty observed credentials remain source-only.
+
+- [x] **Step 3: Make recognized Plan handling synchronous**
+
+Call the structured entry directly from `processChannelError` before retry
+selection. Keep generic disables asynchronous; the structured service entry
+retains multi-key per-key handling.
+
+### Task 10: Fence and Count Health-Check Recovery
+
+**Files:**
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/channel.go`
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `controller/channel-test.go`
+
+- [x] **Step 1: Add peer-fence RED coverage**
+
+After source CAS success, assert that peers with a different generation or a
+future `disabled_until` remain auto-disabled with disabled abilities. Preserve
+compatibility when both marked legacy rows omit generation.
+
+Observed RED: mismatched-generation and not-yet-due peers were enabled.
+
+- [x] **Step 2: Apply generation and due-time checks**
+
+Require matching non-empty generation strings, or explicit both-missing legacy
+compatibility, and require each peer to be due before its own CAS.
+
+- [x] **Step 3: Add committed-count RED coverage**
+
+Assert a source plus peer recovery returns two commits and a stale replay
+returns zero. Exercise `testChannelForHealthCheck` against a real local HTTP
+upstream and require the same summary values.
+
+Observed RED: the service API had no return value; after adding it, controller
+summaries reported one for both the two-row commit and stale no-op.
+
+- [x] **Step 4: Return and aggregate committed enables**
+
+Return the number of successful status CAS commits from
+`EnableChannelForHealthCheck` and add that exact number to the controller
+summary.
+
+### Task 11: Preserve Plan Ownership During Managed Reconciliation
+
+**Files:**
+- Modify: `service/upstream_orchestration_test.go`
+- Modify: `service/upstream_routing.go`
+
+- [x] **Step 1: Add the two-path RED regression**
+
+Run `ReconcileManagedUpstreams` with one shadow route becoming active and one
+already-active route entering steady-state ranking. Assert both owned channels
+remain disabled while route state, rank, priority, endpoint, and models update.
+
+Observed RED: both channels and abilities were enabled, and the activation
+path also appended generic status metadata.
+
+- [x] **Step 2: Share an ownership guard**
+
+Both the route-state activation writer and `rankManagedRoutes` consult
+`PlanQuotaRecoveryDomainKey` before selecting enabled status. Valid ownership
+preserves status, raw metadata, and disabled abilities; ordinary managed
+behavior is unchanged.
+
+### Task 12: Fail Passive Selection Closed
+
+**Files:**
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `controller/channel-test.go`
+
+- [x] **Step 1: Add a database-failure RED regression**
+
+Run the passive system task without the managed-route table and provide an
+otherwise probeable ordinary auto-disabled channel.
+
+Observed RED: the query error was ignored, the task returned success, and the
+upstream received a probe.
+
+- [x] **Step 2: Propagate selection errors**
+
+Return `([]*model.Channel, error)` from `selectChannelsForAutomaticTest`.
+Propagate managed-route query failures from `runChannelTestTask` before worker
+startup and update every selector call site.
+
+### Task 13: Final Verification and Commit
+
+**Files:**
+- Modify only the registered handoff occupancy list.
+
+- [x] **Step 1: Run formatting and focused/package tests**
+
+```bash
+gofmt -w service/channel.go service/channel_quota_test.go \
+  service/upstream_routing.go service/upstream_orchestration_test.go \
+  controller/relay.go controller/channel-test.go \
+  controller/channel_test_internal_test.go
+go test ./service ./controller -count=1
+```
+
+- [x] **Step 2: Run race, vet, and whitespace gates**
+
+```bash
+go test -race ./service -run \
+  'PlanQuota|ClassifyPlanQuota|ReconcileManagedUpstreamsPreservesPlanQuotaOwnership' -count=1
+go test -race ./controller -run \
+  'Test(ChannelForHealthCheckCountsOnlyCommittedRecoveries|RunChannelTestTaskFailsClosedWhenManagedRouteQueryFails|SelectChannelsForAutomaticTest.*|ShouldPrioritizePlanQuotaDisableForManagedChannel)' -count=1
+go vet ./service ./controller
+git diff --check
+```
+
+- [x] **Step 3: Self-review and commit**
+
+Review the cumulative diff for occupancy, secret disclosure, schema changes,
+multi-key behavior, and stale-write protection, then create one focused commit.
+
+### Task 14: Close Final Review Blockers
+
+**Files:**
+
+- Modify: `service/channel.go`
+- Modify: `service/channel_quota_test.go`
+- Modify: `service/upstream_routing.go`
+- Modify: `service/upstream_orchestration_test.go`
+- Modify: `model/channel.go`
+- Modify: `model/channel_status_cas_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: Add all four blocking RED regressions**
+
+Cover empty observed key rotation by key and by tag, managed multi-key Plan
+isolation below the managed threshold, a future source `disabled_until`, and
+deterministic quota-disable interleavings in activation and steady-state rank.
+Add a model contract test for stale and fresh managed channel snapshots.
+
+Observed RED:
+
+```text
+TestDisableChannelForAPIErrorPreservesRotatedEmptyCredentialSource:
+source status became 3 and its ability became disabled after both rotations.
+
+TestDisableChannelManagedPlanMultiKeyImmediatelyIsolatesUsedKey:
+used-key status remained 0 and the managed failure counter became 1.
+
+TestEnableChannelForHealthCheckPreservesPlanQuotaDomainBeforeSourceDue:
+returned 1, enabled the source ability, and cleared source quota metadata.
+
+TestReconcileManagedUpstreamsPreservesConcurrentPlanQuotaDisable:
+activation and steady-state rank both restored channel status 1 and enabled
+the ability.
+
+TestUpdateManagedChannelIfUnchangedPreservesConcurrentStatusOwner:
+build failed because ManagedChannelUpdate and
+UpdateManagedChannelIfUnchanged did not exist.
+```
+
+- [x] **Step 2: Bind empty observed identity and managed multi-key handling**
+
+Require the freshly loaded empty-key source to remain non-multi-key with the
+exact empty raw key and observed tag. Route structured multi-key Plan errors
+directly to `UpdateChannelStatus` with `UsingKey` before managed failure
+accounting.
+
+- [x] **Step 3: Fence source recovery by due time**
+
+Return zero from `EnableChannelForHealthCheck` before any write when the source
+snapshot has `disabled_until > now`. Keep `EnableChannel` unchanged as the
+manual override.
+
+- [x] **Step 4: Make final managed reconciliation atomic**
+
+Remove activation's pre-rank enable. Add a model-owned managed update CAS that
+uses the existing status locks, `lockForUpdate`, and a conditional channel
+update, then commits route rank/multiplier, channel priority/base/models/status,
+and abilities in one transaction. Retry stale snapshots from current state.
+
+- [x] **Step 5: Verify focused GREEN**
+
+```bash
+go test ./service -run \
+  '^(TestDisableChannelForAPIErrorPreservesRotatedEmptyCredentialSource|TestDisableChannelManagedPlanMultiKeyImmediatelyIsolatesUsedKey|TestEnableChannelForHealthCheckPreservesPlanQuotaDomainBeforeSourceDue|TestReconcileManagedUpstreamsPreservesConcurrentPlanQuotaDisable)$' -count=1
+go test ./model -run \
+  '^(TestUpdateManagedChannelIfUnchangedPreservesConcurrentStatusOwner|TestUpdateSingleKeyChannelStatusIfUnchanged.*)$' -count=1
+```
+
+Observed: PASS.
+
+- [x] **Step 6: Run final formatting, package, race, vet, and diff gates**
+
+Run the full requested verification set, including the optional configured
+MySQL/PostgreSQL CAS matrix when DSNs are available, then self-review and
+commit.
+
+Observed: `gofmt`, focused race suites for model/service/controller, full
+`go test ./service ./controller ./model -count=1`, `go vet` for those packages,
+and `git diff --check` all passed. The optional configured-database test passed
+with its MySQL and PostgreSQL cases skipped because `TEST_MYSQL_DSN` and
+`TEST_POSTGRES_DSN` were unset. Cumulative review found no P0-P2 defect.
+
+### Task 15: Resolve Final Specification Review Findings
+
+**Files:**
+
+- Modify: `service/channel.go`
+- Modify: `service/channel_quota_test.go`
+- Modify: `model/channel.go`
+- Modify: `model/channel_status_cas_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: RED for the global automatic-disable gate**
+
+Call `DisableChannelForAPIError` with a qualifying structured 429 while
+`common.AutomaticDisableChannelEnabled` is false. Assert it returns false and
+preserves channel status, `other_info`, `channel_info`, abilities, and managed
+route counters.
+
+Run:
+
+```bash
+go test ./service -run '^TestDisableChannelForAPIErrorHonorsGlobalAutomaticDisable$' -count=1
+```
+
+Observed: FAIL because the entry returned handled, auto-disabled both domain
+rows, wrote quota metadata, and disabled both abilities.
+
+- [x] **Step 2: GREEN for the global gate**
+
+Add the service-entry guard:
+
+```go
+if !common.AutomaticDisableChannelEnabled {
+    return false
+}
+```
+
+Run the focused test and the existing structured classifier/disable tests.
+Observed: PASS.
+
+- [x] **Step 3: RED for disable/recovery overlap**
+
+Start from an owned, due Plan quota domain. During the fresh disable's
+`GetAllChannels` snapshot callback, recover the source and peer from the old
+generation. Assert the fresh disable leaves both rows auto-disabled with the
+same new generation and disabled abilities.
+
+Run:
+
+```bash
+go test ./service -run '^TestFreshPlanQuotaDisableWinsOverOverlappingRecovery$' -count=1
+```
+
+Observed: FAIL because both one-shot CAS calls used stale auto-disabled
+snapshots and left the recovered rows enabled without a new generation.
+
+- [x] **Step 4: GREEN with bounded re-evaluation**
+
+Extract a helper with this responsibility:
+
+```go
+func disablePlanQuotaChannel(
+    channel *model.Channel,
+    failingChannelID int,
+    observedCredential string,
+    observedTag string,
+    domainID string,
+    generation string,
+    reason string,
+    resetAt int64,
+) (bool, error)
+```
+
+For at most `planQuotaDisableMaxAttempts` service attempts, validate exact
+credential/tag/mode and enabled-or-same-owner status, build desired metadata,
+attempt the single-key CAS, then reload and re-evaluate only after a stale
+no-op. Keep the one event generation for every attempt. Stop immediately for
+manual disable, unrelated ownership, or identity/mode rotation.
+
+Run the overlap test plus the existing ownership and rotation tests. Observed:
+PASS.
+
+- [x] **Step 5: RED for managed multi-key request identity**
+
+Add table cases that rotate a request-selected managed multi-key Plan channel
+to another tag and from multi-key to a new single key before
+`DisableChannelForAPIError`. Assert no current key, channel metadata, ability,
+or route counter changes. Retain the unchanged managed multi-key case proving
+immediate `UsingKey` isolation.
+
+Run:
+
+```bash
+go test ./service -run '^TestDisableChannelManagedPlanMultiKey(RequestIdentityFence|ImmediatelyIsolatesUsedKey)$' -count=1
+```
+
+Observed: FAIL because tag rotation disabled the original key index and
+multi-key-to-single-key rotation disabled the replacement channel and ability.
+
+- [x] **Step 6: GREEN with an atomic multi-key request CAS**
+
+Add:
+
+```go
+func UpdateMultiKeyChannelStatusIfUnchanged(
+    expected *Channel,
+    observedTag string,
+    usingKey string,
+    status int,
+    reason string,
+) (bool, error)
+```
+
+Under `withChannelStatusLocks` and a transaction row lock, require the locked
+row to match expected key, tag, status, raw `other_info`, and complete
+`channel_info`; also require the observed tag, multi-key mode, and exact used
+key membership. Reuse `handlerMultiKeyUpdate`, persist status metadata and
+`channel_info` atomically, update abilities only when overall status changes,
+and refresh cache only after commit. Use this helper only for structured Plan
+multi-key handling; preserve general `UpdateChannelStatus`.
+
+Run focused model and service tests. Observed: PASS.
+
+- [x] **Step 7: RED for behavioral lock ordering**
+
+Register GORM query callbacks that record locked table reads inside
+`UpdateManagedChannelIfUnchanged`, then perform a real successful managed
+route/channel/ability update. Assert the first two transactional reads are
+`upstream_managed_routes` then `channels`, and assert all three persisted
+states changed atomically.
+
+Run:
+
+```bash
+go test ./model -run '^TestUpdateManagedChannelIfUnchangedLocksRouteBeforeChannel$' -count=1
+```
+
+Observed: FAIL with only a transactional `channels` read; the route had no
+locking read.
+
+- [x] **Step 8: GREEN with one route-first order**
+
+In `UpdateManagedChannelIfUnchanged`, lock and validate the route by route ID
+and expected channel ID before locking the channel. Keep route, channel, and
+ability writes in the same transaction. Both row reads use `lockForUpdate`, so
+SQLite skips unsupported syntax while MySQL/PostgreSQL retain row locks.
+
+Run the lock-order regression, managed snapshot CAS tests, reconciliation
+tests, and unsupported-model isolation tests. Observed: PASS with transactional
+read order `upstream_managed_routes`, then `channels`.
+
+- [x] **Step 9: Final verification and focused commit**
+
+```bash
+gofmt -w service/channel.go service/channel_quota_test.go \
+  model/channel.go model/channel_status_cas_test.go
+go test ./model ./service ./controller -count=1
+go test -race ./model -run \
+  '^(TestUpdateManagedChannelIfUnchanged|TestUpdateMultiKeyChannelStatusIfUnchanged)' -count=1
+go test -race ./service -run \
+  'PlanQuota|DisableChannelForAPIError|ManagedPlanMultiKey' -count=1
+go test -race ./controller -run \
+  'PlanQuota|ProcessChannelError|ShouldPrioritizePlanQuota' -count=1
+go vet ./model ./service ./controller
+git diff --check
+```
+
+Run the optional configured MySQL/PostgreSQL model matrix when both DSNs are
+available, review scope and credential handling, then create one focused
+commit.
+
+Observed: formatting was clean; the model/service/controller package suite,
+the focused model/service/controller race suites, `go vet`, and
+`git diff --check` passed. The configured-database harness passed with its
+MySQL and PostgreSQL cases skipped because `TEST_MYSQL_DSN` and
+`TEST_POSTGRES_DSN` were unset. Diff review found only the six registered task
+files and no credential disclosure or schema change.
+
+### Task 16: Synchronize Final-Key Memory Routing
+
+**Files:**
+
+- Modify: `model/channel_cache.go`
+- Modify: `model/channel_status_cas_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: Add a cached-selection RED regression**
+
+Start with memory caching enabled and one remaining enabled key. Disable that
+final key through `UpdateMultiKeyChannelStatusIfUnchanged`, then assert cached
+selection returns no channel while the cached `channel_info` contains both
+disabled key states and retains its polling cursor. Re-enable one key and
+assert the channel becomes selectable again with the committed per-key state.
+
+Run:
+
+```bash
+go test ./model -run \
+  '^TestUpdateMultiKeyChannelStatusIfUnchangedSynchronizesMemoryRouting$' -count=1
+```
+
+Observed RED: cached selection returned the overall auto-disabled channel.
+
+- [x] **Step 2: Reconcile routing membership with the full cache update**
+
+When `CacheUpdateChannel` observes an overall status transition, remove all
+existing occurrences of the channel ID from the group/model routing index.
+Reinsert it, preserving priority order and avoiding duplicates, only when the
+committed status is enabled. Keep the full channel replacement and routing
+change under the same cache lock so the committed `channel_info` is retained.
+
+Run the focused test again. Observed: PASS.
+
+- [x] **Step 3: Run final verification and commit**
+
+Run focused model/service tests, the relevant race subsets, `go vet`, `gofmt`,
+and `git diff --check`. Review the final diff for scope, then create one
+focused commit without deployment changes.
+
+Observed: formatting was clean; full model/service package tests, focused
+model/service race subsets, `go vet ./model ./service ./controller`, and
+`git diff --check` passed. The diff contains only the cache implementation,
+its behavior regression, and the existing design/plan updates.
+
+### Task 17: Recover an All-Disabled Multi-Key Channel
+
+**Files:**
+
+- Modify: `controller/channel-test.go`
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `service/channel.go`
+- Modify: `service/channel_quota_test.go`
+- Modify: `model/channel_cache.go`
+- Modify: `model/channel_status_cas_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: RED for final-key automatic probing**
+
+Add controller regressions requiring a health-check-only deep copy of
+`ChannelInfo`, oldest-disabled-time selection with a lower-index tie-break, no
+source snapshot mutation, a failed-probe no-op, and successful recovery of
+exactly the selected key.
+
+Run:
+
+```bash
+go test ./controller -run \
+  '^(TestBuildHealthCheckProbeChannelSelectsOldestAutoDisabledKey|TestChannelForHealthCheckProbesFinalAutoDisabledMultiKey)$' -count=1
+```
+
+Observed RED: build failed because `buildHealthCheckProbeChannel` did not
+exist; without the probe copy, `SetupContextForSelectedChannel` returned
+`ChannelNoAvailableKey`.
+
+- [x] **Step 2: RED for health-check identity fencing**
+
+Call `EnableChannelForHealthCheck` with a stale multi-key source snapshot after
+channel-info, multi-key mode, tag, and key rotation. Require zero committed
+enables and unchanged channel plus ability state.
+
+Run:
+
+```bash
+go test ./service -run \
+  '^(TestEnableChannelForHealthCheckRecoversOnlySelectedFinalKey|TestEnableChannelForHealthCheckFencesMultiKeySnapshotIdentity)$' -count=1
+```
+
+Observed RED: all stale cases returned one; channel-info and tag changes
+re-enabled the selected key, mode rotation enabled the whole channel, and key
+rotation reported success despite no matching key.
+
+- [x] **Step 3: GREEN with an isolated probe and snapshot CAS**
+
+Build a shallow channel copy with independently copied `ChannelInfo` maps.
+When every key is unavailable, select the auto-disabled key with the oldest
+disable time and lower index tie-break, expose only that key in the probe copy,
+and prevent polling-state persistence. Probe the copy, but pass the original
+snapshot and request-selected key to `EnableChannelForHealthCheck`. Route
+multi-key recovery through `UpdateMultiKeyChannelStatusIfUnchanged`.
+
+Observed: both focused controller and service commands passed.
+
+- [x] **Step 4: RED for production re-enable cache membership**
+
+With memory caching enabled, disable the final key through the structured
+production service path, confirm cached random selection excludes the channel,
+then call `EnableChannel` and require cached selection to return it. Add a
+model cache contract that repeats enabled status updates and requires one
+priority-ordered routing ID.
+
+Run:
+
+```bash
+go test ./service -run '^TestEnableChannelRestoresFinalMultiKeyMemoryRouting$' -count=1
+go test ./model -run '^TestCacheUpdateChannelStatusRebuildsOrderedRoutingMembership$' -count=1
+```
+
+Observed RED: the service recovery committed but cached selection remained
+empty; the model routing index contained only the lower-priority peer.
+
+- [x] **Step 5: GREEN with one symmetric routing-index helper**
+
+Under `channelSyncLock`, remove every occurrence of the channel ID from every
+routing entry, then re-add the enabled cached channel from its group/model
+fields and stable-sort by priority. Use the helper from
+`CacheUpdateChannelStatus` and from `CacheUpdateChannel` when status, group,
+models, or priority changes.
+
+Observed: both focused cache commands passed.
+
+- [x] **Step 6: Run final verification and commit**
+
+```bash
+gofmt -w controller/channel-test.go controller/channel_test_internal_test.go \
+  model/channel_cache.go model/channel_status_cas_test.go \
+  service/channel.go service/channel_quota_test.go
+go test ./controller ./model ./service -count=1
+go test -race ./controller -run \
+  'Test(BuildHealthCheckProbeChannel|ChannelForHealthCheckProbesFinalAutoDisabledMultiKey)' -count=1
+go test -race ./model -run \
+  'Test(CacheUpdateChannelStatusRebuildsOrderedRoutingMembership|UpdateMultiKeyChannelStatusIfUnchangedSynchronizesMemoryRouting)' -count=1
+go test -race ./service -run \
+  'TestEnableChannel(ForHealthCheck.*MultiKey|RestoresFinalMultiKeyMemoryRouting)' -count=1
+go vet ./controller ./model ./service
+git diff --check
+```
+
+Review the focused diff, mark the handoff complete, and create one commit
+without deployment changes.
+
+Observed: all three package suites and focused race suites passed. `go vet`
+and `git diff --check` exited cleanly. Review found only the registered
+controller, model, service, test, and documentation changes; no deployment or
+schema files changed.
+
+### Task 18: Preserve Managed Final-Key Isolation During Reconciliation
+
+**Files:**
+
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `model/channel.go`
+- Modify: `model/channel_status_test.go`
+- Modify: `service/upstream_routing.go`
+- Modify: `service/upstream_orchestration_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: RED for the full managed final-key lifecycle**
+
+Disable a managed channel's final enabled key through the structured Plan
+quota path with memory caching enabled. Reconcile its healthy active route and
+require the channel to remain auto-disabled, its ability disabled, and its
+cache route excluded. Then probe the isolated oldest key and require exactly
+that key, the ability, and cached routing to recover.
+
+Run:
+
+```bash
+go test ./controller -run \
+  '^TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedProbe$' \
+  -count=1 -v
+```
+
+Observed RED: reconciliation changed channel status from auto-disabled to
+enabled, enabled the ability, restored cache routing, and left the isolated
+probe with no request or recovery.
+
+- [x] **Step 2: RED for the reusable key-availability contract**
+
+Require missing and explicit enabled statuses within the configured key range
+to count as enabled, and require empty or fully disabled key sets to report no
+enabled key. Require reconciliation preservation only for the fully disabled
+multi-key case when the desired status is enabled.
+
+Run:
+
+```bash
+go test ./model -run '^TestChannelHasEnabledKey$' -count=1
+go test ./service -run \
+  '^TestPreserveManagedPlanQuotaOwnershipRequiresAllMultiKeysDisabled$' \
+  -count=1 -v
+```
+
+Observed RED: the model method did not exist, and the reconciliation predicate
+did not preserve the fully disabled multi-key channel.
+
+- [x] **Step 3: GREEN with one model predicate and reconciliation guard**
+
+Add `Channel.HasEnabledKey`, reuse it from the existing multi-key status
+transition, and preserve the current managed channel status only when
+reconciliation wants to enable a multi-key channel that has no enabled key.
+Keep the existing single-key Plan ownership behavior and allow ordinary
+reconciliation whenever any configured key remains enabled.
+
+Observed: the focused model, service, and end-to-end controller regressions
+passed.
+
+- [x] **Step 4: Verify and commit**
+
+Run formatting, focused tests, full affected package tests, focused race
+tests, `go vet`, and `git diff --check`. Review the final diff and commit only
+the registered implementation, regression, and documentation files.
+
+Observed: `gofmt` produced no remaining diff; focused model, service, and
+controller tests passed; `go test ./model ./service ./controller -count=1`
+passed; all three focused race suites passed; `go vet ./model ./service
+./controller` and `git diff --check` exited cleanly.
+
+### Task 19: Schedule Managed Final-Key Passive Recovery
+
+**Files:**
+
+- Modify: `controller/channel-test.go`
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: Extend the full lifecycle with passive-task RED**
+
+Keep the managed final-key fixture not due and assert passive mode performs no
+probe. Move its `disabled_until` into the past, invoke `runChannelTestTask`
+instead of calling `testChannelForHealthCheck` directly, and assert progress,
+summary, and upstream requests show exactly one selected recovery candidate.
+
+Run:
+
+```bash
+go test ./controller -run \
+  '^TestManagedFinalKeyDisableSurvivesReconciliationAndRecoversThroughIsolatedProbe$' \
+  -count=1 -v
+```
+
+Observed RED: the due run reported progress `0/0`, tested zero channels, and
+sent no request because the managed row had no quota-domain marker.
+
+- [x] **Step 2: Cover the passive-selection boundary**
+
+Extend managed passive-selection coverage with two due all-disabled multi-key
+rows sharing the same Plan tag and credential, one future all-disabled row,
+and one due multi-key row with an enabled key. Require both due all-disabled
+rows independently, while the future and enabled-key rows remain excluded
+along with the existing ordinary managed row.
+
+Observed RED: only the marked and validated legacy rows were returned.
+
+- [x] **Step 3: Admit only channel-specific final-key recovery**
+
+After the existing due check, allow an unowned managed row only when it is
+auto-disabled, multi-key, and `!HasEnabledKey()`. Leave its default
+`channel:<id>` recovery key unchanged. Marked and validated legacy rows retain
+their shared-domain key.
+
+Observed GREEN: both focused controller regressions passed.
+
+- [x] **Step 4: Verify and commit**
+
+Run focused controller/model/service tests, their relevant race suites,
+`go vet`, `gofmt`, and `git diff --check`. Review the final diff, mark the local
+handoff complete, and create one focused commit without deployment changes.
+
+Observed: focused controller/model/service tests and matching race suites
+passed; `go vet ./controller ./model ./service`, `gofmt -d`, and
+`git diff --check` exited cleanly. Review found only the registered controller
+implementation, regression coverage, and design/plan updates.
+
+### Task 20: Persist Managed Final-Key Reset Metadata
+
+**Files:**
+
+- Modify: `controller/channel_test_internal_test.go`
+- Modify: `model/channel.go`
+- Modify: `model/channel_status_cas_test.go`
+- Modify: `service/channel.go`
+- Modify: `service/channel_quota_test.go`
+- Modify: `docs/superpowers/specs/2026-09-23-monthly-plan-quota-isolation-design.md`
+- Modify: `docs/superpowers/plans/2026-09-23-final-plan-quota-recovery-races.md`
+
+- [x] **Step 1: RED for the structured final-key lifecycle**
+
+Remove the manually seeded `disabled_until` from the managed end-to-end
+fixture. Send a structured final-key Plan error with a known reset and require
+the database row to persist `quota_reset_at` plus `disabled_until=reset+60`
+with the final per-key state and disabled ability. Require passive mode to test
+zero channels before due, then make only the deadline due and require one
+isolated recovery.
+
+Observed RED: both reset fields were absent, passive mode immediately probed
+and recovered the channel, and the later due run had no candidate.
+
+- [x] **Step 2: RED for the focused model contract**
+
+Call `UpdateMultiKeyChannelStatusIfUnchanged` with a wished-for focused options
+value. Require a known final-key reset to update metadata and a forced ability
+write failure to roll back status, complete per-key state, deadline metadata,
+and ability state together.
+
+Observed RED: the model package did not compile because the options contract
+and parameter did not exist.
+
+- [x] **Step 3: GREEN with an atomic metadata option**
+
+Add `MultiKeyChannelStatusUpdateOptions`. Merge only `quota_reset_at` and
+`disabled_until` after the selected-key transition leaves the overall channel
+auto-disabled and the structured reset is known. On health-check recovery,
+delete only those two fields after the selected-key transition makes the
+overall channel enabled. Keep all snapshot and request identity comparisons
+unchanged and perform metadata, channel, ability, and cache updates through the
+existing transaction and post-commit path.
+
+Observed: the focused model tests and full managed final-key lifecycle passed.
+
+- [x] **Step 4: Cover partial and unknown reset boundaries**
+
+Require a known structured error that leaves another multi-key credential
+enabled to write no overall deadline or shared Plan ownership marker. Require
+an unknown-reset final-key error to preserve the existing deadline-free
+behavior while still disabling the final key and ability.
+
+Observed: focused service tests passed.
+
+- [x] **Step 5: Verify, review, and commit**
+
+Run `gofmt`, focused and affected-package tests, focused race tests, `go vet`,
+and `git diff --check`. Review for CAS preservation, unrelated metadata
+retention, raw credential disclosure, schema changes, and deployment changes;
+then create one focused commit.
+
+Observed: focused model, service, and end-to-end controller regressions passed;
+`go test ./model ./service ./controller -count=1` passed; focused race suites
+for all three packages passed; `go vet`, `gofmt -d`, and `git diff --check`
+exited cleanly. The configured MySQL and PostgreSQL cases skipped because
+`TEST_MYSQL_DSN` and `TEST_POSTGRES_DSN` were unset. Review found no schema,
+credential, or deployment changes.

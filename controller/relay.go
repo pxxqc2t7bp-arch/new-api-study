@@ -28,7 +28,6 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 
-	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
@@ -208,15 +207,13 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 		recoveryBaseAttempt = recoveryWriter.Attempt()
 		maxRetries = capStreamRecoveryRetries(c, maxRetries)
 	}
-	failoverDeadline := time.Now().Add(time.Duration(operation_setting.GetUpstreamOrchestrationSetting().FailoverBudgetSeconds) * time.Second)
+	var failoverDeadline time.Time
 
 	for ; retryParam.GetRetry() <= maxRetries; retryParam.IncreaseRetry() {
 		relayInfo.StreamStatus = nil
 		relayInfo.PerformanceBusinessRejection = false
 		relayInfo.PerformanceOutputTokens = 0
-		if retryParam.GetRetry() > 0 &&
-			operation_setting.GetUpstreamOrchestrationSetting().Enabled &&
-			time.Now().After(failoverDeadline) {
+		if !failoverDeadline.IsZero() && time.Now().After(failoverDeadline) {
 			c.Set("channel_fallback_reason", "failover_budget_exhausted")
 			break
 		}
@@ -224,7 +221,12 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
-			newAPIError = channelErr
+			if relayInfo.LastError != nil &&
+				shouldPrioritizePlanQuotaDisable(relayInfo.LastError) {
+				newAPIError = relayInfo.LastError
+			} else {
+				newAPIError = channelErr
+			}
 			break
 		}
 		if recoveryWriter != nil {
@@ -347,7 +349,7 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 			relayInfo.LastError = nil
 			channelID := channel.Id
 			elapsed := time.Since(attemptStartedAt)
-			gopool.Go(func() {
+			service.RunRelayAsync(c, func() {
 				service.RecordManagedChannelSuccess(channelID, elapsed)
 			})
 			return
@@ -356,7 +358,16 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
 
-		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
+		if _, processErr := processChannelErrorWithObservedTag(
+			c,
+			*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
+			channel.GetTag(),
+			newAPIError,
+			relayInfo,
+		); processErr != nil {
+			newAPIError = processErr
+			relayInfo.LastError = processErr
+		}
 		c.Set("channel_fallback_reason", fmt.Sprintf("status_%d:%s", newAPIError.StatusCode, newAPIError.GetErrorCode()))
 
 		retry, replacement := retryDecision(
@@ -379,6 +390,9 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		if !retry {
 			break
+		}
+		if failoverDeadline.IsZero() && operation_setting.GetUpstreamOrchestrationSetting().Enabled {
+			failoverDeadline = time.Now().Add(time.Duration(operation_setting.GetUpstreamOrchestrationSetting().FailoverBudgetSeconds) * time.Second)
 		}
 	}
 
@@ -470,6 +484,7 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 		autoBan := c.GetBool("auto_ban")
 		autoBanInt := 1
 		priority := c.GetInt64("channel_priority")
+		tag := common.GetContextKeyString(c, constant.ContextKeyChannelTag)
 		if !autoBan {
 			autoBanInt = 0
 		}
@@ -479,6 +494,10 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 			Name:     c.GetString("channel_name"),
 			Priority: &priority,
 			AutoBan:  &autoBanInt,
+			Tag:      &tag,
+			ChannelInfo: model.ChannelInfo{
+				IsMultiKey: common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey),
+			},
 		}
 		service.RequestPolicy(c).BeginAttempt(channel, info.UsingGroup)
 		return channel, nil
@@ -565,8 +584,129 @@ func retryDecision(
 	return false, newStatefulReplayUnsafeAPIError(reason)
 }
 
-func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
+// processChannelError accepts both the production relay-info form and the
+// observed-tag form introduced by Plan quota fencing.
+func processChannelError(c *gin.Context, channelError types.ChannelError, identityOrError any, errorOrRelayInfo any) {
+	switch value := identityOrError.(type) {
+	case string:
+		err, _ := errorOrRelayInfo.(*types.NewAPIError)
+		_, _ = processChannelErrorWithObservedTag(c, channelError, value, err, nil)
+	case *types.NewAPIError:
+		relayInfo, _ := errorOrRelayInfo.(*relaycommon.RelayInfo)
+		observedTag := common.GetContextKeyString(c, constant.ContextKeyChannelTag)
+		_, _ = processChannelErrorWithObservedTag(c, channelError, observedTag, value, relayInfo)
+	}
+}
+
+func shouldPrioritizePlanQuotaDisable(err *types.NewAPIError) bool {
+	if err == nil {
+		return false
+	}
+	_, quotaLimited := service.ClassifyPlanQuotaError(err)
+	return quotaLimited
+}
+
+func processTaskChannelError(c *gin.Context, channel *model.Channel, taskErr *taskdto.TaskError) *types.NewAPIError {
+	if c == nil || channel == nil || taskErr == nil || taskErr.LocalError {
+		return nil
+	}
+	_, processErr := processChannelErrorWithObservedTag(
+		c,
+		*types.NewChannelError(
+			channel.Id,
+			channel.Type,
+			channel.Name,
+			channel.ChannelInfo.IsMultiKey,
+			common.GetContextKeyString(c, constant.ContextKeyChannelKey),
+			channel.GetAutoBan(),
+		),
+		channel.GetTag(),
+		taskSubmissionAPIError(taskErr),
+		nil,
+	)
+	return processErr
+}
+
+func processChannelErrorWithObservedTag(
+	c *gin.Context,
+	channelError types.ChannelError,
+	observedTag string,
+	err *types.NewAPIError,
+	relayInfo *relaycommon.RelayInfo,
+) (bool, *types.NewAPIError) {
+	return processChannelErrorWithObservedTagMode(
+		c,
+		channelError,
+		observedTag,
+		err,
+		relayInfo,
+		false,
+	)
+}
+
+func processHealthCheckChannelError(
+	c *gin.Context,
+	channelError types.ChannelError,
+	observedTag string,
+	err *types.NewAPIError,
+	relayInfo *relaycommon.RelayInfo,
+) (bool, *types.NewAPIError) {
+	return processChannelErrorWithObservedTagMode(
+		c,
+		channelError,
+		observedTag,
+		err,
+		relayInfo,
+		true,
+	)
+}
+
+func processChannelErrorWithObservedTagMode(
+	c *gin.Context,
+	channelError types.ChannelError,
+	observedTag string,
+	err *types.NewAPIError,
+	relayInfo *relaycommon.RelayInfo,
+	waitForGenericDisable bool,
+) (bool, *types.NewAPIError) {
+	if err == nil {
+		return false, nil
+	}
+	var disableErr error
+	planQuota := shouldPrioritizePlanQuotaDisable(err)
+	channelDisabled := false
+	disableKind := "Plan quota disable"
+	if planQuota {
+		if channelError.AutoBan {
+			// Plan quota authority is handled synchronously so retry selection
+			// cannot observe a stale credential domain.
+			disableResult, callErr := service.DisableChannelForAPIError(channelError, observedTag, err)
+			disableErr = callErr
+			channelDisabled = disableResult.ChannelDisabled
+		}
+		// The shared error path still owns logging, but must not also apply its
+		// generic managed/non-managed disable behavior to a Plan quota error.
+		channelError.AutoBan = false
+	} else if waitForGenericDisable &&
+		channelError.AutoBan &&
+		service.ShouldDisableChannel(err) &&
+		!service.IsManagedChannel(channelError.ChannelId) {
+		disableKind = "channel disable"
+		channelDisabled, disableErr = service.DisableChannelWithResult(
+			channelError,
+			err.MaskSensitiveErrorWithStatusCode(),
+		)
+		channelError.AutoBan = false
+	}
 	service.ProcessChannelError(c, channelError, err, relayInfo)
+	if disableErr != nil {
+		return false, types.NewError(
+			fmt.Errorf("persist %s for channel %d: %w", disableKind, channelError.ChannelId, disableErr),
+			types.ErrorCodeUpdateDataError,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	return channelDisabled, nil
 }
 
 func RelayMidjourney(c *gin.Context) {
@@ -824,13 +964,32 @@ func executeTaskSubmissionWith(
 
 		if lockedCh, ok := relayInfo.LockedChannel.(*model.Channel); ok && lockedCh != nil {
 			channel = lockedCh
-			policy.BeginAttempt(channel, relayInfo.UsingGroup)
 			if retryParam.GetRetry() > 0 {
+				refreshed, refreshErr := model.GetChannelById(lockedCh.Id, true)
+				if refreshErr != nil {
+					taskErr = service.TaskErrorWrapperLocal(
+						fmt.Errorf("failed to refresh locked channel #%d: %w", lockedCh.Id, refreshErr),
+						"setup_locked_channel_failed",
+						http.StatusInternalServerError,
+					)
+					break
+				}
+				relayInfo.LockedChannel = refreshed
+				channel = refreshed
+				if channel.Status != common.ChannelStatusEnabled {
+					taskErr = service.TaskErrorWrapperLocal(
+						fmt.Errorf("locked channel #%d is disabled (status %d)", channel.Id, channel.Status),
+						"setup_locked_channel_disabled",
+						http.StatusServiceUnavailable,
+					)
+					break
+				}
 				if setupErr := middleware.SetupContextForSelectedChannel(c, channel, relayInfo.OriginModelName); setupErr != nil {
 					taskErr = service.TaskErrorWrapperLocal(setupErr.Err, "setup_locked_channel_failed", http.StatusInternalServerError)
 					break
 				}
 			}
+			policy.BeginAttempt(channel, relayInfo.UsingGroup)
 		} else {
 			var channelErr *types.NewAPIError
 			channel, channelErr = getChannel(c, relayInfo, retryParam)
@@ -869,15 +1028,35 @@ func executeTaskSubmissionWith(
 
 		taskAPIError := taskSubmissionAPIError(taskErr)
 		relayInfo.LastError = taskAPIError
-		decision := decideTaskRetry(c, taskErr, maxTaskRetries-retryParam.GetRetry())
-		service.RecordPolicyFailure(c, channel.Id, taskAPIError, decision)
+		persistenceFailed := false
 		if !taskErr.LocalError {
-			processChannelError(c,
+			if _, processErr := processChannelErrorWithObservedTag(
+				c,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
+				channel.GetTag(),
 				taskAPIError,
-				relayInfo)
+				relayInfo,
+			); processErr != nil {
+				persistenceFailed = true
+				taskAPIError = processErr
+				relayInfo.LastError = processErr
+				taskErr = service.TaskErrorWrapperLocal(
+					processErr,
+					string(processErr.GetErrorCode()),
+					processErr.StatusCode,
+				)
+			}
 		}
+		decision := decideTaskRetry(c, taskErr, maxTaskRetries-retryParam.GetRetry())
+		if persistenceFailed {
+			decision = service.DecideRelayRetry(
+				c,
+				taskAPIError,
+				maxTaskRetries-retryParam.GetRetry(),
+			)
+		}
+		service.RecordPolicyFailure(c, channel.Id, taskAPIError, decision)
 
 		willRetry := decision.Action == "retry"
 		diagnostics.attemptFailed(retryParam.GetRetry()+1, channel, taskErr, willRetry)
@@ -1084,11 +1263,15 @@ func respondTaskError(c *gin.Context, taskErr *taskdto.TaskError) {
 // taskSubmissionAPIError adapts a task error for the shared relay error paths.
 // TaskError.Error is nil for many local rejections, so fall back to the message.
 func taskSubmissionAPIError(taskErr *taskdto.TaskError) *types.NewAPIError {
-	err := taskErr.Error
-	if err == nil {
-		err = errors.New(taskErr.Message)
+	var options []types.NewAPIErrorOptions
+	if taskErr.NoRetry {
+		options = append(options, types.ErrOptionWithSkipRetry())
 	}
-	return types.NewOpenAIError(err, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode)
+	return types.WithOpenAIError(types.OpenAIError{
+		Message: taskErr.Message,
+		Type:    taskErr.Type,
+		Code:    taskErr.Code,
+	}, taskErr.StatusCode, options...)
 }
 
 // decideTaskRetry is the single retry decision for task submissions. The

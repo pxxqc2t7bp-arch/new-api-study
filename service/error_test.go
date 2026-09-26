@@ -3,6 +3,8 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -61,6 +63,98 @@ func TestResetStatusCode(t *testing.T) {
 			require.Equal(t, tc.expectedCode, newAPIError.StatusCode)
 		})
 	}
+}
+
+func TestTaskErrorFromAPIErrorPreservesStructuredCodeAndType(t *testing.T) {
+	const message = "structured upstream error"
+	testCases := []struct {
+		name     string
+		code     any
+		errType  string
+		wantCode string
+		wantType string
+	}{
+		{
+			name:     "explicit code takes priority",
+			code:     "rate_limit_exceeded",
+			errType:  "AccountQuotaExceeded",
+			wantCode: "rate_limit_exceeded",
+			wantType: "AccountQuotaExceeded",
+		},
+		{
+			name:     "distinct code and quota type are both preserved",
+			code:     "other_error",
+			errType:  "AccountQuotaExceeded",
+			wantCode: "other_error",
+			wantType: "AccountQuotaExceeded",
+		},
+		{
+			name:     "missing code falls back to type",
+			errType:  "AccountQuotaExceeded",
+			wantCode: "AccountQuotaExceeded",
+			wantType: "AccountQuotaExceeded",
+		},
+		{
+			name:     "empty code falls back to type",
+			code:     "",
+			errType:  "AccountQuotaExceeded",
+			wantCode: "AccountQuotaExceeded",
+			wantType: "AccountQuotaExceeded",
+		},
+		{
+			name:     "unknown code falls back to type",
+			code:     "unknown",
+			errType:  "AccountQuotaExceeded",
+			wantCode: "AccountQuotaExceeded",
+			wantType: "AccountQuotaExceeded",
+		},
+		{
+			name:     "unknown error code falls back to type",
+			code:     "unknown_error",
+			errType:  "AccountQuotaExceeded",
+			wantCode: "AccountQuotaExceeded",
+			wantType: "AccountQuotaExceeded",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			apiErr := types.WithOpenAIError(types.OpenAIError{
+				Message: message,
+				Type:    testCase.errType,
+				Code:    testCase.code,
+			}, http.StatusTooManyRequests)
+
+			taskErr := TaskErrorFromAPIError(apiErr)
+
+			require.NotNil(t, taskErr)
+			require.Equal(t, testCase.wantCode, taskErr.Code)
+			encoded, err := json.Marshal(taskErr)
+			require.NoError(t, err)
+			var response map[string]any
+			require.NoError(t, json.Unmarshal(encoded, &response))
+			require.Equal(t, testCase.wantType, response["type"])
+			require.Equal(t, message, taskErr.Message)
+			require.Equal(t, http.StatusTooManyRequests, taskErr.StatusCode)
+			require.False(t, taskErr.LocalError)
+		})
+	}
+}
+
+func TestTaskErrorConversionsPreserveSkipRetry(t *testing.T) {
+	apiErr := types.NewError(
+		errors.New("persistence failed"),
+		types.ErrorCodeUpdateDataError,
+		types.ErrOptionWithSkipRetry(),
+	)
+
+	converted := TaskErrorFromAPIError(apiErr)
+	require.NotNil(t, converted)
+	require.True(t, converted.NoRetry)
+
+	wrapped := TaskErrorWrapperLocal(apiErr, string(apiErr.GetErrorCode()), apiErr.StatusCode)
+	require.NotNil(t, wrapped)
+	require.True(t, wrapped.NoRetry)
 }
 
 func TestRelayErrorHandlerTruncatesInvalidJSONBodyInLog(t *testing.T) {

@@ -2,22 +2,27 @@ package router
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 const relayFailoverModel = "gpt-3.5-turbo"
@@ -201,6 +206,12 @@ func setupRelayFailoverTest(t *testing.T, memoryCache bool) (*gin.Engine, *model
 	}).Error)
 
 	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		service.SetRelayAsyncRunner(c, func(task func()) {
+			task()
+		})
+		c.Next()
+	})
 	SetRelayRouter(engine)
 	return engine, user
 }
@@ -401,6 +412,128 @@ func TestRelayChannelFailoverFrom429DisablesPrimary(t *testing.T) {
 	assert.Equal(t, 2, backup.callCount())
 }
 
+func TestRelayPlanQuotaTrailingNewlineUsesSelectedKeyAndDisablesPeers(t *testing.T) {
+	engine, user := setupRelayFailoverTest(t, false)
+	const credential = "ExactCasePlanKey"
+	authorization := make(chan string, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization <- r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.","type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	autoBan := 1
+	sourceTag := "plan:relay:selected-source"
+	peerTag := "plan:relay:selected-peer"
+	sourcePriority := int64(30)
+	peerPriority := int64(20)
+	source := model.Channel{
+		Id: 3311, Name: "selected-source", Type: constant.ChannelTypeOpenAI,
+		Key: credential + "\n", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, Tag: &sourceTag, AutoBan: &autoBan,
+		Models: relayFailoverModel, Group: "default", Priority: &sourcePriority,
+	}
+	peer := model.Channel{
+		Id: 3312, Name: "selected-peer", Type: constant.ChannelTypeOpenAI,
+		Key: credential, BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, Tag: &peerTag, AutoBan: &autoBan,
+		Models: "peer-only-model", Group: "default", Priority: &peerPriority,
+	}
+	require.NoError(t, source.Insert())
+	require.NoError(t, peer.Insert())
+
+	response := performRelayFailoverRequest(t, engine)
+
+	require.Equal(t, http.StatusTooManyRequests, response.Code, response.Body.String())
+	require.Len(t, authorization, 1)
+	assert.Equal(t, "Bearer "+credential, <-authorization)
+	hash, ok := model.PlanQuotaDomainHash(credential)
+	require.True(t, ok)
+	for _, channelID := range []int{source.Id, peer.Id} {
+		var stored model.Channel
+		require.NoError(t, model.DB.First(&stored, channelID).Error)
+		assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
+		assert.Equal(t, hash, stored.GetOtherInfo()["quota_domain_id"])
+		var ability model.Ability
+		require.NoError(t, model.DB.First(&ability, "channel_id = ?", channelID).Error)
+		assert.False(t, ability.Enabled)
+	}
+	requireRelayRefunded(t, user.Id)
+}
+
+func TestRelayRetryStopsWhenPlanQuotaDisablePersistenceFails(t *testing.T) {
+	engine, _ := setupRelayFailoverTest(t, false)
+	originalRetryTimes := common.RetryTimes
+	common.RetryTimes = 1
+	t.Cleanup(func() {
+		common.RetryTimes = originalRetryTimes
+	})
+
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{"error":{"message":"You have exceeded the monthly usage quota. It will reset at 2033-05-18 03:33:20 +0000 UTC.","type":"AccountQuotaExceeded","code":"AccountQuotaExceeded"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	backup := newFailoverUpstream(t, "persistence-failure-backup", http.StatusOK)
+
+	autoBan := 1
+	tag := "plan:relay:persistence-failure"
+	priority := int64(30)
+	source := model.Channel{
+		Id: 3313, Name: "persistence-failure-source", Type: constant.ChannelTypeOpenAI,
+		Key: "relay-persistence-key", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusEnabled, Tag: &tag, AutoBan: &autoBan,
+		Models: relayFailoverModel, Group: "default", Priority: &priority,
+	}
+	require.NoError(t, source.Insert())
+	addRelayFailoverChannel(t, 3314, 20, backup)
+
+	forcedErr := errors.New("forced relay Plan quota ability persistence failure")
+	const callbackName = "test:relay_plan_quota_persistence_failure"
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil &&
+			tx.Statement.Schema != nil &&
+			tx.Statement.Schema.Name == "Ability" {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Callback().Update().Remove(callbackName))
+	})
+	initializeRelayFailoverChannels()
+
+	response := performRelayFailoverRequest(t, engine)
+
+	require.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+	assert.Equal(t, string(relaytypes.ErrorCodeUpdateDataError), payload.Error.Code)
+	assert.Equal(t, int32(1), upstreamCalls.Load())
+	assert.Zero(t, backup.callCount())
+
+	var stored model.Channel
+	require.NoError(t, model.DB.First(&stored, source.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+	assert.NotContains(t, stored.GetOtherInfo(), "quota_domain_id")
+	var ability model.Ability
+	require.NoError(t, model.DB.First(&ability, "channel_id = ?", source.Id).Error)
+	assert.True(t, ability.Enabled)
+	hash, ok := model.PlanQuotaDomainHash(source.Key)
+	require.True(t, ok)
+	var authority model.PlanQuotaDomain
+	require.NoError(t, model.DB.First(&authority, "credential_hash = ?", hash).Error)
+	assert.Equal(t, model.PlanQuotaDomainStateActive, authority.State)
+}
+
 func TestRelayChannelFailoverFromConnectionFailure(t *testing.T) {
 	engine, _ := setupRelayFailoverTest(t, false)
 	trace := &failoverCallTrace{}
@@ -462,22 +595,48 @@ func TestRelayChannelFailoverCapsAttemptsAtFivePriorities(t *testing.T) {
 	requireRelayRefunded(t, user.Id)
 }
 
+func TestRelayChannelFailoverFromSlow429StartsBudgetAtFailover(t *testing.T) {
+	engine, _ := setupRelayFailoverTest(t, false)
+	common.AutomaticDisableChannelEnabled = false
+	enableManagedOrchestrationForFailoverTest(t, 1)
+	trace := &failoverCallTrace{}
+	primary := newFailoverUpstream(t, "slow-primary", http.StatusTooManyRequests, trace)
+	primary.setDelay(1100 * time.Millisecond)
+	backup := newFailoverUpstream(t, "backup", http.StatusOK, trace)
+	addRelayFailoverChannel(t, 3641, 30, primary)
+	addRelayFailoverChannel(t, 3642, 20, backup)
+	initializeRelayFailoverChannels()
+
+	response := performRelayFailoverRequest(t, engine)
+
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), "backup")
+	assert.Equal(t, []string{"slow-primary", "backup"}, trace.snapshot())
+	assert.Equal(t, 1, primary.callCount())
+	assert.Equal(t, 1, backup.callCount())
+}
+
 func TestRelayChannelFailoverStopsWhenBudgetExpires(t *testing.T) {
 	engine, user := setupRelayFailoverTest(t, false)
 	enableManagedOrchestrationForFailoverTest(t, 1)
 	trace := &failoverCallTrace{}
-	primary := newFailoverUpstream(t, "slow-primary", http.StatusInternalServerError, trace)
-	primary.setDelay(1100 * time.Millisecond)
-	backup := newFailoverUpstream(t, "backup", http.StatusOK, trace)
+	primary := newFailoverUpstream(t, "primary", http.StatusInternalServerError, trace)
+	slowFallback := newFailoverUpstream(t, "slow-fallback", http.StatusInternalServerError, trace)
+	slowFallback.setDelay(1100 * time.Millisecond)
+	third := newFailoverUpstream(t, "third", http.StatusOK, trace)
 	addRelayFailoverChannel(t, 3651, 30, primary)
-	addRelayFailoverChannel(t, 3652, 20, backup)
+	addRelayFailoverChannel(t, 3652, 20, slowFallback)
+	addRelayFailoverChannel(t, 3653, 10, third)
 	initializeRelayFailoverChannels()
 
 	response := performRelayFailoverRequest(t, engine)
 
 	assert.Equal(t, http.StatusInternalServerError, response.Code, response.Body.String())
-	assert.Equal(t, []string{"slow-primary"}, trace.snapshot())
-	assert.Zero(t, backup.callCount())
+	assert.Contains(t, response.Body.String(), "slow-fallback")
+	assert.Equal(t, []string{"primary", "slow-fallback"}, trace.snapshot())
+	assert.Equal(t, 1, primary.callCount())
+	assert.Equal(t, 1, slowFallback.callCount())
+	assert.Zero(t, third.callCount())
 	requireRelayRefunded(t, user.Id)
 }
 

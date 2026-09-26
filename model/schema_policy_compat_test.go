@@ -9752,12 +9752,14 @@ func TestRequestPolicyBulkWriterUsesProtectedTransaction(t *testing.T) {
 	db := useMigrationTestDB(t)
 	require.NoError(t, db.AutoMigrate(&Option{}))
 	previousSnapshot := CurrentRequestPolicy()
+	previousRetryTimes := common.RetryTimes
 	common.OptionMapRWMutex.Lock()
 	previousOptions := maps.Clone(common.OptionMap)
 	common.OptionMap = maps.Clone(previousSnapshot.Options)
 	common.OptionMapRWMutex.Unlock()
 	t.Cleanup(func() {
 		requestPolicySnapshot.Store(previousSnapshot)
+		common.RetryTimes = previousRetryTimes
 		common.OptionMapRWMutex.Lock()
 		common.OptionMap = previousOptions
 		common.OptionMapRWMutex.Unlock()

@@ -8,6 +8,7 @@ type TaskError struct {
 	// NoRetry prevents duplicate upstream work after a response has been accepted.
 	NoRetry    bool   `json:"-"`
 	Code       string `json:"code"`
+	Type       string `json:"type,omitempty"`
 	Message    string `json:"message"`
 	Data       any    `json:"data"`
 	StatusCode int    `json:"-"`

@@ -38,10 +38,6 @@ type UpstreamSource struct {
 	UpdatedAt           int64    `json:"updated_at" gorm:"bigint;index"`
 }
 
-func (UpstreamSource) TableName() string {
-	return "upstream_sources"
-}
-
 func (source *UpstreamSource) BeforeCreate(_ *gorm.DB) error {
 	now := common.GetTimestamp()
 	source.Key = strings.TrimSpace(source.Key)

@@ -933,11 +933,64 @@ type channelTestSummary struct {
 	Enabled   int `json:"enabled"`
 }
 
+func buildHealthCheckProbeChannel(channel *model.Channel) (*model.Channel, string, bool) {
+	if channel == nil ||
+		(channel.Status != common.ChannelStatusEnabled &&
+			channel.Status != common.ChannelStatusAutoDisabled) ||
+		!channel.ChannelInfo.IsMultiKey {
+		return channel, "", false
+	}
+
+	keys := channel.GetKeys()
+	selectedIndex, due := channel.NextDueAutoDisabledMultiKeyIndex(time.Now().Unix())
+	if !due {
+		return channel, "", false
+	}
+
+	probe := *channel
+	probe.Keys = append([]string(nil), channel.Keys...)
+	probe.ChannelInfo = channel.ChannelInfo
+	probe.ChannelInfo.MultiKeyStatusList = make(map[int]int, len(channel.ChannelInfo.MultiKeyStatusList))
+	for index, status := range channel.ChannelInfo.MultiKeyStatusList {
+		probe.ChannelInfo.MultiKeyStatusList[index] = status
+	}
+	probe.ChannelInfo.MultiKeyDisabledReason = make(map[int]string, len(channel.ChannelInfo.MultiKeyDisabledReason))
+	for index, reason := range channel.ChannelInfo.MultiKeyDisabledReason {
+		probe.ChannelInfo.MultiKeyDisabledReason[index] = reason
+	}
+	probe.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64, len(channel.ChannelInfo.MultiKeyDisabledTime))
+	for index, disabledTime := range channel.ChannelInfo.MultiKeyDisabledTime {
+		probe.ChannelInfo.MultiKeyDisabledTime[index] = disabledTime
+	}
+	probe.ChannelInfo.MultiKeyDisabledUntil = make(map[int]int64, len(channel.ChannelInfo.MultiKeyDisabledUntil))
+	for index, disabledUntil := range channel.ChannelInfo.MultiKeyDisabledUntil {
+		probe.ChannelInfo.MultiKeyDisabledUntil[index] = disabledUntil
+	}
+	for index := range keys {
+		if index == selectedIndex {
+			delete(probe.ChannelInfo.MultiKeyStatusList, index)
+			continue
+		}
+		status, exists := probe.ChannelInfo.MultiKeyStatusList[index]
+		if !exists || status == common.ChannelStatusEnabled {
+			probe.ChannelInfo.MultiKeyStatusList[index] = common.ChannelStatusManuallyDisabled
+		}
+	}
+	// The probe has one enabled key, so random mode selects it without persisting
+	// a polling cursor or the temporary enabled state.
+	probe.ChannelInfo.MultiKeyMode = constant.MultiKeyModeRandom
+	return &probe, keys[selectedIndex], true
+}
+
 func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, testUserID int, allowDisable bool, disableThreshold int64) channelTestSummary {
 	summary := channelTestSummary{}
 	isChannelEnabled := channel.Status == common.ChannelStatusEnabled
+	probeChannel, _, isolatedProbe := buildHealthCheckProbeChannel(channel)
+	if !isolatedProbe {
+		probeChannel = channel
+	}
 	tik := time.Now()
-	result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
+	result := testChannel(ctx, probeChannel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(probeChannel))
 	milliseconds := time.Since(tik).Milliseconds()
 	if ctx.Err() != nil {
 		return summary
@@ -965,17 +1018,47 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 		summary.Failed++
 	}
 
-	if allowDisable && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
-		processChannelError(result.context, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, nil)
-		summary.Disabled++
+	if !isolatedProbe && allowDisable && isChannelEnabled && shouldBanChannel && channel.GetAutoBan() {
+		channelError := *types.NewChannelError(
+			channel.Id,
+			channel.Type,
+			channel.Name,
+			channel.ChannelInfo.IsMultiKey,
+			common.GetContextKeyString(result.context, constant.ContextKeyChannelKey),
+			channel.GetAutoBan(),
+		)
+		channelDisabled, processErr := processHealthCheckChannelError(
+			result.context,
+			channelError,
+			channel.GetTag(),
+			newAPIError,
+			nil,
+		)
+		if processErr != nil {
+			common.SysError(fmt.Sprintf(
+				"failed to disable channel after health check: channel_id=%d error=%s",
+				channel.Id,
+				common.LocalLogPreview(processErr.MaskSensitiveErrorWithStatusCode()),
+			))
+		} else if channelDisabled {
+			summary.Disabled++
+		}
 	}
 
-	if result.localErr == nil && !isChannelEnabled && service.ShouldEnableChannel(newAPIError, channel.Status) {
-		service.EnableChannel(channel.Id, common.GetContextKeyString(result.context, constant.ContextKeyChannelKey), channel.Name)
-		summary.Enabled++
+	shouldRecover := !isChannelEnabled && service.ShouldEnableChannel(newAPIError, channel.Status)
+	if isolatedProbe {
+		shouldRecover = common.AutomaticEnableChannelEnabled && newAPIError == nil
+	}
+	if result.localErr == nil && shouldRecover {
+		summary.Enabled += service.EnableChannelForHealthCheck(
+			channel,
+			common.GetContextKeyString(result.context, constant.ContextKeyChannelKey),
+		)
 	}
 
-	channel.UpdateResponseTime(milliseconds)
+	if !isolatedProbe || result.localErr == nil && newAPIError == nil {
+		channel.UpdateResponseTime(milliseconds)
+	}
 	return summary
 }
 
@@ -1114,7 +1197,10 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 	if strings.TrimSpace(mode) == "" {
 		mode = operation_setting.GetMonitorSetting().ChannelTestMode
 	}
-	selected := selectChannelsForAutomaticTest(channels, mode)
+	selected, err := selectChannelsForAutomaticTest(channels, mode)
+	if err != nil {
+		return channelTestSummary{}, err
+	}
 	allowDisable := mode != operation_setting.ChannelTestModePassiveRecovery
 	concurrency := operation_setting.GetMonitorSetting().ChannelTestConcurrency
 	summary := performChannelTests(ctx, selected, testUserID, allowDisable, concurrency, report)
@@ -1124,18 +1210,19 @@ func runChannelTestTask(ctx context.Context, mode string, notify bool, report fu
 	return summary, nil
 }
 
-func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*model.Channel {
+func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) ([]*model.Channel, error) {
 	selected := make([]*model.Channel, 0, len(channels))
-	selectedPlanDomains := make(map[string]struct{})
+	selectedRecoveryDomains := make(map[string]int)
 	managedChannels := make(map[int]struct{})
 	if mode == operation_setting.ChannelTestModePassiveRecovery {
 		var managedIDs []int
 		if err := model.DB.Model(&model.UpstreamManagedRoute{}).
 			Where("detached = ?", false).
-			Pluck("channel_id", &managedIDs).Error; err == nil {
-			for _, channelID := range managedIDs {
-				managedChannels[channelID] = struct{}{}
-			}
+			Pluck("channel_id", &managedIDs).Error; err != nil {
+			return nil, fmt.Errorf("failed to load managed channels for passive recovery: %w", err)
+		}
+		for _, channelID := range managedIDs {
+			managedChannels[channelID] = struct{}{}
 		}
 	}
 	now := time.Now().Unix()
@@ -1146,27 +1233,50 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 		if mode == operation_setting.ChannelTestModeAutoBanOnly && !channel.GetAutoBan() {
 			continue
 		}
-		if mode == operation_setting.ChannelTestModePassiveRecovery && channel.Status != common.ChannelStatusAutoDisabled {
-			continue
-		}
 		if mode == operation_setting.ChannelTestModePassiveRecovery {
-			if _, managed := managedChannels[channel.Id]; managed {
-				continue
-			}
-			if disabledUntil := channel.GetDisabledUntil(); disabledUntil > now {
-				continue
-			}
-			tag := channel.GetTag()
-			if strings.HasPrefix(tag, "plan:") {
-				if _, exists := selectedPlanDomains[tag]; exists {
+			isMultiKeyRecovery := false
+			_, managed := managedChannels[channel.Id]
+			if channel.ChannelInfo.IsMultiKey {
+				if managed &&
+					(channel.Status != common.ChannelStatusAutoDisabled ||
+						channel.HasEnabledKey()) {
 					continue
 				}
-				selectedPlanDomains[tag] = struct{}{}
+				_, isMultiKeyRecovery = channel.NextDueAutoDisabledMultiKeyIndex(now)
+				if !isMultiKeyRecovery {
+					continue
+				}
+			} else {
+				if channel.Status != common.ChannelStatusAutoDisabled {
+					continue
+				}
+				if disabledUntil := channel.GetDisabledUntil(); disabledUntil > now {
+					continue
+				}
 			}
+			recoveryKey := fmt.Sprintf("channel:%d", channel.Id)
+			sharedRecoveryKey, owned := service.PlanQuotaRecoveryDomainKey(channel)
+			if managed && !owned {
+				if !isMultiKeyRecovery {
+					continue
+				}
+			}
+			if owned {
+				recoveryKey = sharedRecoveryKey
+			}
+			if selectedIndex, exists := selectedRecoveryDomains[recoveryKey]; exists {
+				current := selected[selectedIndex]
+				if channel.TestTime < current.TestTime ||
+					channel.TestTime == current.TestTime && channel.Id < current.Id {
+					selected[selectedIndex] = channel
+				}
+				continue
+			}
+			selectedRecoveryDomains[recoveryKey] = len(selected)
 		}
 		selected = append(selected, channel)
 	}
-	return selected
+	return selected, nil
 }
 
 // TestAllChannels enqueues a channel_test system task instead of running the

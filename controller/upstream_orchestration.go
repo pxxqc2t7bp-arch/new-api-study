@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -14,7 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	notifydto "github.com/QuantumNous/new-api/relaykit/dto"
-	relaytypes "github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
@@ -446,7 +447,20 @@ type upstreamProbeSummary struct {
 }
 
 func runDueUpstreamProbeTask(ctx context.Context) (upstreamProbeSummary, error) {
+	return runDueUpstreamProbeTaskWithDependencies(
+		ctx,
+		service.ReconcileManagedUpstreams,
+		service.NotifyManagedChannelRecovered,
+	)
+}
+
+func runDueUpstreamProbeTaskWithDependencies(
+	ctx context.Context,
+	reconcileManagedUpstreams func(time.Time) (service.UpstreamReconcileSummary, error),
+	notifyManagedChannelRecovered func(*model.Channel),
+) (upstreamProbeSummary, error) {
 	summary := upstreamProbeSummary{}
+	activatedChannelIDs := make([]int, 0)
 	now := common.GetTimestamp()
 	var routes []model.UpstreamManagedRoute
 	if err := model.DB.Where(
@@ -486,66 +500,108 @@ func runDueUpstreamProbeTask(ctx context.Context) (upstreamProbeSummary, error) 
 		summary.Tested++
 		if result.localErr == nil && result.newAPIError == nil {
 			before := route.State
-			if route.State == model.UpstreamRouteStateActive {
-				_, err = model.RecordUpstreamRouteSuccess(route.ChannelID, now, latency)
-				if err == nil {
-					err = model.DB.Model(&model.UpstreamManagedRoute{}).Where("id = ?", route.ID).
-						Updates(map[string]any{"last_probe_at": now, "next_probe_at": int64(0), "updated_at": now}).Error
-				}
-			} else {
-				err = service.MarkManagedRouteProbeResult(route.ID, true, latency, "")
-			}
+			transition, markErr := service.MarkManagedRouteProbeResult(&route, true, latency, "")
+			err = markErr
 			if err != nil {
 				return summary, err
 			}
 			summary.Succeeded++
-			if before != model.UpstreamRouteStateActive {
-				var current model.UpstreamManagedRoute
-				if model.DB.First(&current, route.ID).Error == nil && current.State == model.UpstreamRouteStateActive {
-					summary.Enabled++
-				}
+			if transition.Applied &&
+				before != model.UpstreamRouteStateActive &&
+				transition.State == model.UpstreamRouteStateActive {
+				activatedChannelIDs = append(activatedChannelIDs, route.ChannelID)
 			}
 			continue
 		}
 
 		message := "upstream probe failed"
-		statusCode := http.StatusServiceUnavailable
+		handledPlanQuota := false
 		if result.newAPIError != nil {
+			handledPlanQuota = shouldPrioritizePlanQuotaDisable(result.newAPIError)
+			if handledPlanQuota && common.AutomaticDisableChannelEnabled {
+				_, disableErr := service.DisableChannelForAPIError(
+					*types.NewChannelError(
+						channel.Id,
+						channel.Type,
+						channel.Name,
+						channel.ChannelInfo.IsMultiKey,
+						common.GetContextKeyString(result.context, constant.ContextKeyChannelKey),
+						channel.GetAutoBan(),
+					),
+					common.GetContextKeyString(result.context, constant.ContextKeyChannelTag),
+					result.newAPIError,
+				)
+				if disableErr != nil {
+					return summary, fmt.Errorf(
+						"persist Plan quota disable for channel %d: %w",
+						channel.Id,
+						disableErr,
+					)
+				}
+			}
 			message = result.newAPIError.ErrorWithStatusCode()
-			statusCode = result.newAPIError.StatusCode
 		} else if result.localErr != nil {
 			message = result.localErr.Error()
 		}
-		if route.State == model.UpstreamRouteStateActive {
-			_, disabled, recordErr := service.RecordManagedChannelFailure(
-				*relaytypes.NewChannelError(
-					channel.Id,
-					channel.Type,
-					channel.Name,
-					channel.ChannelInfo.IsMultiKey,
-					"",
-					channel.GetAutoBan(),
-				),
-				message,
-			)
-			if recordErr != nil {
-				return summary, recordErr
-			}
-			if disabled {
-				summary.Disabled++
-			} else {
-				_ = model.DB.Model(&model.UpstreamManagedRoute{}).Where("id = ?", route.ID).
-					Updates(map[string]any{"last_probe_at": now, "next_probe_at": now + 60, "updated_at": now}).Error
-			}
-		} else if err := service.MarkManagedRouteProbeResult(route.ID, false, latency, message); err != nil {
+		if handledPlanQuota {
+			summary.Failed++
+			continue
+		}
+		before := route.State
+		transition, err := service.MarkManagedRouteProbeResult(&route, false, latency, message)
+		if err != nil {
 			return summary, err
 		}
-		_ = statusCode
+		if transition.Applied &&
+			before == model.UpstreamRouteStateActive &&
+			transition.State == model.UpstreamRouteStateQuarantined {
+			summary.Disabled++
+		}
 		summary.Failed++
 	}
-	if summary.Enabled > 0 {
-		if _, err := service.ReconcileManagedUpstreams(time.Now()); err != nil {
-			return summary, err
+	if len(activatedChannelIDs) > 0 {
+		_, reconcileErr := reconcileManagedUpstreams(time.Now())
+		var auditErr error
+		seen := make(map[int]struct{}, len(activatedChannelIDs))
+		for _, channelID := range activatedChannelIDs {
+			if _, exists := seen[channelID]; exists {
+				continue
+			}
+			seen[channelID] = struct{}{}
+
+			var channel model.Channel
+			if err := model.DB.First(&channel, channelID).Error; err != nil {
+				if auditErr == nil {
+					auditErr = err
+				}
+				continue
+			}
+			if channel.Status != common.ChannelStatusEnabled {
+				continue
+			}
+			var ability model.Ability
+			err := model.DB.Where(
+				"channel_id = ? AND enabled = ?",
+				channelID,
+				true,
+			).First(&ability).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				continue
+			}
+			if err != nil {
+				if auditErr == nil {
+					auditErr = err
+				}
+				continue
+			}
+			summary.Enabled++
+			notifyManagedChannelRecovered(&channel)
+		}
+		if reconcileErr != nil {
+			return summary, reconcileErr
+		}
+		if auditErr != nil {
+			return summary, auditErr
 		}
 	}
 	return summary, nil

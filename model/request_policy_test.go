@@ -19,6 +19,19 @@ import (
 	"gorm.io/gorm/schema"
 )
 
+type recordingOptionLocker struct {
+	name   string
+	events *[]string
+}
+
+func (locker recordingOptionLocker) Lock() {
+	*locker.events = append(*locker.events, "lock "+locker.name)
+}
+
+func (locker recordingOptionLocker) Unlock() {
+	*locker.events = append(*locker.events, "unlock "+locker.name)
+}
+
 func TestRequestPolicyDatabaseMatrix(t *testing.T) {
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {
@@ -119,4 +132,38 @@ func TestRequestPolicyDatabaseMatrix(t *testing.T) {
 			assert.Equal(t, "strict", CurrentRequestPolicy().Affinity.SessionMode, "a failed save keeps the persisted global mode")
 		})
 	}
+}
+
+func TestOptionProtocolsUseCanonicalLockOrder(t *testing.T) {
+	t.Run("request policy writer", func(t *testing.T) {
+		events := make([]string, 0, 4)
+		unlock := lockOptionProtocols(
+			recordingOptionLocker{name: "persistence", events: &events},
+			recordingOptionLocker{name: "policy", events: &events},
+			true,
+		)
+		unlock()
+
+		assert.Equal(t, []string{
+			"lock persistence",
+			"lock policy",
+			"unlock policy",
+			"unlock persistence",
+		}, events)
+	})
+
+	t.Run("generic writer", func(t *testing.T) {
+		events := make([]string, 0, 2)
+		unlock := lockOptionProtocols(
+			recordingOptionLocker{name: "persistence", events: &events},
+			recordingOptionLocker{name: "policy", events: &events},
+			false,
+		)
+		unlock()
+
+		assert.Equal(t, []string{
+			"lock persistence",
+			"unlock persistence",
+		}, events)
+	})
 }

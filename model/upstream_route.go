@@ -2,6 +2,7 @@ package model
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -22,6 +23,8 @@ const (
 	UpstreamRouteStateDetached    = "detached"
 	UpstreamRouteStateRetained    = "retained"
 )
+
+var errStaleManagedRouteIsolation = errors.New("managed route isolation snapshot changed")
 
 type UpstreamManagedRoute struct {
 	ID                   int64   `json:"id" gorm:"primaryKey"`
@@ -50,10 +53,6 @@ type UpstreamManagedRoute struct {
 	LastReason           string  `json:"last_reason,omitempty" gorm:"type:text"`
 	CreatedAt            int64   `json:"created_at" gorm:"bigint;index"`
 	UpdatedAt            int64   `json:"updated_at" gorm:"bigint;index"`
-}
-
-func (UpstreamManagedRoute) TableName() string {
-	return "upstream_managed_routes"
 }
 
 func (route *UpstreamManagedRoute) BeforeCreate(_ *gorm.DB) error {
@@ -124,44 +123,497 @@ func ListUpstreamManagedRoutes() ([]UpstreamManagedRoute, error) {
 	return routes, err
 }
 
+type ManagedRouteChannelTransition struct {
+	StatusIfEnabled    int
+	StatusReason       string
+	StatusTime         int64
+	UpdateStatusReason bool
+}
+
+// TransitionManagedRouteChannelIfUnchanged applies a non-active route
+// transition, channel status metadata, and ability disablement atomically.
+func TransitionManagedRouteChannelIfUnchanged(
+	expected *UpstreamManagedRoute,
+	desired *UpstreamManagedRoute,
+	transition ManagedRouteChannelTransition,
+) (bool, bool, error) {
+	if expected == nil ||
+		expected.ID == 0 ||
+		desired == nil ||
+		desired.ID != expected.ID ||
+		desired.SourceID != expected.SourceID ||
+		desired.ExternalGroupID != expected.ExternalGroupID ||
+		desired.Platform != expected.Platform ||
+		desired.Protocol != expected.Protocol ||
+		desired.ChannelID != expected.ChannelID {
+		return false, false, errors.New("managed route transition snapshot is missing or inconsistent")
+	}
+	if desired.State == UpstreamRouteStateActive {
+		return false, false, errors.New("managed route channel transition cannot activate a route")
+	}
+	if transition.StatusIfEnabled != 0 &&
+		transition.StatusIfEnabled != common.ChannelStatusAutoDisabled &&
+		transition.StatusIfEnabled != common.ChannelStatusManuallyDisabled {
+		return false, false, errors.New("managed route channel transition status is invalid")
+	}
+
+	applied := false
+	statusChanged := false
+	var updatedChannel Channel
+	_, err := withChannelStatusLocks(expected.ChannelID, func() (bool, error) {
+		transactionErr := DB.Transaction(func(tx *gorm.DB) error {
+			var current UpstreamManagedRoute
+			err := lockForUpdate(tx).Where("id = ?", expected.ID).First(&current).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if !reflect.DeepEqual(current, *expected) {
+				return nil
+			}
+
+			channel, changed, err := applyManagedRouteChannelTransition(
+				tx,
+				&current,
+				desired,
+				transition,
+			)
+			if err != nil {
+				return err
+			}
+			updatedChannel = *channel
+			statusChanged = changed
+			applied = true
+			return nil
+		})
+		if transactionErr != nil {
+			return false, transactionErr
+		}
+		if applied {
+			CacheUpdateManagedChannelSnapshots([]ManagedChannelCacheUpdate{{
+				Snapshot:           &updatedChannel,
+				UpdateStatusReason: transition.UpdateStatusReason,
+			}})
+		}
+		return applied, nil
+	})
+	if err != nil {
+		return false, false, err
+	}
+	return applied, statusChanged, nil
+}
+
+func applyManagedRouteChannelTransition(
+	tx *gorm.DB,
+	current *UpstreamManagedRoute,
+	desired *UpstreamManagedRoute,
+	transition ManagedRouteChannelTransition,
+) (*Channel, bool, error) {
+	if err := tx.Model(&UpstreamManagedRoute{}).
+		Where("id = ?", current.ID).
+		Updates(managedRouteTransitionUpdates(desired)).Error; err != nil {
+		return nil, false, err
+	}
+
+	var channel Channel
+	if err := lockForUpdate(tx).
+		Where("id = ?", current.ChannelID).
+		First(&channel).Error; err != nil {
+		return nil, false, err
+	}
+	statusChanged := false
+	if channel.Status == common.ChannelStatusEnabled &&
+		transition.StatusIfEnabled != 0 {
+		channel.Status = transition.StatusIfEnabled
+		statusChanged = true
+	}
+	if transition.UpdateStatusReason {
+		info := channel.GetOtherInfo()
+		statusReason := strings.TrimSpace(transition.StatusReason)
+		currentReason, reasonExists := info["status_reason"].(string)
+		_, timeExists := info["status_time"]
+		if statusChanged ||
+			!reasonExists ||
+			currentReason != statusReason ||
+			!timeExists {
+			info["status_reason"] = statusReason
+			info["status_time"] = transition.StatusTime
+			channel.SetOtherInfo(info)
+		}
+	}
+	if err := tx.Model(&Channel{}).
+		Where("id = ?", channel.Id).
+		Updates(map[string]any{
+			"status":     channel.Status,
+			"other_info": channel.OtherInfo,
+		}).Error; err != nil {
+		return nil, false, err
+	}
+	if err := tx.Model(&Ability{}).
+		Where("channel_id = ?", channel.Id).
+		Select("enabled").
+		Update("enabled", false).Error; err != nil {
+		return nil, false, err
+	}
+	return &channel, statusChanged, nil
+}
+
+func managedRouteTransitionUpdates(route *UpstreamManagedRoute) map[string]any {
+	return map[string]any{
+		"external_key_id":       route.ExternalKeyID,
+		"key_fingerprint":       route.KeyFingerprint,
+		"state":                 route.State,
+		"rank":                  route.Rank,
+		"effective_multiplier":  route.EffectiveMultiplier,
+		"consecutive_failures":  route.ConsecutiveFailures,
+		"consecutive_successes": route.ConsecutiveSuccesses,
+		"failure_window_start":  route.FailureWindowStart,
+		"last_failure_at":       route.LastFailureAt,
+		"last_success_at":       route.LastSuccessAt,
+		"last_probe_at":         route.LastProbeAt,
+		"last_latency_ms":       route.LastLatencyMS,
+		"recovery_attempts":     route.RecoveryAttempts,
+		"next_probe_at":         route.NextProbeAt,
+		"red_since":             route.RedSince,
+		"manual_pause_until":    route.ManualPauseUntil,
+		"detached":              route.Detached,
+		"last_reason":           route.LastReason,
+		"updated_at":            route.UpdatedAt,
+	}
+}
+
+// UpdateManagedRouteProbeResultIfUnchanged applies a probe result only while
+// the complete route snapshot observed before the write is still current.
+func UpdateManagedRouteProbeResultIfUnchanged(
+	expected *UpstreamManagedRoute,
+	desired *UpstreamManagedRoute,
+	disableChannel bool,
+	statusReason string,
+	statusTime int64,
+) (bool, bool, error) {
+	if expected == nil ||
+		expected.ID == 0 ||
+		desired == nil ||
+		desired.ID != expected.ID ||
+		desired.SourceID != expected.SourceID ||
+		desired.ExternalGroupID != expected.ExternalGroupID ||
+		desired.Platform != expected.Platform ||
+		desired.Protocol != expected.Protocol ||
+		desired.ChannelID != expected.ChannelID {
+		return false, false, errors.New("managed route probe snapshot is missing or inconsistent")
+	}
+
+	if desired.State != UpstreamRouteStateActive {
+		applied, statusChanged, err := TransitionManagedRouteChannelIfUnchanged(
+			expected,
+			desired,
+			ManagedRouteChannelTransition{
+				StatusIfEnabled:    common.ChannelStatusAutoDisabled,
+				StatusReason:       statusReason,
+				StatusTime:         statusTime,
+				UpdateStatusReason: strings.TrimSpace(statusReason) != "",
+			},
+		)
+		return applied, disableChannel && statusChanged, err
+	}
+
+	applied := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var current UpstreamManagedRoute
+		err := lockForUpdate(tx).Where("id = ?", expected.ID).First(&current).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(current, *expected) {
+			return nil
+		}
+		if err := tx.Model(&UpstreamManagedRoute{}).
+			Where("id = ?", current.ID).
+			Updates(managedRouteTransitionUpdates(desired)).Error; err != nil {
+			return err
+		}
+		applied = true
+		return nil
+	})
+	return applied, false, err
+}
+
+// IsolateManagedRouteModel removes one model from an attached managed route
+// while locking the managed decision rows in canonical order.
+func IsolateManagedRouteModel(
+	expectedRoute *UpstreamManagedRoute,
+	modelName string,
+	reason string,
+	now int64,
+	exclusionOptionKey string,
+) (bool, string, error) {
+	modelName = strings.TrimSpace(modelName)
+	exclusionOptionKey = strings.TrimSpace(exclusionOptionKey)
+	if expectedRoute == nil ||
+		expectedRoute.ID == 0 ||
+		expectedRoute.SourceID == 0 ||
+		expectedRoute.ChannelID == 0 ||
+		modelName == "" ||
+		exclusionOptionKey == "" {
+		return false, "", nil
+	}
+	if err := validateOptionValue(exclusionOptionKey, "{}"); err != nil {
+		return false, "", err
+	}
+
+	// Lock order: option protocol, channel status locks, then database rows in
+	// option/source/group/route/channel order. Do not call an exported option
+	// writer while this mutex is held.
+	optionPersistencePublishMutex.Lock()
+	defer optionPersistencePublishMutex.Unlock()
+
+	optionValue := ""
+	isolated, err := withChannelStatusLocks(expectedRoute.ChannelID, func() (bool, error) {
+		isolated := false
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "key"}},
+				DoNothing: true,
+			}).Create(&Option{Key: exclusionOptionKey, Value: "{}"}).Error; err != nil {
+				return err
+			}
+			var option Option
+			if err := lockForUpdate(tx).
+				Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: exclusionOptionKey}).
+				First(&option).Error; err != nil {
+				return err
+			}
+
+			var source UpstreamSource
+			if err := lockForUpdate(tx).
+				Where("id = ?", expectedRoute.SourceID).
+				First(&source).Error; err != nil {
+				return err
+			}
+
+			var group UpstreamGroup
+			if err := lockForUpdate(tx).
+				Where("source_id = ? AND external_id = ?", source.ID, expectedRoute.ExternalGroupID).
+				First(&group).Error; err != nil {
+				return err
+			}
+
+			var route UpstreamManagedRoute
+			if err := lockForUpdate(tx).
+				Where("id = ?", expectedRoute.ID).
+				First(&route).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errStaleManagedRouteIsolation
+				}
+				return err
+			}
+			if route.SourceID != source.ID ||
+				route.ExternalGroupID != group.ExternalID ||
+				route.Platform != group.Platform ||
+				route.Detached ||
+				!reflect.DeepEqual(route, *expectedRoute) {
+				return errStaleManagedRouteIsolation
+			}
+
+			var channel Channel
+			if err := lockForUpdate(tx).
+				Where("id = ?", route.ChannelID).
+				First(&channel).Error; err != nil {
+				return err
+			}
+
+			channelModels, channelRemoved := removeManagedRouteModel(channel.Models, modelName)
+			var groupModels []string
+			if err := common.UnmarshalJsonStr(group.Models, &groupModels); err != nil {
+				return err
+			}
+			groupModels, groupRemoved := removeManagedRouteModel(strings.Join(groupModels, ","), modelName)
+
+			exclusions := make(map[string][]string)
+			if strings.TrimSpace(option.Value) != "" {
+				if err := common.UnmarshalJsonStr(option.Value, &exclusions); err != nil {
+					return err
+				}
+			}
+			if exclusions == nil {
+				exclusions = make(map[string][]string)
+			}
+			exclusionKey := strings.ToLower(strings.TrimSpace(source.Key)) + ":" +
+				strings.TrimSpace(route.ExternalGroupID)
+			exclusionAdded := true
+			for _, excluded := range exclusions[exclusionKey] {
+				if strings.TrimSpace(excluded) == modelName {
+					exclusionAdded = false
+					break
+				}
+			}
+			if !exclusionAdded && !channelRemoved && !groupRemoved {
+				optionValue = option.Value
+				isolated = true
+				return nil
+			}
+
+			if channelRemoved {
+				channel.Models = strings.Join(channelModels, ",")
+				if err := tx.Model(&Channel{}).
+					Where("id = ?", channel.Id).
+					Update("models", channel.Models).Error; err != nil {
+					return err
+				}
+				if err := channel.UpdateAbilities(tx); err != nil {
+					return err
+				}
+			}
+
+			if groupRemoved {
+				encodedModels, err := common.Marshal(groupModels)
+				if err != nil {
+					return err
+				}
+				if err := tx.Model(&UpstreamGroup{}).
+					Where("id = ?", group.ID).
+					Updates(map[string]any{
+						"models":     string(encodedModels),
+						"updated_at": now,
+					}).Error; err != nil {
+					return err
+				}
+			}
+			if err := tx.Model(&UpstreamManagedRoute{}).
+				Where("id = ?", route.ID).
+				Updates(map[string]any{
+					"last_failure_at": now,
+					"last_reason":     strings.TrimSpace(reason),
+					"updated_at":      now,
+				}).Error; err != nil {
+				return err
+			}
+
+			if exclusionAdded {
+				exclusions[exclusionKey] = append(exclusions[exclusionKey], modelName)
+				encoded, err := common.Marshal(exclusions)
+				if err != nil {
+					return err
+				}
+				option.Value = string(encoded)
+				if err := tx.Model(&Option{}).
+					Where(clause.Eq{Column: clause.Column{Name: "key"}, Value: exclusionOptionKey}).
+					Update("value", option.Value).Error; err != nil {
+					return err
+				}
+			}
+			optionValue = option.Value
+			isolated = true
+			return nil
+		})
+		return isolated, err
+	})
+	if errors.Is(err, errStaleManagedRouteIsolation) {
+		return false, "", nil
+	}
+	return isolated, optionValue, err
+}
+
+func removeManagedRouteModel(models string, target string) ([]string, bool) {
+	items := strings.Split(models, ",")
+	result := make([]string, 0, len(items))
+	removed := false
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if item == target {
+			removed = true
+			continue
+		}
+		result = append(result, item)
+	}
+	return result, removed
+}
+
 func RecordUpstreamRouteFailure(channelID int, now int64, windowSeconds int64, threshold int, reason string) (*UpstreamManagedRoute, bool, error) {
 	var route UpstreamManagedRoute
 	quarantine := false
-	err := DB.Transaction(func(tx *gorm.DB) error {
-		if err := lockForUpdate(tx).Where("channel_id = ? AND detached = ?", channelID, false).First(&route).Error; err != nil {
-			return err
+	found := false
+	var updatedChannel *Channel
+	_, err := withChannelStatusLocks(channelID, func() (bool, error) {
+		transactionErr := DB.Transaction(func(tx *gorm.DB) error {
+			var current UpstreamManagedRoute
+			err := lockForUpdate(tx).
+				Where("channel_id = ? AND detached = ?", channelID, false).
+				First(&current).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			found = true
+			route = current
+			if route.FailureWindowStart == 0 || now-route.FailureWindowStart > windowSeconds {
+				route.FailureWindowStart = now
+				route.ConsecutiveFailures = 1
+			} else {
+				route.ConsecutiveFailures++
+			}
+			route.ConsecutiveSuccesses = 0
+			route.LastFailureAt = now
+			route.LastReason = strings.TrimSpace(reason)
+			if route.ConsecutiveFailures >= threshold {
+				route.State = UpstreamRouteStateQuarantined
+				route.Rank = 0
+				route.RecoveryAttempts = 0
+				route.NextProbeAt = now
+				quarantine = true
+			}
+			route.UpdatedAt = now
+			if !quarantine {
+				return tx.Model(&UpstreamManagedRoute{}).
+					Where("id = ?", route.ID).
+					Updates(managedRouteTransitionUpdates(&route)).Error
+			}
+
+			channel, _, err := applyManagedRouteChannelTransition(
+				tx,
+				&current,
+				&route,
+				ManagedRouteChannelTransition{
+					StatusIfEnabled:    common.ChannelStatusAutoDisabled,
+					StatusReason:       reason,
+					StatusTime:         now,
+					UpdateStatusReason: true,
+				},
+			)
+			if err != nil {
+				return err
+			}
+			updatedChannel = channel
+			return nil
+		})
+		if transactionErr != nil {
+			return false, transactionErr
 		}
-		if route.FailureWindowStart == 0 || now-route.FailureWindowStart > windowSeconds {
-			route.FailureWindowStart = now
-			route.ConsecutiveFailures = 1
-		} else {
-			route.ConsecutiveFailures++
+		if updatedChannel != nil {
+			CacheUpdateManagedChannelSnapshots([]ManagedChannelCacheUpdate{{
+				Snapshot:           updatedChannel,
+				UpdateStatusReason: true,
+			}})
 		}
-		route.LastFailureAt = now
-		route.LastReason = strings.TrimSpace(reason)
-		if route.ConsecutiveFailures >= threshold {
-			route.State = UpstreamRouteStateQuarantined
-			route.RecoveryAttempts = 0
-			route.NextProbeAt = now
-			quarantine = true
-		}
-		route.UpdatedAt = now
-		return tx.Model(&UpstreamManagedRoute{}).Where("id = ?", route.ID).Updates(map[string]any{
-			"state":                 route.State,
-			"consecutive_failures":  route.ConsecutiveFailures,
-			"consecutive_successes": 0,
-			"failure_window_start":  route.FailureWindowStart,
-			"last_failure_at":       route.LastFailureAt,
-			"last_reason":           route.LastReason,
-			"recovery_attempts":     route.RecoveryAttempts,
-			"next_probe_at":         route.NextProbeAt,
-			"updated_at":            route.UpdatedAt,
-		}).Error
+		return found, nil
 	})
-	if errors.Is(err, gorm.ErrRecordNotFound) {
+	if err != nil {
+		return nil, false, err
+	}
+	if !found {
 		return nil, false, nil
 	}
-	return &route, quarantine, err
+	return &route, quarantine, nil
 }
 
 func RecordUpstreamRouteSuccess(channelID int, now int64, latencyMS int64) (*UpstreamManagedRoute, error) {

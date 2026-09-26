@@ -30,6 +30,7 @@ func InitChannelCache() {
 		rebuildTaskAliasView()
 		return
 	}
+	channelSyncLock.Lock()
 	newChannelId2channel := make(map[int]*Channel)
 	newChannel2advancedCustomConfig := make(map[int]*kitdto.AdvancedCustomConfig)
 	var channels []*Channel
@@ -78,7 +79,6 @@ func InitChannelCache() {
 		}
 	}
 
-	channelSyncLock.Lock()
 	group2model2channels = newGroup2model2channels
 	//channelsIDM = newChannelId2channel
 	for i, channel := range newChannelId2channel {
@@ -305,40 +305,65 @@ func CacheUpdateChannelStatus(id int, status int) {
 	defer channelSyncLock.Unlock()
 	if channel, ok := channelsIDM[id]; ok {
 		channel.Status = status
+		syncChannelRoutingIndexLocked(channel)
 	}
-	if status != common.ChannelStatusEnabled {
-		// delete the channel from group2model2channels
-		for group, model2channels := range group2model2channels {
-			for model, channels := range model2channels {
-				for i, channelId := range channels {
-					if channelId == id {
-						// remove the channel from the slice
-						group2model2channels[group][model] = append(channels[:i], channels[i+1:]...)
-						break
-					}
+}
+
+func syncChannelRoutingIndexLocked(channel *Channel) {
+	for group, model2channels := range group2model2channels {
+		for model, channels := range model2channels {
+			filtered := channels[:0]
+			for _, channelID := range channels {
+				if channelID != channel.Id {
+					filtered = append(filtered, channelID)
 				}
 			}
+			group2model2channels[group][model] = filtered
+		}
+	}
+	if channel.Status != common.ChannelStatusEnabled {
+		return
+	}
+
+	if group2model2channels == nil {
+		group2model2channels = make(map[string]map[string][]int)
+	}
+	addedRoutes := make(map[string]struct{})
+	for _, group := range strings.Split(channel.Group, ",") {
+		if group2model2channels[group] == nil {
+			group2model2channels[group] = make(map[string][]int)
+		}
+		for _, model := range strings.Split(channel.Models, ",") {
+			routeKey := group + "\x00" + model
+			if _, exists := addedRoutes[routeKey]; exists {
+				continue
+			}
+			addedRoutes[routeKey] = struct{}{}
+			channels := append(group2model2channels[group][model], channel.Id)
+			sort.SliceStable(channels, func(i, j int) bool {
+				return channelsIDM[channels[i]].GetPriority() > channelsIDM[channels[j]].GetPriority()
+			})
+			group2model2channels[group][model] = channels
 		}
 	}
 }
 
-func CacheUpdateChannel(channel *Channel) {
-	if !common.MemoryCacheEnabled {
-		return
-	}
-	channelSyncLock.Lock()
-	if channel == nil {
-		channelSyncLock.Unlock()
-		return
-	}
-
+func cacheUpdateChannelLocked(channel *Channel) {
 	if channelsIDM == nil {
 		channelsIDM = make(map[int]*Channel)
 	}
+	routingChanged := true
 	if oldChannel, ok := channelsIDM[channel.Id]; ok {
 		logger.LogDebug(nil, "CacheUpdateChannel before: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, oldChannel.ChannelInfo.MultiKeyPollingIndex)
+		routingChanged = oldChannel.Status != channel.Status ||
+			oldChannel.Group != channel.Group ||
+			oldChannel.Models != channel.Models ||
+			oldChannel.GetPriority() != channel.GetPriority()
 	}
 	channelsIDM[channel.Id] = channel
+	if routingChanged {
+		syncChannelRoutingIndexLocked(channel)
+	}
 	if channel2advancedCustomConfig == nil {
 		channel2advancedCustomConfig = make(map[int]*kitdto.AdvancedCustomConfig)
 	}
@@ -349,10 +374,207 @@ func CacheUpdateChannel(channel *Channel) {
 		}
 	}
 	logger.LogDebug(nil, "CacheUpdateChannel after: id=%d, name=%s, status=%d, polling_index=%d", channel.Id, channel.Name, channel.Status, channel.ChannelInfo.MultiKeyPollingIndex)
+}
+
+type ChannelStatusCacheUpdate struct {
+	Snapshot          *Channel
+	UpdateChannelInfo bool
+}
+
+// CacheUpdateChannelStatusSnapshots publishes only status-owned fields from
+// committed snapshots, preserving newer cache state outside that ownership.
+func CacheUpdateChannelStatusSnapshots(updates []ChannelStatusCacheUpdate) {
+	if !common.MemoryCacheEnabled {
+		for _, update := range updates {
+			if update.Snapshot != nil {
+				invalidateTaskAliasView()
+				InvalidatePricingCache()
+				break
+			}
+		}
+		return
+	}
+
+	updated := false
+	aliasChanged := false
+	channelSyncLock.Lock()
+	for _, update := range updates {
+		if update.Snapshot == nil {
+			continue
+		}
+
+		snapshot := update.Snapshot
+		published := *snapshot
+		cached, exists := channelsIDM[snapshot.Id]
+		if exists && cached != nil {
+			published = *cached
+		}
+		if !exists || cached == nil || cached.Status != snapshot.Status {
+			aliasChanged = true
+		}
+		published.Status = snapshot.Status
+		published.OtherInfo = snapshot.OtherInfo
+		if update.UpdateChannelInfo {
+			pollingIndex := published.ChannelInfo.MultiKeyPollingIndex
+			published.ChannelInfo = snapshot.ChannelInfo
+			if exists && cached != nil {
+				published.ChannelInfo.MultiKeyPollingIndex = pollingIndex
+			}
+		}
+		if (!exists || cached == nil) && published.ChannelInfo.IsMultiKey {
+			published.Keys = published.GetKeys()
+		}
+		cacheUpdateChannelLocked(&published)
+		updated = true
+	}
+	channelSyncLock.Unlock()
+	if aliasChanged {
+		invalidateTaskAliasView()
+	}
+	if updated {
+		InvalidatePricingCache()
+	}
+}
+
+type ManagedChannelCacheUpdate struct {
+	Snapshot            *Channel
+	UpdateRoutingConfig bool
+	UpdateStatusReason  bool
+}
+
+// CacheUpdateManagedChannelSnapshots publishes only reconciliation-owned
+// fields while preserving newer cache state from independent writers.
+func CacheUpdateManagedChannelSnapshots(updates []ManagedChannelCacheUpdate) {
+	if !common.MemoryCacheEnabled {
+		for _, update := range updates {
+			if update.Snapshot != nil {
+				invalidateTaskAliasView()
+				InvalidatePricingCache()
+				break
+			}
+		}
+		return
+	}
+
+	updated := false
+	aliasChanged := false
+	channelSyncLock.Lock()
+	for _, update := range updates {
+		if update.Snapshot == nil {
+			continue
+		}
+
+		snapshot := update.Snapshot
+		published := *snapshot
+		cached, exists := channelsIDM[snapshot.Id]
+		if exists && cached != nil {
+			published = *cached
+		}
+		if !exists || cached == nil || cached.Status != snapshot.Status {
+			aliasChanged = true
+		}
+		published.Status = snapshot.Status
+		if update.UpdateRoutingConfig {
+			if !exists || cached == nil ||
+				cached.Models != snapshot.Models ||
+				cached.GetModelMapping() != snapshot.GetModelMapping() {
+				aliasChanged = true
+			}
+			published.Priority = snapshot.Priority
+			published.BaseURL = snapshot.BaseURL
+			published.Models = snapshot.Models
+			published.ModelMapping = snapshot.ModelMapping
+		}
+		if update.UpdateStatusReason {
+			publishedInfo := published.GetOtherInfo()
+			snapshotInfo := snapshot.GetOtherInfo()
+			for _, key := range []string{"status_reason", "status_time"} {
+				if value, exists := snapshotInfo[key]; exists {
+					publishedInfo[key] = value
+				} else {
+					delete(publishedInfo, key)
+				}
+			}
+			published.SetOtherInfo(publishedInfo)
+		}
+		cacheUpdateChannelLocked(&published)
+		updated = true
+	}
+	channelSyncLock.Unlock()
+	if aliasChanged {
+		invalidateTaskAliasView()
+	}
+	if updated {
+		InvalidatePricingCache()
+	}
+}
+
+func CacheUpdateChannels(channels []*Channel) {
+	if !common.MemoryCacheEnabled {
+		for _, channel := range channels {
+			if channel != nil {
+				invalidateTaskAliasView()
+				InvalidatePricingCache()
+				break
+			}
+		}
+		return
+	}
+
+	updated := false
+	channelSyncLock.Lock()
+	for _, channel := range channels {
+		if channel == nil {
+			continue
+		}
+		cacheUpdateChannelLocked(channel)
+		updated = true
+	}
 	// Lock ordering: do NOT hold channelSyncLock while calling
 	// InvalidatePricingCache. GetPricing acquires updatePricingLock first and then
 	// channelSyncLock.RLock (via loadPricingAdvancedCustomConfigs); acquiring
 	// updatePricingLock while holding channelSyncLock would be an AB-BA deadlock.
 	channelSyncLock.Unlock()
+	if updated {
+		invalidateTaskAliasView()
+		InvalidatePricingCache()
+	}
+}
+
+func CacheUpdateChannel(channel *Channel) {
+	CacheUpdateChannels([]*Channel{channel})
+}
+
+func CacheDeleteChannels(channelIDs []int) {
+	if len(channelIDs) == 0 {
+		return
+	}
+
+	if common.MemoryCacheEnabled {
+		deleted := make(map[int]struct{}, len(channelIDs))
+		for _, channelID := range channelIDs {
+			deleted[channelID] = struct{}{}
+		}
+
+		channelSyncLock.Lock()
+		for channelID := range deleted {
+			delete(channelsIDM, channelID)
+			delete(channel2advancedCustomConfig, channelID)
+		}
+		for group, model2channels := range group2model2channels {
+			for model, channelIDs := range model2channels {
+				kept := channelIDs[:0]
+				for _, channelID := range channelIDs {
+					if _, remove := deleted[channelID]; !remove {
+						kept = append(kept, channelID)
+					}
+				}
+				group2model2channels[group][model] = kept
+			}
+		}
+		channelSyncLock.Unlock()
+	}
+
+	invalidateTaskAliasView()
 	InvalidatePricingCache()
 }

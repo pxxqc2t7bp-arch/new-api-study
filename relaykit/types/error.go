@@ -96,6 +96,7 @@ type NewAPIError struct {
 	recordErrorLog *bool
 	errorType      ErrorType
 	errorCode      ErrorCode
+	originalStatus *int
 	StatusCode     int
 	Metadata       json.RawMessage
 }
@@ -120,6 +121,24 @@ func (e *NewAPIError) GetErrorType() ErrorType {
 		return ""
 	}
 	return e.errorType
+}
+
+// RecordOriginalStatusCode preserves the status before the first successful mapping.
+func (e *NewAPIError) RecordOriginalStatusCode(statusCode int) {
+	if e == nil || e.originalStatus != nil {
+		return
+	}
+	e.originalStatus = &statusCode
+}
+
+func (e *NewAPIError) GetOriginalStatusCode() int {
+	if e == nil {
+		return 0
+	}
+	if e.originalStatus != nil {
+		return *e.originalStatus
+	}
+	return e.StatusCode
 }
 
 func (e *NewAPIError) Error() string {

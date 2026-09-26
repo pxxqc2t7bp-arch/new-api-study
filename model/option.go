@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -25,6 +26,28 @@ import (
 type Option struct {
 	Key   string `json:"key" gorm:"primaryKey;not null"`
 	Value string `json:"value"`
+}
+
+// optionPersistencePublishMutex serializes local option persistence with
+// publication. Callers must not enter an exported option writer while holding
+// it; locked paths use updateOptionMap directly to avoid reentrant deadlocks.
+var optionPersistencePublishMutex sync.Mutex
+
+func lockOptionProtocols(
+	persistence sync.Locker,
+	requestPolicy sync.Locker,
+	includeRequestPolicy bool,
+) func() {
+	persistence.Lock()
+	if includeRequestPolicy {
+		requestPolicy.Lock()
+	}
+	return func() {
+		if includeRequestPolicy {
+			requestPolicy.Unlock()
+		}
+		persistence.Unlock()
+	}
 }
 
 func AllOption() ([]*Option, error) {
@@ -205,8 +228,12 @@ func InitOptionMap() {
 }
 
 func loadOptionsFromDatabase() {
-	requestPolicyOptionMutex.Lock()
-	defer requestPolicyOptionMutex.Unlock()
+	unlockOptionProtocols := lockOptionProtocols(
+		&optionPersistencePublishMutex,
+		&requestPolicyOptionMutex,
+		true,
+	)
+	defer unlockOptionProtocols()
 	defer func() {
 		if err := refreshRequestPolicySnapshot(); err != nil {
 			common.SysError("invalid request policy: " + err.Error())
@@ -449,6 +476,9 @@ func UpdateOption(key string, value string) error {
 	if err := validateOptionValue(key, value); err != nil {
 		return err
 	}
+	optionPersistencePublishMutex.Lock()
+	defer optionPersistencePublishMutex.Unlock()
+
 	if err := runOptionWriteTransaction(DB, func(tx *gorm.DB) error {
 		return saveGenericOptionTx(tx, key, value)
 	}); err != nil {
@@ -456,6 +486,26 @@ func UpdateOption(key string, value string) error {
 	}
 	// Update OptionMap
 	return updateOptionMap(key, value)
+}
+
+// PublishOptionValue updates in-memory consumers for an option whose database
+// write has already committed. It re-reads under the option protocol so a
+// delayed publisher cannot overwrite a newer local write with a stale value.
+func PublishOptionValue(key string, _ string) error {
+	optionPersistencePublishMutex.Lock()
+	defer optionPersistencePublishMutex.Unlock()
+
+	var option Option
+	if err := DB.Where(clause.Eq{
+		Column: clause.Column{Name: "key"},
+		Value:  key,
+	}).First(&option).Error; err != nil {
+		return err
+	}
+	if err := validateOptionValue(key, option.Value); err != nil {
+		return err
+	}
+	return updateOptionMap(key, option.Value)
 }
 
 // UpdateOptionsBulk persists multiple key/value pairs in a single database
@@ -478,23 +528,33 @@ func UpdateOptionsBulk(values map[string]string) error {
 			return err
 		}
 	}
-	var policySnapshot *RequestPolicySnapshot
+
+	hasRequestPolicyOption := false
 	for key := range values {
 		if IsRequestPolicyOption(key) {
-			requestPolicyOptionMutex.Lock()
-			defer requestPolicyOptionMutex.Unlock()
-			options := maps.Clone(CurrentRequestPolicy().Options)
-			for key, value := range values {
-				if IsRequestPolicyOption(key) {
-					options[key] = value
-				}
-			}
-			var err error
-			policySnapshot, err = BuildRequestPolicy(options)
-			if err != nil {
-				return err
-			}
+			hasRequestPolicyOption = true
 			break
+		}
+	}
+	unlockOptionProtocols := lockOptionProtocols(
+		&optionPersistencePublishMutex,
+		&requestPolicyOptionMutex,
+		hasRequestPolicyOption,
+	)
+	defer unlockOptionProtocols()
+
+	var policySnapshot *RequestPolicySnapshot
+	if hasRequestPolicyOption {
+		options := maps.Clone(CurrentRequestPolicy().Options)
+		for key, value := range values {
+			if IsRequestPolicyOption(key) {
+				options[key] = value
+			}
+		}
+		var err error
+		policySnapshot, err = BuildRequestPolicy(options)
+		if err != nil {
+			return err
 		}
 	}
 
