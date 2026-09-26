@@ -995,6 +995,55 @@ class ConfigTransactionTest(unittest.TestCase):
             [],
         )
 
+    def test_transaction_lock_rejects_real_ancestor_replacement(self):
+        original_cwd = Path.cwd()
+        for path_kind in ("absolute", "relative"):
+            with self.subTest(path_kind=path_kind):
+                case_root = self.root / path_kind
+                case_root.mkdir()
+                os.chdir(case_root)
+                try:
+                    lock_ancestor = Path("lock-anchor")
+                    relocated_ancestor = Path("relocated-lock-anchor")
+                    if path_kind == "absolute":
+                        lock_ancestor = case_root / lock_ancestor
+                        relocated_ancestor = case_root / relocated_ancestor
+                    lock_ancestor.mkdir()
+                    backup_root = lock_ancestor / "backups"
+                    second_entered = False
+
+                    with guard._transaction_lock(backup_root):
+                        lock_ancestor.rename(relocated_ancestor)
+                        backup_root.mkdir(parents=True, mode=0o700)
+                        backup_root.chmod(0o700)
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "configuration transaction is already active",
+                        ):
+                            with guard._transaction_lock(
+                                backup_root,
+                                create_root=False,
+                            ):
+                                second_entered = True
+
+                    self.assertFalse(second_entered)
+                    self.assertFalse(
+                        (
+                            backup_root
+                            / ".zcode-responses-item-guard"
+                        ).exists()
+                    )
+                    self.assertTrue(
+                        (
+                            relocated_ancestor
+                            / "backups"
+                            / ".zcode-responses-item-guard"
+                            / "transaction.lock"
+                        ).is_file()
+                    )
+                finally:
+                    os.chdir(original_cwd)
+
     def test_transaction_lock_creates_missing_root_ancestors(self):
         backup_root = (
             self.root
@@ -3357,6 +3406,44 @@ class ConfigTransactionTest(unittest.TestCase):
             self.original_bytes,
         )
 
+    def test_apply_fatal_with_restore_errors_reraises_original(self):
+        restore_errors = ["v2 restore write"]
+        expected_note = (
+            "configuration apply failed; rollback verification failed: "
+            "v2 restore write"
+        )
+
+        for fatal_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(fatal_type=fatal_type.__name__):
+                fatal_error = fatal_type("injected apply fatal")
+                with (
+                    mock.patch.object(
+                        guard,
+                        "_verify_transaction_state",
+                        side_effect=fatal_error,
+                    ),
+                    mock.patch.object(
+                        guard,
+                        "_restore_and_verify",
+                        return_value=restore_errors,
+                    ) as restore,
+                ):
+                    with self.assertRaises(fatal_type) as raised:
+                        guard.execute(
+                            self.paths,
+                            apply=True,
+                            backup_root=self.backup_root,
+                            timestamp="20260926T120045Z",
+                        )
+
+                self.assertIs(raised.exception, fatal_error)
+                restore.assert_called_once()
+                if hasattr(fatal_error, "add_note"):
+                    self.assertIn(
+                        expected_note,
+                        getattr(fatal_error, "__notes__", []),
+                    )
+
     def test_output_third_party_drift_is_not_overwritten_on_rollback(self):
         output = self.root / "third-party-output.json"
         original_output = b'{"existing":"report"}\n'
@@ -4239,6 +4326,45 @@ class ConfigTransactionTest(unittest.TestCase):
             [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
             self.original_modes,
         )
+
+    def test_rollback_fatal_with_restore_errors_reraises_original(self):
+        timestamp = "20260926T121016Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        restore_errors = ["cli restore write"]
+        expected_note = (
+            "configuration rollback failed; "
+            "roll-forward verification failed: cli restore write"
+        )
+
+        for fatal_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(fatal_type=fatal_type.__name__):
+                fatal_error = fatal_type("injected rollback fatal")
+                with (
+                    mock.patch.object(
+                        guard,
+                        "_verify_transaction_state",
+                        side_effect=fatal_error,
+                    ),
+                    mock.patch.object(
+                        guard,
+                        "_restore_and_verify",
+                        return_value=restore_errors,
+                    ) as restore,
+                ):
+                    with self.assertRaises(fatal_type) as raised:
+                        guard.rollback_backup(
+                            self.paths,
+                            backup_dir,
+                        )
+
+                self.assertIs(raised.exception, fatal_error)
+                restore.assert_called_once()
+                if hasattr(fatal_error, "add_note"):
+                    self.assertIn(
+                        expected_note,
+                        getattr(fatal_error, "__notes__", []),
+                    )
 
     def test_rollback_output_rejects_transaction_lock_aliases(self):
         for alias_kind in ("exact", "child", "symlink", "hardlink"):

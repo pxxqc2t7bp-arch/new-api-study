@@ -1289,6 +1289,34 @@ def _validate_transaction_output_path(
 
 
 @contextmanager
+def _stable_transaction_anchor_lock(root: Path) -> Iterator[None]:
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    anchor = root.anchor if root.is_absolute() else "."
+    descriptor = os.open(anchor, directory_flags)
+    try:
+        try:
+            fcntl.flock(
+                descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                "configuration transaction is already active"
+            ) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
 def _transaction_lock(
     root: Path,
     *,
@@ -1300,9 +1328,8 @@ def _transaction_lock(
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    with _open_parent_directory(
-        root,
-        create_parents=create_root,
+    with _stable_transaction_anchor_lock(root), _open_parent_directory(
+        root, create_parents=create_root
     ) as (
         root_parent_descriptor,
         root_name,
@@ -2072,16 +2099,21 @@ def execute(
                 output_snapshot,
             )
             if rollback_errors:
-                raise RuntimeError(
+                failure_message = (
                     "configuration apply failed; "
                     "rollback verification failed: %s"
                     % ", ".join(rollback_errors)
-                ) from exc
+                )
+            else:
+                failure_message = (
+                    "configuration apply failed; original files restored"
+                )
             if not isinstance(exc, Exception):
+                add_note = getattr(exc, "add_note", None)
+                if callable(add_note):
+                    add_note(failure_message)
                 raise
-            raise RuntimeError(
-                "configuration apply failed; original files restored"
-            ) from exc
+            raise RuntimeError(failure_message) from exc
 
     return report
 
@@ -2197,16 +2229,21 @@ def rollback_backup(
                 output_snapshot,
             )
             if rollback_errors:
-                raise RuntimeError(
+                failure_message = (
                     "configuration rollback failed; "
                     "roll-forward verification failed: %s"
                     % ", ".join(rollback_errors)
-                ) from exc
+                )
+            else:
+                failure_message = (
+                    "configuration rollback failed; applied files restored"
+                )
             if not isinstance(exc, Exception):
+                add_note = getattr(exc, "add_note", None)
+                if callable(add_note):
+                    add_note(failure_message)
                 raise
-            raise RuntimeError(
-                "configuration rollback failed; applied files restored"
-            ) from exc
+            raise RuntimeError(failure_message) from exc
 
     return report
 
