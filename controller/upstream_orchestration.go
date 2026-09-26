@@ -488,6 +488,9 @@ func runDueUpstreamProbeTaskWithDependencies(
 		if err != nil {
 			return summary, err
 		}
+		if channel.ChannelInfo.IsMultiKey && !channel.HasEnabledKey() {
+			continue
+		}
 		endpointType := string(constant.EndpointTypeOpenAI)
 		if route.Protocol == model.UpstreamProtocolAnthropic {
 			endpointType = string(constant.EndpointTypeAnthropic)

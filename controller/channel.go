@@ -1280,12 +1280,19 @@ func UpdateChannelStatus(c *gin.Context) {
 	changed := false
 	if req.Status == common.ChannelStatusEnabled {
 		changed, err = service.EnableChannel(id, "", "")
-		if err != nil {
-			common.ApiError(c, err)
-			return
-		}
-	} else if model.UpdateChannelStatus(id, "", req.Status, "manual operation") {
-		changed = true
+	} else {
+		changed, err = model.UpdateChannelStatusWithError(id, "", req.Status, "manual operation")
+	}
+	if err != nil {
+		recordManageAuditFailure(c, "channel.status_update", map[string]any{
+			"id":      id,
+			"status":  req.Status,
+			"changed": false,
+		})
+		common.ApiError(c, err)
+		return
+	}
+	if req.Status != common.ChannelStatusEnabled && changed {
 		closeActiveChannelWebSockets([]int{id})
 	}
 	recordManageAudit(c, "channel.status_update", map[string]any{
@@ -1307,26 +1314,54 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 		return
 	}
 	changedCount := 0
-	var disabledIDs []int
+	var changedIDs []int
 	for _, id := range req.Ids {
 		if req.Status == common.ChannelStatusEnabled {
 			changed, err := service.EnableChannel(id, "", "")
 			if err != nil {
+				recordManageAuditFailure(c, "channel.status_update_batch", map[string]any{
+					"changed_ids": changedIDs,
+					"count":       changedCount,
+					"failed_id":   id,
+					"total":       len(req.Ids),
+					"status":      req.Status,
+				})
 				common.ApiError(c, err)
 				return
 			}
 			if changed {
 				changedCount++
+				changedIDs = append(changedIDs, id)
 			}
-		} else if model.UpdateChannelStatus(id, "", req.Status, "manual batch operation") {
-			changedCount++
-			if req.Status != common.ChannelStatusEnabled {
-				disabledIDs = append(disabledIDs, id)
+		} else {
+			changed, err := model.UpdateChannelStatusWithError(
+				id,
+				"",
+				req.Status,
+				"manual batch operation",
+			)
+			if err != nil {
+				if len(changedIDs) > 0 {
+					closeActiveChannelWebSockets(changedIDs)
+				}
+				recordManageAuditFailure(c, "channel.status_update_batch", map[string]any{
+					"changed_ids": changedIDs,
+					"count":       changedCount,
+					"failed_id":   id,
+					"total":       len(req.Ids),
+					"status":      req.Status,
+				})
+				common.ApiError(c, err)
+				return
+			}
+			if changed {
+				changedCount++
+				changedIDs = append(changedIDs, id)
 			}
 		}
 	}
-	if len(disabledIDs) > 0 {
-		closeActiveChannelWebSockets(disabledIDs)
+	if req.Status != common.ChannelStatusEnabled && len(changedIDs) > 0 {
+		closeActiveChannelWebSockets(changedIDs)
 	}
 	recordManageAudit(c, "channel.status_update_batch", map[string]any{
 		"count":  changedCount,

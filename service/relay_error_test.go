@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 
 	"github.com/gin-gonic/gin"
@@ -105,6 +106,11 @@ func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
 	notifyLimitStore.Delete(notifyKey)
 	t.Cleanup(func() { notifyLimitStore.Delete(notifyKey) })
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	runnerInvoked := false
+	SetRelayAsyncRunner(c, func(task func()) {
+		runnerInvoked = true
+		task()
+	})
 	apiErr := types.NewErrorWithStatusCode(errors.New("upstream https://private.example.com/path?token=review-token api_key:review-secret"), types.ErrorCodeChannelNoAvailableKey, http.StatusUnauthorized)
 	ProcessChannelError(c, types.ChannelError{ChannelId: channel.Id, ChannelName: channel.Name, AutoBan: true}, apiErr, nil)
 	var notification WebhookPayload
@@ -123,6 +129,66 @@ func TestProcessChannelErrorMasksDisableReasonAndNotification(t *testing.T) {
 	assert.NotContains(t, notification.Content, "review-token")
 	assert.NotContains(t, notification.Content, "review-secret")
 	assert.Equal(t, http.StatusUnauthorized, apiErr.StatusCode)
+	assert.True(t, runnerInvoked)
+}
+
+func TestProcessChannelErrorUsesRequestAsyncRunnerForManagedFailure(t *testing.T) {
+	previousDB := model.DB
+	previousErrorLog := constant.ErrorLogEnabled
+	orchestration := operation_setting.GetUpstreamOrchestrationSetting()
+	previousOrchestration := *orchestration
+	t.Cleanup(func() {
+		model.DB = previousDB
+		constant.ErrorLogEnabled = previousErrorLog
+		*orchestration = previousOrchestration
+	})
+
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := database.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	require.NoError(t, database.AutoMigrate(&model.Channel{}, &model.UpstreamManagedRoute{}))
+	model.DB = database
+	constant.ErrorLogEnabled = false
+	orchestration.Enabled = true
+	orchestration.FailureThreshold = 2
+	orchestration.FailureWindowMinutes = 5
+
+	channel := model.Channel{
+		Name: "managed-relay-error", Status: common.ChannelStatusEnabled,
+		Models: "test-model", Group: "default",
+	}
+	require.NoError(t, database.Create(&channel).Error)
+	route := model.UpstreamManagedRoute{
+		SourceID: 1, ExternalGroupID: "managed-relay-error",
+		Platform: "openai", Protocol: model.UpstreamProtocolOpenAI,
+		ChannelID: channel.Id, State: model.UpstreamRouteStateActive,
+	}
+	require.NoError(t, database.Create(&route).Error)
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	runnerInvoked := false
+	SetRelayAsyncRunner(c, func(task func()) {
+		runnerInvoked = true
+		task()
+	})
+	apiErr := types.NewOpenAIError(
+		errors.New("managed upstream failed"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusInternalServerError,
+	)
+	ProcessChannelError(c, types.ChannelError{
+		ChannelId: channel.Id, ChannelName: channel.Name, AutoBan: true,
+	}, apiErr, nil)
+
+	require.Eventually(t, func() bool {
+		var stored model.UpstreamManagedRoute
+		return database.First(&stored, route.ID).Error == nil &&
+			stored.ConsecutiveFailures == 1
+	}, time.Second, 10*time.Millisecond)
+	assert.True(t, runnerInvoked)
 }
 
 func TestDecideRelayRetryReasons(t *testing.T) {

@@ -368,6 +368,166 @@ func TestRunDueUpstreamProbeTaskKeepsFailedSiblingQuarantinedAfterRealReconcile(
 	assert.False(t, failureAbility.Enabled)
 }
 
+func TestRunDueUpstreamProbeTaskLeavesExhaustedMultiKeyForPassiveRecovery(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+
+	originalMemoryCacheEnabled := common.MemoryCacheEnabled
+	originalLogConsumeEnabled := common.LogConsumeEnabled
+	originalAutomaticEnableChannelEnabled := common.AutomaticEnableChannelEnabled
+	common.MemoryCacheEnabled = false
+	common.LogConsumeEnabled = false
+	common.AutomaticEnableChannelEnabled = true
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	originalSetting := *setting
+	setting.Enabled = true
+	setting.FailureThreshold = 1
+	setting.FailureWindowMinutes = 5
+	setting.ProbeTimeoutSeconds = 5
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(
+		`{"gpt-managed-exhausted-key":1}`,
+	))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = originalMemoryCacheEnabled
+		common.LogConsumeEnabled = originalLogConsumeEnabled
+		common.AutomaticEnableChannelEnabled = originalAutomaticEnableChannelEnabled
+		*setting = originalSetting
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
+
+	user := model.User{
+		Username: "managed-exhausted-key-root",
+		Role:     common.RoleRootUser,
+		Status:   common.UserStatusEnabled,
+		Group:    "default",
+		Quota:    1_000_000,
+	}
+	require.NoError(t, db.Create(&user).Error)
+
+	requestKeys := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestKeys <- request.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"id":"chatcmpl-managed-exhausted-key",
+			"object":"chat.completion",
+			"created":1,
+			"model":"gpt-managed-exhausted-key",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	now := time.Now()
+	autoBan := 1
+	tag := "plan:managed:exhausted-key"
+	channel := model.Channel{
+		Name: "managed-exhausted-key", Type: constant.ChannelTypeOpenAI,
+		Key: "key-a\nkey-b", BaseURL: &upstream.URL,
+		Status: common.ChannelStatusAutoDisabled, Tag: &tag, AutoBan: &autoBan,
+		Models: "gpt-managed-exhausted-key", Group: "default",
+		TestTime: 123456789, ResponseTime: 4321,
+		ChannelInfo: model.ChannelInfo{
+			IsMultiKey:   true,
+			MultiKeySize: 2,
+			MultiKeyMode: constant.MultiKeyModePolling,
+			MultiKeyStatusList: map[int]int{
+				0: common.ChannelStatusAutoDisabled,
+				1: common.ChannelStatusAutoDisabled,
+			},
+			MultiKeyDisabledReason: map[int]string{
+				0: "newer quota exhaustion",
+				1: "older quota exhaustion",
+			},
+			MultiKeyDisabledTime: map[int]int64{
+				0: now.Add(-time.Hour).Unix(),
+				1: now.Add(-2 * time.Hour).Unix(),
+			},
+			MultiKeyDisabledUntil: map[int]int64{
+				0: now.Add(-time.Minute).Unix(),
+				1: now.Add(-time.Minute).Unix(),
+			},
+		},
+	}
+	channel.SetOtherInfo(map[string]any{
+		"disabled_until": now.Add(-time.Minute).Unix(),
+		"owner":          "preserved",
+	})
+	require.NoError(t, db.Create(&channel).Error)
+	require.NoError(t, channel.AddAbilities(nil))
+	route := model.UpstreamManagedRoute{
+		SourceID: 1, ExternalGroupID: "managed-exhausted-key",
+		Platform: "openai", Protocol: model.UpstreamProtocolOpenAI,
+		ChannelID: channel.Id, State: model.UpstreamRouteStateActive,
+		Rank: 7, ConsecutiveSuccesses: 2,
+		LastSuccessAt: now.Add(-2 * time.Minute).Unix(),
+		NextProbeAt:   now.Add(-time.Minute).Unix(),
+	}
+	require.NoError(t, db.Create(&route).Error)
+
+	var beforeRoute model.UpstreamManagedRoute
+	require.NoError(t, db.First(&beforeRoute, route.ID).Error)
+	var beforeChannel model.Channel
+	require.NoError(t, db.First(&beforeChannel, channel.Id).Error)
+	var beforeAbility model.Ability
+	require.NoError(t, db.First(&beforeAbility, "channel_id = ?", channel.Id).Error)
+
+	routeSummary, err := runDueUpstreamProbeTaskWithDependencies(
+		context.Background(),
+		func(time.Time) (service.UpstreamReconcileSummary, error) {
+			t.Fatal("skipped route probes must not reconcile managed upstreams")
+			return service.UpstreamReconcileSummary{}, nil
+		},
+		func(*model.Channel) {
+			t.Fatal("skipped route probes must not notify recovery")
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, upstreamProbeSummary{}, routeSummary)
+	assert.Empty(t, requestKeys)
+
+	var afterRouteProbe model.UpstreamManagedRoute
+	require.NoError(t, db.First(&afterRouteProbe, route.ID).Error)
+	assert.Equal(t, beforeRoute, afterRouteProbe)
+	var afterRouteChannel model.Channel
+	require.NoError(t, db.First(&afterRouteChannel, channel.Id).Error)
+	assert.Equal(t, beforeChannel, afterRouteChannel)
+	var afterRouteAbility model.Ability
+	require.NoError(t, db.First(&afterRouteAbility, "channel_id = ?", channel.Id).Error)
+	assert.Equal(t, beforeAbility, afterRouteAbility)
+
+	recoverySummary := testChannelForHealthCheck(
+		context.Background(),
+		&afterRouteChannel,
+		user.Id,
+		false,
+		10_000_000,
+	)
+
+	assert.Equal(t, channelTestSummary{Tested: 1, Succeeded: 1, Enabled: 1}, recoverySummary)
+	require.Len(t, requestKeys, 1)
+	assert.Equal(t, "Bearer key-b", <-requestKeys)
+
+	var recovered model.Channel
+	require.NoError(t, db.First(&recovered, channel.Id).Error)
+	assert.Equal(t, common.ChannelStatusEnabled, recovered.Status)
+	assert.Equal(t, common.ChannelStatusAutoDisabled, recovered.ChannelInfo.MultiKeyStatusList[0])
+	assert.NotContains(t, recovered.ChannelInfo.MultiKeyStatusList, 1)
+	assert.Equal(t, "preserved", recovered.GetOtherInfo()["owner"])
+	assert.NotContains(t, recovered.GetOtherInfo(), "disabled_until")
+	var recoveredAbility model.Ability
+	require.NoError(t, db.First(&recoveredAbility, "channel_id = ?", channel.Id).Error)
+	assert.True(t, recoveredAbility.Enabled)
+	var afterRecoveryRoute model.UpstreamManagedRoute
+	require.NoError(t, db.First(&afterRecoveryRoute, route.ID).Error)
+	assert.Equal(t, beforeRoute, afterRecoveryRoute)
+}
+
 func TestRunDueUpstreamProbeTaskConsumesPlanQuotaOnceForActualCredential(t *testing.T) {
 	tests := []struct {
 		name             string

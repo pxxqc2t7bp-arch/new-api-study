@@ -142,6 +142,31 @@ func recordManageAudit(c *gin.Context, action string, params map[string]any) {
 	recordManageAuditFor(c, c.GetInt("id"), action, params)
 }
 
+func recordManageAuditFailure(c *gin.Context, action string, params map[string]any) {
+	if params == nil {
+		params = map[string]any{}
+	}
+	auditInfo := &model.AuditRequestInfo{
+		Method:  c.Request.Method,
+		Route:   c.FullPath(),
+		Path:    c.FullPath(),
+		Status:  c.Writer.Status(),
+		Success: false,
+	}
+	model.RecordOperationAuditLog(
+		c.GetInt("id"),
+		c.GetInt("role"),
+		auditContentEN(action, params),
+		c.ClientIP(),
+		action,
+		params,
+		auditOperatorInfo(c),
+		auditInfo,
+		c,
+	)
+	markAuditLogged(c)
+}
+
 // recordManageAuditFor 记录一条管理审计日志，日志归属于操作者；targetUserId
 // 只表示被操作用户，用于在结构化参数中保留目标上下文。
 func recordManageAuditFor(c *gin.Context, targetUserId int, action string, params map[string]any) {

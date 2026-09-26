@@ -7,15 +7,44 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync/atomic"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/wsmanager"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+type observingResponseRecorder struct {
+	*httptest.ResponseRecorder
+	beforeFirstWrite func()
+	observed         bool
+}
+
+func (recorder *observingResponseRecorder) observe() {
+	if recorder.observed {
+		return
+	}
+	recorder.observed = true
+	if recorder.beforeFirstWrite != nil {
+		recorder.beforeFirstWrite()
+	}
+}
+
+func (recorder *observingResponseRecorder) WriteHeader(statusCode int) {
+	recorder.observe()
+	recorder.ResponseRecorder.WriteHeader(statusCode)
+}
+
+func (recorder *observingResponseRecorder) Write(data []byte) (int, error) {
+	recorder.observe()
+	return recorder.ResponseRecorder.Write(data)
+}
 
 func createControllerPlanQuotaDomain(
 	t *testing.T,
@@ -313,6 +342,382 @@ func TestChannelStatusEndpointsReportPlanQuotaRecoveryFailure(t *testing.T) {
 			assert.Equal(t, common.ChannelStatusAutoDisabled, stored.Status)
 		})
 	}
+}
+
+func TestChannelStatusEndpointsReportManualDisableFailure(t *testing.T) {
+	tests := []struct {
+		name      string
+		path      string
+		action    string
+		body      func(int) []byte
+		params    func(int) string
+		setParams func(*gin.Context, int)
+		handle    func(*gin.Context)
+	}{
+		{
+			name:   "single",
+			path:   "/api/channel/1/status",
+			action: "channel.status_update",
+			body: func(_ int) []byte {
+				return []byte(fmt.Sprintf(
+					`{"status":%d}`,
+					common.ChannelStatusManuallyDisabled,
+				))
+			},
+			params: func(id int) string {
+				return fmt.Sprintf(
+					`{"changed":false,"id":%d,"status":%d}`,
+					id,
+					common.ChannelStatusManuallyDisabled,
+				)
+			},
+			setParams: func(context *gin.Context, id int) {
+				context.Params = gin.Params{{Key: "id", Value: strconv.Itoa(id)}}
+			},
+			handle: UpdateChannelStatus,
+		},
+		{
+			name:   "batch",
+			path:   "/api/channel/status/batch",
+			action: "channel.status_update_batch",
+			body: func(id int) []byte {
+				return []byte(fmt.Sprintf(
+					`{"ids":[%d],"status":%d}`,
+					id,
+					common.ChannelStatusManuallyDisabled,
+				))
+			},
+			params: func(id int) string {
+				return fmt.Sprintf(
+					`{"changed_ids":null,"count":0,"failed_id":%d,"status":%d,"total":1}`,
+					id,
+					common.ChannelStatusManuallyDisabled,
+				)
+			},
+			setParams: func(_ *gin.Context, _ int) {},
+			handle:    BatchUpdateChannelStatus,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := setupModelListControllerTestDB(t)
+			require.NoError(t, db.AutoMigrate(&model.AuditLog{}))
+			channel := model.Channel{
+				Name:   "manual-disable-failure-" + testCase.name,
+				Key:    "manual-disable-failure-key-" + testCase.name,
+				Status: common.ChannelStatusEnabled,
+				Models: "gpt-4.1",
+				Group:  "default",
+			}
+			require.NoError(t, db.Create(&channel).Error)
+			require.NoError(t, channel.AddAbilities(db))
+			closed := make(chan string, 1)
+			unregister := wsmanager.Register(channel.Id, "responses", func(reason string) {
+				closed <- reason
+			})
+			t.Cleanup(unregister)
+
+			forcedErr := errors.New("forced manual disable ability failure")
+			callbackName := "test:controller_manual_disable_failure_" + testCase.name
+			require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement != nil && tx.Statement.Table == "abilities" {
+					tx.AddError(forcedErr)
+				}
+			}))
+			t.Cleanup(func() {
+				require.NoError(t, db.Callback().Update().Remove(callbackName))
+			})
+
+			recorder := &observingResponseRecorder{
+				ResponseRecorder: httptest.NewRecorder(),
+			}
+			recorder.beforeFirstWrite = func() {
+				var failureAudits int64
+				assert.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).
+					Where("action = ? AND success = ?", testCase.action, false).
+					Count(&failureAudits).Error)
+				assert.Equal(t, int64(1), failureAudits)
+			}
+			context, _ := gin.CreateTestContext(recorder)
+			context.Set("id", 900)
+			context.Set("role", common.RoleRootUser)
+			context.Set("username", "manual-disable-root")
+			testCase.setParams(context, channel.Id)
+			context.Request = httptest.NewRequest(
+				http.MethodPost,
+				testCase.path,
+				bytes.NewReader(testCase.body(channel.Id)),
+			)
+			context.Request.Header.Set("Content-Type", "application/json")
+
+			testCase.handle(context)
+
+			require.Equal(t, http.StatusOK, recorder.Code)
+			var response struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			assert.False(t, response.Success)
+			assert.Contains(t, response.Message, forcedErr.Error())
+
+			var stored model.Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			assert.Equal(t, common.ChannelStatusEnabled, stored.Status)
+			var ability model.Ability
+			require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
+			assert.True(t, ability.Enabled)
+			select {
+			case reason := <-closed:
+				t.Fatalf("failed disable closed websocket: %s", reason)
+			default:
+			}
+			var successfulAudits int64
+			require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).
+				Where("action = ? AND success = ?", testCase.action, true).
+				Count(&successfulAudits).Error)
+			assert.Zero(t, successfulAudits)
+			var audit model.AuditLog
+			require.NoError(t, model.LOG_DB.
+				Where("action = ?", testCase.action).
+				Last(&audit).Error)
+			assert.False(t, audit.Success)
+			require.NotNil(t, audit.Other.AuditInfo)
+			assert.False(t, audit.Other.AuditInfo.Success)
+			require.NotNil(t, audit.Other.Op)
+			paramsJSON, err := common.Marshal(audit.Other.Op.Params)
+			require.NoError(t, err)
+			assert.JSONEq(t, testCase.params(channel.Id), string(paramsJSON))
+		})
+	}
+}
+
+func TestBatchUpdateChannelStatusCleansUpPartialManualDisableBeforeReportingFailure(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.AuditLog{}))
+	channels := []model.Channel{
+		{
+			Name: "partial-disable-committed", Key: "partial-disable-key-1",
+			Status: common.ChannelStatusEnabled, Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Name: "partial-disable-failed", Key: "partial-disable-key-2",
+			Status: common.ChannelStatusEnabled, Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Name: "partial-disable-unprocessed", Key: "partial-disable-key-3",
+			Status: common.ChannelStatusEnabled, Models: "gpt-4.1", Group: "default",
+		},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for index := range channels {
+		require.NoError(t, channels[index].AddAbilities(db))
+	}
+
+	committedClosed := make(chan string, 1)
+	unregisterCommitted := wsmanager.Register(channels[0].Id, "responses", func(reason string) {
+		committedClosed <- reason
+	})
+	t.Cleanup(unregisterCommitted)
+	failedClosed := make(chan string, 1)
+	unregisterFailed := wsmanager.Register(channels[1].Id, "responses", func(reason string) {
+		failedClosed <- reason
+	})
+	t.Cleanup(unregisterFailed)
+
+	forcedErr := errors.New("forced second manual disable ability failure")
+	var abilityUpdates atomic.Int32
+	callbackName := "test:controller_partial_manual_disable_failure"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil &&
+			tx.Statement.Table == "abilities" &&
+			abilityUpdates.Add(1) == 2 {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Update().Remove(callbackName))
+	})
+
+	body := []byte(fmt.Sprintf(
+		`{"ids":[%d,%d,%d],"status":%d}`,
+		channels[0].Id,
+		channels[1].Id,
+		channels[2].Id,
+		common.ChannelStatusManuallyDisabled,
+	))
+	committedClosedBeforeResponse := false
+	recorder := &observingResponseRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+	}
+	recorder.beforeFirstWrite = func() {
+		select {
+		case reason := <-committedClosed:
+			committedClosedBeforeResponse = true
+			assert.Equal(t, service.ChannelDisabledCloseReason, reason)
+		default:
+			assert.Fail(t, "committed disable left websocket open before response")
+		}
+		var failureAudits int64
+		assert.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).
+			Where("action = ? AND success = ?", "channel.status_update_batch", false).
+			Count(&failureAudits).Error)
+		assert.Equal(t, int64(1), failureAudits)
+	}
+	context, _ := gin.CreateTestContext(recorder)
+	context.Set("id", 901)
+	context.Set("role", common.RoleRootUser)
+	context.Set("username", "partial-disable-root")
+	context.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/channel/status/batch",
+		bytes.NewReader(body),
+	)
+	context.Request.Header.Set("Content-Type", "application/json")
+
+	BatchUpdateChannelStatus(context)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.False(t, response.Success)
+	assert.Contains(t, response.Message, forcedErr.Error())
+	assert.Equal(t, int32(2), abilityUpdates.Load())
+
+	var stored []model.Channel
+	require.NoError(t, db.Order("id").Find(&stored).Error)
+	require.Len(t, stored, 3)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored[0].Status)
+	assert.Equal(t, common.ChannelStatusEnabled, stored[1].Status)
+	assert.Equal(t, common.ChannelStatusEnabled, stored[2].Status)
+	assert.True(t, committedClosedBeforeResponse)
+	select {
+	case reason := <-failedClosed:
+		t.Fatalf("failed disable closed websocket: %s", reason)
+	default:
+	}
+
+	var audit model.AuditLog
+	require.NoError(t, model.LOG_DB.
+		Where("action = ?", "channel.status_update_batch").
+		Last(&audit).Error)
+	assert.False(t, audit.Success)
+	require.NotNil(t, audit.Other.AuditInfo)
+	assert.False(t, audit.Other.AuditInfo.Success)
+	require.NotNil(t, audit.Other.Op)
+	paramsJSON, err := common.Marshal(audit.Other.Op.Params)
+	require.NoError(t, err)
+	assert.JSONEq(t, fmt.Sprintf(
+		`{"changed_ids":[%d],"count":1,"failed_id":%d,"status":%d,"total":3}`,
+		channels[0].Id,
+		channels[1].Id,
+		common.ChannelStatusManuallyDisabled,
+	), string(paramsJSON))
+}
+
+func TestBatchUpdateChannelStatusAuditsPartialManualEnableBeforeReportingFailure(t *testing.T) {
+	db := setupModelListControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.AuditLog{}))
+	channels := []model.Channel{
+		{
+			Name: "partial-enable-committed", Key: "partial-enable-key-1",
+			Status: common.ChannelStatusManuallyDisabled, Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Name: "partial-enable-failed", Key: "partial-enable-key-2",
+			Status: common.ChannelStatusManuallyDisabled, Models: "gpt-4.1", Group: "default",
+		},
+		{
+			Name: "partial-enable-unprocessed", Key: "partial-enable-key-3",
+			Status: common.ChannelStatusManuallyDisabled, Models: "gpt-4.1", Group: "default",
+		},
+	}
+	require.NoError(t, db.Create(&channels).Error)
+	for index := range channels {
+		require.NoError(t, channels[index].AddAbilities(db))
+	}
+
+	forcedErr := errors.New("forced second manual enable ability failure")
+	var abilityUpdates atomic.Int32
+	callbackName := "test:controller_partial_manual_enable_failure"
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement != nil &&
+			tx.Statement.Table == "abilities" &&
+			abilityUpdates.Add(1) == 2 {
+			tx.AddError(forcedErr)
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Update().Remove(callbackName))
+	})
+
+	body := []byte(fmt.Sprintf(
+		`{"ids":[%d,%d,%d],"status":%d}`,
+		channels[0].Id,
+		channels[1].Id,
+		channels[2].Id,
+		common.ChannelStatusEnabled,
+	))
+	recorder := &observingResponseRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+	}
+	recorder.beforeFirstWrite = func() {
+		var failureAudits int64
+		assert.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).
+			Where("action = ? AND success = ?", "channel.status_update_batch", false).
+			Count(&failureAudits).Error)
+		assert.Equal(t, int64(1), failureAudits)
+	}
+	context, _ := gin.CreateTestContext(recorder)
+	context.Set("id", 902)
+	context.Set("role", common.RoleRootUser)
+	context.Set("username", "partial-enable-root")
+	context.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/channel/status/batch",
+		bytes.NewReader(body),
+	)
+	context.Request.Header.Set("Content-Type", "application/json")
+
+	BatchUpdateChannelStatus(context)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var response struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+	assert.False(t, response.Success)
+	assert.Contains(t, response.Message, forcedErr.Error())
+	assert.Equal(t, int32(2), abilityUpdates.Load())
+
+	var stored []model.Channel
+	require.NoError(t, db.Order("id").Find(&stored).Error)
+	require.Len(t, stored, 3)
+	assert.Equal(t, common.ChannelStatusEnabled, stored[0].Status)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored[1].Status)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, stored[2].Status)
+
+	var audit model.AuditLog
+	require.NoError(t, model.LOG_DB.
+		Where("action = ?", "channel.status_update_batch").
+		Last(&audit).Error)
+	assert.False(t, audit.Success)
+	require.NotNil(t, audit.Other.AuditInfo)
+	assert.False(t, audit.Other.AuditInfo.Success)
+	require.NotNil(t, audit.Other.Op)
+	paramsJSON, err := common.Marshal(audit.Other.Op.Params)
+	require.NoError(t, err)
+	assert.JSONEq(t, fmt.Sprintf(
+		`{"changed_ids":[%d],"count":1,"failed_id":%d,"status":%d,"total":3}`,
+		channels[0].Id,
+		channels[1].Id,
+		common.ChannelStatusEnabled,
+	), string(paramsJSON))
 }
 
 func createControllerOwnerlessPlanQuotaDomain(

@@ -28,14 +28,33 @@ func TestRefreshCodexChannelCredentialRoutesThroughPlanQuotaAuthority(t *testing
 	previousLogType := common.LogDatabaseType()
 	previousMemoryCacheEnabled := common.MemoryCacheEnabled
 	previousRefresh := refreshCodexOAuthTokenForCredential
+	var channelID int
+	const (
+		concurrentUsedQuota          = int64(73)
+		concurrentBalance            = 12.5
+		concurrentBalanceUpdatedTime = int64(1_999_999_990)
+		concurrentResponseTime       = 321
+		concurrentTestTime           = int64(1_999_999_995)
+	)
 	model.DB = db
 	common.SetDatabaseTypes(common.DatabaseTypeSQLite, previousLogType)
-	common.MemoryCacheEnabled = false
+	common.MemoryCacheEnabled = true
 	refreshCodexOAuthTokenForCredential = func(
 		context.Context,
 		string,
 		string,
 	) (*CodexOAuthTokenResult, error) {
+		if updateErr := db.Model(&model.Channel{}).
+			Where("id = ?", channelID).
+			Updates(map[string]any{
+				"used_quota":           concurrentUsedQuota,
+				"balance":              concurrentBalance,
+				"balance_updated_time": concurrentBalanceUpdatedTime,
+				"response_time":        concurrentResponseTime,
+				"test_time":            concurrentTestTime,
+			}).Error; updateErr != nil {
+			return nil, updateErr
+		}
 		return &CodexOAuthTokenResult{
 			AccessToken:  "new-access-token",
 			RefreshToken: "new-refresh-token",
@@ -79,15 +98,24 @@ func TestRefreshCodexChannelCredentialRoutesThroughPlanQuotaAuthority(t *testing
 	})
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, channel.AddAbilities(db))
+	channelID = channel.Id
+	model.InitChannelCache()
 
-	_, updated, err := RefreshCodexChannelCredential(
+	refreshed, updated, err := RefreshCodexChannelCredential(
 		context.Background(),
 		channel.Id,
 		CodexCredentialRefreshOptions{},
 	)
 	require.NoError(t, err)
+	require.NotNil(t, refreshed)
 	require.NotNil(t, updated)
+	assert.Equal(t, "new-refresh-token", refreshed.RefreshToken)
 	assert.NotEqual(t, oldCredential, updated.Key)
+	assert.Equal(t, concurrentUsedQuota, updated.UsedQuota)
+	assert.Equal(t, concurrentBalance, updated.Balance)
+	assert.Equal(t, concurrentBalanceUpdatedTime, updated.BalanceUpdatedTime)
+	assert.Equal(t, concurrentResponseTime, updated.ResponseTime)
+	assert.Equal(t, concurrentTestTime, updated.TestTime)
 
 	newHash, ok := model.PlanQuotaDomainHash(updated.Key)
 	require.True(t, ok)
@@ -106,4 +134,15 @@ func TestRefreshCodexChannelCredentialRoutesThroughPlanQuotaAuthority(t *testing
 	var ability model.Ability
 	require.NoError(t, db.First(&ability, "channel_id = ?", channel.Id).Error)
 	assert.False(t, ability.Enabled)
+	var stored model.Channel
+	require.NoError(t, db.First(&stored, channel.Id).Error)
+	assert.Equal(t, updated.Key, stored.Key)
+	assert.Equal(t, concurrentUsedQuota, stored.UsedQuota)
+	assert.Equal(t, concurrentBalance, stored.Balance)
+	assert.Equal(t, concurrentBalanceUpdatedTime, stored.BalanceUpdatedTime)
+	assert.Equal(t, concurrentResponseTime, stored.ResponseTime)
+	assert.Equal(t, concurrentTestTime, stored.TestTime)
+	cached, cacheErr := model.CacheGetChannel(channel.Id)
+	require.NoError(t, cacheErr)
+	assert.Equal(t, stored, *cached)
 }

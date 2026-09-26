@@ -2609,38 +2609,181 @@ func TestPlanQuotaDomainEditTagMutationEntersDisabledAuthority(t *testing.T) {
 }
 
 func TestPlanQuotaDomainCredentialRotationUsesSnapshotFence(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Channel) map[string]any
+	}{
+		{
+			name: "key changed",
+			mutate: func(current *Channel) map[string]any {
+				current.Key = "authority-secret-credential-concurrent"
+				return map[string]any{"key": current.Key}
+			},
+		},
+		{
+			name: "tag changed",
+			mutate: func(current *Channel) map[string]any {
+				current.SetTag("plan:test:credential-concurrent")
+				return map[string]any{"tag": current.Tag}
+			},
+		},
+		{
+			name: "type changed",
+			mutate: func(current *Channel) map[string]any {
+				current.Type = constant.ChannelTypeCodex
+				return map[string]any{"type": current.Type}
+			},
+		},
+		{
+			name: "multi key identity changed",
+			mutate: func(current *Channel) map[string]any {
+				current.ChannelInfo.IsMultiKey = true
+				current.ChannelInfo.MultiKeySize = 1
+				return map[string]any{"channel_info": current.ChannelInfo}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := setupPlanQuotaAuthorityTest(t, "")
+			tag := "plan:test:credential-old"
+			oldCredential := "authority-secret-credential-old"
+			newCredential := "authority-secret-credential-new"
+			channel := createPlanQuotaDomainFixture(
+				t, db, oldCredential, tag, PlanQuotaDomainStateActive, 0, 0,
+			)
+			newHash, ok := PlanQuotaDomainHash(newCredential)
+			require.True(t, ok)
+			require.NoError(t, db.Create(&PlanQuotaDomain{
+				CredentialHash: newHash,
+				Generation:     111,
+				State:          PlanQuotaDomainStateDisabled,
+				DisabledUntil:  2_000_000_000,
+			}).Error)
+
+			expected, err := GetChannelById(channel.Id, true)
+			require.NoError(t, err)
+			concurrent := *expected
+			require.NoError(t, db.Model(&Channel{}).
+				Where("id = ?", channel.Id).
+				Updates(test.mutate(&concurrent)).Error)
+
+			updated, changed, err := UpdateChannelCredentialIfUnchanged(expected, newCredential)
+			require.NoError(t, err)
+			assert.False(t, changed)
+			assert.Nil(t, updated)
+
+			var stored Channel
+			require.NoError(t, db.First(&stored, channel.Id).Error)
+			assert.Equal(t, concurrent.Key, stored.Key)
+			assert.Equal(t, concurrent.GetTag(), stored.GetTag())
+			assert.Equal(t, concurrent.Type, stored.Type)
+			assert.Equal(t, concurrent.ChannelInfo.IsMultiKey, stored.ChannelInfo.IsMultiKey)
+		})
+	}
+}
+
+func TestPlanQuotaDomainCredentialRotationLocksAuthoritiesBeforeChannel(t *testing.T) {
 	db := setupPlanQuotaAuthorityTest(t, "")
-	oldTag := "plan:test:credential-old"
-	newTag := "plan:test:credential-new"
-	oldCredential := "authority-secret-credential-old"
-	newCredential := "authority-secret-credential-new"
+	tag := "plan:test:credential-lock-order"
+	oldCredential := "authority-secret-credential-lock-z"
+	newCredential := "authority-secret-credential-lock-a"
 	channel := createPlanQuotaDomainFixture(
-		t, db, oldCredential, oldTag, PlanQuotaDomainStateActive, 0, 0,
+		t, db, oldCredential, tag, PlanQuotaDomainStateActive, 0, 0,
 	)
 	newHash, ok := PlanQuotaDomainHash(newCredential)
 	require.True(t, ok)
 	require.NoError(t, db.Create(&PlanQuotaDomain{
 		CredentialHash: newHash,
-		Generation:     111,
-		State:          PlanQuotaDomainStateDisabled,
-		DisabledUntil:  2_000_000_000,
+		State:          PlanQuotaDomainStateActive,
 	}).Error)
-
 	expected, err := GetChannelById(channel.Id, true)
 	require.NoError(t, err)
-	require.NoError(t, db.Model(&Channel{}).
-		Where("id = ?", channel.Id).
-		Update("tag", newTag).Error)
+
+	var queries []string
+	callbackName := "test:plan_quota_credential_lock_order"
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil || tx.Statement.Schema == nil {
+			return
+		}
+		switch tx.Statement.Schema.Name {
+		case "PlanQuotaDomain":
+			domain, ok := tx.Statement.Dest.(*PlanQuotaDomain)
+			if ok && domain.CredentialHash != "" {
+				queries = append(queries, domain.CredentialHash)
+			}
+		case "Channel":
+			queries = append(queries, "channel")
+		}
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Query().Remove(callbackName))
+	})
+
+	_, changed, err := UpdateChannelCredentialIfUnchanged(expected, newCredential)
+	require.NoError(t, err)
+	require.True(t, changed)
+	oldHash, ok := PlanQuotaDomainHash(oldCredential)
+	require.True(t, ok)
+	expectedQueries := []string{oldHash, newHash}
+	sort.Strings(expectedQueries)
+	expectedQueries = append(expectedQueries, "channel")
+	assert.Equal(t, expectedQueries, queries)
+}
+
+func TestPlanQuotaDomainCredentialRotationDoesNotRetryUnknownWrite(t *testing.T) {
+	db := setupPlanQuotaAuthorityTest(t, "")
+	require.NoError(t, db.Exec(
+		"CREATE TABLE credential_commit_failure_parents (id INTEGER PRIMARY KEY)",
+	).Error)
+	require.NoError(t, db.Exec(
+		"CREATE TABLE credential_commit_failure_children ("+
+			"id INTEGER PRIMARY KEY, parent_id INTEGER, "+
+			"FOREIGN KEY(parent_id) REFERENCES credential_commit_failure_parents(id) "+
+			"DEFERRABLE INITIALLY DEFERRED)",
+	).Error)
+	tag := "plan:test:credential-unknown-write"
+	oldCredential := "authority-secret-credential-unknown-old"
+	newCredential := "authority-secret-credential-unknown-new"
+	channel := createPlanQuotaDomainFixture(
+		t, db, oldCredential, tag, PlanQuotaDomainStateActive, 0, 0,
+	)
+	expected, err := GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+
+	var writes atomic.Int32
+	callbackName := "test:plan_quota_credential_unknown_write"
+	require.NoError(t, db.Callback().Update().After("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement == nil ||
+			tx.Statement.Schema == nil ||
+			tx.Statement.Schema.Name != "Channel" {
+			return
+		}
+		updates, ok := tx.Statement.Dest.(map[string]any)
+		if !ok {
+			return
+		}
+		if _, updatesKey := updates["key"]; !updatesKey {
+			return
+		}
+		writes.Add(1)
+		tx.AddError(tx.Session(&gorm.Session{NewDB: true, SkipHooks: true}).
+			Exec(
+				"INSERT INTO credential_commit_failure_children (id, parent_id) VALUES (?, ?)",
+				1,
+				999,
+			).Error)
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, db.Callback().Update().Remove(callbackName))
+	})
 
 	updated, changed, err := UpdateChannelCredentialIfUnchanged(expected, newCredential)
-	require.NoError(t, err)
+	require.Error(t, err)
 	assert.False(t, changed)
 	assert.Nil(t, updated)
-
-	var stored Channel
-	require.NoError(t, db.First(&stored, channel.Id).Error)
-	assert.Equal(t, oldCredential, stored.Key)
-	assert.Equal(t, newTag, stored.GetTag())
+	assert.Equal(t, int32(1), writes.Load())
 }
 
 func TestPlanQuotaDomainCredentialRotationIntoDisabledAuthority(t *testing.T) {

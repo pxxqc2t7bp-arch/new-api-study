@@ -1043,28 +1043,95 @@ func compactPositiveChannelIDs(sortedIDs []int) []int {
 }
 
 // UpdateChannelCredentialIfUnchanged rotates a credential only while the
-// caller's complete channel snapshot remains current.
+// credential-domain identity observed by the caller remains current.
 func UpdateChannelCredentialIfUnchanged(
 	expected *Channel,
 	credential string,
 ) (*Channel, bool, error) {
-	updated, err := mutateChannelSnapshotsWithPlanQuotaDomains(
-		[]*Channel{expected},
-		false,
-		func(channel *Channel) {
-			channel.Key = credential
-		},
-	)
+	if expected == nil || expected.Id <= 0 {
+		return nil, false, errors.New("channel credential snapshot is missing")
+	}
+
+	prospective := *expected
+	prospective.Key = credential
+	requests := make([]planQuotaCredentialLock, 0, 2)
+	oldRequest, oldMember := planQuotaCredentialForChannel(expected, false)
+	if oldMember {
+		requests = append(requests, oldRequest)
+	}
+	newRequest, newMember := planQuotaCredentialForChannel(&prospective, true)
+	if newMember {
+		if oldMember && oldRequest.hash == newRequest.hash {
+			newRequest.allowCreate = false
+		}
+		requests = append(requests, newRequest)
+	}
+
+	var updated Channel
+	observeChannelStatusPublication(channelStatusPublicationBeforeWrite)
+	changed, err := withChannelStatusesLocks([]int{expected.Id}, func() (bool, error) {
+		err := DB.Transaction(func(tx *gorm.DB) error {
+			domains, err := lockPlanQuotaDomains(tx, requests)
+			if err != nil {
+				return err
+			}
+
+			var current Channel
+			if err := lockForUpdate(tx).
+				Where("id = ?", expected.Id).
+				First(&current).Error; err != nil {
+				return err
+			}
+			if current.Key != expected.Key ||
+				current.GetTag() != expected.GetTag() ||
+				current.Type != expected.Type ||
+				current.ChannelInfo.IsMultiKey != expected.ChannelInfo.IsMultiKey {
+				return errPlanQuotaDomainSnapshotChanged
+			}
+
+			updated = current
+			updated.Key = credential
+			oldHash, currentOldMember := PlanQuotaDomainMembership(&current)
+			newHash, currentNewMember := PlanQuotaDomainMembership(&updated)
+			ownershipCleared := currentOldMember &&
+				(!currentNewMember || newHash != oldHash) &&
+				clearPlanQuotaDomainOwnership(&updated, oldHash, current.GetTag())
+			if currentNewMember {
+				domain := domains[newHash]
+				if domain == nil {
+					return errPlanQuotaDomainInvariant
+				}
+				applyPlanQuotaDomainState(&updated, domain, ownershipCleared)
+			}
+
+			if err := tx.Model(&Channel{}).
+				Where("id = ?", updated.Id).
+				Updates(map[string]any{
+					"key":        updated.Key,
+					"status":     updated.Status,
+					"other_info": updated.OtherInfo,
+				}).Error; err != nil {
+				return err
+			}
+			return updated.UpdateAbilities(tx)
+		})
+		if err != nil {
+			return false, err
+		}
+		observeChannelStatusPublication(channelStatusPublicationAfterCommit)
+		CacheUpdateChannel(&updated)
+		return true, nil
+	})
 	if errors.Is(err, errPlanQuotaDomainSnapshotChanged) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, err
 	}
-	if len(updated) != 1 {
+	if !changed {
 		return nil, false, nil
 	}
-	return updated[0], true, nil
+	return &updated, true, nil
 }
 
 func nextPlanQuotaGeneration(current int64, requested int64) int64 {

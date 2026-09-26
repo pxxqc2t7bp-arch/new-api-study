@@ -12,7 +12,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
-	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 )
 
@@ -86,7 +85,7 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 				))
 			}
 		} else if channelError.AutoBan && ShouldRecordManagedRouteFailure(err) {
-			gopool.Go(func() {
+			RunRelayAsync(c, func() {
 				if _, _, recordErr := RecordManagedChannelFailure(channelError, reason); recordErr != nil {
 					common.SysError(fmt.Sprintf(
 						"failed to record managed channel failure: channel_id=%d error=%v",
@@ -97,7 +96,7 @@ func ProcessChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			})
 		}
 	} else if ShouldDisableChannel(err) && channelError.AutoBan {
-		gopool.Go(func() {
+		RunRelayAsync(c, func() {
 			DisableChannel(channelError, reason)
 		})
 	}
