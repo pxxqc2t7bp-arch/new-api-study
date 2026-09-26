@@ -119,19 +119,26 @@ def assert_safe_report(test_case, report):
         "jwt",
     ):
         test_case.assertNotIn(forbidden, lowered)
-    test_case.assertEqual(
-        set(report),
-        {"hash", "provider", "header", "change"},
-    )
+    expected_keys = {"hash", "provider", "header", "change"}
+    if "operation" in report:
+        expected_keys.add("operation")
+        test_case.assertEqual(report["operation"], "rollback")
+    test_case.assertEqual(set(report), expected_keys)
     test_case.assertEqual(report["provider"], {"id": guard.PROVIDER_ID})
-    test_case.assertEqual(
+    test_case.assertIn(
         report["header"],
-        {"name": guard.HEADER_NAME, "value": guard.HEADER_VALUE},
+        (
+            {"name": guard.HEADER_NAME, "value": guard.HEADER_VALUE},
+            {"name": guard.HEADER_NAME, "value": None},
+        ),
     )
     test_case.assertEqual(set(report["change"]), {"v2", "cli"})
     for change in report["change"].values():
         test_case.assertEqual(set(change), {"status"})
-        test_case.assertIn(change["status"], {"pending", "applied", "unchanged"})
+        test_case.assertIn(
+            change["status"],
+            {"pending", "applied", "unchanged", "rolled_back"},
+        )
     test_case.assertIn(
         set(report["hash"]),
         (
@@ -1326,6 +1333,456 @@ class ConfigTransactionTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, lowered)
         assert_safe_report(self, report)
+
+    def test_rollback_success_restores_backup_bytes_and_current_modes(self):
+        timestamp = "20260926T121000Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        rollback_modes = [0o604, 0o640]
+        for path, mode in zip(self.paths, rollback_modes):
+            path.chmod(mode)
+        output = self.root / "rollback.json"
+        status = []
+
+        report = guard.rollback_backup(
+            self.paths,
+            backup_dir,
+            output_path=output,
+            status_sink=status.append,
+        )
+
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+        self.assertEqual(
+            [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
+            rollback_modes,
+        )
+        self.assertEqual(report["operation"], "rollback")
+        self.assertEqual(
+            report["hash"],
+            {
+                "v2": {
+                    "before_sha256": sha256(self.updated_bytes[0]),
+                    "after_sha256": self.original_hashes[0],
+                },
+                "cli": {
+                    "before_sha256": sha256(self.updated_bytes[1]),
+                    "after_sha256": self.original_hashes[1],
+                },
+                "backup_manifest_sha256": sha256(
+                    (backup_dir / "manifest.json").read_bytes()
+                ),
+            },
+        )
+        self.assertEqual(
+            report["change"],
+            {
+                "v2": {"status": "rolled_back"},
+                "cli": {"status": "rolled_back"},
+            },
+        )
+        self.assertEqual(
+            json.loads(output.read_text(encoding="ascii")),
+            report,
+        )
+        self.assertEqual(len(status), 1)
+        combined = json.dumps(report, sort_keys=True) + status[0]
+        self.assertNotIn(str(backup_dir), combined)
+        self.assertNotIn(SECRET, combined)
+        self.assertNotIn(OTHER_SECRET, combined)
+        assert_safe_report(self, report)
+
+    def test_rollback_rejects_relative_backup_and_invalid_manifest_path(self):
+        timestamp = "20260926T121001Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            guard.rollback_backup(
+                self.paths,
+                Path(timestamp),
+                output_path=self.root / "relative.json",
+            )
+
+        manifest_path = backup_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+        manifest["backup_path"]["v2"] = "../v2/config.json"
+        manifest_path.write_bytes(json_bytes(manifest))
+        manifest_path.chmod(0o600)
+
+        with self.assertRaisesRegex(ValueError, "manifest"):
+            guard.rollback_backup(
+                self.paths,
+                backup_dir,
+                output_path=self.root / "bad-path.json",
+            )
+
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.updated_bytes,
+        )
+
+    def test_rollback_rejects_invalid_manifest_structure(self):
+        timestamp = "20260926T121002Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        manifest_path = backup_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+        manifest["unexpected"] = {}
+        manifest_path.write_bytes(json_bytes(manifest))
+        manifest_path.chmod(0o600)
+
+        with self.assertRaisesRegex(ValueError, "manifest"):
+            guard.rollback_backup(
+                self.paths,
+                backup_dir,
+                output_path=self.root / "bad-manifest.json",
+            )
+
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.updated_bytes,
+        )
+
+    def test_rollback_rejects_backup_hash_mismatch(self):
+        timestamp = "20260926T121003Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        backup = backup_dir / "v2" / "config.json"
+        backup.write_bytes(b'{"tampered":true}\n')
+        backup.chmod(0o600)
+
+        with self.assertRaisesRegex(RuntimeError, "backup hash"):
+            guard.rollback_backup(
+                self.paths,
+                backup_dir,
+                output_path=self.root / "bad-hash.json",
+            )
+
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.updated_bytes,
+        )
+
+    def test_rollback_rejects_non_regular_and_wrong_mode_backup_files(self):
+        for invalid_kind in ("symlink", "mode"):
+            with self.subTest(invalid_kind=invalid_kind):
+                with tempfile.TemporaryDirectory(
+                    dir=self.root
+                ) as temporary_directory:
+                    root = Path(temporary_directory)
+                    paths = [
+                        root / ".zcode" / "v2" / "config.json",
+                        root / ".zcode" / "cli" / "config.json",
+                    ]
+                    for path, config, mode in zip(
+                        paths,
+                        self.originals,
+                        self.original_modes,
+                    ):
+                        write_config(path, config, mode)
+                    backup_root = root / ".zcode" / "backups"
+                    timestamp = "20260926T121004Z"
+                    guard.execute(
+                        paths,
+                        apply=True,
+                        backup_root=backup_root,
+                        timestamp=timestamp,
+                    )
+                    backup_dir = backup_root / timestamp
+                    manifest_path = backup_dir / "manifest.json"
+                    if invalid_kind == "symlink":
+                        manifest_copy = root / "manifest-copy.json"
+                        manifest_copy.write_bytes(manifest_path.read_bytes())
+                        manifest_copy.chmod(0o600)
+                        manifest_path.unlink()
+                        manifest_path.symlink_to(manifest_copy)
+                        expected_error = "regular file"
+                    else:
+                        (
+                            backup_dir / "cli" / "config.json"
+                        ).chmod(0o640)
+                        expected_error = "mode"
+
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        expected_error,
+                    ):
+                        guard.rollback_backup(
+                            paths,
+                            backup_dir,
+                            output_path=root / "invalid-backup.json",
+                        )
+
+    def test_rollback_rejects_insecure_backup_root_without_chmod(self):
+        timestamp = "20260926T121012Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        self.backup_root.chmod(0o755)
+
+        with self.assertRaisesRegex(RuntimeError, "backup root mode"):
+            guard.rollback_backup(
+                self.paths,
+                backup_dir,
+                output_path=self.root / "insecure-root.json",
+            )
+
+        self.assertEqual(
+            stat.S_IMODE(self.backup_root.stat().st_mode),
+            0o755,
+        )
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.updated_bytes,
+        )
+
+    def test_rollback_rejects_unapplied_current_content(self):
+        timestamp = "20260926T121005Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        third_party = b'{"third_party":"before-rollback"}\n'
+        self.paths[0].write_bytes(third_party)
+        self.paths[0].chmod(self.original_modes[0])
+
+        with self.assertRaisesRegex(RuntimeError, "current state"):
+            guard.rollback_backup(
+                self.paths,
+                backup_dir,
+                output_path=self.root / "drift.json",
+            )
+
+        self.assertEqual(self.paths[0].read_bytes(), third_party)
+        self.assertEqual(self.paths[1].read_bytes(), self.updated_bytes[1])
+
+    def test_rollback_cas_detects_same_hash_new_inode_without_overwrite(self):
+        timestamp = "20260926T121006Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        real_atomic_write = guard.atomic_write
+        drifted_identity = []
+
+        def drift_after_first_rollback_write(path, data, mode, **kwargs):
+            result = real_atomic_write(path, data, mode, **kwargs)
+            if path == self.paths[0] and data == self.original_bytes[0]:
+                replacement = self.paths[1].with_suffix(".replacement")
+                replacement.write_bytes(self.paths[1].read_bytes())
+                replacement.chmod(self.original_modes[1])
+                os.replace(replacement, self.paths[1])
+                drifted_identity.append(
+                    (self.paths[1].stat().st_dev, self.paths[1].stat().st_ino)
+                )
+            return result
+
+        with mock.patch.object(
+            guard,
+            "atomic_write",
+            side_effect=drift_after_first_rollback_write,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "roll-forward verification failed",
+            ):
+                guard.rollback_backup(
+                    self.paths,
+                    backup_dir,
+                    output_path=self.root / "inode-drift.json",
+                )
+
+        self.assertEqual(self.paths[0].read_bytes(), self.updated_bytes[0])
+        self.assertEqual(self.paths[1].read_bytes(), self.updated_bytes[1])
+        self.assertEqual(
+            (self.paths[1].stat().st_dev, self.paths[1].stat().st_ino),
+            drifted_identity[0],
+        )
+
+    def test_rollback_cas_detects_mode_drift_without_overwrite(self):
+        timestamp = "20260926T121007Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        real_atomic_write = guard.atomic_write
+
+        def drift_after_first_rollback_write(path, data, mode, **kwargs):
+            result = real_atomic_write(path, data, mode, **kwargs)
+            if path == self.paths[0] and data == self.original_bytes[0]:
+                self.paths[1].chmod(0o604)
+            return result
+
+        with mock.patch.object(
+            guard,
+            "atomic_write",
+            side_effect=drift_after_first_rollback_write,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "roll-forward verification failed",
+            ):
+                guard.rollback_backup(
+                    self.paths,
+                    backup_dir,
+                    output_path=self.root / "mode-drift.json",
+                )
+
+        self.assertEqual(self.paths[0].read_bytes(), self.updated_bytes[0])
+        self.assertEqual(self.paths[1].read_bytes(), self.updated_bytes[1])
+        self.assertEqual(stat.S_IMODE(self.paths[1].stat().st_mode), 0o604)
+
+    def test_rollback_second_replace_failure_restores_applied_state(self):
+        timestamp = "20260926T121008Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        real_replace = os.replace
+        rollback_write_count = 0
+
+        def fail_second_rollback_replace(source, destination):
+            nonlocal rollback_write_count
+            if destination in self.paths:
+                source_raw = Path(source).read_bytes()
+                if source_raw in self.original_bytes:
+                    rollback_write_count += 1
+                    if rollback_write_count == 2:
+                        raise OSError("injected second rollback failure")
+            return real_replace(source, destination)
+
+        with mock.patch.object(
+            guard.os,
+            "replace",
+            side_effect=fail_second_rollback_replace,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "applied files restored",
+            ):
+                guard.rollback_backup(
+                    self.paths,
+                    backup_dir,
+                    output_path=self.root / "second-write.json",
+                )
+
+        self.assertEqual(rollback_write_count, 2)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.updated_bytes,
+        )
+        self.assertEqual(
+            [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
+            self.original_modes,
+        )
+
+    def test_rollback_report_failure_restores_applied_state(self):
+        timestamp = "20260926T121009Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        output = self.root / "rollback-report-failure.json"
+
+        with mock.patch.object(
+            guard,
+            "_write_report",
+            side_effect=OSError("injected rollback report failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "applied files restored",
+            ):
+                guard.rollback_backup(
+                    self.paths,
+                    backup_dir,
+                    output_path=output,
+                )
+
+        self.assertFalse(output.exists())
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.updated_bytes,
+        )
+
+    def test_cli_rollback_stdout_failure_restores_configs_and_output(self):
+        timestamp = "20260926T121010Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        output = self.root / "rollback-stdout-failure.json"
+        stdout = FailingStdout(BrokenPipeError("injected broken pipe"))
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(
+                guard,
+                "default_config_paths",
+                return_value=self.paths,
+            ),
+            mock.patch.object(guard.sys, "stdout", stdout),
+            mock.patch.object(guard.sys, "stderr", stderr),
+        ):
+            result = guard.main(
+                [
+                    "--rollback-backup",
+                    str(backup_dir),
+                    "--output",
+                    str(output),
+                ]
+            )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.write_count, 1)
+        self.assertEqual(stderr.getvalue(), "ERROR: change=failed\n")
+        self.assertFalse(output.exists())
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.updated_bytes,
+        )
+
+    def test_rollback_replace_baseexception_restores_and_reraises(self):
+        timestamp = "20260926T121011Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        real_replace = os.replace
+        interrupted = False
+
+        def replace_first_config_then_interrupt(source, destination):
+            nonlocal interrupted
+            result = real_replace(source, destination)
+            if destination == self.paths[0] and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt("injected rollback interrupt")
+            return result
+
+        with mock.patch.object(
+            guard.os,
+            "replace",
+            side_effect=replace_first_config_then_interrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                guard.rollback_backup(
+                    self.paths,
+                    backup_dir,
+                    output_path=self.root / "interrupt.json",
+                )
+
+        self.assertTrue(interrupted)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.updated_bytes,
+        )
+        self.assertEqual(
+            [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
+            self.original_modes,
+        )
+
+    def test_apply_and_rollback_cli_options_are_mutually_exclusive(self):
+        stderr = io.StringIO()
+        with mock.patch.object(guard.sys, "stderr", stderr):
+            with self.assertRaises(SystemExit):
+                guard.parse_args(
+                    [
+                        "--apply",
+                        "--rollback-backup",
+                        str(self.backup_root / "backup"),
+                        "--output",
+                        str(self.root / "report.json"),
+                    ]
+                )
+        self.assertIn("not allowed with argument --apply", stderr.getvalue())
 
 
 if __name__ == "__main__":

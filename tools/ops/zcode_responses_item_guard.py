@@ -28,6 +28,7 @@ EXPECTED_BASE_URL = "https://study.chenxy.online:10443/v1"
 EXPECTED_HOST = "study.chenxy.online"
 EXPECTED_PORT = 10443
 TIMESTAMP_PATTERN = re.compile(r"\A\d{8}T\d{6}Z\Z")
+SHA256_PATTERN = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 def _decode_config(raw: bytes, path: Path) -> dict[str, Any]:
@@ -246,8 +247,22 @@ def _validate_output_path(
 
 
 @contextmanager
-def _transaction_lock(root: Path) -> Iterator[None]:
-    _ensure_private_directory(root, parents=True)
+def _transaction_lock(
+    root: Path,
+    *,
+    create_root: bool = True,
+) -> Iterator[None]:
+    if create_root:
+        _ensure_private_directory(root, parents=True)
+    else:
+        try:
+            root_status = root.lstat()
+        except FileNotFoundError as exc:
+            raise RuntimeError("backup root is missing") from exc
+        if not stat.S_ISDIR(root_status.st_mode):
+            raise RuntimeError("backup root is not a directory")
+        if stat.S_IMODE(root_status.st_mode) != 0o700:
+            raise RuntimeError("backup root mode verification failed")
     lock_directory = root / ".zcode-responses-item-guard"
     _ensure_private_directory(lock_directory)
     lock_path = lock_directory / "transaction.lock"
@@ -519,6 +534,177 @@ def _verify_backups(
         raise RuntimeError("backup manifest mode verification failed")
 
 
+def _read_private_backup_file(path: Path, description: str) -> bytes:
+    try:
+        before = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError("%s is missing" % description) from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError("%s is not a regular file" % description)
+    if stat.S_IMODE(before.st_mode) != 0o600:
+        raise RuntimeError("%s mode verification failed" % description)
+    raw = path.read_bytes()
+    after = path.lstat()
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or (before.st_dev, before.st_ino)
+        != (after.st_dev, after.st_ino)
+        or stat.S_IMODE(after.st_mode) != 0o600
+    ):
+        raise RuntimeError("%s drift detected" % description)
+    return raw
+
+
+def _load_rollback_backup(
+    paths: Sequence[Path],
+    labels: Sequence[str],
+    backup_dir: Path,
+) -> tuple[list[dict[str, Any]], str]:
+    try:
+        backup_status = backup_dir.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError("backup directory is missing") from exc
+    if not stat.S_ISDIR(backup_status.st_mode):
+        raise RuntimeError("backup directory is not a directory")
+    if stat.S_IMODE(backup_status.st_mode) != 0o700:
+        raise RuntimeError("backup directory mode verification failed")
+
+    manifest_path = backup_dir / "manifest.json"
+    manifest_raw = _read_private_backup_file(
+        manifest_path,
+        "backup manifest",
+    )
+    try:
+        manifest = json.loads(manifest_raw.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("backup manifest is invalid") from exc
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "hash",
+        "backup_path",
+    }:
+        raise ValueError("backup manifest structure is invalid")
+    hashes = manifest["hash"]
+    backup_paths = manifest["backup_path"]
+    expected_labels = set(labels)
+    if (
+        not isinstance(hashes, dict)
+        or set(hashes) != expected_labels
+        or not isinstance(backup_paths, dict)
+        or set(backup_paths) != expected_labels
+    ):
+        raise ValueError("backup manifest structure is invalid")
+
+    snapshots = []
+    for path, label in zip(paths, labels):
+        expected_relative_path = str(Path(label) / path.name)
+        digest = hashes[label]
+        if (
+            not isinstance(digest, str)
+            or SHA256_PATTERN.fullmatch(digest) is None
+            or backup_paths[label] != expected_relative_path
+        ):
+            raise ValueError("backup manifest entry is invalid: %s" % label)
+        label_dir = backup_dir / label
+        try:
+            label_status = label_dir.lstat()
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "backup label directory is missing: %s" % label
+            ) from exc
+        if not stat.S_ISDIR(label_status.st_mode):
+            raise RuntimeError(
+                "backup label path is not a directory: %s" % label
+            )
+        if stat.S_IMODE(label_status.st_mode) != 0o700:
+            raise RuntimeError(
+                "backup label directory mode verification failed: %s"
+                % label
+            )
+
+        backup_path = backup_dir / expected_relative_path
+        backup_raw = _read_private_backup_file(
+            backup_path,
+            "backup configuration %s" % label,
+        )
+        if _sha256(backup_raw) != digest:
+            raise RuntimeError(
+                "backup hash verification failed: %s" % label
+            )
+        backup_config = _decode_config(backup_raw, backup_path)
+        applied_config, change = apply_guard(backup_config)
+        applied_raw = (
+            _encode_config(applied_config)
+            if applied_config != backup_config
+            else backup_raw
+        )
+
+        identity, current_raw, current_mode = _observed_file_state(path)
+        if _sha256(current_raw) != _sha256(applied_raw):
+            raise RuntimeError(
+                "rollback current state does not match applied backup: %s"
+                % label
+            )
+        snapshots.append(
+            {
+                "label": label,
+                "path": path,
+                "mode": current_mode,
+                "identity": identity,
+                "updated_identity": None,
+                "original": current_raw,
+                "original_sha256": _sha256(current_raw),
+                "updated": backup_config,
+                "updated_raw": backup_raw,
+                "updated_sha256": digest,
+                "change": change,
+                "changed": True,
+                "backup_path": backup_path,
+            }
+        )
+
+    final_backup_status = backup_dir.lstat()
+    if (
+        not stat.S_ISDIR(final_backup_status.st_mode)
+        or (backup_status.st_dev, backup_status.st_ino)
+        != (final_backup_status.st_dev, final_backup_status.st_ino)
+        or stat.S_IMODE(final_backup_status.st_mode) != 0o700
+    ):
+        raise RuntimeError("backup directory drift detected")
+    return snapshots, _sha256(manifest_raw)
+
+
+def _validate_rollback_output_path(
+    backup_dir: Path,
+    snapshots: Sequence[dict[str, Any]],
+    output_path: Optional[Path],
+) -> None:
+    if output_path is None:
+        return
+    resolved_output = output_path.resolve(strict=False)
+    resolved_backup = backup_dir.resolve(strict=False)
+    try:
+        resolved_output.relative_to(resolved_backup)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("output path must not be inside the backup directory")
+
+    protected_paths = [backup_dir / "manifest.json"]
+    protected_paths.extend(
+        snapshot["backup_path"] for snapshot in snapshots
+    )
+    for protected_path in protected_paths:
+        aliases_backup = resolved_output == protected_path.resolve(
+            strict=False
+        )
+        if output_path.exists() and protected_path.exists():
+            aliases_backup = aliases_backup or output_path.samefile(
+                protected_path
+            )
+        if aliases_backup:
+            raise ValueError("output path must not alias a backup file")
+
+
 def _verify_readback(snapshot: dict[str, Any]) -> None:
     path = snapshot["path"]
     state = _observed_file_state(path)
@@ -751,6 +937,117 @@ def execute(
     return report
 
 
+def rollback_backup(
+    paths: list[Path],
+    backup_dir: Path,
+    *,
+    output_path: Optional[Path] = None,
+    status_sink: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """Restore both configs from one validated apply backup transaction."""
+    if not backup_dir.is_absolute():
+        raise ValueError("rollback backup directory must be absolute")
+    if backup_dir != Path(os.path.abspath(str(backup_dir))):
+        raise ValueError(
+            "rollback backup directory must be a normalized absolute path"
+        )
+    _validate_output_path(paths, output_path)
+    labels = _config_labels(paths)
+    try:
+        backup_status = backup_dir.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError("backup directory is missing") from exc
+    if not stat.S_ISDIR(backup_status.st_mode):
+        raise RuntimeError("backup directory is not a directory")
+
+    with _transaction_lock(backup_dir.parent, create_root=False):
+        snapshots, manifest_sha256 = _load_rollback_backup(
+            paths,
+            labels,
+            backup_dir,
+        )
+        _validate_rollback_output_path(
+            backup_dir,
+            snapshots,
+            output_path,
+        )
+        output_snapshot = (
+            _snapshot_output(output_path) if output_path is not None else None
+        )
+        projection = redacted_report(snapshots[0]["updated"])
+        report = {
+            "operation": "rollback",
+            "hash": {
+                snapshot["label"]: {
+                    "before_sha256": snapshot["original_sha256"],
+                    "after_sha256": snapshot["updated_sha256"],
+                }
+                for snapshot in snapshots
+            },
+            "provider": projection["provider"],
+            "header": projection["header"],
+            "change": {
+                snapshot["label"]: {"status": "rolled_back"}
+                for snapshot in snapshots
+            },
+        }
+        report["hash"]["backup_manifest_sha256"] = manifest_sha256
+
+        try:
+            written_labels = set()
+            _verify_transaction_state(snapshots, written_labels)
+            if output_snapshot is not None:
+                _verify_output_state(output_snapshot, updated=False)
+            for snapshot in snapshots:
+                _verify_transaction_state(snapshots, written_labels)
+                atomic_write(
+                    snapshot["path"],
+                    snapshot["updated_raw"],
+                    snapshot["mode"],
+                    on_replace=lambda identity, current=snapshot: (
+                        current.__setitem__("updated_identity", identity)
+                    ),
+                )
+                written_labels.add(snapshot["label"])
+            for snapshot in snapshots:
+                _verify_readback(snapshot)
+            if output_path is not None:
+                output_snapshot["updated_sha256"] = _sha256(
+                    _encode_report(report)
+                )
+                _verify_transaction_state(snapshots, written_labels)
+                _verify_output_state(output_snapshot, updated=False)
+                _write_report(
+                    output_path,
+                    report,
+                    on_replace=lambda identity: output_snapshot.__setitem__(
+                        "updated_identity",
+                        identity,
+                    ),
+                )
+                _verify_output_state(output_snapshot, updated=True)
+            _emit_status(report, status_sink)
+        except BaseException as exc:
+            rollback_errors = _restore_and_verify(
+                None,
+                snapshots,
+                output_snapshot,
+            )
+            if rollback_errors:
+                raise RuntimeError(
+                    "configuration rollback failed; "
+                    "roll-forward verification failed: %s"
+                    % ", ".join(rollback_errors)
+                ) from exc
+            if not isinstance(exc, Exception):
+                raise
+            raise RuntimeError(
+                "configuration rollback failed; applied files restored"
+            ) from exc
+
+    return report
+
+
 def default_config_paths() -> list[Path]:
     root = Path.home() / ".zcode"
     return [
@@ -763,8 +1060,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Configure the ZCode Responses input-item guard.",
     )
-    parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--output", required=True)
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument("--apply", action="store_true")
+    operation.add_argument(
+        "--rollback-backup",
+        metavar="ABSOLUTE_BACKUP_DIR",
+    )
+    parser.add_argument("--output", required=True, metavar="PATH")
     return parser.parse_args(argv)
 
 
@@ -792,13 +1094,23 @@ def _emit_status(
 ) -> None:
     if status_sink is None:
         return
-    fields = [
-        "hash=%s" % _sha256(_encode_report(report)),
-        "provider=%s" % PROVIDER_ID,
-        "header=%s:%s" % (HEADER_NAME, HEADER_VALUE),
-        "change.v2=%s" % report["change"]["v2"]["status"],
-        "change.cli=%s" % report["change"]["cli"]["status"],
-    ]
+    fields = []
+    if "operation" in report:
+        fields.append("operation=%s" % report["operation"])
+    header_value = report["header"]["value"]
+    fields.extend(
+        [
+            "hash=%s" % _sha256(_encode_report(report)),
+            "provider=%s" % PROVIDER_ID,
+            "header=%s:%s"
+            % (
+                HEADER_NAME,
+                header_value if header_value is not None else "absent",
+            ),
+            "change.v2=%s" % report["change"]["v2"]["status"],
+            "change.cli=%s" % report["change"]["cli"]["status"],
+        ]
+    )
     status_sink(" ".join(fields))
 
 
@@ -810,12 +1122,21 @@ def _write_stdout_line(line: str) -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
-        execute(
-            default_config_paths(),
-            apply=args.apply,
-            output_path=Path(args.output),
-            status_sink=_write_stdout_line,
-        )
+        paths = default_config_paths()
+        if args.rollback_backup is not None:
+            rollback_backup(
+                paths,
+                Path(args.rollback_backup),
+                output_path=Path(args.output),
+                status_sink=_write_stdout_line,
+            )
+        else:
+            execute(
+                paths,
+                apply=args.apply,
+                output_path=Path(args.output),
+                status_sink=_write_stdout_line,
+            )
     except Exception:
         print("ERROR: change=failed", file=sys.stderr)
         return 1
