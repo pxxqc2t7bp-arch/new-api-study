@@ -418,6 +418,8 @@ def _sanitize_temporary_file(
             raise RuntimeError(
                 "temporary file identity verification failed"
             )
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
         remaining = opened.st_size
         zeroes = b"\0" * min(1 << 20, max(remaining, 1))
         os.lseek(descriptor, 0, os.SEEK_SET)
@@ -545,6 +547,8 @@ def _unlink_known_temporary_once(
     path: Path,
     known_states: tuple[tuple[tuple[int, int], bytes, int], ...],
     errors: list[BaseException],
+    *,
+    content_may_differ: bool = False,
 ) -> bool:
     temporary_state = _cleanup_file_state_at(
         parent_dir_fd,
@@ -555,9 +559,19 @@ def _unlink_known_temporary_once(
     )
     if temporary_state is _MISSING_FILE_STATE:
         return True
+    state_is_known = temporary_state in known_states
+    if (
+        content_may_differ
+        and temporary_state is not _UNKNOWN_FILE_STATE
+    ):
+        state_is_known = any(
+            temporary_state[0] == identity
+            and temporary_state[2] in (mode, 0o600)
+            for identity, _content, mode in known_states
+        )
     if (
         temporary_state is _UNKNOWN_FILE_STATE
-        or temporary_state not in known_states
+        or not state_is_known
     ):
         if temporary_state is not _UNKNOWN_FILE_STATE:
             errors.append(RuntimeError("temporary file drift detected"))
@@ -569,6 +583,10 @@ def _unlink_known_temporary_once(
     except BaseException as error:
         errors.append(error)
         return False
+    try:
+        os.fsync(parent_dir_fd)
+    except BaseException as error:
+        errors.append(error)
     return True
 
 
@@ -598,28 +616,30 @@ def _sanitize_or_unlink_known_temporary(
     if temporary_state is _MISSING_FILE_STATE:
         return True
     if (
-        temporary_state is not _UNKNOWN_FILE_STATE
-        and temporary_state in known_states
+        temporary_state is _UNKNOWN_FILE_STATE
+        or temporary_state not in known_states
     ):
-        try:
-            _sanitize_temporary_file(
-                parent_dir_fd,
-                temporary_name,
-                temporary_state[0],
-            )
-        except BaseException as error:
-            errors.append(error)
+        if temporary_state is not _UNKNOWN_FILE_STATE:
+            errors.append(RuntimeError("temporary file drift detected"))
+        return False
 
-    sanitized_states = known_states + tuple(
-        (identity, b"", mode)
-        for identity, _content, mode in known_states
-    )
+    owned_state = (temporary_state,)
+    try:
+        _sanitize_temporary_file(
+            parent_dir_fd,
+            temporary_name,
+            temporary_state[0],
+        )
+    except BaseException as error:
+        errors.append(error)
+
     if _unlink_known_temporary_once(
         parent_dir_fd,
         temporary_name,
         path,
-        sanitized_states,
+        owned_state,
         errors,
+        content_may_differ=True,
     ):
         return True
 
@@ -633,7 +653,8 @@ def _sanitize_or_unlink_known_temporary(
     return (
         temporary_state is not _MISSING_FILE_STATE
         and temporary_state is not _UNKNOWN_FILE_STATE
-        and temporary_state in sanitized_states
+        and temporary_state[0] == owned_state[0][0]
+        and temporary_state[2] in (owned_state[0][2], 0o600)
         and temporary_state[1] == b""
     )
 
@@ -760,6 +781,7 @@ def _remove_if_matches(
             0o600,
         )
         temporary_cleanup_complete = False
+        primary_error = None
         try:
             os.fchmod(placeholder_descriptor, 0o600)
             os.fsync(placeholder_descriptor)
@@ -814,6 +836,7 @@ def _remove_if_matches(
                 raise removal_error.with_traceback(
                     removal_error.__traceback__
                 )
+            os.fsync(parent_dir_fd)
             try:
                 os.unlink(temporary_name, dir_fd=parent_dir_fd)
             except BaseException:
@@ -831,7 +854,11 @@ def _remove_if_matches(
                 raise
             else:
                 temporary_cleanup_complete = True
+                os.fsync(parent_dir_fd)
             os.fsync(parent_dir_fd)
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
             if placeholder_open:
                 os.close(placeholder_descriptor)
@@ -852,10 +879,24 @@ def _remove_if_matches(
                             "target removal temporary cleanup incomplete"
                         )
                     )
+                if final_cleanup_errors:
                     _raise_cleanup_errors(
-                        "target removal cleanup failed",
-                        final_cleanup_errors,
-                        final_cleanup_errors[0],
+                        (
+                            "target removal temporary cleanup incomplete"
+                            if not temporary_cleanup_complete
+                            else "target removal cleanup failed"
+                        ),
+                        (
+                            [primary_error]
+                            if primary_error is not None
+                            else []
+                        )
+                        + final_cleanup_errors,
+                        (
+                            primary_error
+                            if primary_error is not None
+                            else final_cleanup_errors[0]
+                        ),
                     )
 
 
@@ -896,6 +937,7 @@ def atomic_write(
             data,
             mode,
         )
+        primary_error = None
         try:
             os.fchmod(file_descriptor, mode)
             with os.fdopen(file_descriptor, "wb") as handle:
@@ -935,7 +977,6 @@ def atomic_write(
                         temporary_name,
                         dir_fd=parent_dir_fd,
                     )
-                    temporary_cleanup_complete = True
                 except FileNotFoundError:
                     temporary_cleanup_complete = True
                 except BaseException as cleanup_error:
@@ -962,6 +1003,10 @@ def atomic_write(
                             cleanup_errors.append(retry_error)
                         else:
                             temporary_cleanup_complete = True
+                            try:
+                                os.fsync(parent_dir_fd)
+                            except BaseException as fsync_error:
+                                cleanup_errors.append(fsync_error)
                     elif current_pair[1] is _MISSING_FILE_STATE:
                         temporary_cleanup_complete = True
                     else:
@@ -1007,7 +1052,12 @@ def atomic_write(
                         cleanup_errors,
                         cleanup_error,
                     )
+                else:
+                    os.fsync(parent_dir_fd)
             os.fsync(parent_dir_fd)
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
             if descriptor_open:
                 os.close(file_descriptor)
@@ -1037,10 +1087,24 @@ def atomic_write(
                             "incomplete"
                         )
                     )
+                if final_cleanup_errors:
                     _raise_cleanup_errors(
-                        "atomic replacement cleanup failed",
-                        final_cleanup_errors,
-                        final_cleanup_errors[0],
+                        (
+                            "atomic replacement temporary cleanup incomplete"
+                            if not temporary_cleanup_complete
+                            else "atomic replacement cleanup failed"
+                        ),
+                        (
+                            [primary_error]
+                            if primary_error is not None
+                            else []
+                        )
+                        + final_cleanup_errors,
+                        (
+                            primary_error
+                            if primary_error is not None
+                            else final_cleanup_errors[0]
+                        ),
                     )
 
 

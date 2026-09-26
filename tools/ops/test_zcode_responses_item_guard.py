@@ -1478,6 +1478,52 @@ class ConfigTransactionTest(unittest.TestCase):
             [],
         )
 
+    def test_remove_if_matches_fsyncs_after_each_successful_unlink(self):
+        output = self.root / "remove-output.json"
+        output.write_bytes(b'{"report":"safe"}\n')
+        output.chmod(0o640)
+        expected_state = guard._observed_file_state(output, "output")
+        parent_status = self.root.stat()
+        real_unlink = guard.os.unlink
+        real_fsync = guard.os.fsync
+        events = []
+
+        def record_unlink(name, *args, **kwargs):
+            result = real_unlink(name, *args, **kwargs)
+            if kwargs.get("dir_fd") is not None:
+                events.append("unlink")
+            return result
+
+        def record_parent_fsync(file_descriptor):
+            file_status = os.fstat(file_descriptor)
+            if (
+                file_status.st_dev,
+                file_status.st_ino,
+            ) == (
+                parent_status.st_dev,
+                parent_status.st_ino,
+            ):
+                events.append("dir-fsync")
+            return real_fsync(file_descriptor)
+
+        with mock.patch.object(
+            guard.os,
+            "unlink",
+            side_effect=record_unlink,
+        ), mock.patch.object(
+            guard.os,
+            "fsync",
+            side_effect=record_parent_fsync,
+        ):
+            guard._remove_if_matches(output, expected_state)
+
+        unlink_positions = [
+            index for index, event in enumerate(events) if event == "unlink"
+        ]
+        self.assertEqual(len(unlink_positions), 2)
+        for position in unlink_positions:
+            self.assertEqual(events[position + 1], "dir-fsync")
+
     def test_remove_if_matches_recovers_when_restore_exchange_first_fails(
         self,
     ):
@@ -1545,6 +1591,68 @@ class ConfigTransactionTest(unittest.TestCase):
         self.assertEqual(output.read_bytes(), original)
         self.assertEqual(target_unlinks, 1)
         self.assertGreaterEqual(target_exchanges, 3)
+
+    def test_remove_if_matches_continues_after_partial_sanitize_failure(self):
+        output = self.root / "remove-secret.json"
+        original = ("%s:%s" % (SECRET, OTHER_SECRET)).encode("utf-8")
+        output.write_bytes(original)
+        output.chmod(0o600)
+        expected_state = guard._observed_file_state(output, "output")
+        real_unlink = guard.os.unlink
+        temporary_unlinks = 0
+        sanitize_attempts = 0
+
+        def fail_first_two_temporary_unlinks(name, *args, **kwargs):
+            nonlocal temporary_unlinks
+            directory_fd = kwargs.get("dir_fd")
+            if (
+                directory_fd is not None
+                and os.fspath(name).startswith(".remove-secret.json.")
+                and temporary_unlinks < 2
+            ):
+                temporary_unlinks += 1
+                raise OSError("injected temporary cleanup failure")
+            return real_unlink(name, *args, **kwargs)
+
+        def partially_sanitize_then_fail(
+            parent_dir_fd,
+            name,
+            expected_identity,
+        ):
+            nonlocal sanitize_attempts
+            sanitize_attempts += 1
+            descriptor = os.open(name, os.O_WRONLY, dir_fd=parent_dir_fd)
+            try:
+                opened = os.fstat(descriptor)
+                self.assertEqual(
+                    (opened.st_dev, opened.st_ino),
+                    expected_identity,
+                )
+                os.write(descriptor, b"\0" * 4)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            raise OSError("injected partial sanitize failure")
+
+        with mock.patch.object(
+            guard.os,
+            "unlink",
+            side_effect=fail_first_two_temporary_unlinks,
+        ), mock.patch.object(
+            guard,
+            "_rename_noreplace",
+            side_effect=FileExistsError("injected occupied target"),
+        ), mock.patch.object(
+            guard,
+            "_sanitize_temporary_file",
+            side_effect=partially_sanitize_then_fail,
+        ):
+            with self.assertRaises((OSError, RuntimeError)):
+                guard._remove_if_matches(output, expected_state)
+
+        self.assertEqual(sanitize_attempts, 1)
+        self.assertFalse(output.exists())
+        assert_no_secret_temporary_files(self, self.root)
 
     def test_directory_replacement_is_not_moved_or_left_displaced(self):
         output = self.root / "report.json"
@@ -2054,6 +2162,83 @@ class ConfigTransactionTest(unittest.TestCase):
 
         self.assertEqual(temporary.read_bytes(), b"")
 
+    def test_cleanup_after_sanitize_failure_rejects_owner_metadata_drift(self):
+        original = ("%s:%s" % (SECRET, OTHER_SECRET)).encode("utf-8")
+
+        for drift_kind in ("inode", "type", "mode"):
+            with self.subTest(drift_kind=drift_kind):
+                case_root = self.root / drift_kind
+                case_root.mkdir()
+                temporary = case_root / ".secret-temporary"
+                temporary.write_bytes(original)
+                temporary.chmod(0o600)
+                known_state = guard._observed_file_state(temporary)
+                directory_flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                directory_fd = os.open(case_root, directory_flags)
+                real_unlink = guard.os.unlink
+                unlink_attempts = 0
+
+                def fail_first_unlink(name, *args, **kwargs):
+                    nonlocal unlink_attempts
+                    unlink_attempts += 1
+                    if unlink_attempts == 1:
+                        raise OSError("injected initial unlink failure")
+                    return real_unlink(name, *args, **kwargs)
+
+                def drift_during_sanitize(
+                    parent_dir_fd,
+                    name,
+                    _expected_identity,
+                ):
+                    if drift_kind == "inode":
+                        replacement = case_root / ".replacement"
+                        replacement.write_bytes(b"third-party")
+                        replacement.chmod(0o600)
+                        os.replace(replacement, temporary)
+                    elif drift_kind == "type":
+                        real_unlink(name, dir_fd=parent_dir_fd)
+                        os.mkdir(name, mode=0o700, dir_fd=parent_dir_fd)
+                    else:
+                        temporary.write_bytes(b"third-party")
+                        temporary.chmod(0o640)
+                    raise OSError("injected sanitize failure with drift")
+
+                errors = []
+                try:
+                    with mock.patch.object(
+                        guard.os,
+                        "unlink",
+                        side_effect=fail_first_unlink,
+                    ), mock.patch.object(
+                        guard,
+                        "_sanitize_temporary_file",
+                        side_effect=drift_during_sanitize,
+                    ):
+                        cleanup_complete = (
+                            guard._sanitize_or_unlink_known_temporary(
+                                directory_fd,
+                                temporary.name,
+                                temporary,
+                                (known_state,),
+                                errors,
+                            )
+                        )
+                finally:
+                    os.close(directory_fd)
+
+                self.assertFalse(cleanup_complete)
+                self.assertEqual(unlink_attempts, 1)
+                self.assertTrue(temporary.exists())
+                if drift_kind == "type":
+                    self.assertTrue(temporary.is_dir())
+                else:
+                    self.assertEqual(temporary.read_bytes(), b"third-party")
+                self.assertNotEqual(errors, [])
+
     def test_cleanup_retry_sanitizes_replacement_after_restore(self):
         real_unlink = guard.os.unlink
         cleanup_attempts = []
@@ -2268,6 +2453,167 @@ class ConfigTransactionTest(unittest.TestCase):
         self.assertGreaterEqual(cleanup_attempts, 3)
         self.assertGreaterEqual(sanitize_attempts, 1)
 
+    def test_atomic_cleanup_continues_after_partial_sanitize_failure(self):
+        path = self.paths[0]
+        expected_state = guard._observed_file_state(path)
+        real_unlink = guard.os.unlink
+        cleanup_attempts = 0
+        sanitize_attempts = 0
+
+        def fail_first_three_temporary_unlinks(name, *args, **kwargs):
+            nonlocal cleanup_attempts
+            directory_fd = kwargs.get("dir_fd")
+            if (
+                directory_fd is not None
+                and dir_fd_entry_matches_path(
+                    directory_fd,
+                    path.name,
+                    path,
+                )
+                and os.fspath(name).startswith(".config.json.")
+                and cleanup_attempts < 3
+            ):
+                cleanup_attempts += 1
+                raise OSError("injected temporary cleanup failure")
+            return real_unlink(name, *args, **kwargs)
+
+        def partially_sanitize_then_fail(
+            parent_dir_fd,
+            name,
+            expected_identity,
+        ):
+            nonlocal sanitize_attempts
+            sanitize_attempts += 1
+            descriptor = os.open(name, os.O_WRONLY, dir_fd=parent_dir_fd)
+            try:
+                opened = os.fstat(descriptor)
+                self.assertEqual(
+                    (opened.st_dev, opened.st_ino),
+                    expected_identity,
+                )
+                os.write(descriptor, b"\0" * 8)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            raise OSError("injected partial sanitize failure")
+
+        with mock.patch.object(
+            guard.os,
+            "unlink",
+            side_effect=fail_first_three_temporary_unlinks,
+        ), mock.patch.object(
+            guard,
+            "_sanitize_temporary_file",
+            side_effect=partially_sanitize_then_fail,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "atomic replacement cleanup failed",
+            ):
+                guard.atomic_write(
+                    path,
+                    self.updated_bytes[0],
+                    self.original_modes[0],
+                    expected_state=expected_state,
+                )
+
+        self.assertEqual(sanitize_attempts, 1)
+        self.assertEqual(path.read_bytes(), self.original_bytes[0])
+        assert_no_secret_temporary_files(self, self.home)
+
+    def test_atomic_final_cleanup_propagates_directory_fsync_failure(self):
+        path = self.paths[0]
+        parent_status = path.parent.stat()
+        real_fsync = guard.os.fsync
+        parent_fsync_attempts = 0
+
+        def fail_parent_fsync(file_descriptor):
+            nonlocal parent_fsync_attempts
+            file_status = os.fstat(file_descriptor)
+            if (
+                file_status.st_dev,
+                file_status.st_ino,
+            ) == (
+                parent_status.st_dev,
+                parent_status.st_ino,
+            ):
+                parent_fsync_attempts += 1
+                raise OSError("injected cleanup directory fsync failure")
+            return real_fsync(file_descriptor)
+
+        def fail_before_replace(_identity):
+            raise OSError("injected pre-replace failure")
+
+        with mock.patch.object(
+            guard.os,
+            "fsync",
+            side_effect=fail_parent_fsync,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "atomic replacement cleanup failed",
+            ):
+                guard.atomic_write(
+                    path,
+                    self.updated_bytes[0],
+                    self.original_modes[0],
+                    on_replace=fail_before_replace,
+                    expected_state=guard._observed_file_state(path),
+                )
+
+        self.assertEqual(parent_fsync_attempts, 1)
+        self.assertEqual(path.read_bytes(), self.original_bytes[0])
+        self.assertEqual(list(path.parent.glob(".config.json.*")), [])
+
+    def test_atomic_final_cleanup_reraises_captured_baseexception(self):
+        path = self.paths[0]
+        real_unlink = guard.os.unlink
+
+        for fatal_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(fatal_type=fatal_type.__name__):
+                cleanup_error = fatal_type("injected cleanup interrupt")
+                temporary_unlinks = 0
+
+                def interrupt_first_temporary_unlink(
+                    name,
+                    *args,
+                    **kwargs,
+                ):
+                    nonlocal temporary_unlinks
+                    directory_fd = kwargs.get("dir_fd")
+                    if (
+                        directory_fd is not None
+                        and os.fspath(name).startswith(".config.json.")
+                    ):
+                        temporary_unlinks += 1
+                        if temporary_unlinks == 1:
+                            raise cleanup_error
+                    return real_unlink(name, *args, **kwargs)
+
+                def fail_before_replace(_identity):
+                    raise OSError("injected pre-replace failure")
+
+                with mock.patch.object(
+                    guard.os,
+                    "unlink",
+                    side_effect=interrupt_first_temporary_unlink,
+                ):
+                    with self.assertRaises(fatal_type) as raised:
+                        guard.atomic_write(
+                            path,
+                            self.updated_bytes[0],
+                            self.original_modes[0],
+                            on_replace=fail_before_replace,
+                            expected_state=guard._observed_file_state(path),
+                        )
+
+                self.assertIs(raised.exception, cleanup_error)
+                self.assertEqual(temporary_unlinks, 2)
+                self.assertEqual(
+                    list(path.parent.glob(".config.json.*")),
+                    [],
+                )
+
     def test_persistent_cleanup_failure_leaves_only_sanitized_temp(self):
         real_unlink = guard.os.unlink
         cleanup_attempts = 0
@@ -2330,6 +2676,75 @@ class ConfigTransactionTest(unittest.TestCase):
                 OTHER_SECRET.encode("utf-8"),
                 temporary_content,
             )
+
+    def test_permanent_unlink_and_sanitize_failure_reports_private_residual(
+        self,
+    ):
+        path = self.paths[0]
+        real_unlink = guard.os.unlink
+        real_write = guard.os.write
+        replacement_identities = []
+        cleanup_attempts = 0
+        sanitize_attempts = 0
+
+        def fail_temporary_unlinks(name, *args, **kwargs):
+            nonlocal cleanup_attempts
+            directory_fd = kwargs.get("dir_fd")
+            if (
+                directory_fd is not None
+                and os.fspath(name).startswith(".config.json.")
+            ):
+                cleanup_attempts += 1
+                raise OSError("injected permanent unlink failure")
+            return real_unlink(name, *args, **kwargs)
+
+        def fail_sanitize_writes(file_descriptor, data):
+            nonlocal sanitize_attempts
+            file_status = os.fstat(file_descriptor)
+            identity = (file_status.st_dev, file_status.st_ino)
+            if identity in replacement_identities:
+                sanitize_attempts += 1
+                raise OSError("injected permanent sanitize failure")
+            return real_write(file_descriptor, data)
+
+        def record_replacement_then_fail(identity):
+            replacement_identities.append(identity)
+            raise OSError("injected pre-replace failure")
+
+        with mock.patch.object(
+            guard.os,
+            "unlink",
+            side_effect=fail_temporary_unlinks,
+        ), mock.patch.object(
+            guard.os,
+            "write",
+            side_effect=fail_sanitize_writes,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "atomic replacement temporary cleanup incomplete",
+            ):
+                guard.atomic_write(
+                    path,
+                    self.updated_bytes[0],
+                    self.original_modes[0],
+                    on_replace=record_replacement_then_fail,
+                    expected_state=guard._observed_file_state(path),
+                )
+
+        self.assertGreaterEqual(cleanup_attempts, 2)
+        self.assertGreaterEqual(sanitize_attempts, 1)
+        self.assertEqual(path.read_bytes(), self.original_bytes[0])
+        residuals = list(path.parent.glob(".config.json.*"))
+        self.assertEqual(len(residuals), 1)
+        residual_status = residuals[0].lstat()
+        self.assertTrue(stat.S_ISREG(residual_status.st_mode))
+        self.assertEqual(
+            (residual_status.st_dev, residual_status.st_ino),
+            replacement_identities[0],
+        )
+        self.assertEqual(stat.S_IMODE(residual_status.st_mode), 0o600)
+        self.assertIn(SECRET.encode("utf-8"), residuals[0].read_bytes())
 
     def test_readback_validation_failure_rolls_back_both_files(self):
         real_verify_readback = guard._verify_readback
