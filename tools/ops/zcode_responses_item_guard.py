@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -29,6 +31,7 @@ EXPECTED_HOST = "study.chenxy.online"
 EXPECTED_PORT = 10443
 TIMESTAMP_PATTERN = re.compile(r"\A\d{8}T\d{6}Z\Z")
 SHA256_PATTERN = re.compile(r"\A[0-9a-f]{64}\Z")
+_UNCONDITIONAL_WRITE = object()
 
 
 def _decode_config(raw: bytes, path: Path) -> dict[str, Any]:
@@ -162,12 +165,130 @@ def _ensure_private_directory(path: Path, *, parents: bool = False) -> None:
     os.chmod(path, 0o700)
 
 
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename without replacing an existing destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_raw = os.fsencode(source)
+    destination_raw = os.fsencode(destination)
+    if sys.platform == "darwin":
+        rename_call = libc.renamex_np
+        rename_call.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_call.restype = ctypes.c_int
+        result = rename_call(source_raw, destination_raw, 0x00000004)
+    elif sys.platform.startswith("linux"):
+        try:
+            rename_call = libc.renameat2
+        except AttributeError as exc:
+            raise RuntimeError(
+                "atomic no-replace rename is unavailable"
+            ) from exc
+        rename_call.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename_call.restype = ctypes.c_int
+        result = rename_call(
+            -100,
+            source_raw,
+            -100,
+            destination_raw,
+            0x00000001,
+        )
+    else:
+        raise RuntimeError("atomic no-replace rename is unavailable")
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            str(destination),
+        )
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        str(source),
+        str(destination),
+    )
+
+
+def _move_target_if_matches(
+    path: Path,
+    expected_state: tuple[tuple[int, int], bytes, int],
+) -> Path:
+    displaced_descriptor, displaced_name = tempfile.mkstemp(
+        prefix=".%s.displaced." % path.name,
+        dir=str(path.parent),
+    )
+    os.close(displaced_descriptor)
+    displaced_path = Path(displaced_name)
+    displaced_path.unlink()
+    move_error = None
+    move_traceback = None
+    try:
+        _rename_noreplace(path, displaced_path)
+    except BaseException as exc:
+        move_error = exc
+        move_traceback = exc.__traceback__
+    try:
+        displaced_state = _observed_file_state(displaced_path)
+    except BaseException:
+        if move_error is not None:
+            raise move_error.with_traceback(move_traceback)
+        raise
+    if displaced_state == expected_state and move_error is None:
+        return displaced_path
+
+    try:
+        _rename_noreplace(displaced_path, path)
+    except FileExistsError:
+        pass
+    if move_error is not None:
+        raise move_error.with_traceback(move_traceback)
+    raise RuntimeError("target drift detected: %s" % path)
+
+
+def _remove_if_matches(
+    path: Path,
+    expected_state: tuple[tuple[int, int], bytes, int],
+) -> None:
+    displaced_path = _move_target_if_matches(path, expected_state)
+    try:
+        displaced_path.unlink()
+        _fsync_directory(path.parent)
+    except BaseException:
+        try:
+            displaced_path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                _rename_noreplace(displaced_path, path)
+            except FileExistsError:
+                pass
+        raise
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise RuntimeError("target drift detected: %s" % path)
+
+
 def atomic_write(
     path: Path,
     data: bytes,
     mode: int,
     *,
     on_replace: Optional[Callable[[tuple[int, int]], None]] = None,
+    expected_state: object = _UNCONDITIONAL_WRITE,
 ) -> None:
     """Write bytes through a same-directory temporary file and replace."""
     file_descriptor, temporary_name = tempfile.mkstemp(
@@ -190,7 +311,38 @@ def atomic_write(
             os.fsync(handle.fileno())
         if on_replace is not None:
             on_replace(replacement_identity)
-        os.replace(temporary_path, path)
+        if expected_state is _UNCONDITIONAL_WRITE:
+            os.replace(temporary_path, path)
+        elif expected_state is None:
+            _rename_noreplace(temporary_path, path)
+        else:
+            displaced_path = _move_target_if_matches(path, expected_state)
+            committed = False
+            try:
+                _rename_noreplace(temporary_path, path)
+                committed = True
+            except BaseException:
+                try:
+                    target_state = _observed_file_state(path)
+                except BaseException:
+                    target_state = None
+                if (
+                    target_state is not None
+                    and target_state[0] == replacement_identity
+                ):
+                    committed = True
+                else:
+                    try:
+                        _rename_noreplace(displaced_path, path)
+                    except FileExistsError:
+                        pass
+                raise
+            finally:
+                if committed:
+                    try:
+                        displaced_path.unlink()
+                    except FileNotFoundError:
+                        pass
         _fsync_directory(path.parent)
     finally:
         if descriptor_open:
@@ -689,6 +841,33 @@ def _validate_rollback_output_path(
     else:
         raise ValueError("output path must not be inside the backup directory")
 
+    lock_directory = backup_dir.parent / ".zcode-responses-item-guard"
+    resolved_lock_directory = lock_directory.resolve(strict=False)
+    try:
+        resolved_output.relative_to(resolved_lock_directory)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(
+            "output path must not alias the transaction lock directory"
+        )
+    if output_path.exists() and lock_directory.exists():
+        for current_root, directory_names, file_names in os.walk(
+            lock_directory,
+            followlinks=False,
+        ):
+            for name in directory_names + file_names:
+                protected_path = Path(current_root) / name
+                try:
+                    aliases_lock = output_path.samefile(protected_path)
+                except FileNotFoundError:
+                    continue
+                if aliases_lock:
+                    raise ValueError(
+                        "output path must not alias the transaction lock "
+                        "directory"
+                    )
+
     protected_paths = [backup_dir / "manifest.json"]
     protected_paths.extend(
         snapshot["backup_path"] for snapshot in snapshots
@@ -755,6 +934,7 @@ def _restore_and_verify(
                 on_replace=lambda identity, label=snapshot["label"]: (
                     restored_identities.__setitem__(label, identity)
                 ),
+                expected_state=state,
             )
         except BaseException:
             errors.append("%s restore write" % snapshot["label"])
@@ -792,8 +972,7 @@ def _restore_output(snapshot: dict[str, Any]) -> list[str]:
         if not _matches_file_state(snapshot, state, updated=True):
             return ["output third-party content"]
         try:
-            path.unlink()
-            _fsync_directory(path.parent)
+            _remove_if_matches(path, state)
         except BaseException:
             return ["output restore delete"]
         try:
@@ -818,6 +997,7 @@ def _restore_output(snapshot: dict[str, Any]) -> list[str]:
             snapshot["original"],
             snapshot["mode"],
             on_replace=restored_identity.append,
+            expected_state=state,
         )
         identity, restored_raw, restored_mode = _observed_file_state(
             path, "output"
@@ -896,6 +1076,11 @@ def execute(
                                 identity,
                             )
                         ),
+                        expected_state=(
+                            snapshot["identity"],
+                            snapshot["original"],
+                            snapshot["mode"],
+                        ),
                     )
                     written_labels.add(snapshot["label"])
             for snapshot in snapshots:
@@ -912,6 +1097,15 @@ def execute(
                     on_replace=lambda identity: output_snapshot.__setitem__(
                         "updated_identity",
                         identity,
+                    ),
+                    expected_state=(
+                        (
+                            output_snapshot["identity"],
+                            output_snapshot["original"],
+                            output_snapshot["mode"],
+                        )
+                        if output_snapshot["existed"]
+                        else None
                     ),
                 )
                 _verify_output_state(output_snapshot, updated=True)
@@ -1007,6 +1201,11 @@ def rollback_backup(
                     on_replace=lambda identity, current=snapshot: (
                         current.__setitem__("updated_identity", identity)
                     ),
+                    expected_state=(
+                        snapshot["identity"],
+                        snapshot["original"],
+                        snapshot["mode"],
+                    ),
                 )
                 written_labels.add(snapshot["label"])
             for snapshot in snapshots:
@@ -1023,6 +1222,15 @@ def rollback_backup(
                     on_replace=lambda identity: output_snapshot.__setitem__(
                         "updated_identity",
                         identity,
+                    ),
+                    expected_state=(
+                        (
+                            output_snapshot["identity"],
+                            output_snapshot["original"],
+                            output_snapshot["mode"],
+                        )
+                        if output_snapshot["existed"]
+                        else None
                     ),
                 )
                 _verify_output_state(output_snapshot, updated=True)
@@ -1075,10 +1283,22 @@ def _write_report(
     report: dict[str, Any],
     *,
     on_replace: Optional[Callable[[tuple[int, int]], None]] = None,
+    expected_state: object = _UNCONDITIONAL_WRITE,
 ) -> str:
     raw = _encode_report(report)
-    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
-    atomic_write(path, raw, mode, on_replace=on_replace)
+    if expected_state is _UNCONDITIONAL_WRITE:
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    elif expected_state is None:
+        mode = 0o600
+    else:
+        mode = expected_state[2]
+    atomic_write(
+        path,
+        raw,
+        mode,
+        on_replace=on_replace,
+        expected_state=expected_state,
+    )
     return _sha256(raw)
 
 

@@ -80,6 +80,18 @@ def write_config(path, config, mode):
     path.chmod(mode)
 
 
+def rename_noreplace_for_test(source, destination):
+    source = Path(source)
+    destination = Path(destination)
+    try:
+        destination.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise FileExistsError("destination exists: %s" % destination)
+    os.rename(source, destination)
+
+
 class FailingStdout:
     def __init__(self, error):
         self.error = error
@@ -622,20 +634,21 @@ class ConfigTransactionTest(unittest.TestCase):
         self.assertFalse(self.backup_root.exists())
 
     def test_second_replace_failure_rolls_back_both_files_and_hashes(self):
-        real_replace = os.replace
+        real_rename_noreplace = guard._rename_noreplace
         target_write_count = 0
 
         def fail_second_target_replace(source, destination):
             nonlocal target_write_count
-            if destination in self.paths:
+            source_raw = Path(source).read_bytes()
+            if destination in self.paths and source_raw in self.updated_bytes:
                 target_write_count += 1
                 if target_write_count == 2:
                     raise OSError("injected second replace failure")
-            return real_replace(source, destination)
+            return real_rename_noreplace(source, destination)
 
         with mock.patch.object(
-            guard.os,
-            "replace",
+            guard,
+            "_rename_noreplace",
             side_effect=fail_second_target_replace,
         ):
             with self.assertRaisesRegex(
@@ -847,14 +860,18 @@ class ConfigTransactionTest(unittest.TestCase):
         )
 
     def test_config_replace_baseexception_rolls_back_and_reraises(self):
-        real_replace = os.replace
+        real_rename_noreplace = guard._rename_noreplace
         interrupted = False
         status = []
 
         def replace_first_config_then_interrupt(source, destination):
             nonlocal interrupted
-            result = real_replace(source, destination)
-            if destination == self.paths[0] and not interrupted:
+            is_first_config_commit = (
+                destination == self.paths[0]
+                and Path(source).read_bytes() == self.updated_bytes[0]
+            )
+            result = real_rename_noreplace(source, destination)
+            if is_first_config_commit and not interrupted:
                 interrupted = True
                 raise KeyboardInterrupt(
                     "injected config replace interrupt"
@@ -862,8 +879,8 @@ class ConfigTransactionTest(unittest.TestCase):
             return result
 
         with mock.patch.object(
-            guard.os,
-            "replace",
+            guard,
+            "_rename_noreplace",
             side_effect=replace_first_config_then_interrupt,
         ):
             with self.assertRaises(KeyboardInterrupt):
@@ -1093,14 +1110,15 @@ class ConfigTransactionTest(unittest.TestCase):
         original_output = b'{"existing":"report"}\n'
         output.write_bytes(original_output)
         output.chmod(0o640)
-        real_replace = os.replace
+        real_rename_noreplace = guard._rename_noreplace
         interrupted = False
         status = []
 
         def replace_output_then_interrupt(source, destination):
             nonlocal interrupted
-            result = real_replace(source, destination)
-            if destination == output and not interrupted:
+            is_output_commit = destination == output
+            result = real_rename_noreplace(source, destination)
+            if is_output_commit and not interrupted:
                 interrupted = True
                 raise KeyboardInterrupt(
                     "injected output replace interrupt"
@@ -1108,8 +1126,8 @@ class ConfigTransactionTest(unittest.TestCase):
             return result
 
         with mock.patch.object(
-            guard.os,
-            "replace",
+            guard,
+            "_rename_noreplace",
             side_effect=replace_output_then_interrupt,
         ):
             with self.assertRaises(KeyboardInterrupt):
@@ -1162,6 +1180,56 @@ class ConfigTransactionTest(unittest.TestCase):
         self.assertEqual(status_calls, 1)
         self.assertEqual(output.read_bytes(), third_party)
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+
+    def test_new_output_final_delete_drift_is_not_removed_on_rollback(self):
+        output = self.root / "new-third-party-output.json"
+        third_party = self.root / "new-third-party-replacement.json"
+        third_party_bytes = b'{"third_party":"before-output-delete"}\n'
+        third_party.write_bytes(third_party_bytes)
+        third_party.chmod(0o604)
+        third_party_identity = (
+            third_party.stat().st_dev,
+            third_party.stat().st_ino,
+        )
+        drift_injected = False
+
+        def drift_at_output_vacate(source, destination):
+            nonlocal drift_injected
+            if Path(source) == output and not drift_injected:
+                os.replace(third_party, output)
+                drift_injected = True
+            return rename_noreplace_for_test(source, destination)
+
+        with mock.patch.object(
+            guard,
+            "_rename_noreplace",
+            side_effect=drift_at_output_vacate,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "rollback verification failed",
+            ):
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120036Z",
+                    output_path=output,
+                    status_sink=lambda _line: (_ for _ in ()).throw(
+                        OSError("injected status failure")
+                    ),
+                )
+
+        self.assertTrue(drift_injected)
+        self.assertEqual(output.read_bytes(), third_party_bytes)
+        self.assertEqual(
+            (output.stat().st_dev, output.stat().st_ino),
+            third_party_identity,
+        )
         self.assertEqual(
             [path.read_bytes() for path in self.paths],
             self.original_bytes,
@@ -1597,6 +1665,108 @@ class ConfigTransactionTest(unittest.TestCase):
             drifted_identity[0],
         )
 
+    def test_rollback_final_commit_drift_is_not_overwritten(self):
+        timestamp = "20260926T121013Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        third_party = self.root / "third-party-v2.json"
+        third_party_bytes = b'{"third_party":"rollback-final-commit"}\n'
+        third_party.write_bytes(third_party_bytes)
+        third_party.chmod(0o604)
+        third_party_identity = (
+            third_party.stat().st_dev,
+            third_party.stat().st_ino,
+        )
+        drift_injected = False
+
+        def drift_at_target_vacate(source, destination):
+            nonlocal drift_injected
+            if Path(source) == self.paths[0] and not drift_injected:
+                os.replace(third_party, self.paths[0])
+                drift_injected = True
+            return rename_noreplace_for_test(source, destination)
+
+        with mock.patch.object(
+            guard,
+            "_rename_noreplace",
+            create=True,
+            side_effect=drift_at_target_vacate,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "roll-forward verification failed",
+            ):
+                guard.rollback_backup(
+                    self.paths,
+                    backup_dir,
+                    output_path=self.root / "final-commit-drift.json",
+                )
+
+        self.assertTrue(drift_injected)
+        self.assertEqual(self.paths[0].read_bytes(), third_party_bytes)
+        self.assertEqual(
+            (self.paths[0].stat().st_dev, self.paths[0].stat().st_ino),
+            third_party_identity,
+        )
+        self.assertEqual(self.paths[1].read_bytes(), self.updated_bytes[1])
+
+    def test_rollback_roll_forward_final_commit_drift_is_not_overwritten(self):
+        timestamp = "20260926T121014Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        third_party = self.root / "third-party-roll-forward-v2.json"
+        third_party_bytes = b'{"third_party":"roll-forward-final-commit"}\n'
+        third_party.write_bytes(third_party_bytes)
+        third_party.chmod(0o604)
+        third_party_identity = (
+            third_party.stat().st_dev,
+            third_party.stat().st_ino,
+        )
+        v2_vacates = 0
+        second_rollback_commit_failed = False
+
+        def fail_rollback_then_drift_roll_forward(source, destination):
+            nonlocal v2_vacates, second_rollback_commit_failed
+            source = Path(source)
+            destination = Path(destination)
+            if source == self.paths[0]:
+                v2_vacates += 1
+                if v2_vacates == 2:
+                    os.replace(third_party, self.paths[0])
+            if (
+                destination == self.paths[1]
+                and source.read_bytes() == self.original_bytes[1]
+                and not second_rollback_commit_failed
+            ):
+                second_rollback_commit_failed = True
+                raise OSError("injected second rollback commit failure")
+            return rename_noreplace_for_test(source, destination)
+
+        with mock.patch.object(
+            guard,
+            "_rename_noreplace",
+            create=True,
+            side_effect=fail_rollback_then_drift_roll_forward,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "roll-forward verification failed",
+            ):
+                guard.rollback_backup(
+                    self.paths,
+                    backup_dir,
+                    output_path=self.root / "roll-forward-drift.json",
+                )
+
+        self.assertTrue(second_rollback_commit_failed)
+        self.assertEqual(v2_vacates, 2)
+        self.assertEqual(self.paths[0].read_bytes(), third_party_bytes)
+        self.assertEqual(
+            (self.paths[0].stat().st_dev, self.paths[0].stat().st_ino),
+            third_party_identity,
+        )
+        self.assertEqual(self.paths[1].read_bytes(), self.updated_bytes[1])
+
     def test_rollback_cas_detects_mode_drift_without_overwrite(self):
         timestamp = "20260926T121007Z"
         self.execute(apply=True, timestamp=timestamp)
@@ -1632,7 +1802,7 @@ class ConfigTransactionTest(unittest.TestCase):
         timestamp = "20260926T121008Z"
         self.execute(apply=True, timestamp=timestamp)
         backup_dir = self.backup_root / timestamp
-        real_replace = os.replace
+        real_rename_noreplace = guard._rename_noreplace
         rollback_write_count = 0
 
         def fail_second_rollback_replace(source, destination):
@@ -1643,11 +1813,11 @@ class ConfigTransactionTest(unittest.TestCase):
                     rollback_write_count += 1
                     if rollback_write_count == 2:
                         raise OSError("injected second rollback failure")
-            return real_replace(source, destination)
+            return real_rename_noreplace(source, destination)
 
         with mock.patch.object(
-            guard.os,
-            "replace",
+            guard,
+            "_rename_noreplace",
             side_effect=fail_second_rollback_replace,
         ):
             with self.assertRaisesRegex(
@@ -1736,20 +1906,24 @@ class ConfigTransactionTest(unittest.TestCase):
         timestamp = "20260926T121011Z"
         self.execute(apply=True, timestamp=timestamp)
         backup_dir = self.backup_root / timestamp
-        real_replace = os.replace
+        real_rename_noreplace = guard._rename_noreplace
         interrupted = False
 
         def replace_first_config_then_interrupt(source, destination):
             nonlocal interrupted
-            result = real_replace(source, destination)
-            if destination == self.paths[0] and not interrupted:
+            is_first_config_commit = (
+                destination == self.paths[0]
+                and Path(source).read_bytes() == self.original_bytes[0]
+            )
+            result = real_rename_noreplace(source, destination)
+            if is_first_config_commit and not interrupted:
                 interrupted = True
                 raise KeyboardInterrupt("injected rollback interrupt")
             return result
 
         with mock.patch.object(
-            guard.os,
-            "replace",
+            guard,
+            "_rename_noreplace",
             side_effect=replace_first_config_then_interrupt,
         ):
             with self.assertRaises(KeyboardInterrupt):
@@ -1768,6 +1942,78 @@ class ConfigTransactionTest(unittest.TestCase):
             [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
             self.original_modes,
         )
+
+    def test_rollback_output_rejects_transaction_lock_aliases(self):
+        for alias_kind in ("exact", "child", "symlink", "hardlink"):
+            with self.subTest(alias=alias_kind):
+                with tempfile.TemporaryDirectory(
+                    dir=self.root
+                ) as temporary_directory:
+                    root = Path(temporary_directory)
+                    paths = [
+                        root / ".zcode" / "v2" / "config.json",
+                        root / ".zcode" / "cli" / "config.json",
+                    ]
+                    for path, config, mode in zip(
+                        paths,
+                        self.originals,
+                        self.original_modes,
+                    ):
+                        write_config(path, config, mode)
+                    backup_root = root / ".zcode" / "backups"
+                    timestamp = "20260926T121015Z"
+                    guard.execute(
+                        paths,
+                        apply=True,
+                        backup_root=backup_root,
+                        timestamp=timestamp,
+                    )
+                    backup_dir = backup_root / timestamp
+                    lock_directory = (
+                        backup_root / ".zcode-responses-item-guard"
+                    )
+                    lock_path = lock_directory / "transaction.lock"
+                    lock_bytes = lock_path.read_bytes()
+                    lock_identity = (
+                        lock_path.stat().st_dev,
+                        lock_path.stat().st_ino,
+                    )
+                    if alias_kind == "exact":
+                        output = lock_path
+                    elif alias_kind == "child":
+                        output = lock_directory / "report.json"
+                    else:
+                        output = root / ("%s-lock-output.json" % alias_kind)
+                        if alias_kind == "symlink":
+                            output.symlink_to(lock_path)
+                        else:
+                            os.link(lock_path, output)
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "transaction lock",
+                    ):
+                        guard.rollback_backup(
+                            paths,
+                            backup_dir,
+                            output_path=output,
+                        )
+
+                    self.assertEqual(
+                        [path.read_bytes() for path in paths],
+                        self.updated_bytes,
+                    )
+                    self.assertEqual(lock_path.read_bytes(), lock_bytes)
+                    self.assertEqual(
+                        (lock_path.stat().st_dev, lock_path.stat().st_ino),
+                        lock_identity,
+                    )
+                    if alias_kind == "child":
+                        self.assertFalse(output.exists())
+                    elif alias_kind == "symlink":
+                        self.assertTrue(output.is_symlink())
+                    else:
+                        self.assertTrue(output.samefile(lock_path))
 
     def test_apply_and_rollback_cli_options_are_mutually_exclusive(self):
         stderr = io.StringIO()
