@@ -51,7 +51,7 @@ func isNativeArkResponsesURL(rawURL string) bool {
 		return false
 	}
 
-	labels := strings.Split(parsedURL.Hostname(), ".")
+	labels := strings.Split(strings.ToLower(parsedURL.Hostname()), ".")
 	path := strings.TrimSuffix(parsedURL.EscapedPath(), "/")
 	return len(labels) == 4 &&
 		labels[0] == "ark" &&
@@ -102,11 +102,18 @@ func enforceArkResponsesInputItemLimit(
 		return nil
 	}
 
-	rawLimit := ""
-	if control.present {
-		rawLimit = control.raw
+	var limit int
+	var source string
+	var err error
+	if control.present && control.raw == "" {
+		err = fmt.Errorf(
+			"%s must be an integer from 1 through %d",
+			responsesInputItemSoftLimitHeader,
+			arkResponsesHardInputItemLimit,
+		)
+	} else {
+		limit, source, err = resolveResponsesInputItemLimit(control.raw)
 	}
-	limit, source, err := resolveResponsesInputItemLimit(rawLimit)
 	if err != nil {
 		return types.WithOpenAIError(types.OpenAIError{
 			Message: err.Error(),

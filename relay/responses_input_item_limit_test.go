@@ -63,6 +63,7 @@ func TestIsNativeArkResponsesURL(t *testing.T) {
 		want   bool
 	}{
 		{rawURL: "https://ark.cn-beijing.volces.com/api/v3/responses", want: true},
+		{rawURL: "https://ARK.CN-BEIJING.VOLCES.COM/api/v3/responses", want: true},
 		{rawURL: "https://ark.cn-beijing.volces.com/api/coding/v3/responses", want: true},
 		{rawURL: "https://ark.cn-beijing.volces.com/api/v3/chat/completions", want: false},
 		{rawURL: "https://ark.cn-beijing.volces.com.example/v1/responses", want: false},
@@ -207,6 +208,41 @@ func TestPrepareResponsesRequestItemLimit(t *testing.T) {
 		requireResponsesInputItemLimitError(t, apiErr, 901, 900)
 		assert.False(t, reader.read, "oversized input must be rejected before body storage is read")
 		assert.Empty(t, c.Request.Header.Get(responsesInputItemSoftLimitHeaderForTest))
+	})
+
+	t.Run("empty soft limit rejects and deletes header before reading body", func(t *testing.T) {
+		reader := &responsesInputFailReader{}
+		c, info, request := newResponsesInputItemLimitContext(
+			t,
+			responsesInputItems(1),
+			reader,
+			constant.ChannelTypeVolcEngine,
+			"https://ark.cn-beijing.volces.com/api/v3",
+			dto.ChannelOtherSettings{},
+		)
+		canonicalHeader := http.CanonicalHeaderKey(responsesInputItemSoftLimitHeaderForTest)
+		c.Request.Header[canonicalHeader] = []string{""}
+		_, present := c.Request.Header[canonicalHeader]
+		require.True(t, present)
+
+		adaptor, body, closer, apiErr := PrepareResponsesRequest(c, info, request)
+
+		assert.Nil(t, adaptor)
+		assert.Nil(t, body)
+		assert.Nil(t, closer)
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+		assert.Equal(t, types.ErrorTypeOpenAIError, apiErr.GetErrorType())
+		assert.Equal(t, types.ErrorCodeInvalidRequest, apiErr.GetErrorCode())
+		assert.True(t, types.IsSkipRetryError(apiErr))
+		assert.Equal(t, types.OpenAIError{
+			Message: "X-NewAPI-Responses-Input-Item-Soft-Limit must be an integer from 1 through 1000",
+			Type:    "invalid_request_error",
+			Param:   responsesInputItemSoftLimitHeaderForTest,
+			Code:    string(types.ErrorCodeInvalidRequest),
+		}, apiErr.ToOpenAIError())
+		assert.False(t, reader.read, "empty header must be rejected before body storage is read")
+		assert.NotContains(t, c.Request.Header, canonicalHeader)
 	})
 
 	t.Run("invalid soft limit rejects and deletes header before reading body", func(t *testing.T) {
