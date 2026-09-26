@@ -1962,6 +1962,9 @@ def _restore_output(snapshot: dict[str, Any]) -> _RestoreErrors:
             path.lstat()
         except FileNotFoundError:
             return errors
+        except BaseException as error:
+            errors.record("output restore state", error)
+            return errors
         try:
             state = _observed_file_state(path, "output")
         except BaseException as error:

@@ -3613,6 +3613,103 @@ class ConfigTransactionTest(unittest.TestCase):
                 )
             )
 
+    def test_apply_original_fatal_precedes_output_lstat_fatal(self):
+        real_lstat = Path.lstat
+        expected_note = (
+            "configuration apply failed; rollback verification failed: "
+            "output restore state"
+        )
+
+        for index, (original_type, restore_type) in enumerate(
+            (
+                (KeyboardInterrupt, SystemExit),
+                (SystemExit, KeyboardInterrupt),
+            ),
+            start=2,
+        ):
+            with self.subTest(original_type=original_type.__name__):
+                output = self.root / (
+                    "apply-original-%s.json" % original_type.__name__
+                )
+                original_fatal = original_type("injected apply fatal")
+                restore_fatal = restore_type("injected output lstat fatal")
+                restoring = False
+
+                def fail_status(_line):
+                    nonlocal restoring
+                    restoring = True
+                    raise original_fatal
+
+                def interrupt_output_lstat(path):
+                    if restoring and path == output:
+                        raise restore_fatal
+                    return real_lstat(path)
+
+                with mock.patch.object(
+                    Path,
+                    "lstat",
+                    autospec=True,
+                    side_effect=interrupt_output_lstat,
+                ):
+                    with self.assertRaises(BaseException) as raised:
+                        guard.execute(
+                            self.paths,
+                            apply=True,
+                            backup_root=self.backup_root,
+                            timestamp="20260926T12005%dZ" % index,
+                            output_path=output,
+                            status_sink=fail_status,
+                        )
+
+                self.assertIs(raised.exception, original_fatal)
+                if hasattr(original_fatal, "add_note"):
+                    self.assertIn(
+                        expected_note,
+                        getattr(original_fatal, "__notes__", []),
+                    )
+
+    def test_apply_output_lstat_fatal_precedes_original_exception(self):
+        output = self.root / "apply-exception-output.json"
+        original_error = OSError("injected apply status failure")
+        restore_fatal = KeyboardInterrupt("injected output lstat interrupt")
+        real_lstat = Path.lstat
+        restoring = False
+
+        def fail_status(_line):
+            nonlocal restoring
+            restoring = True
+            raise original_error
+
+        def interrupt_output_lstat(path):
+            if restoring and path == output:
+                raise restore_fatal
+            return real_lstat(path)
+
+        with mock.patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=interrupt_output_lstat,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120051Z",
+                    output_path=output,
+                    status_sink=fail_status,
+                )
+
+        self.assertIs(raised.exception, restore_fatal)
+        self.assertIs(raised.exception.__cause__, original_error)
+        if hasattr(restore_fatal, "add_note"):
+            self.assertIn(
+                "configuration apply failed; rollback verification failed: "
+                "output restore state",
+                getattr(restore_fatal, "__notes__", []),
+            )
+
     def test_output_third_party_drift_is_not_overwritten_on_rollback(self):
         output = self.root / "third-party-output.json"
         original_output = b'{"existing":"report"}\n'
@@ -4695,6 +4792,102 @@ class ConfigTransactionTest(unittest.TestCase):
                     "v2 restore write" in note
                     for note in getattr(original_fatal, "__notes__", [])
                 )
+            )
+
+    def test_rollback_original_fatal_precedes_output_lstat_fatal(self):
+        timestamp = "20260926T121021Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        real_lstat = Path.lstat
+        expected_note = (
+            "configuration rollback failed; "
+            "roll-forward verification failed: output restore state"
+        )
+
+        for original_type, restore_type in (
+            (KeyboardInterrupt, SystemExit),
+            (SystemExit, KeyboardInterrupt),
+        ):
+            with self.subTest(original_type=original_type.__name__):
+                output = self.root / (
+                    "rollback-original-%s.json" % original_type.__name__
+                )
+                original_fatal = original_type("injected rollback fatal")
+                restore_fatal = restore_type("injected output lstat fatal")
+                restoring = False
+
+                def fail_status(_line):
+                    nonlocal restoring
+                    restoring = True
+                    raise original_fatal
+
+                def interrupt_output_lstat(path):
+                    if restoring and path == output:
+                        raise restore_fatal
+                    return real_lstat(path)
+
+                with mock.patch.object(
+                    Path,
+                    "lstat",
+                    autospec=True,
+                    side_effect=interrupt_output_lstat,
+                ):
+                    with self.assertRaises(BaseException) as raised:
+                        guard.rollback_backup(
+                            self.paths,
+                            backup_dir,
+                            output_path=output,
+                            status_sink=fail_status,
+                        )
+
+                self.assertIs(raised.exception, original_fatal)
+                if hasattr(original_fatal, "add_note"):
+                    self.assertIn(
+                        expected_note,
+                        getattr(original_fatal, "__notes__", []),
+                    )
+
+    def test_rollback_output_lstat_fatal_precedes_original_exception(self):
+        timestamp = "20260926T121022Z"
+        self.execute(apply=True, timestamp=timestamp)
+        backup_dir = self.backup_root / timestamp
+        output = self.root / "rollback-exception-output.json"
+        original_error = OSError("injected rollback status failure")
+        restore_fatal = SystemExit("injected output lstat exit")
+        real_lstat = Path.lstat
+        restoring = False
+
+        def fail_status(_line):
+            nonlocal restoring
+            restoring = True
+            raise original_error
+
+        def interrupt_output_lstat(path):
+            if restoring and path == output:
+                raise restore_fatal
+            return real_lstat(path)
+
+        with mock.patch.object(
+            Path,
+            "lstat",
+            autospec=True,
+            side_effect=interrupt_output_lstat,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                guard.rollback_backup(
+                    self.paths,
+                    backup_dir,
+                    output_path=output,
+                    status_sink=fail_status,
+                )
+
+        self.assertIs(raised.exception, restore_fatal)
+        self.assertIs(raised.exception.__cause__, original_error)
+        if hasattr(restore_fatal, "add_note"):
+            self.assertIn(
+                "configuration rollback failed; "
+                "roll-forward verification failed: output restore state",
+                getattr(restore_fatal, "__notes__", []),
             )
 
     def test_rollback_output_rejects_transaction_lock_aliases(self):
