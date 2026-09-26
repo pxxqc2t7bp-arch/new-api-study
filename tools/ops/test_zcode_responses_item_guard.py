@@ -104,6 +104,25 @@ def read_bytes_at(directory_fd, name):
         os.close(descriptor)
 
 
+def assert_no_secret_temporary_files(test_case, root):
+    secret_markers = (
+        SECRET.encode("utf-8"),
+        OTHER_SECRET.encode("utf-8"),
+    )
+    leaks = []
+    for candidate in root.rglob("*"):
+        if not candidate.name.startswith(".") or not candidate.is_file():
+            continue
+        content = candidate.read_bytes()
+        if any(marker in content for marker in secret_markers):
+            leaks.append(candidate)
+    test_case.assertEqual(
+        leaks,
+        [],
+        "secret_temp_leaks=%d" % len(leaks),
+    )
+
+
 def rename_noreplace_for_test(
     source_dir_fd,
     source_name,
@@ -1459,6 +1478,74 @@ class ConfigTransactionTest(unittest.TestCase):
             [],
         )
 
+    def test_remove_if_matches_recovers_when_restore_exchange_first_fails(
+        self,
+    ):
+        output = self.root / "remove-secret.json"
+        original = ("%s:%s" % (SECRET, OTHER_SECRET)).encode("utf-8")
+        output.write_bytes(original)
+        output.chmod(0o640)
+        expected_state = guard._observed_file_state(output, "output")
+        real_unlink = guard.os.unlink
+        real_rename_exchange = guard._rename_exchange
+        target_unlinks = 0
+        target_exchanges = 0
+
+        def fail_first_target_unlink(name, *args, **kwargs):
+            nonlocal target_unlinks
+            directory_fd = kwargs.get("dir_fd")
+            if (
+                directory_fd is not None
+                and dir_fd_entry_matches_path(
+                    directory_fd,
+                    os.fspath(name),
+                    output,
+                )
+                and target_unlinks == 0
+            ):
+                target_unlinks += 1
+                raise OSError("injected target unlink failure")
+            return real_unlink(name, *args, **kwargs)
+
+        def fail_first_restore_exchange(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+        ):
+            nonlocal target_exchanges
+            if dir_fd_entry_matches_path(
+                destination_dir_fd,
+                destination_name,
+                output,
+            ):
+                target_exchanges += 1
+                if target_exchanges == 2:
+                    raise OSError("injected restore exchange failure")
+            return real_rename_exchange(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+            )
+
+        with mock.patch.object(
+            guard.os,
+            "unlink",
+            side_effect=fail_first_target_unlink,
+        ), mock.patch.object(
+            guard,
+            "_rename_exchange",
+            side_effect=fail_first_restore_exchange,
+        ):
+            with self.assertRaises((OSError, RuntimeError)):
+                guard._remove_if_matches(output, expected_state)
+
+        assert_no_secret_temporary_files(self, self.root)
+        self.assertEqual(output.read_bytes(), original)
+        self.assertEqual(target_unlinks, 1)
+        self.assertGreaterEqual(target_exchanges, 3)
+
     def test_directory_replacement_is_not_moved_or_left_displaced(self):
         output = self.root / "report.json"
         original_output = b'{"existing":"report"}\n'
@@ -1971,7 +2058,7 @@ class ConfigTransactionTest(unittest.TestCase):
         real_unlink = guard.os.unlink
         cleanup_attempts = []
 
-        def fail_first_two_temporary_cleanup_attempts(
+        def fail_first_four_temporary_cleanup_attempts(
             name,
             *args,
             **kwargs,
@@ -1993,7 +2080,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 and os.fspath(name).startswith(
                     ".config.json."
                 )
-                and len(cleanup_attempts) < 2
+                and len(cleanup_attempts) < 4
             ):
                 cleanup_attempts.append(read_bytes_at(directory_fd, name))
                 raise OSError("injected temporary cleanup failure")
@@ -2002,7 +2089,7 @@ class ConfigTransactionTest(unittest.TestCase):
         with mock.patch.object(
             guard.os,
             "unlink",
-            side_effect=fail_first_two_temporary_cleanup_attempts,
+            side_effect=fail_first_four_temporary_cleanup_attempts,
         ):
             with self.assertRaisesRegex(
                 RuntimeError,
@@ -2010,12 +2097,14 @@ class ConfigTransactionTest(unittest.TestCase):
             ):
                 self.execute(apply=True)
 
-        self.assertEqual(len(cleanup_attempts), 2)
+        self.assertEqual(len(cleanup_attempts), 4)
         self.assertIn(SECRET.encode("utf-8"), cleanup_attempts[0])
-        self.assertNotIn(SECRET.encode("utf-8"), cleanup_attempts[1])
+        self.assertIn(SECRET.encode("utf-8"), cleanup_attempts[1])
+        self.assertIn(SECRET.encode("utf-8"), cleanup_attempts[2])
+        self.assertNotIn(SECRET.encode("utf-8"), cleanup_attempts[3])
         self.assertNotIn(
             OTHER_SECRET.encode("utf-8"),
-            cleanup_attempts[1],
+            cleanup_attempts[3],
         )
         self.assertEqual(
             [path.read_bytes() for path in self.paths],
@@ -2041,6 +2130,143 @@ class ConfigTransactionTest(unittest.TestCase):
                 OTHER_SECRET.encode("utf-8"),
                 temporary_content,
             )
+
+    def test_atomic_cleanup_recovers_when_restore_exchange_first_fails(self):
+        path = self.paths[0]
+        expected_state = guard._observed_file_state(path)
+        real_unlink = guard.os.unlink
+        real_rename_exchange = guard._rename_exchange
+        cleanup_attempts = 0
+        target_exchanges = 0
+
+        def fail_first_two_temporary_unlinks(name, *args, **kwargs):
+            nonlocal cleanup_attempts
+            directory_fd = kwargs.get("dir_fd")
+            if (
+                directory_fd is not None
+                and dir_fd_entry_matches_path(
+                    directory_fd,
+                    path.name,
+                    path,
+                )
+                and os.fspath(name).startswith(".config.json.")
+                and cleanup_attempts < 2
+            ):
+                cleanup_attempts += 1
+                raise OSError("injected temporary cleanup failure")
+            return real_unlink(name, *args, **kwargs)
+
+        def fail_first_restore_exchange(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+        ):
+            nonlocal target_exchanges
+            if dir_fd_entry_matches_path(
+                destination_dir_fd,
+                destination_name,
+                path,
+            ):
+                target_exchanges += 1
+                if target_exchanges == 2:
+                    raise OSError("injected restore exchange failure")
+            return real_rename_exchange(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+            )
+
+        with mock.patch.object(
+            guard.os,
+            "unlink",
+            side_effect=fail_first_two_temporary_unlinks,
+        ), mock.patch.object(
+            guard,
+            "_rename_exchange",
+            side_effect=fail_first_restore_exchange,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "atomic replacement cleanup failed",
+            ):
+                guard.atomic_write(
+                    path,
+                    self.updated_bytes[0],
+                    self.original_modes[0],
+                    expected_state=expected_state,
+                )
+
+        assert_no_secret_temporary_files(self, self.home)
+        self.assertEqual(path.read_bytes(), self.original_bytes[0])
+        self.assertGreaterEqual(cleanup_attempts, 2)
+        self.assertGreaterEqual(target_exchanges, 3)
+
+    def test_atomic_cleanup_retries_after_first_sanitize_failure(self):
+        path = self.paths[0]
+        expected_state = guard._observed_file_state(path)
+        real_unlink = guard.os.unlink
+        real_sanitize = guard._sanitize_temporary_file
+        cleanup_attempts = 0
+        sanitize_attempts = 0
+
+        def fail_first_three_temporary_unlinks(name, *args, **kwargs):
+            nonlocal cleanup_attempts
+            directory_fd = kwargs.get("dir_fd")
+            if (
+                directory_fd is not None
+                and dir_fd_entry_matches_path(
+                    directory_fd,
+                    path.name,
+                    path,
+                )
+                and os.fspath(name).startswith(".config.json.")
+                and cleanup_attempts < 3
+            ):
+                cleanup_attempts += 1
+                raise OSError("injected temporary cleanup failure")
+            return real_unlink(name, *args, **kwargs)
+
+        def fail_first_sanitize(
+            parent_dir_fd,
+            name,
+            expected_identity,
+        ):
+            nonlocal sanitize_attempts
+            sanitize_attempts += 1
+            if sanitize_attempts == 1:
+                raise OSError("injected sanitize failure")
+            return real_sanitize(
+                parent_dir_fd,
+                name,
+                expected_identity,
+            )
+
+        with mock.patch.object(
+            guard.os,
+            "unlink",
+            side_effect=fail_first_three_temporary_unlinks,
+        ), mock.patch.object(
+            guard,
+            "_sanitize_temporary_file",
+            side_effect=fail_first_sanitize,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "atomic replacement cleanup failed",
+            ):
+                guard.atomic_write(
+                    path,
+                    self.updated_bytes[0],
+                    self.original_modes[0],
+                    expected_state=expected_state,
+                )
+
+        assert_no_secret_temporary_files(self, self.home)
+        self.assertEqual(path.read_bytes(), self.original_bytes[0])
+        self.assertGreaterEqual(cleanup_attempts, 3)
+        self.assertGreaterEqual(sanitize_attempts, 1)
 
     def test_persistent_cleanup_failure_leaves_only_sanitized_temp(self):
         real_unlink = guard.os.unlink

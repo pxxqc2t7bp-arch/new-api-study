@@ -32,6 +32,8 @@ EXPECTED_PORT = 10443
 TIMESTAMP_PATTERN = re.compile(r"\A\d{8}T\d{6}Z\Z")
 SHA256_PATTERN = re.compile(r"\A[0-9a-f]{64}\Z")
 _UNCONDITIONAL_WRITE = object()
+_MISSING_FILE_STATE = object()
+_UNKNOWN_FILE_STATE = object()
 
 
 def _decode_config(raw: bytes, path: Path) -> dict[str, Any]:
@@ -446,6 +448,211 @@ def _sanitize_temporary_file(
         os.close(descriptor)
 
 
+def _cleanup_file_state_at(
+    parent_dir_fd: int,
+    name: str,
+    path: Path,
+    description: str,
+    errors: list[BaseException],
+) -> object:
+    try:
+        return _observed_file_state_at(
+            parent_dir_fd,
+            name,
+            path,
+            description,
+        )
+    except FileNotFoundError:
+        return _MISSING_FILE_STATE
+    except BaseException as error:
+        errors.append(error)
+        return _UNKNOWN_FILE_STATE
+
+
+def _cleanup_state_pair(
+    parent_dir_fd: int,
+    temporary_name: str,
+    target_name: str,
+    path: Path,
+    errors: list[BaseException],
+) -> tuple[object, object]:
+    target_state = _cleanup_file_state_at(
+        parent_dir_fd,
+        target_name,
+        path,
+        "cleanup target",
+        errors,
+    )
+    temporary_state = _cleanup_file_state_at(
+        parent_dir_fd,
+        temporary_name,
+        path,
+        "cleanup temporary file",
+        errors,
+    )
+    return target_state, temporary_state
+
+
+def _recover_known_exchange(
+    parent_dir_fd: int,
+    temporary_name: str,
+    target_name: str,
+    path: Path,
+    staged_pair: tuple[object, object],
+    restored_pair: tuple[object, object],
+    errors: list[BaseException],
+) -> tuple[object, object]:
+    for _attempt in range(2):
+        current_pair = _cleanup_state_pair(
+            parent_dir_fd,
+            temporary_name,
+            target_name,
+            path,
+            errors,
+        )
+        if current_pair == restored_pair:
+            return current_pair
+        if current_pair != staged_pair:
+            errors.append(
+                RuntimeError("cleanup exchange state verification failed")
+            )
+            return current_pair
+        try:
+            _rename_exchange(
+                parent_dir_fd,
+                temporary_name,
+                parent_dir_fd,
+                target_name,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    current_pair = _cleanup_state_pair(
+        parent_dir_fd,
+        temporary_name,
+        target_name,
+        path,
+        errors,
+    )
+    if current_pair != restored_pair:
+        errors.append(RuntimeError("cleanup exchange recovery failed"))
+    return current_pair
+
+
+def _unlink_known_temporary_once(
+    parent_dir_fd: int,
+    temporary_name: str,
+    path: Path,
+    known_states: tuple[tuple[tuple[int, int], bytes, int], ...],
+    errors: list[BaseException],
+) -> bool:
+    temporary_state = _cleanup_file_state_at(
+        parent_dir_fd,
+        temporary_name,
+        path,
+        "cleanup temporary file",
+        errors,
+    )
+    if temporary_state is _MISSING_FILE_STATE:
+        return True
+    if (
+        temporary_state is _UNKNOWN_FILE_STATE
+        or temporary_state not in known_states
+    ):
+        if temporary_state is not _UNKNOWN_FILE_STATE:
+            errors.append(RuntimeError("temporary file drift detected"))
+        return False
+    try:
+        os.unlink(temporary_name, dir_fd=parent_dir_fd)
+    except FileNotFoundError:
+        return True
+    except BaseException as error:
+        errors.append(error)
+        return False
+    return True
+
+
+def _sanitize_or_unlink_known_temporary(
+    parent_dir_fd: int,
+    temporary_name: str,
+    path: Path,
+    known_states: tuple[tuple[tuple[int, int], bytes, int], ...],
+    errors: list[BaseException],
+) -> bool:
+    if _unlink_known_temporary_once(
+        parent_dir_fd,
+        temporary_name,
+        path,
+        known_states,
+        errors,
+    ):
+        return True
+
+    temporary_state = _cleanup_file_state_at(
+        parent_dir_fd,
+        temporary_name,
+        path,
+        "cleanup temporary file",
+        errors,
+    )
+    if temporary_state is _MISSING_FILE_STATE:
+        return True
+    if (
+        temporary_state is not _UNKNOWN_FILE_STATE
+        and temporary_state in known_states
+    ):
+        try:
+            _sanitize_temporary_file(
+                parent_dir_fd,
+                temporary_name,
+                temporary_state[0],
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    sanitized_states = known_states + tuple(
+        (identity, b"", mode)
+        for identity, _content, mode in known_states
+    )
+    if _unlink_known_temporary_once(
+        parent_dir_fd,
+        temporary_name,
+        path,
+        sanitized_states,
+        errors,
+    ):
+        return True
+
+    temporary_state = _cleanup_file_state_at(
+        parent_dir_fd,
+        temporary_name,
+        path,
+        "cleanup temporary file",
+        errors,
+    )
+    return (
+        temporary_state is not _MISSING_FILE_STATE
+        and temporary_state is not _UNKNOWN_FILE_STATE
+        and temporary_state in sanitized_states
+        and temporary_state[1] == b""
+    )
+
+
+def _raise_cleanup_errors(
+    message: str,
+    errors: list[BaseException],
+    cause: BaseException,
+) -> None:
+    fatal_error = next(
+        (error for error in errors if not isinstance(error, Exception)),
+        None,
+    )
+    if fatal_error is not None:
+        raise fatal_error.with_traceback(fatal_error.__traceback__)
+    error_types = ", ".join(type(error).__name__ for error in errors)
+    raise RuntimeError("%s: %s" % (message, error_types)) from cause
+
+
 def _exchange_target_if_matches(
     parent_dir_fd: int,
     replacement_name: str,
@@ -547,17 +754,17 @@ def _remove_if_matches(
             placeholder_status.st_dev,
             placeholder_status.st_ino,
         )
+        placeholder_state = (
+            placeholder_identity,
+            b"",
+            0o600,
+        )
         temporary_cleanup_complete = False
         try:
             os.fchmod(placeholder_descriptor, 0o600)
             os.fsync(placeholder_descriptor)
             os.close(placeholder_descriptor)
             placeholder_open = False
-            placeholder_state = (
-                placeholder_identity,
-                b"",
-                0o600,
-            )
             _exchange_target_if_matches(
                 parent_dir_fd,
                 temporary_name,
@@ -568,30 +775,45 @@ def _remove_if_matches(
             )
             try:
                 os.unlink(target_name, dir_fd=parent_dir_fd)
-            except BaseException:
+            except BaseException as removal_error:
+                cleanup_errors = []
+                _recover_known_exchange(
+                    parent_dir_fd,
+                    temporary_name,
+                    target_name,
+                    path,
+                    (placeholder_state, expected_state),
+                    (expected_state, placeholder_state),
+                    cleanup_errors,
+                )
+                temporary_cleanup_complete = (
+                    _sanitize_or_unlink_known_temporary(
+                        parent_dir_fd,
+                        temporary_name,
+                        path,
+                        (placeholder_state, expected_state),
+                        cleanup_errors,
+                    )
+                )
                 try:
-                    _rename_exchange(
-                        parent_dir_fd,
-                        temporary_name,
-                        parent_dir_fd,
-                        target_name,
-                    )
-                finally:
-                    _sanitize_temporary_file(
-                        parent_dir_fd,
-                        temporary_name,
-                        placeholder_identity,
-                    )
-                    try:
-                        os.unlink(
-                            temporary_name,
-                            dir_fd=parent_dir_fd,
+                    os.fsync(parent_dir_fd)
+                except BaseException as fsync_error:
+                    cleanup_errors.append(fsync_error)
+                if not temporary_cleanup_complete:
+                    cleanup_errors.append(
+                        RuntimeError(
+                            "target removal temporary cleanup incomplete"
                         )
-                    except FileNotFoundError:
-                        pass
-                    else:
-                        temporary_cleanup_complete = True
-                raise
+                    )
+                if cleanup_errors:
+                    _raise_cleanup_errors(
+                        "target removal recovery failed",
+                        [removal_error] + cleanup_errors,
+                        removal_error,
+                    )
+                raise removal_error.with_traceback(
+                    removal_error.__traceback__
+                )
             try:
                 os.unlink(temporary_name, dir_fd=parent_dir_fd)
             except BaseException:
@@ -614,35 +836,27 @@ def _remove_if_matches(
             if placeholder_open:
                 os.close(placeholder_descriptor)
             if not temporary_cleanup_complete:
-                try:
-                    current_temporary = os.stat(
+                final_cleanup_errors = []
+                temporary_cleanup_complete = (
+                    _sanitize_or_unlink_known_temporary(
+                        parent_dir_fd,
                         temporary_name,
-                        dir_fd=parent_dir_fd,
-                        follow_symlinks=False,
+                        path,
+                        (placeholder_state, expected_state),
+                        final_cleanup_errors,
                     )
-                except FileNotFoundError:
-                    pass
-                else:
-                    if (
-                        stat.S_ISREG(current_temporary.st_mode)
-                        and (
-                            current_temporary.st_dev,
-                            current_temporary.st_ino,
+                )
+                if not temporary_cleanup_complete:
+                    final_cleanup_errors.append(
+                        RuntimeError(
+                            "target removal temporary cleanup incomplete"
                         )
-                        == placeholder_identity
-                    ):
-                        _sanitize_temporary_file(
-                            parent_dir_fd,
-                            temporary_name,
-                            placeholder_identity,
-                        )
-                        try:
-                            os.unlink(
-                                temporary_name,
-                                dir_fd=parent_dir_fd,
-                            )
-                        except FileNotFoundError:
-                            pass
+                    )
+                    _raise_cleanup_errors(
+                        "target removal cleanup failed",
+                        final_cleanup_errors,
+                        final_cleanup_errors[0],
+                    )
 
 
 def atomic_write(
@@ -677,6 +891,11 @@ def atomic_write(
             temporary_status.st_dev,
             temporary_status.st_ino,
         )
+        replacement_state = (
+            replacement_identity,
+            data,
+            mode,
+        )
         try:
             os.fchmod(file_descriptor, mode)
             with os.fdopen(file_descriptor, "wb") as handle:
@@ -703,11 +922,6 @@ def atomic_write(
                 )
                 temporary_cleanup_complete = True
             else:
-                replacement_state = (
-                    replacement_identity,
-                    data,
-                    mode,
-                )
                 _exchange_target_if_matches(
                     parent_dir_fd,
                     temporary_name,
@@ -726,128 +940,108 @@ def atomic_write(
                     temporary_cleanup_complete = True
                 except BaseException as cleanup_error:
                     cleanup_errors = [cleanup_error]
-                    try:
-                        _rename_exchange(
-                            parent_dir_fd,
-                            temporary_name,
-                            parent_dir_fd,
-                            target_name,
-                        )
-                    except BaseException as restore_error:
-                        cleanup_errors.append(restore_error)
-                    try:
-                        restored_target_state = _observed_file_state_at(
-                            parent_dir_fd,
-                            target_name,
-                            path,
-                            "restored target",
-                        )
-                    except BaseException as state_error:
-                        cleanup_errors.append(state_error)
-                        restored_target_state = None
-                    try:
-                        restored_temporary_state = (
-                            _observed_file_state_at(
-                                parent_dir_fd,
-                                temporary_name,
-                                path,
-                                "replacement temporary file",
-                            )
-                        )
-                    except BaseException as state_error:
-                        cleanup_errors.append(state_error)
-                        restored_temporary_state = None
-                    restored = (
-                        restored_target_state == expected_state
-                        and restored_temporary_state
-                        == replacement_state
-                    )
-                    if not restored:
-                        cleanup_errors.append(
-                            RuntimeError(
-                                "atomic replacement recovery "
-                                "verification failed"
-                            )
-                        )
-                    else:
-                        try:
-                            _sanitize_temporary_file(
-                                parent_dir_fd,
-                                temporary_name,
-                                replacement_identity,
-                            )
-                        except BaseException as sanitize_error:
-                            cleanup_errors.append(sanitize_error)
-                        else:
-                            try:
-                                os.unlink(
-                                    temporary_name,
-                                    dir_fd=parent_dir_fd,
-                                )
-                            except FileNotFoundError:
-                                temporary_cleanup_complete = True
-                            except BaseException as retry_error:
-                                cleanup_errors.append(retry_error)
-                                temporary_cleanup_complete = True
-                            else:
-                                temporary_cleanup_complete = True
-                        try:
-                            os.fsync(parent_dir_fd)
-                        except BaseException as fsync_error:
-                            cleanup_errors.append(fsync_error)
-                    temporary_cleanup_complete = True
-                    fatal_error = next(
-                        (
-                            error
-                            for error in cleanup_errors
-                            if not isinstance(error, Exception)
-                        ),
-                        None,
-                    )
-                    if fatal_error is not None:
-                        raise fatal_error
-                    error_types = ", ".join(
-                        type(error).__name__
-                        for error in cleanup_errors
-                    )
-                    raise RuntimeError(
-                        "atomic replacement cleanup failed: %s"
-                        % error_types
-                    ) from cleanup_error
-            os.fsync(parent_dir_fd)
-        finally:
-            if descriptor_open:
-                os.close(file_descriptor)
-            if not temporary_cleanup_complete:
-                try:
-                    current_temporary = os.stat(
+                    current_pair = _cleanup_state_pair(
+                        parent_dir_fd,
                         temporary_name,
-                        dir_fd=parent_dir_fd,
-                        follow_symlinks=False,
+                        target_name,
+                        path,
+                        cleanup_errors,
                     )
-                except FileNotFoundError:
-                    pass
-                else:
-                    if (
-                        stat.S_ISREG(current_temporary.st_mode)
-                        and (
-                            current_temporary.st_dev,
-                            current_temporary.st_ino,
-                        )
-                        == replacement_identity
+                    if current_pair == (
+                        replacement_state,
+                        expected_state,
                     ):
-                        _sanitize_temporary_file(
-                            parent_dir_fd,
-                            temporary_name,
-                            replacement_identity,
-                        )
                         try:
                             os.unlink(
                                 temporary_name,
                                 dir_fd=parent_dir_fd,
                             )
                         except FileNotFoundError:
-                            pass
+                            temporary_cleanup_complete = True
+                        except BaseException as retry_error:
+                            cleanup_errors.append(retry_error)
+                        else:
+                            temporary_cleanup_complete = True
+                    elif current_pair[1] is _MISSING_FILE_STATE:
+                        temporary_cleanup_complete = True
+                    else:
+                        cleanup_errors.append(
+                            RuntimeError(
+                                "atomic replacement cleanup state "
+                                "verification failed"
+                            )
+                        )
+
+                    if not temporary_cleanup_complete:
+                        _recover_known_exchange(
+                            parent_dir_fd,
+                            temporary_name,
+                            target_name,
+                            path,
+                            (replacement_state, expected_state),
+                            (expected_state, replacement_state),
+                            cleanup_errors,
+                        )
+                        temporary_cleanup_complete = (
+                            _sanitize_or_unlink_known_temporary(
+                                parent_dir_fd,
+                                temporary_name,
+                                path,
+                                (replacement_state, expected_state),
+                                cleanup_errors,
+                            )
+                        )
+                    try:
+                        os.fsync(parent_dir_fd)
+                    except BaseException as fsync_error:
+                        cleanup_errors.append(fsync_error)
+                    if not temporary_cleanup_complete:
+                        cleanup_errors.append(
+                            RuntimeError(
+                                "atomic replacement temporary cleanup "
+                                "incomplete"
+                            )
+                        )
+                    _raise_cleanup_errors(
+                        "atomic replacement cleanup failed",
+                        cleanup_errors,
+                        cleanup_error,
+                    )
+            os.fsync(parent_dir_fd)
+        finally:
+            if descriptor_open:
+                os.close(file_descriptor)
+            if not temporary_cleanup_complete:
+                final_cleanup_errors = []
+                temporary_cleanup_complete = (
+                    _sanitize_or_unlink_known_temporary(
+                        parent_dir_fd,
+                        temporary_name,
+                        path,
+                        (replacement_state,)
+                        if (
+                            expected_state is _UNCONDITIONAL_WRITE
+                            or expected_state is None
+                        )
+                        else (
+                            replacement_state,
+                            expected_state,
+                        ),
+                        final_cleanup_errors,
+                    )
+                )
+                if not temporary_cleanup_complete:
+                    final_cleanup_errors.append(
+                        RuntimeError(
+                            "atomic replacement temporary cleanup "
+                            "incomplete"
+                        )
+                    )
+                    _raise_cleanup_errors(
+                        "atomic replacement cleanup failed",
+                        final_cleanup_errors,
+                        final_cleanup_errors[0],
+                    )
 
 
 def _write_private_file(path: Path, data: bytes) -> None:
