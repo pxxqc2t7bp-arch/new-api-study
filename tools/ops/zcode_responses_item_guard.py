@@ -187,9 +187,9 @@ def atomic_write(
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
         if on_replace is not None:
             on_replace(replacement_identity)
+        os.replace(temporary_path, path)
         _fsync_directory(path.parent)
     finally:
         if descriptor_open:

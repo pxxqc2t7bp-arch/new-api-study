@@ -614,22 +614,22 @@ class ConfigTransactionTest(unittest.TestCase):
         self.assertEqual([path.read_bytes() for path in self.paths], before)
         self.assertFalse(self.backup_root.exists())
 
-    def test_second_write_failure_rolls_back_both_files_and_hashes(self):
-        real_atomic_write = guard.atomic_write
+    def test_second_replace_failure_rolls_back_both_files_and_hashes(self):
+        real_replace = os.replace
         target_write_count = 0
 
-        def fail_second_target_write(path, data, mode, **kwargs):
+        def fail_second_target_replace(source, destination):
             nonlocal target_write_count
-            if path in self.paths:
+            if destination in self.paths:
                 target_write_count += 1
                 if target_write_count == 2:
-                    raise OSError("injected second write failure")
-            return real_atomic_write(path, data, mode, **kwargs)
+                    raise OSError("injected second replace failure")
+            return real_replace(source, destination)
 
         with mock.patch.object(
-            guard,
-            "atomic_write",
-            side_effect=fail_second_target_write,
+            guard.os,
+            "replace",
+            side_effect=fail_second_target_replace,
         ):
             with self.assertRaisesRegex(
                 RuntimeError, "configuration apply failed"
@@ -839,6 +839,46 @@ class ConfigTransactionTest(unittest.TestCase):
             self.original_modes,
         )
 
+    def test_config_replace_baseexception_rolls_back_and_reraises(self):
+        real_replace = os.replace
+        interrupted = False
+        status = []
+
+        def replace_first_config_then_interrupt(source, destination):
+            nonlocal interrupted
+            result = real_replace(source, destination)
+            if destination == self.paths[0] and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt(
+                    "injected config replace interrupt"
+                )
+            return result
+
+        with mock.patch.object(
+            guard.os,
+            "replace",
+            side_effect=replace_first_config_then_interrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120034Z",
+                    status_sink=status.append,
+                )
+
+        self.assertTrue(interrupted)
+        self.assertEqual(status, [])
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+        self.assertEqual(
+            [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
+            self.original_modes,
+        )
+
     def test_readback_validation_failure_rolls_back_both_files(self):
         real_verify_readback = guard._verify_readback
         readback_count = 0
@@ -1034,6 +1074,49 @@ class ConfigTransactionTest(unittest.TestCase):
         self.assertEqual(stdout.write_count, 1)
         self.assertEqual(stdout.flush_count, 1)
         self.assertEqual(stderr.getvalue(), "ERROR: change=failed\n")
+        self.assertEqual(output.read_bytes(), original_output)
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o640)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+
+    def test_output_replace_baseexception_restores_output_and_reraises(self):
+        output = self.root / "interrupted-output.json"
+        original_output = b'{"existing":"report"}\n'
+        output.write_bytes(original_output)
+        output.chmod(0o640)
+        real_replace = os.replace
+        interrupted = False
+        status = []
+
+        def replace_output_then_interrupt(source, destination):
+            nonlocal interrupted
+            result = real_replace(source, destination)
+            if destination == output and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt(
+                    "injected output replace interrupt"
+                )
+            return result
+
+        with mock.patch.object(
+            guard.os,
+            "replace",
+            side_effect=replace_output_then_interrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120035Z",
+                    output_path=output,
+                    status_sink=status.append,
+                )
+
+        self.assertTrue(interrupted)
+        self.assertEqual(status, [])
         self.assertEqual(output.read_bytes(), original_output)
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o640)
         self.assertEqual(
