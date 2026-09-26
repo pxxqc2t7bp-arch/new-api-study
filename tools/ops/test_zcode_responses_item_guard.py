@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 import stat
@@ -83,10 +84,58 @@ def assert_safe_report(test_case, report):
     lowered = serialized.lower()
     test_case.assertNotIn(SECRET, serialized)
     test_case.assertNotIn(OTHER_SECRET, serialized)
-    for forbidden in ("apikey", "token", "cookie", "authorization", "jwt"):
+    for forbidden in (
+        "secret",
+        "key",
+        "token",
+        "cookie",
+        "authorization",
+        "jwt",
+    ):
         test_case.assertNotIn(forbidden, lowered)
-    allowed = {"hash", "provider", "header", "change", "backup_path"}
-    test_case.assertLessEqual(set(report), allowed)
+    test_case.assertEqual(
+        set(report),
+        {"hash", "provider", "header", "change"},
+    )
+    test_case.assertEqual(report["provider"], {"id": guard.PROVIDER_ID})
+    test_case.assertEqual(
+        report["header"],
+        {"name": guard.HEADER_NAME, "value": guard.HEADER_VALUE},
+    )
+    test_case.assertEqual(set(report["change"]), {"v2", "cli"})
+    for change in report["change"].values():
+        test_case.assertEqual(set(change), {"status"})
+        test_case.assertIn(change["status"], {"pending", "applied", "unchanged"})
+    test_case.assertIn(
+        set(report["hash"]),
+        (
+            {"v2", "cli"},
+            {"v2", "cli", "backup_manifest_sha256"},
+        ),
+    )
+    for label in ("v2", "cli"):
+        test_case.assertEqual(
+            set(report["hash"][label]),
+            {"before_sha256", "after_sha256"},
+        )
+
+    def all_keys(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                yield key
+                yield from all_keys(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from all_keys(child)
+
+    forbidden_keys = {
+        "kind",
+        "base_url",
+        "before",
+        "after",
+        "backup_path",
+    }
+    test_case.assertTrue(forbidden_keys.isdisjoint(all_keys(report)))
 
 
 class ApplyGuardTest(unittest.TestCase):
@@ -210,19 +259,26 @@ class ApplyGuardTest(unittest.TestCase):
         self.assertEqual(
             report,
             {
-                "provider": {
-                    "id": guard.PROVIDER_ID,
-                    "kind": "openai",
-                    "base_url": EXPECTED_BASE_URL,
-                },
+                "provider": {"id": guard.PROVIDER_ID},
                 "header": {
                     "name": guard.HEADER_NAME,
                     "value": guard.HEADER_VALUE,
-                    "configured": True,
                 },
             },
         )
-        assert_safe_report(self, report)
+        serialized = json.dumps(report, ensure_ascii=False, sort_keys=True)
+        lowered = serialized.lower()
+        for forbidden in (
+            SECRET,
+            OTHER_SECRET,
+            "secret",
+            "key",
+            "token",
+            "cookie",
+            "authorization",
+            "jwt",
+        ):
+            self.assertNotIn(forbidden.lower(), lowered)
 
 
 class ConfigTransactionTest(unittest.TestCase):
@@ -245,6 +301,13 @@ class ConfigTransactionTest(unittest.TestCase):
             write_config(path, config, mode)
         self.original_bytes = [path.read_bytes() for path in self.paths]
         self.original_hashes = [sha256(data) for data in self.original_bytes]
+        self.updated_bytes = []
+        for config in self.originals:
+            updated = deepcopy(config)
+            updated["provider"][guard.PROVIDER_ID]["options"]["headers"][
+                guard.HEADER_NAME
+            ] = guard.HEADER_VALUE
+            self.updated_bytes.append(json_bytes(updated))
         self.backup_root = self.home / ".zcode" / "backups"
 
     def tearDown(self):
@@ -258,6 +321,33 @@ class ConfigTransactionTest(unittest.TestCase):
             timestamp=timestamp,
         )
 
+    def expected_report(self, status, manifest_sha256=None):
+        hashes = {
+            label: {
+                "before_sha256": original_hash,
+                "after_sha256": sha256(updated),
+            }
+            for label, original_hash, updated in zip(
+                ("v2", "cli"),
+                self.original_hashes,
+                self.updated_bytes,
+            )
+        }
+        if manifest_sha256 is not None:
+            hashes["backup_manifest_sha256"] = manifest_sha256
+        return {
+            "hash": hashes,
+            "provider": {"id": guard.PROVIDER_ID},
+            "header": {
+                "name": guard.HEADER_NAME,
+                "value": guard.HEADER_VALUE,
+            },
+            "change": {
+                "v2": {"status": status},
+                "cli": {"status": status},
+            },
+        }
+
     def test_dry_run_does_not_write_or_create_backups(self):
         report = self.execute(apply=False)
 
@@ -266,10 +356,7 @@ class ConfigTransactionTest(unittest.TestCase):
             self.original_bytes,
         )
         self.assertFalse(self.backup_root.exists())
-        self.assertEqual(
-            [report["change"][label]["status"] for label in ("v2", "cli")],
-            ["pending", "pending"],
-        )
+        self.assertEqual(report, self.expected_report("pending"))
         assert_safe_report(self, report)
 
     def test_apply_preserves_modes_and_creates_protected_backups(self):
@@ -297,10 +384,12 @@ class ConfigTransactionTest(unittest.TestCase):
         manifest_text = manifest.read_text(encoding="utf-8")
         self.assertNotIn(SECRET, manifest_text)
         self.assertNotIn(OTHER_SECRET, manifest_text)
-        self.assertEqual(report["backup_path"], str(backup_dir))
         self.assertEqual(
-            [report["change"][label]["status"] for label in ("v2", "cli")],
-            ["applied", "applied"],
+            report,
+            self.expected_report(
+                "applied",
+                manifest_sha256=sha256(manifest.read_bytes()),
+            ),
         )
         assert_safe_report(self, report)
 
@@ -384,6 +473,97 @@ class ConfigTransactionTest(unittest.TestCase):
             self.original_modes,
         )
 
+    def test_cli_apply_report_failure_rolls_back_both_configs_once(self):
+        output = self.root / "apply.json"
+        timestamp = "20260926T120001Z"
+        report_write_count = 0
+
+        def fail_report_write(path, report):
+            nonlocal report_write_count
+            report_write_count += 1
+            self.assertEqual(path, output)
+            self.assertEqual(
+                [sha256(path.read_bytes()) for path in self.paths],
+                [sha256(data) for data in self.updated_bytes],
+            )
+            raise OSError("injected report write failure")
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                guard,
+                "default_config_paths",
+                return_value=self.paths,
+            ),
+            mock.patch.object(guard.Path, "home", return_value=self.home),
+            mock.patch.object(
+                guard.time,
+                "strftime",
+                return_value=timestamp,
+            ),
+            mock.patch.object(
+                guard,
+                "_write_report",
+                side_effect=fail_report_write,
+            ),
+            mock.patch.object(guard.sys, "stderr", stderr),
+        ):
+            result = guard.main(
+                ["--apply", "--output", str(output)]
+            )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stderr.getvalue(), "ERROR: change=failed\n")
+        self.assertEqual(report_write_count, 1)
+        self.assertEqual(
+            [sha256(path.read_bytes()) for path in self.paths],
+            self.original_hashes,
+        )
+        self.assertEqual(
+            [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
+            self.original_modes,
+        )
+        backup_dir = self.backup_root / timestamp
+        self.assertTrue((backup_dir / "manifest.json").is_file())
+        for label, original in zip(("v2", "cli"), self.original_bytes):
+            self.assertEqual(
+                (backup_dir / label / "config.json").read_bytes(),
+                original,
+            )
+
+    def test_cli_dry_run_report_failure_does_not_mutate_or_rollback(self):
+        output = self.root / "dry-run-failure.json"
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                guard,
+                "default_config_paths",
+                return_value=self.paths,
+            ),
+            mock.patch.object(
+                guard,
+                "_write_report",
+                side_effect=OSError("injected dry-run report failure"),
+            ) as report_write,
+            mock.patch.object(guard, "_restore_and_verify") as restore,
+            mock.patch.object(guard.sys, "stderr", stderr),
+        ):
+            result = guard.main(["--output", str(output)])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stderr.getvalue(), "ERROR: change=failed\n")
+        report_write.assert_called_once()
+        restore.assert_not_called()
+        self.assertEqual(
+            [sha256(path.read_bytes()) for path in self.paths],
+            self.original_hashes,
+        )
+        self.assertEqual(
+            [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
+            self.original_modes,
+        )
+        self.assertFalse(self.backup_root.exists())
+
     def test_cli_defaults_to_real_paths_under_home_and_stays_dry_run(self):
         output = self.root / "dry-run.json"
         script = Path(guard.__file__)
@@ -408,24 +588,34 @@ class ConfigTransactionTest(unittest.TestCase):
             [path.read_bytes() for path in self.paths],
             self.original_bytes,
         )
-        combined_output = result.stdout + result.stderr + output.read_text(
-            encoding="utf-8"
+        report = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(report, self.expected_report("pending"))
+        self.assertEqual(
+            result.stdout,
+            "hash=%s provider=%s header=%s:%s "
+            "change.v2=pending change.cli=pending\n"
+            % (
+                sha256(output.read_bytes()),
+                guard.PROVIDER_ID,
+                guard.HEADER_NAME,
+                guard.HEADER_VALUE,
+            ),
         )
+        self.assertEqual(result.stderr, "")
+        combined_output = result.stdout + output.read_text(encoding="utf-8")
         lowered = combined_output.lower()
         self.assertNotIn(SECRET, combined_output)
         self.assertNotIn(OTHER_SECRET, combined_output)
         for forbidden in (
-            "apikey",
+            "secret",
+            "key",
             "token",
             "cookie",
             "authorization",
             "jwt",
         ):
             self.assertNotIn(forbidden, lowered)
-        assert_safe_report(
-            self,
-            json.loads(output.read_text(encoding="utf-8")),
-        )
+        assert_safe_report(self, report)
 
 
 if __name__ == "__main__":

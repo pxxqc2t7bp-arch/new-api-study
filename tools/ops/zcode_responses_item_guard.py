@@ -111,15 +111,10 @@ def redacted_report(config: dict[str, Any]) -> dict[str, Any]:
     headers = options.get("headers") or {}
     value = headers.get(HEADER_NAME)
     return {
-        "provider": {
-            "id": PROVIDER_ID,
-            "kind": provider["kind"],
-            "base_url": EXPECTED_BASE_URL,
-        },
+        "provider": {"id": PROVIDER_ID},
         "header": {
             "name": HEADER_NAME,
             "value": HEADER_VALUE if value == HEADER_VALUE else None,
-            "configured": value == HEADER_VALUE,
         },
     }
 
@@ -266,12 +261,6 @@ def _snapshot(path: Path, label: str) -> dict[str, Any]:
     }
 
 
-def _safe_before(value: Any) -> Any:
-    if value is None or value == HEADER_VALUE:
-        return value
-    return "different"
-
-
 def _build_report(
     snapshots: list[dict[str, Any]],
     applied: bool,
@@ -286,10 +275,7 @@ def _build_report(
             for snapshot in snapshots
         },
         "provider": projection["provider"],
-        "header": {
-            "name": HEADER_NAME,
-            "value": HEADER_VALUE,
-        },
+        "header": projection["header"],
         "change": {},
     }
     for snapshot in snapshots:
@@ -299,11 +285,7 @@ def _build_report(
             status = "applied"
         else:
             status = "pending"
-        report["change"][snapshot["label"]] = {
-            "before": _safe_before(snapshot["change"]["before"]),
-            "after": HEADER_VALUE,
-            "status": status,
-        }
+        report["change"][snapshot["label"]] = {"status": status}
     return report
 
 
@@ -378,6 +360,7 @@ def execute(
     apply: bool,
     backup_root: Optional[Path] = None,
     timestamp: Optional[str] = None,
+    output_path: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Validate both configs, then dry-run or apply one rollback-safe update."""
     labels = _config_labels(paths)
@@ -386,6 +369,8 @@ def execute(
     ]
     report = _build_report(snapshots, applied=apply)
     if not apply or not any(snapshot["changed"] for snapshot in snapshots):
+        if output_path is not None:
+            _write_report(output_path, report)
         return report
 
     backup_timestamp = timestamp or time.strftime(
@@ -393,6 +378,9 @@ def execute(
     )
     backup_dir = create_backup(paths, backup_timestamp, backup_root)
     _verify_backups(backup_dir, snapshots)
+    report["hash"]["backup_manifest_sha256"] = _file_sha256(
+        backup_dir / "manifest.json"
+    )
 
     try:
         for snapshot in snapshots:
@@ -404,6 +392,8 @@ def execute(
                 )
         for snapshot in snapshots:
             _verify_readback(snapshot)
+        if output_path is not None:
+            _write_report(output_path, report)
     except Exception as exc:
         rollback_errors = _restore_and_verify(backup_dir, snapshots)
         if rollback_errors:
@@ -415,10 +405,6 @@ def execute(
             "configuration apply failed; original files restored"
         ) from exc
 
-    report["backup_path"] = str(backup_dir)
-    report["hash"]["backup_manifest_sha256"] = _file_sha256(
-        backup_dir / "manifest.json"
-    )
     return report
 
 
@@ -440,34 +426,38 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def _write_report(path: Path, report: dict[str, Any]) -> str:
-    raw = (
-        json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    ).encode("ascii")
+    raw = _encode_report(report)
     mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
     atomic_write(path, raw, mode)
     return _sha256(raw)
 
 
+def _encode_report(report: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    ).encode("ascii")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
-        report = execute(default_config_paths(), apply=args.apply)
-        report_sha256 = _write_report(Path(args.output), report)
+        report = execute(
+            default_config_paths(),
+            apply=args.apply,
+            output_path=Path(args.output),
+        )
+        report_sha256 = _sha256(_encode_report(report))
     except Exception:
         print("ERROR: change=failed", file=sys.stderr)
         return 1
 
-    statuses = sorted(
-        {item["status"] for item in report["change"].values()}
-    )
     fields = [
-        "change=%s" % ",".join(statuses),
+        "hash=%s" % report_sha256,
         "provider=%s" % PROVIDER_ID,
         "header=%s:%s" % (HEADER_NAME, HEADER_VALUE),
-        "hash=%s" % report_sha256,
+        "change.v2=%s" % report["change"]["v2"]["status"],
+        "change.cli=%s" % report["change"]["cli"]["status"],
     ]
-    if "backup_path" in report:
-        fields.append("backup_path=%s" % report["backup_path"])
     print(" ".join(fields))
     return 0
 
