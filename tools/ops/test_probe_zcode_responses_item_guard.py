@@ -13,19 +13,30 @@ from tools.ops import probe_zcode_responses_item_guard as probe
 
 
 PROMPT_TEXT = "fixture prompt content must never be recorded"
-BODY = json.dumps(
-    {
-        "model": probe.MODEL,
-        "input": [
-            {
-                "type": "message",
-                "role": "user",
-                "content": PROMPT_TEXT,
-            }
-        ],
-        "stream": True,
-    }
-).encode()
+
+
+def request_body(*contents):
+    return json.dumps(
+        {
+            "model": probe.MODEL,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": content,
+                }
+                for content in contents
+            ],
+            "stream": True,
+        }
+    ).encode()
+
+
+BODY = request_body(
+    PROMPT_TEXT,
+    "fixture retained item one",
+    "fixture retained item two",
+)
 
 
 def request_headers(soft_limit=probe.HEADER_VALUE):
@@ -37,22 +48,16 @@ def request_headers(soft_limit=probe.HEADER_VALUE):
 
 
 def compaction_body():
-    return json.dumps(
-        {
-            "model": probe.MODEL,
-            "input": [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": (
-                        "Your task is to create a detailed summary of the "
-                        "conversation so far."
-                    ),
-                }
-            ],
-            "stream": True,
-        }
-    ).encode()
+    return request_body(
+        "Your task is to create a detailed summary of the conversation so far."
+    )
+
+
+def compacted_retry_body():
+    return request_body(
+        "fixture summary",
+        "fixture request after compaction",
+    )
 
 
 class LoopbackURLTest(unittest.TestCase):
@@ -228,7 +233,7 @@ class FixtureStateTest(unittest.TestCase):
         self.assertEqual(summary.status, 200)
         self.assertIn(b"<summary>fixture summary</summary>", summary.body)
 
-        answer = self.request()
+        answer = self.request(compacted_retry_body())
         self.assertEqual(answer.status, 200)
         self.assertIn(b"fixture final answer", answer.body)
 
@@ -259,6 +264,7 @@ class FixtureStateTest(unittest.TestCase):
                     "content_type",
                     "body_bytes",
                     "body_sha256",
+                    "item_count",
                     "phase",
                 },
             )
@@ -267,9 +273,26 @@ class FixtureStateTest(unittest.TestCase):
                 hashlib.sha256(
                     compaction_body()
                     if request["phase"] == "compaction_summary"
-                    else BODY
+                    else (
+                        compacted_retry_body()
+                        if request["phase"] == "automatic_retry"
+                        else BODY
+                    )
                 ).hexdigest(),
             )
+        self.assertEqual(
+            [
+                request["item_count"]
+                for request in self.state.requests
+                if request["phase"]
+                in {
+                    "ordinary_overflow",
+                    "compaction_summary",
+                    "automatic_retry",
+                }
+            ],
+            [3, 1, 2],
+        )
 
     def test_requires_compaction_marker_after_context_error(self):
         self.request()
@@ -283,6 +306,94 @@ class FixtureStateTest(unittest.TestCase):
         self.assertFalse(self.state.passed)
         self.assertFalse(self.state.reactive_compaction)
         self.assertEqual(self.state.failure_reason, "compaction request not observed")
+
+    def test_rejects_uncompacted_original_body_as_automatic_retry(self):
+        self.request()
+        for _ in range(3):
+            self.request()
+        self.request()
+        self.request(compaction_body())
+
+        response = self.request(BODY)
+
+        self.assertEqual(response.status, 409)
+        self.assertFalse(self.state.passed)
+        self.assertFalse(self.state.reactive_compaction)
+        self.assertEqual(
+            self.state.failure_reason,
+            "automatic retry did not include fixture summary",
+        )
+
+    def test_requires_automatic_retry_to_reduce_input_item_count(self):
+        self.request()
+        for _ in range(3):
+            self.request()
+        self.request()
+        self.request(compaction_body())
+        uncompressed_retry = request_body(
+            "fixture summary",
+            "fixture retained item one",
+            "fixture retained item two",
+        )
+
+        response = self.request(uncompressed_retry)
+
+        self.assertEqual(response.status, 409)
+        self.assertFalse(self.state.passed)
+        self.assertFalse(self.state.reactive_compaction)
+        self.assertEqual(
+            self.state.failure_reason,
+            "automatic retry did not reduce input item count",
+        )
+
+    def test_requires_json_object_with_array_input_for_compaction_phases(self):
+        invalid_bodies = (
+            b"not-json",
+            json.dumps(["not", "an", "object"]).encode(),
+            json.dumps({"input": "not-an-array"}).encode(),
+        )
+
+        for phase in (
+            "ordinary_overflow",
+            "compaction_summary",
+            "automatic_retry",
+        ):
+            for invalid_body in invalid_bodies:
+                with self.subTest(phase=phase, invalid_body=invalid_body):
+                    state = probe.FixtureState(history_turns=0)
+                    state.handle_post(
+                        probe.RESPONSES_PATH,
+                        self.headers,
+                        BODY,
+                    )
+                    if phase in {"compaction_summary", "automatic_retry"}:
+                        state.handle_post(
+                            probe.RESPONSES_PATH,
+                            self.headers,
+                            BODY,
+                        )
+                    if phase == "automatic_retry":
+                        state.handle_post(
+                            probe.RESPONSES_PATH,
+                            self.headers,
+                            compaction_body(),
+                        )
+
+                    response = state.handle_post(
+                        probe.RESPONSES_PATH,
+                        self.headers,
+                        invalid_body,
+                    )
+
+                    self.assertEqual(response.status, 400)
+                    self.assertFalse(state.passed)
+                    self.assertFalse(state.reactive_compaction)
+                    self.assertEqual(
+                        state.failure_reason,
+                        "%s request must be a JSON object with array input"
+                        % phase.replace("_", " "),
+                    )
+                    self.assertIsNone(state.requests[-1]["item_count"])
 
     def test_rejects_wrong_path_or_header_without_redirect(self):
         wrong_path = self.request(path="/redirect")
@@ -309,7 +420,11 @@ class FixtureStateTest(unittest.TestCase):
             self.headers,
             compaction_body(),
         )
-        state.handle_post(probe.RESPONSES_PATH, self.headers, BODY)
+        state.handle_post(
+            probe.RESPONSES_PATH,
+            self.headers,
+            compacted_retry_body(),
+        )
 
         response = state.handle_post(
             probe.RESPONSES_PATH,
@@ -334,18 +449,21 @@ class FixtureStateTest(unittest.TestCase):
 
 
 class FakeProcess:
-    def __init__(self, *, timeout_once=False, returncode=0):
+    def __init__(self, *, communicate_outcomes=(), returncode=0):
         self.pid = 4242
         self.returncode = returncode
-        self.timeout_once = timeout_once
+        self.communicate_outcomes = list(communicate_outcomes)
         self.communicate_timeouts = []
         self.communicate_calls = 0
 
     def communicate(self, timeout):
         self.communicate_calls += 1
         self.communicate_timeouts.append(timeout)
-        if self.timeout_once and self.communicate_calls == 1:
-            raise subprocess.TimeoutExpired(["node", "zcode.cjs"], timeout)
+        if self.communicate_outcomes:
+            outcome = self.communicate_outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
         return "0.16.9\n", ""
 
 
@@ -400,7 +518,12 @@ class SubprocessTest(unittest.TestCase):
         self.assertTrue(calls[0][1]["text"])
 
     def test_timeout_kills_process_group_and_raises_redacted_error(self):
-        process = FakeProcess(timeout_once=True)
+        process = FakeProcess(
+            communicate_outcomes=(
+                subprocess.TimeoutExpired(["node", "zcode.cjs"], 7),
+                subprocess.TimeoutExpired(["node", "zcode.cjs"], 5),
+            )
+        )
         killed = []
 
         with self.assertRaisesRegex(
@@ -421,6 +544,49 @@ class SubprocessTest(unittest.TestCase):
         message = str(raised.exception)
         self.assertNotIn(PROMPT_TEXT, message)
         self.assertNotIn("/private/tmp", message)
+
+    def test_keyboard_interrupt_kills_and_reaps_before_reraising(self):
+        interrupted = KeyboardInterrupt("fixture interrupt")
+        process = FakeProcess(communicate_outcomes=(interrupted,))
+        killed = []
+
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            probe.run_process(
+                ["node", "zcode.cjs"],
+                cwd=Path("/tmp/workspace"),
+                env={"HOME": "/tmp/home"},
+                timeout=7,
+                popen_factory=lambda argv, **kwargs: process,
+                killpg=lambda pid, sig: killed.append((pid, sig)),
+            )
+
+        self.assertIs(raised.exception, interrupted)
+        self.assertEqual(killed, [(process.pid, signal.SIGKILL)])
+        self.assertEqual(process.communicate_timeouts, [7, 5])
+
+    def test_generic_communicate_error_kills_and_attempts_one_bounded_reap(self):
+        communicate_error = RuntimeError("fixture communicate error")
+        process = FakeProcess(
+            communicate_outcomes=(
+                communicate_error,
+                subprocess.TimeoutExpired(["node", "zcode.cjs"], 5),
+            )
+        )
+        killed = []
+
+        with self.assertRaises(RuntimeError) as raised:
+            probe.run_process(
+                ["node", "zcode.cjs"],
+                cwd=Path("/tmp/workspace"),
+                env={"HOME": "/tmp/home"},
+                timeout=7,
+                popen_factory=lambda argv, **kwargs: process,
+                killpg=lambda pid, sig: killed.append((pid, sig)),
+            )
+
+        self.assertIs(raised.exception, communicate_error)
+        self.assertEqual(killed, [(process.pid, signal.SIGKILL)])
+        self.assertEqual(process.communicate_timeouts, [7, 5])
 
     def test_rejects_timeout_above_bound_before_spawning(self):
         spawned = []
@@ -447,7 +613,11 @@ class ReportTest(unittest.TestCase):
             request_headers(),
             compaction_body(),
         )
-        state.handle_post(probe.RESPONSES_PATH, request_headers(), BODY)
+        state.handle_post(
+            probe.RESPONSES_PATH,
+            request_headers(),
+            compacted_retry_body(),
+        )
 
         report = probe.build_report(
             state,
@@ -461,6 +631,8 @@ class ReportTest(unittest.TestCase):
                 "path",
                 "soft_limit",
                 "request_counts",
+                "item_counts",
+                "compaction_delta",
                 "order",
                 "reactive_compaction",
                 "passed",
@@ -481,6 +653,15 @@ class ReportTest(unittest.TestCase):
                 "automatic_retry": 1,
             },
         )
+        self.assertEqual(
+            report["item_counts"],
+            {
+                "ordinary_overflow": 3,
+                "compaction_summary": 1,
+                "automatic_retry": 2,
+            },
+        )
+        self.assertEqual(report["compaction_delta"], 1)
         self.assertTrue(report["reactive_compaction"])
         self.assertTrue(report["passed"])
         serialized = json.dumps(report, sort_keys=True).lower()

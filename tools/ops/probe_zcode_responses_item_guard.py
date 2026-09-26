@@ -66,6 +66,7 @@ BUILTIN_PROVIDER_CONFIG_PATH = (
 COMPACTION_MARKER = (
     "your task is to create a detailed summary of the conversation so far"
 )
+SUMMARY_MARKER = "fixture summary"
 
 
 class ProbeFailure(RuntimeError):
@@ -291,6 +292,20 @@ def is_compaction_request(body: bytes) -> bool:
     return any(COMPACTION_MARKER in value.lower() for value in _strings(value))
 
 
+def _request_object_with_array_input(body: bytes) -> Optional[dict[str, Any]]:
+    try:
+        value = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or not isinstance(value.get("input"), list):
+        return None
+    return value
+
+
+def _contains_marker(value: Any, marker: str) -> bool:
+    return any(marker in text.lower() for text in _strings(value))
+
+
 def _header(headers: Mapping[str, str], name: str) -> Optional[str]:
     lowered_name = name.lower()
     for candidate, value in headers.items():
@@ -345,6 +360,10 @@ class FixtureState:
         self.failure_reason: Optional[str] = None
         self._phase = "header_probe"
         self._history_completed = 0
+        self._ordinary_overflow_item_count: Optional[int] = None
+        self._automatic_retry_item_count: Optional[int] = None
+        self._compaction_marker_observed = False
+        self._retry_summary_observed = False
         self._lock = threading.Lock()
 
     def _expected_phase(self) -> str:
@@ -358,6 +377,7 @@ class FixtureState:
         headers: Mapping[str, str],
         body: bytes,
         phase: str,
+        item_count: Optional[int],
     ) -> None:
         self.requests.append(
             {
@@ -366,6 +386,7 @@ class FixtureState:
                 "content_type": _header(headers, "Content-Type"),
                 "body_bytes": len(body),
                 "body_sha256": hashlib.sha256(body).hexdigest(),
+                "item_count": item_count,
                 "phase": phase,
             }
         )
@@ -406,7 +427,13 @@ class FixtureState:
                 )
 
             phase = self._expected_phase()
-            self._record(path, headers, body, phase)
+            request_value = _request_object_with_array_input(body)
+            item_count = (
+                len(request_value["input"])
+                if request_value is not None
+                else None
+            )
+            self._record(path, headers, body, phase, item_count)
             if path != RESPONSES_PATH:
                 return self._fail(
                     "unexpected request path",
@@ -418,6 +445,24 @@ class FixtureState:
                     "soft-limit header mismatch",
                     400,
                     "probe_header_mismatch",
+                )
+
+            if (
+                self._phase
+                in {
+                    "ordinary_overflow",
+                    "compaction_summary",
+                    "automatic_retry",
+                }
+                and request_value is None
+            ):
+                return self._fail(
+                    (
+                        "%s request must be a JSON object with array input"
+                        % self._phase.replace("_", " ")
+                    ),
+                    400,
+                    "probe_invalid_request_body",
                 )
 
             if self._phase == "header_probe":
@@ -450,12 +495,14 @@ class FixtureState:
                 )
 
             if self._phase == "ordinary_overflow":
-                if is_compaction_request(body):
+                assert request_value is not None
+                if _contains_marker(request_value, COMPACTION_MARKER):
                     return self._fail(
                         "ordinary overflow request not observed",
                         409,
                         "probe_order_mismatch",
                     )
+                self._ordinary_overflow_item_count = item_count
                 self._phase = "compaction_summary"
                 return _json_response(
                     400,
@@ -470,12 +517,14 @@ class FixtureState:
                 )
 
             if self._phase == "compaction_summary":
-                if not is_compaction_request(body):
+                assert request_value is not None
+                if not _contains_marker(request_value, COMPACTION_MARKER):
                     return self._fail(
                         "compaction request not observed",
                         409,
                         "probe_order_mismatch",
                     )
+                self._compaction_marker_observed = True
                 self._phase = "automatic_retry"
                 return _text_response(
                     (
@@ -486,12 +535,29 @@ class FixtureState:
                 )
 
             if self._phase == "automatic_retry":
-                if is_compaction_request(body):
+                assert request_value is not None
+                assert item_count is not None
+                assert self._ordinary_overflow_item_count is not None
+                if _contains_marker(request_value, COMPACTION_MARKER):
                     return self._fail(
                         "automatic retry request not observed",
                         409,
                         "probe_order_mismatch",
                     )
+                if not _contains_marker(request_value, SUMMARY_MARKER):
+                    return self._fail(
+                        "automatic retry did not include fixture summary",
+                        409,
+                        "probe_retry_summary_missing",
+                    )
+                if item_count >= self._ordinary_overflow_item_count:
+                    return self._fail(
+                        "automatic retry did not reduce input item count",
+                        409,
+                        "probe_retry_not_compacted",
+                    )
+                self._automatic_retry_item_count = item_count
+                self._retry_summary_observed = True
                 self._phase = "done"
                 return _text_response(
                     "fixture final answer",
@@ -512,8 +578,18 @@ class FixtureState:
             "automatic_retry",
         ]
         return (
-            len(self.order) >= len(expected_tail)
+            self.failure_reason is None
+            and self._phase == "done"
+            and len(self.order) >= len(expected_tail)
             and self.order[-len(expected_tail) :] == expected_tail
+            and self._compaction_marker_observed
+            and self._retry_summary_observed
+            and self._ordinary_overflow_item_count is not None
+            and self._automatic_retry_item_count is not None
+            and (
+                self._automatic_retry_item_count
+                < self._ordinary_overflow_item_count
+            )
         )
 
     @property
@@ -528,6 +604,7 @@ class FixtureState:
         return (
             self.failure_reason is None
             and self._phase == "done"
+            and self.reactive_compaction
             and self.order == expected_order
             and all(
                 request["path"] == RESPONSES_PATH
@@ -654,16 +731,20 @@ def run_process(
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
+    except BaseException as exc:
         try:
             killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except BaseException:
+            pass
         try:
             process.communicate(timeout=min(5, timeout))
-        except subprocess.TimeoutExpired:
+        except BaseException:
             pass
-        raise ProbeFailure("ZCode subprocess timed out") from exc
+        if isinstance(exc, subprocess.TimeoutExpired):
+            raise ProbeFailure("ZCode subprocess timed out") from exc
+        raise
     return ProcessResult(
         returncode=process.returncode,
         stdout=stdout,
@@ -779,6 +860,28 @@ def build_report(
     version: str,
 ) -> dict[str, Any]:
     counts = Counter(state.order)
+    item_counts = {
+        phase: next(
+            (
+                request["item_count"]
+                for request in reversed(state.requests)
+                if request["phase"] == phase
+            ),
+            None,
+        )
+        for phase in (
+            "ordinary_overflow",
+            "compaction_summary",
+            "automatic_retry",
+        )
+    }
+    overflow_count = item_counts["ordinary_overflow"]
+    retry_count = item_counts["automatic_retry"]
+    compaction_delta = (
+        overflow_count - retry_count
+        if isinstance(overflow_count, int) and isinstance(retry_count, int)
+        else None
+    )
     path = (
         RESPONSES_PATH
         if state.requests
@@ -805,6 +908,8 @@ def build_report(
             "compaction_summary": counts["compaction_summary"],
             "automatic_retry": counts["automatic_retry"],
         },
+        "item_counts": item_counts,
+        "compaction_delta": compaction_delta,
         "order": list(state.order),
         "reactive_compaction": state.reactive_compaction,
         "passed": state.passed,
@@ -976,6 +1081,12 @@ def _empty_report() -> dict[str, Any]:
             "compaction_summary": 0,
             "automatic_retry": 0,
         },
+        "item_counts": {
+            "ordinary_overflow": None,
+            "compaction_summary": None,
+            "automatic_retry": None,
+        },
+        "compaction_delta": None,
         "order": [],
         "reactive_compaction": False,
         "passed": False,
