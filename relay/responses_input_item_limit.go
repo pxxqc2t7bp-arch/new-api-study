@@ -1,14 +1,15 @@
 package relay
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 
-	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -25,7 +26,7 @@ const (
 )
 
 type responsesInputItemLimitControl struct {
-	raw     string
+	values  []string
 	present bool
 }
 
@@ -51,7 +52,8 @@ func isNativeArkResponsesURL(rawURL string) bool {
 		return false
 	}
 
-	labels := strings.Split(strings.ToLower(parsedURL.Hostname()), ".")
+	host := strings.TrimSuffix(strings.ToLower(parsedURL.Hostname()), ".")
+	labels := strings.Split(host, ".")
 	path := strings.TrimSuffix(parsedURL.EscapedPath(), "/")
 	return len(labels) == 4 &&
 		labels[0] == "ark" &&
@@ -62,15 +64,34 @@ func isNativeArkResponsesURL(rawURL string) bool {
 }
 
 func countResponsesInputItems(raw json.RawMessage) (count int, isArray bool, err error) {
-	if common.GetJsonType(raw) != "array" {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
 		return 0, false, nil
 	}
 
-	var items []json.RawMessage
-	if err := common.Unmarshal(raw, &items); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	if _, err := decoder.Token(); err != nil {
 		return 0, true, err
 	}
-	return len(items), true, nil
+
+	var item json.RawMessage
+	for decoder.More() {
+		if err := decoder.Decode(&item); err != nil {
+			return count, true, err
+		}
+		count++
+		item = item[:0]
+	}
+	if _, err := decoder.Token(); err != nil {
+		return count, true, err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("unexpected JSON token after input array")
+		}
+		return count, true, err
+	}
+	return count, true, nil
 }
 
 func enforceArkResponsesInputItemLimit(
@@ -79,23 +100,21 @@ func enforceArkResponsesInputItemLimit(
 	requestURL string,
 	request *dto.OpenAIResponsesRequest,
 ) *types.NewAPIError {
-	controlValue, captured := c.Get(responsesInputItemLimitContextKey)
-	var control responsesInputItemLimitControl
-	if captured {
-		control = controlValue.(responsesInputItemLimitControl)
-	} else {
-		if c.Request != nil {
-			canonicalHeader := http.CanonicalHeaderKey(responsesInputItemSoftLimitHeader)
-			values, present := c.Request.Header[canonicalHeader]
-			control.present = present
-			if len(values) > 0 {
-				control.raw = values[0]
+	controlValue, _ := c.Get(responsesInputItemLimitContextKey)
+	control, captured := controlValue.(responsesInputItemLimitControl)
+	if c.Request != nil {
+		for key, values := range c.Request.Header {
+			if strings.EqualFold(key, responsesInputItemSoftLimitHeader) {
+				if !captured {
+					control.present = true
+					control.values = append(control.values, values...)
+				}
+				delete(c.Request.Header, key)
 			}
 		}
-		c.Set(responsesInputItemLimitContextKey, control)
 	}
-	if c.Request != nil {
-		c.Request.Header.Del(responsesInputItemSoftLimitHeader)
+	if !captured {
+		c.Set(responsesInputItemLimitContextKey, control)
 	}
 
 	if !isNativeArkResponsesURL(requestURL) {
@@ -105,14 +124,18 @@ func enforceArkResponsesInputItemLimit(
 	var limit int
 	var source string
 	var err error
-	if control.present && control.raw == "" {
+	if control.present && (len(control.values) != 1 || control.values[0] == "") {
 		err = fmt.Errorf(
 			"%s must be an integer from 1 through %d",
 			responsesInputItemSoftLimitHeader,
 			arkResponsesHardInputItemLimit,
 		)
 	} else {
-		limit, source, err = resolveResponsesInputItemLimit(control.raw)
+		rawLimit := ""
+		if control.present {
+			rawLimit = control.values[0]
+		}
+		limit, source, err = resolveResponsesInputItemLimit(rawLimit)
 	}
 	if err != nil {
 		return types.WithOpenAIError(types.OpenAIError{

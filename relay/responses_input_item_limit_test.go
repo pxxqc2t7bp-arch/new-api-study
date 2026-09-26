@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -64,9 +65,11 @@ func TestIsNativeArkResponsesURL(t *testing.T) {
 	}{
 		{rawURL: "https://ark.cn-beijing.volces.com/api/v3/responses", want: true},
 		{rawURL: "https://ARK.CN-BEIJING.VOLCES.COM/api/v3/responses", want: true},
+		{rawURL: "https://ARK.CN-BEIJING.VOLCES.COM./api/v3/responses", want: true},
 		{rawURL: "https://ark.cn-beijing.volces.com/api/coding/v3/responses", want: true},
 		{rawURL: "https://ark.cn-beijing.volces.com/api/v3/chat/completions", want: false},
 		{rawURL: "https://ark.cn-beijing.volces.com.example/v1/responses", want: false},
+		{rawURL: "https://ark.cn-beijing.volces.com.example./v1/responses", want: false},
 		{rawURL: "https://fallback.example/v1/responses", want: false},
 	}
 
@@ -75,6 +78,74 @@ func TestIsNativeArkResponsesURL(t *testing.T) {
 			assert.Equal(t, tt.want, isNativeArkResponsesURL(tt.rawURL))
 		})
 	}
+}
+
+func TestCountResponsesInputItems(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       json.RawMessage
+		wantCount   int
+		wantIsArray bool
+		wantErr     bool
+	}{
+		{
+			name:  "scalar bypass",
+			input: json.RawMessage(`"hello"`),
+		},
+		{
+			name:        "array with trailing whitespace",
+			input:       json.RawMessage("[{}, null]\n\t"),
+			wantCount:   2,
+			wantIsArray: true,
+		},
+		{
+			name:        "malformed array",
+			input:       json.RawMessage(`[{},`),
+			wantIsArray: true,
+			wantErr:     true,
+		},
+		{
+			name:        "additional token after array",
+			input:       json.RawMessage(`[{}] true`),
+			wantIsArray: true,
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			count, isArray, err := countResponsesInputItems(tt.input)
+
+			assert.Equal(t, tt.wantIsArray, isArray)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantCount, count)
+		})
+	}
+}
+
+func TestCountResponsesInputItemsStreamsLargeArrayToExactEnd(t *testing.T) {
+	const itemCount = 100_000
+
+	var input bytes.Buffer
+	input.Grow(itemCount*2 + 1)
+	input.WriteByte('[')
+	for index := 0; index < itemCount; index++ {
+		if index > 0 {
+			input.WriteByte(',')
+		}
+		input.WriteByte('0')
+	}
+	input.WriteByte(']')
+
+	count, isArray, err := countResponsesInputItems(input.Bytes())
+
+	require.NoError(t, err)
+	assert.True(t, isArray)
+	assert.Equal(t, itemCount, count)
 }
 
 func TestArkResponsesInputItemLimit(t *testing.T) {
@@ -276,6 +347,54 @@ func TestPrepareResponsesRequestItemLimit(t *testing.T) {
 		assert.Empty(t, c.Request.Header.Get(responsesInputItemSoftLimitHeaderForTest))
 	})
 
+	for _, tt := range []struct {
+		name    string
+		headers http.Header
+	}{
+		{
+			name: "present header with zero values",
+			headers: http.Header{
+				strings.ToLower(responsesInputItemSoftLimitHeaderForTest): nil,
+			},
+		},
+		{
+			name: "multiple values across differently cased keys",
+			headers: http.Header{
+				http.CanonicalHeaderKey(responsesInputItemSoftLimitHeaderForTest): {"1000"},
+				strings.ToLower(responsesInputItemSoftLimitHeaderForTest):         {"900"},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := &responsesInputFailReader{}
+			c, info, request := newResponsesInputItemLimitContext(
+				t,
+				responsesInputItems(1),
+				reader,
+				constant.ChannelTypeVolcEngine,
+				"https://ark.cn-beijing.volces.com/api/v3",
+				dto.ChannelOtherSettings{},
+			)
+			for key, values := range tt.headers {
+				c.Request.Header[key] = values
+			}
+
+			adaptor, body, closer, apiErr := PrepareResponsesRequest(c, info, request)
+
+			assert.Nil(t, adaptor)
+			assert.Nil(t, body)
+			assert.Nil(t, closer)
+			require.NotNil(t, apiErr)
+			assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+			assert.Equal(t, types.ErrorCodeInvalidRequest, apiErr.GetErrorCode())
+			assert.True(t, types.IsSkipRetryError(apiErr))
+			assert.False(t, reader.read, "invalid header must be rejected before body storage is read")
+			for key := range c.Request.Header {
+				assert.False(t, strings.EqualFold(key, responsesInputItemSoftLimitHeaderForTest))
+			}
+		})
+	}
+
 	t.Run("advanced custom native Ark route is guarded", func(t *testing.T) {
 		reader := &responsesInputFailReader{}
 		c, info, request := newResponsesInputItemLimitContext(
@@ -315,7 +434,8 @@ func TestPrepareResponsesRequestItemLimit(t *testing.T) {
 			"https://fallback.example",
 			dto.ChannelOtherSettings{},
 		)
-		c.Request.Header.Set(responsesInputItemSoftLimitHeaderForTest, "900")
+		lowercaseHeader := strings.ToLower(responsesInputItemSoftLimitHeaderForTest)
+		c.Request.Header[lowercaseHeader] = []string{"900"}
 		t.Cleanup(func() {
 			common.CleanupBodyStorage(c)
 		})
@@ -330,6 +450,7 @@ func TestPrepareResponsesRequestItemLimit(t *testing.T) {
 		require.NoError(t, firstCloser.Close())
 		assert.Equal(t, rawBody, got)
 		assert.Empty(t, c.Request.Header.Get(responsesInputItemSoftLimitHeaderForTest))
+		assert.NotContains(t, c.Request.Header, lowercaseHeader)
 
 		common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeVolcEngine)
 		common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "https://ark.cn-beijing.volces.com/api/v3")
@@ -345,6 +466,23 @@ func TestPrepareResponsesRequestItemLimit(t *testing.T) {
 		assert.Nil(t, secondCloser)
 		requireResponsesInputItemLimitError(t, apiErr, 901, 900)
 		assert.Empty(t, c.Request.Header.Get(responsesInputItemSoftLimitHeaderForTest))
+		assert.NotContains(t, c.Request.Header, lowercaseHeader)
+	})
+
+	t.Run("unexpected private context value does not panic", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		c.Set(responsesInputItemLimitContextKey, "unexpected value type")
+
+		apiErr := enforceArkResponsesInputItemLimit(
+			c,
+			&relaycommon.RelayInfo{},
+			"https://ark.cn-beijing.volces.com/api/v3/responses",
+			&dto.OpenAIResponsesRequest{Input: json.RawMessage(`[{}]`)},
+		)
+
+		require.Nil(t, apiErr)
 	})
 
 	for _, tt := range []struct {
@@ -399,6 +537,60 @@ func TestPrepareResponsesRequestItemLimit(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, rawBody, got)
 			assert.Empty(t, c.Request.Header.Get(responsesInputItemSoftLimitHeaderForTest))
+		})
+	}
+}
+
+func TestPrepareResponsesRequestGetRequestURLFailureAllowsRetry(t *testing.T) {
+	tests := []struct {
+		name    string
+		baseURL string
+		routes  []dto.AdvancedCustomRoute
+	}{
+		{
+			name:    "invalid base URL",
+			baseURL: "://invalid",
+			routes: []dto.AdvancedCustomRoute{{
+				IncomingPath: "/v1/responses",
+				UpstreamPath: "/responses",
+				Converter:    relayconvert.ConverterNone,
+			}},
+		},
+		{
+			name:    "no matching route",
+			baseURL: "https://upstream.example",
+			routes: []dto.AdvancedCustomRoute{{
+				IncomingPath: "/v1/chat/completions",
+				UpstreamPath: "/chat/completions",
+				Converter:    relayconvert.ConverterNone,
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := &responsesInputFailReader{}
+			c, info, request := newResponsesInputItemLimitContext(
+				t,
+				responsesInputItems(1),
+				reader,
+				constant.ChannelTypeAdvancedCustom,
+				tt.baseURL,
+				dto.ChannelOtherSettings{
+					AdvancedCustom: &dto.AdvancedCustomConfig{Routes: tt.routes},
+				},
+			)
+
+			adaptor, body, closer, apiErr := PrepareResponsesRequest(c, info, request)
+
+			assert.Nil(t, adaptor)
+			assert.Nil(t, body)
+			assert.Nil(t, closer)
+			require.NotNil(t, apiErr)
+			assert.Equal(t, http.StatusInternalServerError, apiErr.StatusCode)
+			assert.Equal(t, types.ErrorCodeConvertRequestFailed, apiErr.GetErrorCode())
+			assert.False(t, types.IsSkipRetryError(apiErr))
+			assert.False(t, reader.read, "URL preflight failure must happen before body storage is read")
 		})
 	}
 }

@@ -51,7 +51,7 @@ func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *d
 	adaptor.Init(info)
 	requestURL, err := adaptor.GetRequestURL(info)
 	if err != nil {
-		return nil, nil, nil, newConvertRequestFailedError(c, info, err)
+		return nil, nil, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed)
 	}
 	if apiErr := enforceArkResponsesInputItemLimit(c, info, requestURL, request); apiErr != nil {
 		return nil, nil, nil, apiErr
