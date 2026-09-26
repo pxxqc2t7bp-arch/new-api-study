@@ -269,14 +269,14 @@ func TestPrepareResponsesRequestItemLimit(t *testing.T) {
 	})
 
 	t.Run("soft limit persists across channel attempts", func(t *testing.T) {
-		input := responsesInputItems(900)
+		input := responsesInputItems(901)
 		rawBody := responsesInputRequestBody(input)
 		c, info, request := newResponsesInputItemLimitContext(
 			t,
 			input,
 			bytes.NewReader(rawBody),
 			constant.ChannelTypeVolcEngine,
-			"https://ark.cn-beijing.volces.com/api/v3",
+			"https://fallback.example",
 			dto.ChannelOtherSettings{},
 		)
 		c.Request.Header.Set(responsesInputItemSoftLimitHeaderForTest, "900")
@@ -295,7 +295,8 @@ func TestPrepareResponsesRequestItemLimit(t *testing.T) {
 		assert.Equal(t, rawBody, got)
 		assert.Empty(t, c.Request.Header.Get(responsesInputItemSoftLimitHeaderForTest))
 
-		request.Input = responsesInputItems(901)
+		common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeVolcEngine)
+		common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "https://ark.cn-beijing.volces.com/api/v3")
 		adaptor, secondBody, secondCloser, apiErr := PrepareResponsesRequest(c, info, request)
 		if secondCloser != nil {
 			t.Cleanup(func() {
