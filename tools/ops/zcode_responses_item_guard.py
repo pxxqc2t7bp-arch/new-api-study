@@ -454,42 +454,77 @@ def _transaction_lock(
             raise RuntimeError("backup root is not a directory")
         if stat.S_IMODE(root_status.st_mode) != 0o700:
             raise RuntimeError("backup root mode verification failed")
-    lock_directory = _transaction_lock_directory(root)
-    _ensure_private_directory(lock_directory)
-    lock_path = lock_directory / "transaction.lock"
-    flags = (
-        os.O_RDWR
+    root_flags = (
+        os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    lock_created = False
+    root_descriptor = os.open(root, root_flags)
     try:
-        descriptor = os.open(
-            lock_path,
-            flags | os.O_CREAT | os.O_EXCL,
-            0o600,
-        )
-        lock_created = True
-    except FileExistsError:
-        descriptor = os.open(lock_path, flags)
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise RuntimeError("transaction lock is not a regular file")
-        os.fchmod(descriptor, 0o600)
-        if lock_created:
-            _fsync_directory(lock_directory)
+        opened_root_status = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(opened_root_status.st_mode):
+            raise RuntimeError("backup root is not a directory")
+        if (
+            not create_root
+            and stat.S_IMODE(opened_root_status.st_mode) != 0o700
+        ):
+            raise RuntimeError("backup root mode verification failed")
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(
+                root_descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
         except BlockingIOError as exc:
             raise RuntimeError(
                 "configuration transaction is already active"
             ) from exc
         try:
-            yield
+            lock_directory = _transaction_lock_directory(root)
+            _ensure_private_directory(lock_directory)
+            lock_path = lock_directory / "transaction.lock"
+            flags = (
+                os.O_RDWR
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            lock_created = False
+            try:
+                descriptor = os.open(
+                    lock_path,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                lock_created = True
+            except FileExistsError:
+                descriptor = os.open(lock_path, flags)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise RuntimeError(
+                        "transaction lock is not a regular file"
+                    )
+                os.fchmod(descriptor, 0o600)
+                if lock_created:
+                    _fsync_directory(lock_directory)
+                try:
+                    fcntl.flock(
+                        descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError as exc:
+                    raise RuntimeError(
+                        "configuration transaction is already active"
+                    ) from exc
+                try:
+                    yield
+                finally:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            fcntl.flock(root_descriptor, fcntl.LOCK_UN)
     finally:
-        os.close(descriptor)
+        os.close(root_descriptor)
 
 
 def create_backup(

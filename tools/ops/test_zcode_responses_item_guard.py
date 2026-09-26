@@ -1006,6 +1006,198 @@ class ConfigTransactionTest(unittest.TestCase):
             lock_identity,
         )
 
+    def test_root_lock_blocks_transaction_during_lock_path_cas(self):
+        with guard._transaction_lock(self.backup_root):
+            pass
+        lock_directory = (
+            self.backup_root / ".zcode-responses-item-guard"
+        )
+        lock_path = lock_directory / "transaction.lock"
+        lock_bytes = lock_path.read_bytes()
+        lock_identity = (
+            lock_path.stat().st_dev,
+            lock_path.stat().st_ino,
+        )
+        first_output_parent = self.root / "final-output"
+        first_output_parent.mkdir()
+        first_output = first_output_parent / "transaction.lock"
+        first_output.write_bytes(b"ordinary output before validation\n")
+        third_party = b'{"third_party":"must-not-win"}\n'
+        output_redirected = threading.Event()
+        cas_window_open = threading.Event()
+        release_cas_window = threading.Event()
+        second_entered = threading.Event()
+        first_errors = []
+        second_errors = []
+        cas_after_final_validation = []
+        output_checks = 0
+        real_transaction_lock = guard._transaction_lock
+        real_verify_output_state = guard._verify_output_state
+        real_rename_noreplace = guard._rename_noreplace
+
+        @contextmanager
+        def track_transaction_lock(root, **kwargs):
+            with real_transaction_lock(root, **kwargs):
+                if threading.current_thread().name == "second-apply":
+                    second_entered.set()
+                    self.paths[0].write_bytes(third_party)
+                    self.paths[0].chmod(self.original_modes[0])
+                    raise AssertionError(
+                        "second transaction entered critical section"
+                    )
+                yield
+
+        def redirect_after_final_output_validation(snapshot, *, updated):
+            nonlocal output_checks
+            result = real_verify_output_state(snapshot, updated=updated)
+            if (
+                threading.current_thread().name == "first-apply"
+                and snapshot["path"] == first_output
+                and not updated
+            ):
+                output_checks += 1
+                if output_checks == 2:
+                    first_output.unlink()
+                    first_output_parent.rmdir()
+                    first_output_parent.symlink_to(
+                        lock_directory,
+                        target_is_directory=True,
+                    )
+                    output_redirected.set()
+            return result
+
+        def block_first_lock_path_move(source, destination):
+            result = real_rename_noreplace(source, destination)
+            if (
+                threading.current_thread().name == "first-apply"
+                and source == first_output
+                and destination.name.startswith(
+                    ".transaction.lock.displaced."
+                )
+            ):
+                cas_after_final_validation.append(
+                    output_redirected.is_set()
+                )
+                cas_window_open.set()
+                if not release_cas_window.wait(timeout=5):
+                    raise RuntimeError("test timed out releasing CAS window")
+            return result
+
+        def run_first_apply():
+            try:
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120024Z",
+                    output_path=first_output,
+                )
+            except BaseException as exc:
+                first_errors.append(exc)
+
+        def run_second_apply():
+            try:
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120025Z",
+                    output_path=self.root / "second-report.json",
+                )
+            except BaseException as exc:
+                second_errors.append(exc)
+
+        with mock.patch.object(
+            guard,
+            "_transaction_lock",
+            side_effect=track_transaction_lock,
+        ), mock.patch.object(
+            guard,
+            "_verify_output_state",
+            side_effect=redirect_after_final_output_validation,
+        ), mock.patch.object(
+            guard,
+            "_rename_noreplace",
+            side_effect=block_first_lock_path_move,
+        ):
+            first_worker = threading.Thread(
+                target=run_first_apply,
+                name="first-apply",
+            )
+            second_worker = threading.Thread(
+                target=run_second_apply,
+                name="second-apply",
+            )
+            first_worker.start()
+            self.assertTrue(cas_window_open.wait(timeout=5))
+            self.assertFalse(lock_path.exists())
+            try:
+                second_worker.start()
+                second_worker.join(timeout=5)
+                self.assertFalse(second_worker.is_alive())
+            finally:
+                release_cas_window.set()
+                first_worker.join(timeout=5)
+                if second_worker.is_alive():
+                    second_worker.join(timeout=5)
+
+        self.assertFalse(first_worker.is_alive())
+        self.assertFalse(second_worker.is_alive())
+        self.assertEqual(output_checks, 2)
+        self.assertEqual(cas_after_final_validation, [True])
+        self.assertFalse(second_entered.is_set())
+        self.assertEqual(len(second_errors), 1)
+        self.assertIsInstance(second_errors[0], RuntimeError)
+        self.assertRegex(
+            str(second_errors[0]),
+            "configuration transaction is already active",
+        )
+        self.assertFalse((self.root / "second-report.json").exists())
+        self.assertEqual(len(first_errors), 1)
+        self.assertIsInstance(first_errors[0], RuntimeError)
+        self.assertRegex(str(first_errors[0]), "configuration apply failed")
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+        self.assertNotEqual(self.paths[0].read_bytes(), third_party)
+        self.assertEqual(lock_path.read_bytes(), lock_bytes)
+        self.assertEqual(
+            (lock_path.stat().st_dev, lock_path.stat().st_ino),
+            lock_identity,
+        )
+
+    def test_transaction_root_lock_release_after_error_allows_later_transaction(
+        self,
+    ):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "injected transaction failure",
+        ):
+            with guard._transaction_lock(self.backup_root):
+                raise RuntimeError("injected transaction failure")
+
+        entered = threading.Event()
+        errors = []
+
+        def run_later_transaction():
+            try:
+                with guard._transaction_lock(
+                    self.backup_root,
+                    create_root=False,
+                ):
+                    entered.set()
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=run_later_transaction)
+        worker.start()
+        worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(entered.is_set())
+        self.assertEqual(errors, [])
+
     def test_backup_stops_before_copying_a_drifted_config(self):
         real_write_private_file = guard._write_private_file
         third_party = b'{"third_party":"during-backup"}\n'
