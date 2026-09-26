@@ -173,8 +173,28 @@ def _open_parent_directory(path: Path) -> Iterator[tuple[int, str]]:
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    descriptor = os.open(path.parent, flags)
+    parent = path.parent
+    if path.is_absolute():
+        descriptor = os.open(path.anchor, flags)
+        components = parent.parts[1:]
+    else:
+        descriptor = os.open(".", flags)
+        components = parent.parts
     try:
+        for component in components:
+            if component in ("", "."):
+                continue
+            if component == "..":
+                raise ValueError(
+                    "path must not contain parent directory traversal"
+                )
+            next_descriptor = os.open(
+                component,
+                flags,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
         yield descriptor, path.name
     finally:
         os.close(descriptor)
@@ -185,6 +205,11 @@ def _rename_noreplace(
     source_name: str,
     destination_dir_fd: int,
     destination_name: str,
+    *,
+    expected_source_state: Optional[
+        tuple[tuple[int, int], bytes, int]
+    ] = None,
+    source_path: Optional[Path] = None,
 ) -> None:
     """Atomically rename without replacing an existing destination."""
     libc = ctypes.CDLL(None, use_errno=True)
@@ -192,21 +217,7 @@ def _rename_noreplace(
     destination_raw = os.fsencode(destination_name)
     if sys.platform == "darwin":
         rename_call = libc.renameatx_np
-        rename_call.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        rename_call.restype = ctypes.c_int
-        result = rename_call(
-            source_dir_fd,
-            source_raw,
-            destination_dir_fd,
-            destination_raw,
-            0x00000004,
-        )
+        rename_flag = 0x00000004
     elif sys.platform.startswith("linux"):
         try:
             rename_call = libc.renameat2
@@ -214,23 +225,36 @@ def _rename_noreplace(
             raise RuntimeError(
                 "atomic no-replace rename is unavailable"
             ) from exc
-        rename_call.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        rename_call.restype = ctypes.c_int
-        result = rename_call(
-            source_dir_fd,
-            source_raw,
-            destination_dir_fd,
-            destination_raw,
-            0x00000001,
-        )
+        rename_flag = 0x00000001
     else:
         raise RuntimeError("atomic no-replace rename is unavailable")
+    rename_call.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    rename_call.restype = ctypes.c_int
+    if expected_source_state is not None:
+        observed_source_state = _observed_file_state_at(
+            source_dir_fd,
+            source_name,
+            source_path or Path(source_name),
+            "target",
+        )
+        if observed_source_state != expected_source_state:
+            raise RuntimeError(
+                "target drift detected: %s"
+                % (source_path or source_name)
+            )
+    result = rename_call(
+        source_dir_fd,
+        source_raw,
+        destination_dir_fd,
+        destination_raw,
+        rename_flag,
+    )
     if result == 0:
         return
     error_number = ctypes.get_errno()
@@ -364,6 +388,8 @@ def _move_target_if_matches(
             target_name,
             parent_dir_fd,
             displaced_name,
+            expected_source_state=expected_state,
+            source_path=path,
         )
     except BaseException as exc:
         move_error = exc
@@ -542,6 +568,30 @@ def atomic_write(
                             )
                         except FileNotFoundError:
                             pass
+                        except BaseException:
+                            replacement_displaced_name = (
+                                _move_target_if_matches(
+                                    parent_dir_fd,
+                                    target_name,
+                                    path,
+                                    (
+                                        replacement_identity,
+                                        data,
+                                        mode,
+                                    ),
+                                )
+                            )
+                            _restore_displaced(
+                                parent_dir_fd,
+                                displaced_name,
+                                target_name,
+                            )
+                            os.unlink(
+                                replacement_displaced_name,
+                                dir_fd=parent_dir_fd,
+                            )
+                            os.fsync(parent_dir_fd)
+                            raise
             os.fsync(parent_dir_fd)
         finally:
             if descriptor_open:

@@ -109,6 +109,7 @@ def rename_noreplace_for_test(
     source_name,
     destination_dir_fd,
     destination_name,
+    **_kwargs,
 ):
     try:
         os.stat(
@@ -367,7 +368,7 @@ class ApplyGuardTest(unittest.TestCase):
 class ConfigTransactionTest(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary_directory.name)
+        self.root = Path(self.temporary_directory.name).resolve()
         self.home = self.root / "home"
         self.paths = [
             self.home / ".zcode" / "v2" / "config.json",
@@ -810,6 +811,7 @@ class ConfigTransactionTest(unittest.TestCase):
             source_name,
             destination_dir_fd,
             destination_name,
+            **kwargs,
         ):
             nonlocal target_write_count
             source_raw = read_bytes_at(source_dir_fd, source_name)
@@ -830,6 +832,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 source_name,
                 destination_dir_fd,
                 destination_name,
+                **kwargs,
             )
 
         with mock.patch.object(
@@ -1220,6 +1223,214 @@ class ConfigTransactionTest(unittest.TestCase):
             lock_identity,
         )
 
+    def test_output_ancestor_redirect_never_moves_transaction_lock(self):
+        with guard._transaction_lock(self.backup_root):
+            pass
+        lock_directory = (
+            self.backup_root / ".zcode-responses-item-guard"
+        )
+        lock_path = lock_directory / "transaction.lock"
+        lock_bytes = lock_path.read_bytes()
+        lock_identity = (
+            lock_path.stat().st_dev,
+            lock_path.stat().st_ino,
+        )
+        output_ancestor = self.root / "output-ancestor"
+        output_parent = (
+            output_ancestor / ".zcode-responses-item-guard"
+        )
+        output_parent.mkdir(parents=True)
+        output = output_parent / "transaction.lock"
+        original_output = b"ordinary output before redirect\n"
+        output.write_bytes(original_output)
+        output.chmod(0o640)
+        output_snapshot = guard._snapshot_output(output)
+        expected_state = (
+            output_snapshot["identity"],
+            output_snapshot["original"],
+            output_snapshot["mode"],
+        )
+        relocated_ancestor = self.root / "relocated-output-ancestor"
+        output_ancestor.rename(relocated_ancestor)
+        output_ancestor.symlink_to(
+            self.backup_root,
+            target_is_directory=True,
+        )
+        redirected_moves = []
+        real_rename_noreplace = guard._rename_noreplace
+
+        def track_redirected_move(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+            **kwargs,
+        ):
+            if (
+                dir_fd_entry_matches_path(
+                    source_dir_fd,
+                    source_name,
+                    lock_path,
+                )
+                and destination_name.startswith(
+                    ".transaction.lock.displaced."
+                )
+            ):
+                redirected_moves.append(destination_name)
+            return real_rename_noreplace(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+                **kwargs,
+            )
+
+        with mock.patch.object(
+            guard,
+            "_rename_noreplace",
+            side_effect=track_redirected_move,
+        ):
+            with self.assertRaises((OSError, RuntimeError)):
+                guard._write_report(
+                    output,
+                    {"change": "must-fail-closed"},
+                    expected_state=expected_state,
+                )
+
+        self.assertEqual(redirected_moves, [])
+        relocated_output = (
+            relocated_ancestor
+            / ".zcode-responses-item-guard"
+            / "transaction.lock"
+        )
+        self.assertEqual(relocated_output.read_bytes(), original_output)
+        self.assertEqual(stat.S_IMODE(relocated_output.stat().st_mode), 0o640)
+        self.assertEqual(lock_path.read_bytes(), lock_bytes)
+        self.assertEqual(
+            (lock_path.stat().st_dev, lock_path.stat().st_ino),
+            lock_identity,
+        )
+        self.assertEqual(
+            list(lock_directory.glob(".transaction.lock.displaced.*")),
+            [],
+        )
+
+    def test_directory_replacement_is_not_moved_or_left_displaced(self):
+        output = self.root / "report.json"
+        original_output = b'{"existing":"report"}\n'
+        output.write_bytes(original_output)
+        output.chmod(0o640)
+        output_snapshot = guard._snapshot_output(output)
+        expected_state = (
+            output_snapshot["identity"],
+            output_snapshot["original"],
+            output_snapshot["mode"],
+        )
+        preserved_original = self.root / "attacker-preserved-report.json"
+        replacement_identities = []
+        moved_exceptional_objects = []
+        injected = False
+        real_rename_noreplace = guard._rename_noreplace
+
+        def replace_with_directory_at_target_move(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+            **kwargs,
+        ):
+            nonlocal injected
+            is_target_move = (
+                not injected
+                and dir_fd_entry_matches_path(
+                    source_dir_fd,
+                    source_name,
+                    output,
+                )
+                and destination_name.startswith(
+                    ".report.json.displaced."
+                )
+            )
+            if not is_target_move:
+                return real_rename_noreplace(
+                    source_dir_fd,
+                    source_name,
+                    destination_dir_fd,
+                    destination_name,
+                    **kwargs,
+                )
+
+            injected = True
+            os.rename(
+                source_name,
+                preserved_original.name,
+                src_dir_fd=source_dir_fd,
+                dst_dir_fd=source_dir_fd,
+            )
+            os.mkdir(source_name, dir_fd=source_dir_fd)
+            first_replacement = os.stat(
+                source_name,
+                dir_fd=source_dir_fd,
+                follow_symlinks=False,
+            )
+            replacement_identities.append(
+                (first_replacement.st_dev, first_replacement.st_ino)
+            )
+            try:
+                return real_rename_noreplace(
+                    source_dir_fd,
+                    source_name,
+                    destination_dir_fd,
+                    destination_name,
+                    **kwargs,
+                )
+            finally:
+                try:
+                    os.stat(
+                        source_name,
+                        dir_fd=source_dir_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    moved_exceptional_objects.append(
+                        replacement_identities[-1]
+                    )
+                    os.mkdir(source_name, dir_fd=source_dir_fd)
+                    reoccupying = os.stat(
+                        source_name,
+                        dir_fd=source_dir_fd,
+                        follow_symlinks=False,
+                    )
+                    replacement_identities.append(
+                        (reoccupying.st_dev, reoccupying.st_ino)
+                    )
+
+        with mock.patch.object(
+            guard,
+            "_rename_noreplace",
+            side_effect=replace_with_directory_at_target_move,
+        ):
+            with self.assertRaises((OSError, RuntimeError)):
+                guard._write_report(
+                    output,
+                    {"change": "must-fail-closed"},
+                    expected_state=expected_state,
+                )
+
+        self.assertTrue(injected)
+        self.assertEqual(moved_exceptional_objects, [])
+        output_status = output.lstat()
+        self.assertTrue(stat.S_ISDIR(output_status.st_mode))
+        self.assertEqual(
+            (output_status.st_dev, output_status.st_ino),
+            replacement_identities[-1],
+        )
+        self.assertEqual(preserved_original.read_bytes(), original_output)
+        self.assertEqual(
+            list(self.root.glob(".report.json.displaced.*")),
+            [],
+        )
+
     def test_output_parent_redirect_cannot_move_locked_backup_root(self):
         with guard._transaction_lock(self.backup_root):
             pass
@@ -1530,6 +1741,7 @@ class ConfigTransactionTest(unittest.TestCase):
             source_name,
             destination_dir_fd,
             destination_name,
+            **kwargs,
         ):
             nonlocal interrupted
             is_first_config_commit = (
@@ -1546,6 +1758,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 source_name,
                 destination_dir_fd,
                 destination_name,
+                **kwargs,
             )
             if is_first_config_commit and not interrupted:
                 interrupted = True
@@ -1577,6 +1790,64 @@ class ConfigTransactionTest(unittest.TestCase):
         self.assertEqual(
             [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
             self.original_modes,
+        )
+
+    def test_displaced_cleanup_failure_restores_without_secret_temp(self):
+        real_unlink = guard.os.unlink
+        cleanup_failures = 0
+
+        def fail_first_committed_displaced_cleanup(
+            name,
+            *args,
+            **kwargs,
+        ):
+            nonlocal cleanup_failures
+            directory_fd = kwargs.get("dir_fd")
+            targets_first_config_parent = False
+            if directory_fd is not None:
+                directory_status = os.fstat(directory_fd)
+                parent_status = self.paths[0].parent.stat()
+                targets_first_config_parent = (
+                    directory_status.st_dev,
+                    directory_status.st_ino,
+                ) == (
+                    parent_status.st_dev,
+                    parent_status.st_ino,
+                )
+            if (
+                cleanup_failures == 0
+                and targets_first_config_parent
+                and os.fspath(name).startswith(
+                    ".config.json.displaced."
+                )
+            ):
+                cleanup_failures += 1
+                raise OSError("injected displaced cleanup failure")
+            return real_unlink(name, *args, **kwargs)
+
+        with mock.patch.object(
+            guard.os,
+            "unlink",
+            side_effect=fail_first_committed_displaced_cleanup,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "configuration apply failed",
+            ):
+                self.execute(apply=True)
+
+        self.assertEqual(cleanup_failures, 1)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+        self.assertEqual(
+            [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
+            self.original_modes,
+        )
+        self.assertEqual(
+            list(self.home.rglob(".*.displaced.*")),
+            [],
         )
 
     def test_readback_validation_failure_rolls_back_both_files(self):
@@ -1795,6 +2066,7 @@ class ConfigTransactionTest(unittest.TestCase):
             source_name,
             destination_dir_fd,
             destination_name,
+            **kwargs,
         ):
             nonlocal interrupted
             is_output_commit = dir_fd_entry_matches_path(
@@ -1807,6 +2079,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 source_name,
                 destination_dir_fd,
                 destination_name,
+                **kwargs,
             )
             if is_output_commit and not interrupted:
                 interrupted = True
@@ -1892,6 +2165,7 @@ class ConfigTransactionTest(unittest.TestCase):
             source_name,
             destination_dir_fd,
             destination_name,
+            **kwargs,
         ):
             nonlocal drift_injected
             if (
@@ -1909,6 +2183,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 source_name,
                 destination_dir_fd,
                 destination_name,
+                **kwargs,
             )
 
         with mock.patch.object(
@@ -2391,6 +2666,7 @@ class ConfigTransactionTest(unittest.TestCase):
             source_name,
             destination_dir_fd,
             destination_name,
+            **kwargs,
         ):
             nonlocal drift_injected
             if (
@@ -2408,6 +2684,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 source_name,
                 destination_dir_fd,
                 destination_name,
+                **kwargs,
             )
 
         with mock.patch.object(
@@ -2454,6 +2731,7 @@ class ConfigTransactionTest(unittest.TestCase):
             source_name,
             destination_dir_fd,
             destination_name,
+            **kwargs,
         ):
             nonlocal v2_vacates, second_rollback_commit_failed
             if dir_fd_entry_matches_path(
@@ -2481,6 +2759,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 source_name,
                 destination_dir_fd,
                 destination_name,
+                **kwargs,
             )
 
         with mock.patch.object(
@@ -2551,6 +2830,7 @@ class ConfigTransactionTest(unittest.TestCase):
             source_name,
             destination_dir_fd,
             destination_name,
+            **kwargs,
         ):
             nonlocal rollback_write_count
             is_target = any(
@@ -2572,6 +2852,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 source_name,
                 destination_dir_fd,
                 destination_name,
+                **kwargs,
             )
 
         with mock.patch.object(
@@ -2673,6 +2954,7 @@ class ConfigTransactionTest(unittest.TestCase):
             source_name,
             destination_dir_fd,
             destination_name,
+            **kwargs,
         ):
             nonlocal interrupted
             is_first_config_commit = (
@@ -2689,6 +2971,7 @@ class ConfigTransactionTest(unittest.TestCase):
                 source_name,
                 destination_dir_fd,
                 destination_name,
+                **kwargs,
             )
             if is_first_config_commit and not interrupted:
                 interrupted = True
