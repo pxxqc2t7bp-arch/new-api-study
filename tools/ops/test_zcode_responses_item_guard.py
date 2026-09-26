@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -86,6 +87,21 @@ class FailingStdout:
 
     def write(self, value):
         self.write_count += 1
+        raise self.error
+
+
+class FlushFailingStdout:
+    def __init__(self, error):
+        self.error = error
+        self.write_count = 0
+        self.flush_count = 0
+
+    def write(self, value):
+        self.write_count += 1
+        return len(value)
+
+    def flush(self):
+        self.flush_count += 1
         raise self.error
 
 
@@ -369,6 +385,116 @@ class ConfigTransactionTest(unittest.TestCase):
         self.assertEqual(report, self.expected_report("pending"))
         assert_safe_report(self, report)
 
+    def test_output_aliases_are_rejected_before_dry_run_or_apply(self):
+        for apply in (False, True):
+            for alias_kind in ("same-path", "symlink", "hardlink"):
+                with self.subTest(apply=apply, alias=alias_kind):
+                    with tempfile.TemporaryDirectory(
+                        dir=self.root
+                    ) as temporary_directory:
+                        root = Path(temporary_directory)
+                        paths = [
+                            root / ".zcode" / "v2" / "config.json",
+                            root / ".zcode" / "cli" / "config.json",
+                        ]
+                        for path, config, mode in zip(
+                            paths,
+                            self.originals,
+                            self.original_modes,
+                        ):
+                            write_config(path, config, mode)
+                        if alias_kind == "same-path":
+                            output = paths[0]
+                        else:
+                            output = root / ("%s.json" % alias_kind)
+                            if alias_kind == "symlink":
+                                output.symlink_to(paths[0])
+                            else:
+                                os.link(paths[0], output)
+                        before = [path.read_bytes() for path in paths]
+                        modes = [
+                            stat.S_IMODE(path.stat().st_mode)
+                            for path in paths
+                        ]
+                        backup_root = root / ".zcode" / "backups"
+
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "output path must not alias a configuration path",
+                        ):
+                            guard.execute(
+                                paths,
+                                apply=apply,
+                                backup_root=backup_root,
+                                timestamp="20260926T120010Z",
+                                output_path=output,
+                            )
+
+                        self.assertEqual(
+                            [path.read_bytes() for path in paths],
+                            before,
+                        )
+                        self.assertEqual(
+                            [
+                                stat.S_IMODE(path.stat().st_mode)
+                                for path in paths
+                            ],
+                            modes,
+                        )
+                        self.assertFalse(backup_root.exists())
+
+    def test_config_symlink_is_rejected_before_dry_run_or_apply(self):
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                with tempfile.TemporaryDirectory(
+                    dir=self.root
+                ) as temporary_directory:
+                    root = Path(temporary_directory)
+                    paths = [
+                        root / ".zcode" / "v2" / "config.json",
+                        root / ".zcode" / "cli" / "config.json",
+                    ]
+                    symlink_target = root / "actual-v2-config.json"
+                    write_config(
+                        symlink_target,
+                        self.originals[0],
+                        self.original_modes[0],
+                    )
+                    paths[0].parent.mkdir(parents=True)
+                    paths[0].symlink_to(symlink_target)
+                    write_config(
+                        paths[1],
+                        self.originals[1],
+                        self.original_modes[1],
+                    )
+                    before = [
+                        symlink_target.read_bytes(),
+                        paths[1].read_bytes(),
+                    ]
+                    backup_root = root / ".zcode" / "backups"
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "configuration path is not a regular file",
+                    ):
+                        guard.execute(
+                            paths,
+                            apply=apply,
+                            backup_root=backup_root,
+                            timestamp="20260926T120011Z",
+                            output_path=root / "report.json",
+                        )
+
+                    self.assertTrue(paths[0].is_symlink())
+                    self.assertEqual(
+                        [
+                            symlink_target.read_bytes(),
+                            paths[1].read_bytes(),
+                        ],
+                        before,
+                    )
+                    self.assertFalse(backup_root.exists())
+
     def test_apply_preserves_modes_and_creates_protected_backups(self):
         report = self.execute(apply=True)
         backup_dir = self.backup_root / "20260926T120000Z"
@@ -403,6 +529,80 @@ class ConfigTransactionTest(unittest.TestCase):
         )
         assert_safe_report(self, report)
 
+    def test_idempotent_apply_reports_without_replacing_configs_or_backup(self):
+        for path, updated, mode in zip(
+            self.paths,
+            self.updated_bytes,
+            self.original_modes,
+        ):
+            path.write_bytes(updated)
+            path.chmod(mode)
+        identities = [
+            (path.stat().st_dev, path.stat().st_ino) for path in self.paths
+        ]
+        output = self.root / "unchanged-report.json"
+        status = []
+
+        report = guard.execute(
+            self.paths,
+            apply=True,
+            backup_root=self.backup_root,
+            timestamp="20260926T120012Z",
+            output_path=output,
+            status_sink=status.append,
+        )
+
+        self.assertEqual(
+            [(path.stat().st_dev, path.stat().st_ino) for path in self.paths],
+            identities,
+        )
+        self.assertEqual(
+            [report["change"][label]["status"] for label in ("v2", "cli")],
+            ["unchanged", "unchanged"],
+        )
+        self.assertTrue(output.is_file())
+        self.assertEqual(len(status), 1)
+        self.assertFalse(
+            (self.backup_root / "20260926T120012Z").exists()
+        )
+
+    def test_apply_fsyncs_each_created_backup_directory_entry(self):
+        fsynced_directories = set()
+        real_fsync = os.fsync
+
+        def record_fsync(file_descriptor):
+            file_status = os.fstat(file_descriptor)
+            if stat.S_ISDIR(file_status.st_mode):
+                fsynced_directories.add(
+                    (file_status.st_dev, file_status.st_ino)
+                )
+            return real_fsync(file_descriptor)
+
+        with mock.patch.object(
+            guard.os,
+            "fsync",
+            side_effect=record_fsync,
+        ):
+            self.execute(apply=True)
+
+        backup_dir = self.backup_root / "20260926T120000Z"
+        expected_directories = {
+            path: (path.stat().st_dev, path.stat().st_ino)
+            for path in (
+                self.backup_root.parent,
+                self.backup_root,
+                self.backup_root / ".zcode-responses-item-guard",
+                backup_dir,
+                backup_dir / "v2",
+                backup_dir / "cli",
+                self.paths[0].parent,
+                self.paths[1].parent,
+            )
+        }
+        for path, identity in expected_directories.items():
+            with self.subTest(path=path):
+                self.assertIn(identity, fsynced_directories)
+
     def test_invalid_second_config_is_rejected_before_backup_or_write(self):
         invalid = config_fixture(kind="anthropic")
         write_config(self.paths[1], invalid, self.original_modes[1])
@@ -418,13 +618,13 @@ class ConfigTransactionTest(unittest.TestCase):
         real_atomic_write = guard.atomic_write
         target_write_count = 0
 
-        def fail_second_target_write(path, data, mode):
+        def fail_second_target_write(path, data, mode, **kwargs):
             nonlocal target_write_count
             if path in self.paths:
                 target_write_count += 1
                 if target_write_count == 2:
                     raise OSError("injected second write failure")
-            return real_atomic_write(path, data, mode)
+            return real_atomic_write(path, data, mode, **kwargs)
 
         with mock.patch.object(
             guard,
@@ -453,20 +653,206 @@ class ConfigTransactionTest(unittest.TestCase):
                 0o600,
             )
 
-    def test_readback_validation_failure_rolls_back_both_files(self):
-        real_load_config = guard.load_config
-        load_count = 0
+    def test_concurrent_apply_is_rejected_by_stable_private_lock(self):
+        real_atomic_write = guard.atomic_write
+        first_write_started = threading.Event()
+        release_first_write = threading.Event()
+        outer_errors = []
 
-        def fail_first_readback(path):
-            nonlocal load_count
-            load_count += 1
-            if load_count == 3:
-                raise ValueError("injected readback validation failure")
-            return real_load_config(path)
+        def block_outer_first_write(path, data, mode, **kwargs):
+            if (
+                threading.current_thread().name == "outer-apply"
+                and path == self.paths[0]
+                and data == self.updated_bytes[0]
+            ):
+                first_write_started.set()
+                if not release_first_write.wait(timeout=5):
+                    raise RuntimeError("test timed out releasing first write")
+            return real_atomic_write(path, data, mode, **kwargs)
+
+        def run_outer_apply():
+            try:
+                self.execute(
+                    apply=True,
+                    timestamp="20260926T120020Z",
+                )
+            except BaseException as exc:
+                outer_errors.append(exc)
 
         with mock.patch.object(
             guard,
-            "load_config",
+            "atomic_write",
+            side_effect=block_outer_first_write,
+        ):
+            worker = threading.Thread(
+                target=run_outer_apply,
+                name="outer-apply",
+            )
+            worker.start()
+            self.assertTrue(first_write_started.wait(timeout=5))
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "configuration transaction is already active",
+                ):
+                    self.execute(
+                        apply=True,
+                        timestamp="20260926T120021Z",
+                    )
+                self.assertEqual(
+                    [path.read_bytes() for path in self.paths],
+                    self.original_bytes,
+                )
+            finally:
+                release_first_write.set()
+                worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(outer_errors, [])
+        lock_files = list(self.backup_root.rglob("*.lock"))
+        self.assertEqual(len(lock_files), 1)
+        self.assertEqual(stat.S_IMODE(lock_files[0].stat().st_mode), 0o600)
+        self.assertEqual(
+            stat.S_IMODE(lock_files[0].parent.stat().st_mode),
+            0o700,
+        )
+
+    def test_backup_stops_before_copying_a_drifted_config(self):
+        real_write_private_file = guard._write_private_file
+        third_party = b'{"third_party":"during-backup"}\n'
+
+        def drift_after_first_backup(path, data):
+            result = real_write_private_file(path, data)
+            if path.parent.name == "v2" and path.name == "config.json":
+                self.paths[1].write_bytes(third_party)
+                self.paths[1].chmod(self.original_modes[1])
+            return result
+
+        with mock.patch.object(
+            guard,
+            "_write_private_file",
+            side_effect=drift_after_first_backup,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "rollback verification failed",
+            ):
+                self.execute(apply=True)
+
+        backup_dir = self.backup_root / "20260926T120000Z"
+        self.assertFalse((backup_dir / "cli" / "config.json").exists())
+        self.assertEqual(self.paths[0].read_bytes(), self.original_bytes[0])
+        self.assertEqual(self.paths[1].read_bytes(), third_party)
+
+    def test_write_drift_does_not_overwrite_third_party_content(self):
+        real_atomic_write = guard.atomic_write
+        third_party = b'{"third_party":"between-writes"}\n'
+
+        def drift_after_first_target_write(path, data, mode, **kwargs):
+            result = real_atomic_write(path, data, mode, **kwargs)
+            if path == self.paths[0] and data == self.updated_bytes[0]:
+                self.paths[1].write_bytes(third_party)
+                self.paths[1].chmod(self.original_modes[1])
+            return result
+
+        with mock.patch.object(
+            guard,
+            "atomic_write",
+            side_effect=drift_after_first_target_write,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "rollback verification failed",
+            ):
+                self.execute(apply=True)
+
+        self.assertEqual(self.paths[0].read_bytes(), self.original_bytes[0])
+        self.assertEqual(self.paths[1].read_bytes(), third_party)
+
+    def test_same_hash_new_inode_is_detected_before_target_write(self):
+        real_atomic_write = guard.atomic_write
+        updated_write_count = 0
+
+        def replace_second_after_first_target_write(
+            path, data, mode, **kwargs
+        ):
+            nonlocal updated_write_count
+            result = real_atomic_write(path, data, mode, **kwargs)
+            if path in self.paths and data in self.updated_bytes:
+                updated_write_count += 1
+            if path == self.paths[0] and data == self.updated_bytes[0]:
+                replacement = self.paths[1].with_suffix(".replacement")
+                replacement.write_bytes(self.original_bytes[1])
+                replacement.chmod(self.original_modes[1])
+                os.replace(replacement, self.paths[1])
+            return result
+
+        with mock.patch.object(
+            guard,
+            "atomic_write",
+            side_effect=replace_second_after_first_target_write,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "configuration apply failed",
+            ):
+                self.execute(apply=True)
+
+        self.assertEqual(updated_write_count, 1)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+
+    def test_directory_fsync_baseexception_rolls_back_and_reraises(self):
+        real_fsync = os.fsync
+        target_parent = self.paths[0].parent.stat()
+        interrupted = False
+
+        def interrupt_first_target_directory_fsync(file_descriptor):
+            nonlocal interrupted
+            file_status = os.fstat(file_descriptor)
+            is_target_parent = (
+                file_status.st_dev == target_parent.st_dev
+                and file_status.st_ino == target_parent.st_ino
+            )
+            if is_target_parent and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt("injected directory fsync interrupt")
+            return real_fsync(file_descriptor)
+
+        with mock.patch.object(
+            guard.os,
+            "fsync",
+            side_effect=interrupt_first_target_directory_fsync,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.execute(apply=True)
+
+        self.assertTrue(interrupted)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+        self.assertEqual(
+            [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
+            self.original_modes,
+        )
+
+    def test_readback_validation_failure_rolls_back_both_files(self):
+        real_verify_readback = guard._verify_readback
+        readback_count = 0
+
+        def fail_first_readback(snapshot):
+            nonlocal readback_count
+            readback_count += 1
+            if readback_count == 1:
+                raise ValueError("injected readback validation failure")
+            return real_verify_readback(snapshot)
+
+        with mock.patch.object(
+            guard,
+            "_verify_readback",
             side_effect=fail_first_readback,
         ):
             with self.assertRaisesRegex(
@@ -488,7 +874,7 @@ class ConfigTransactionTest(unittest.TestCase):
         timestamp = "20260926T120001Z"
         report_write_count = 0
 
-        def fail_report_write(path, report):
+        def fail_report_write(path, report, **_kwargs):
             nonlocal report_write_count
             report_write_count += 1
             self.assertEqual(path, output)
@@ -542,73 +928,198 @@ class ConfigTransactionTest(unittest.TestCase):
             )
 
     def test_cli_apply_stdout_failure_rolls_back_both_configs_once(self):
-        failures = (
-            ("broken-pipe", BrokenPipeError("injected broken pipe")),
-            ("os-error", OSError("injected stdout failure")),
-        )
-        for index, (name, error) in enumerate(failures, start=2):
-            with self.subTest(error=name):
-                output = self.root / ("%s.json" % name)
-                timestamp = "20260926T12000%dZ" % index
-                stdout = FailingStdout(error)
-                stderr = io.StringIO()
-                with (
-                    mock.patch.object(
-                        guard,
-                        "default_config_paths",
-                        return_value=self.paths,
-                    ),
-                    mock.patch.object(
-                        guard.Path,
-                        "home",
-                        return_value=self.home,
-                    ),
-                    mock.patch.object(
-                        guard.time,
-                        "strftime",
-                        return_value=timestamp,
-                    ),
-                    mock.patch.object(guard.sys, "stdout", stdout),
-                    mock.patch.object(guard.sys, "stderr", stderr),
-                ):
-                    try:
-                        result = guard.main(
-                            ["--apply", "--output", str(output)]
-                        )
-                    except OSError as exc:
-                        self.fail(
-                            "main leaked stdout failure: %s"
-                            % type(exc).__name__
-                        )
+        output = self.root / "write-failure.json"
+        timestamp = "20260926T120002Z"
+        stdout = FailingStdout(BrokenPipeError("injected broken pipe"))
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                guard,
+                "default_config_paths",
+                return_value=self.paths,
+            ),
+            mock.patch.object(guard.Path, "home", return_value=self.home),
+            mock.patch.object(
+                guard.time,
+                "strftime",
+                return_value=timestamp,
+            ),
+            mock.patch.object(guard.sys, "stdout", stdout),
+            mock.patch.object(guard.sys, "stderr", stderr),
+        ):
+            result = guard.main(["--apply", "--output", str(output)])
 
-                self.assertEqual(result, 1)
-                self.assertEqual(stdout.write_count, 1)
-                self.assertEqual(
-                    stderr.getvalue(),
-                    "ERROR: change=failed\n",
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.write_count, 1)
+        self.assertEqual(stderr.getvalue(), "ERROR: change=failed\n")
+        self.assertFalse(output.exists())
+        self.assertEqual(
+            [sha256(path.read_bytes()) for path in self.paths],
+            self.original_hashes,
+        )
+        self.assertEqual(
+            [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
+            self.original_modes,
+        )
+        backup_dir = self.backup_root / timestamp
+        self.assertTrue((backup_dir / "manifest.json").is_file())
+        for label, original in zip(("v2", "cli"), self.original_bytes):
+            self.assertEqual(
+                (backup_dir / label / "config.json").read_bytes(),
+                original,
+            )
+
+    def test_cli_apply_flush_failure_deletes_new_output_and_rolls_back(self):
+        output = self.root / "flush-new-output.json"
+        stdout = FlushFailingStdout(OSError("injected flush failure"))
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                guard,
+                "default_config_paths",
+                return_value=self.paths,
+            ),
+            mock.patch.object(guard.Path, "home", return_value=self.home),
+            mock.patch.object(
+                guard.time,
+                "strftime",
+                return_value="20260926T120030Z",
+            ),
+            mock.patch.object(guard.sys, "stdout", stdout),
+            mock.patch.object(guard.sys, "stderr", stderr),
+        ):
+            result = guard.main(["--apply", "--output", str(output)])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.write_count, 1)
+        self.assertEqual(stdout.flush_count, 1)
+        self.assertEqual(stderr.getvalue(), "ERROR: change=failed\n")
+        self.assertFalse(output.exists())
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+        self.assertEqual(
+            [stat.S_IMODE(path.stat().st_mode) for path in self.paths],
+            self.original_modes,
+        )
+
+    def test_cli_apply_flush_failure_restores_existing_output(self):
+        output = self.root / "flush-existing-output.json"
+        original_output = b'{"existing":"report"}\n'
+        output.write_bytes(original_output)
+        output.chmod(0o640)
+        stdout = FlushFailingStdout(
+            BrokenPipeError("injected flush broken pipe")
+        )
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                guard,
+                "default_config_paths",
+                return_value=self.paths,
+            ),
+            mock.patch.object(guard.Path, "home", return_value=self.home),
+            mock.patch.object(
+                guard.time,
+                "strftime",
+                return_value="20260926T120031Z",
+            ),
+            mock.patch.object(guard.sys, "stdout", stdout),
+            mock.patch.object(guard.sys, "stderr", stderr),
+        ):
+            result = guard.main(["--apply", "--output", str(output)])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.write_count, 1)
+        self.assertEqual(stdout.flush_count, 1)
+        self.assertEqual(stderr.getvalue(), "ERROR: change=failed\n")
+        self.assertEqual(output.read_bytes(), original_output)
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o640)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+
+    def test_output_third_party_drift_is_not_overwritten_on_rollback(self):
+        output = self.root / "third-party-output.json"
+        original_output = b'{"existing":"report"}\n'
+        third_party = b'{"third_party":"after-report"}\n'
+        output.write_bytes(original_output)
+        output.chmod(0o640)
+        status_calls = 0
+
+        def drift_output_and_fail(_line):
+            nonlocal status_calls
+            status_calls += 1
+            output.write_bytes(third_party)
+            output.chmod(0o600)
+            raise OSError("injected status failure")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "rollback verification failed",
+        ):
+            guard.execute(
+                self.paths,
+                apply=True,
+                backup_root=self.backup_root,
+                timestamp="20260926T120032Z",
+                output_path=output,
+                status_sink=drift_output_and_fail,
+            )
+
+        self.assertEqual(status_calls, 1)
+        self.assertEqual(output.read_bytes(), third_party)
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+
+    def test_same_hash_new_inode_drift_is_not_overwritten_on_rollback(self):
+        output = self.root / "same-hash-third-party-output.json"
+        replacement_identities = {}
+
+        def replace_with_same_content_and_fail(_line):
+            replacements = {
+                "v2": self.paths[0],
+                "output": output,
+            }
+            for label, path in replacements.items():
+                replacement = path.with_suffix(".replacement")
+                replacement.write_bytes(path.read_bytes())
+                replacement.chmod(stat.S_IMODE(path.stat().st_mode))
+                os.replace(replacement, path)
+                replacement_identities[label] = (
+                    path.stat().st_dev,
+                    path.stat().st_ino,
                 )
-                self.assertTrue(output.is_file())
-                self.assertEqual(
-                    [sha256(path.read_bytes()) for path in self.paths],
-                    self.original_hashes,
-                )
-                self.assertEqual(
-                    [
-                        stat.S_IMODE(path.stat().st_mode)
-                        for path in self.paths
-                    ],
-                    self.original_modes,
-                )
-                backup_dir = self.backup_root / timestamp
-                self.assertTrue((backup_dir / "manifest.json").is_file())
-                for label, original in zip(
-                    ("v2", "cli"),
-                    self.original_bytes,
-                ):
-                    self.assertEqual(
-                        (backup_dir / label / "config.json").read_bytes(),
-                        original,
-                    )
+            raise OSError("injected status failure")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "rollback verification failed",
+        ):
+            guard.execute(
+                self.paths,
+                apply=True,
+                backup_root=self.backup_root,
+                timestamp="20260926T120033Z",
+                output_path=output,
+                status_sink=replace_with_same_content_and_fail,
+            )
+
+        self.assertEqual(
+            (self.paths[0].stat().st_dev, self.paths[0].stat().st_ino),
+            replacement_identities["v2"],
+        )
+        self.assertEqual(self.paths[0].read_bytes(), self.updated_bytes[0])
+        self.assertEqual(self.paths[1].read_bytes(), self.original_bytes[1])
+        self.assertEqual(
+            (output.stat().st_dev, output.stat().st_ino),
+            replacement_identities["output"],
+        )
 
     def test_cli_dry_run_stdout_failure_is_caught_without_rollback(self):
         output = self.root / "dry-run-stdout-failure.json"
