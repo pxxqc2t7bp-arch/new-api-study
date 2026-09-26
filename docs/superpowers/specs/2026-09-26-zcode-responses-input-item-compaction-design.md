@@ -63,6 +63,8 @@ Rules:
 - The header applies only to `POST /v1/responses`.
 - It applies only when the resolved upstream URL is an official regional Ark
   host matching `ark.<region>.volces.com`.
+- The resolved upstream path must end in `/responses`; Ark-hosted routes that
+  convert the request to `/chat/completions` are not subject to this guard.
 - It applies only when `input` is an array. Scalar string input is unchanged.
 - A valid soft limit is an integer from 1 through 1000.
 - A malformed or out-of-range header fails locally with an
@@ -110,7 +112,8 @@ Add a focused Responses input-item guard before the pass-through branch in
 The guard:
 
 1. Resolves the final request URL through the selected adaptor.
-2. Determines whether the final host is an official Ark regional host.
+2. Determines whether the final host is an official Ark regional host and the
+   final path is a native Responses endpoint.
 3. Parses the optional soft-limit header.
 4. Counts top-level Responses input items without inspecting their content.
 5. Returns a typed OpenAI context-limit error when the count exceeds the
@@ -142,7 +145,10 @@ The update must:
 
 Before either real config file is changed, a disposable loopback capture must
 prove that ZCode 3.14.3 accepts `options.headers` for this provider kind and
-emits the exact soft-limit header. Failure blocks the configuration change.
+emits the exact soft-limit header. The same fixture must return a synthetic
+`context_length_exceeded` error after several successful turns and observe
+ZCode issue a compaction request followed by an automatic retry. Failure
+blocks the configuration change.
 
 The model's advertised 1,048,576-token context remains unchanged. Compaction
 is now triggered by item pressure independently of token pressure.
@@ -221,8 +227,8 @@ custom headers.
 7. Prove custom-header emission with a disposable loopback capture.
 8. Back up and update the two ZCode configuration files.
 9. Restart or reload ZCode only if configuration hot reload does not apply.
-10. Verify that a disposable 901-item ZCode session triggers compaction before
-    a normal model request reaches Ark.
+10. Verify the 900/901 boundary with direct requests using the configured
+    ZCode token, and verify one ordinary ZCode task completes.
 11. Run three post-configuration ZCode and all-enabled-model regression
     rounds.
 
