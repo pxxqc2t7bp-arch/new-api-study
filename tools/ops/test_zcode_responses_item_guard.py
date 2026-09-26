@@ -81,16 +81,53 @@ def write_config(path, config, mode):
     path.chmod(mode)
 
 
-def rename_noreplace_for_test(source, destination):
-    source = Path(source)
-    destination = Path(destination)
+def dir_fd_entry_matches_path(directory_fd, name, path):
+    directory_status = os.fstat(directory_fd)
+    parent_status = path.parent.stat()
+    return (
+        name == path.name
+        and (directory_status.st_dev, directory_status.st_ino)
+        == (parent_status.st_dev, parent_status.st_ino)
+    )
+
+
+def read_bytes_at(directory_fd, name):
+    descriptor = os.open(name, os.O_RDONLY, dir_fd=directory_fd)
     try:
-        destination.lstat()
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1 << 20)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+
+
+def rename_noreplace_for_test(
+    source_dir_fd,
+    source_name,
+    destination_dir_fd,
+    destination_name,
+):
+    try:
+        os.stat(
+            destination_name,
+            dir_fd=destination_dir_fd,
+            follow_symlinks=False,
+        )
     except FileNotFoundError:
         pass
     else:
-        raise FileExistsError("destination exists: %s" % destination)
-    os.rename(source, destination)
+        raise FileExistsError(
+            "destination exists: %s" % destination_name
+        )
+    os.rename(
+        source_name,
+        destination_name,
+        src_dir_fd=source_dir_fd,
+        dst_dir_fd=destination_dir_fd,
+    )
 
 
 class FailingStdout:
@@ -768,14 +805,32 @@ class ConfigTransactionTest(unittest.TestCase):
         real_rename_noreplace = guard._rename_noreplace
         target_write_count = 0
 
-        def fail_second_target_replace(source, destination):
+        def fail_second_target_replace(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+        ):
             nonlocal target_write_count
-            source_raw = Path(source).read_bytes()
-            if destination in self.paths and source_raw in self.updated_bytes:
+            source_raw = read_bytes_at(source_dir_fd, source_name)
+            is_target = any(
+                dir_fd_entry_matches_path(
+                    destination_dir_fd,
+                    destination_name,
+                    path,
+                )
+                for path in self.paths
+            )
+            if is_target and source_raw in self.updated_bytes:
                 target_write_count += 1
                 if target_write_count == 2:
                     raise OSError("injected second replace failure")
-            return real_rename_noreplace(source, destination)
+            return real_rename_noreplace(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+            )
 
         with mock.patch.object(
             guard,
@@ -1033,7 +1088,7 @@ class ConfigTransactionTest(unittest.TestCase):
         output_checks = 0
         real_transaction_lock = guard._transaction_lock
         real_verify_output_state = guard._verify_output_state
-        real_rename_noreplace = guard._rename_noreplace
+        real_open_parent_directory = guard._open_parent_directory
 
         @contextmanager
         def track_transaction_lock(root, **kwargs):
@@ -1066,14 +1121,11 @@ class ConfigTransactionTest(unittest.TestCase):
                     output_redirected.set()
             return result
 
-        def block_first_lock_path_move(source, destination):
-            result = real_rename_noreplace(source, destination)
+        @contextmanager
+        def block_first_lock_parent_open(path):
             if (
                 threading.current_thread().name == "first-apply"
-                and source == first_output
-                and destination.name.startswith(
-                    ".transaction.lock.displaced."
-                )
+                and path == first_output
             ):
                 cas_after_final_validation.append(
                     output_redirected.is_set()
@@ -1081,7 +1133,8 @@ class ConfigTransactionTest(unittest.TestCase):
                 cas_window_open.set()
                 if not release_cas_window.wait(timeout=5):
                     raise RuntimeError("test timed out releasing CAS window")
-            return result
+            with real_open_parent_directory(path) as opened:
+                yield opened
 
         def run_first_apply():
             try:
@@ -1117,8 +1170,8 @@ class ConfigTransactionTest(unittest.TestCase):
             side_effect=redirect_after_final_output_validation,
         ), mock.patch.object(
             guard,
-            "_rename_noreplace",
-            side_effect=block_first_lock_path_move,
+            "_open_parent_directory",
+            side_effect=block_first_lock_parent_open,
         ):
             first_worker = threading.Thread(
                 target=run_first_apply,
@@ -1130,7 +1183,7 @@ class ConfigTransactionTest(unittest.TestCase):
             )
             first_worker.start()
             self.assertTrue(cas_window_open.wait(timeout=5))
-            self.assertFalse(lock_path.exists())
+            self.assertTrue(lock_path.exists())
             try:
                 second_worker.start()
                 second_worker.join(timeout=5)
@@ -1165,6 +1218,153 @@ class ConfigTransactionTest(unittest.TestCase):
         self.assertEqual(
             (lock_path.stat().st_dev, lock_path.stat().st_ino),
             lock_identity,
+        )
+
+    def test_output_parent_redirect_cannot_move_locked_backup_root(self):
+        with guard._transaction_lock(self.backup_root):
+            pass
+        backup_root_identity = (
+            self.backup_root.stat().st_dev,
+            self.backup_root.stat().st_ino,
+        )
+        output_parent = self.root / "redirected-output"
+        output_parent.mkdir()
+        output = output_parent / self.backup_root.name
+        output.write_bytes(b"ordinary output before validation\n")
+        output.chmod(0o640)
+        first_body_finished = threading.Event()
+        release_first_lock = threading.Event()
+        second_entered = threading.Event()
+        first_errors = []
+        second_errors = []
+        output_checks = 0
+        real_transaction_lock = guard._transaction_lock
+        real_verify_output_state = guard._verify_output_state
+
+        @contextmanager
+        def track_transaction_lock(root, **kwargs):
+            with real_transaction_lock(root, **kwargs):
+                if threading.current_thread().name == "second-apply":
+                    second_entered.set()
+                try:
+                    yield
+                finally:
+                    if threading.current_thread().name == "first-apply":
+                        first_body_finished.set()
+                        if not release_first_lock.wait(timeout=5):
+                            raise RuntimeError(
+                                "test timed out releasing first lock"
+                            )
+
+        def redirect_after_final_output_validation(snapshot, *, updated):
+            nonlocal output_checks
+            result = real_verify_output_state(snapshot, updated=updated)
+            if (
+                threading.current_thread().name == "first-apply"
+                and snapshot["path"] == output
+                and not updated
+            ):
+                output_checks += 1
+                if output_checks == 2:
+                    output.unlink()
+                    output_parent.rmdir()
+                    output_parent.symlink_to(
+                        self.backup_root.parent,
+                        target_is_directory=True,
+                    )
+            return result
+
+        def run_first_apply():
+            try:
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120026Z",
+                    output_path=output,
+                )
+            except BaseException as exc:
+                first_errors.append(exc)
+
+        def run_second_apply():
+            try:
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120027Z",
+                    output_path=self.root / "second-root-report.json",
+                )
+            except BaseException as exc:
+                second_errors.append(exc)
+
+        with mock.patch.object(
+            guard,
+            "_transaction_lock",
+            side_effect=track_transaction_lock,
+        ), mock.patch.object(
+            guard,
+            "_verify_output_state",
+            side_effect=redirect_after_final_output_validation,
+        ):
+            first_worker = threading.Thread(
+                target=run_first_apply,
+                name="first-apply",
+            )
+            second_worker = threading.Thread(
+                target=run_second_apply,
+                name="second-apply",
+            )
+            first_worker.start()
+            self.assertTrue(first_body_finished.wait(timeout=5))
+            try:
+                try:
+                    backup_root_status = self.backup_root.stat()
+                except FileNotFoundError:
+                    observed_backup_root_identity = None
+                else:
+                    observed_backup_root_identity = (
+                        backup_root_status.st_dev,
+                        backup_root_status.st_ino,
+                    )
+                second_worker.start()
+                second_worker.join(timeout=5)
+                self.assertFalse(second_worker.is_alive())
+            finally:
+                release_first_lock.set()
+                first_worker.join(timeout=5)
+                if second_worker.is_alive():
+                    second_worker.join(timeout=5)
+
+        self.assertFalse(first_worker.is_alive())
+        self.assertFalse(second_worker.is_alive())
+        self.assertEqual(output_checks, 2)
+        self.assertEqual(
+            {
+                "backup_root_identity": observed_backup_root_identity,
+                "second_transaction_entered": second_entered.is_set(),
+            },
+            {
+                "backup_root_identity": backup_root_identity,
+                "second_transaction_entered": False,
+            },
+        )
+        self.assertEqual(len(first_errors), 1)
+        self.assertIsInstance(first_errors[0], RuntimeError)
+        self.assertRegex(str(first_errors[0]), "configuration apply failed")
+        self.assertEqual(len(second_errors), 1)
+        self.assertIsInstance(second_errors[0], RuntimeError)
+        self.assertRegex(
+            str(second_errors[0]),
+            "configuration transaction is already active",
+        )
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+        self.assertEqual(
+            list(self.backup_root.parent.glob(".backups.displaced.*")),
+            [],
         )
 
     def test_transaction_root_lock_release_after_error_allows_later_transaction(
@@ -1325,13 +1525,28 @@ class ConfigTransactionTest(unittest.TestCase):
         interrupted = False
         status = []
 
-        def replace_first_config_then_interrupt(source, destination):
+        def replace_first_config_then_interrupt(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+        ):
             nonlocal interrupted
             is_first_config_commit = (
-                destination == self.paths[0]
-                and Path(source).read_bytes() == self.updated_bytes[0]
+                dir_fd_entry_matches_path(
+                    destination_dir_fd,
+                    destination_name,
+                    self.paths[0],
+                )
+                and read_bytes_at(source_dir_fd, source_name)
+                == self.updated_bytes[0]
             )
-            result = real_rename_noreplace(source, destination)
+            result = real_rename_noreplace(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+            )
             if is_first_config_commit and not interrupted:
                 interrupted = True
                 raise KeyboardInterrupt(
@@ -1575,10 +1790,24 @@ class ConfigTransactionTest(unittest.TestCase):
         interrupted = False
         status = []
 
-        def replace_output_then_interrupt(source, destination):
+        def replace_output_then_interrupt(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+        ):
             nonlocal interrupted
-            is_output_commit = destination == output
-            result = real_rename_noreplace(source, destination)
+            is_output_commit = dir_fd_entry_matches_path(
+                destination_dir_fd,
+                destination_name,
+                output,
+            )
+            result = real_rename_noreplace(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+            )
             if is_output_commit and not interrupted:
                 interrupted = True
                 raise KeyboardInterrupt(
@@ -1658,12 +1887,29 @@ class ConfigTransactionTest(unittest.TestCase):
         )
         drift_injected = False
 
-        def drift_at_output_vacate(source, destination):
+        def drift_at_output_vacate(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+        ):
             nonlocal drift_injected
-            if Path(source) == output and not drift_injected:
+            if (
+                dir_fd_entry_matches_path(
+                    source_dir_fd,
+                    source_name,
+                    output,
+                )
+                and not drift_injected
+            ):
                 os.replace(third_party, output)
                 drift_injected = True
-            return rename_noreplace_for_test(source, destination)
+            return rename_noreplace_for_test(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+            )
 
         with mock.patch.object(
             guard,
@@ -2140,12 +2386,29 @@ class ConfigTransactionTest(unittest.TestCase):
         )
         drift_injected = False
 
-        def drift_at_target_vacate(source, destination):
+        def drift_at_target_vacate(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+        ):
             nonlocal drift_injected
-            if Path(source) == self.paths[0] and not drift_injected:
+            if (
+                dir_fd_entry_matches_path(
+                    source_dir_fd,
+                    source_name,
+                    self.paths[0],
+                )
+                and not drift_injected
+            ):
                 os.replace(third_party, self.paths[0])
                 drift_injected = True
-            return rename_noreplace_for_test(source, destination)
+            return rename_noreplace_for_test(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+            )
 
         with mock.patch.object(
             guard,
@@ -2186,22 +2449,39 @@ class ConfigTransactionTest(unittest.TestCase):
         v2_vacates = 0
         second_rollback_commit_failed = False
 
-        def fail_rollback_then_drift_roll_forward(source, destination):
+        def fail_rollback_then_drift_roll_forward(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+        ):
             nonlocal v2_vacates, second_rollback_commit_failed
-            source = Path(source)
-            destination = Path(destination)
-            if source == self.paths[0]:
+            if dir_fd_entry_matches_path(
+                source_dir_fd,
+                source_name,
+                self.paths[0],
+            ):
                 v2_vacates += 1
                 if v2_vacates == 2:
                     os.replace(third_party, self.paths[0])
             if (
-                destination == self.paths[1]
-                and source.read_bytes() == self.original_bytes[1]
+                dir_fd_entry_matches_path(
+                    destination_dir_fd,
+                    destination_name,
+                    self.paths[1],
+                )
+                and read_bytes_at(source_dir_fd, source_name)
+                == self.original_bytes[1]
                 and not second_rollback_commit_failed
             ):
                 second_rollback_commit_failed = True
                 raise OSError("injected second rollback commit failure")
-            return rename_noreplace_for_test(source, destination)
+            return rename_noreplace_for_test(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+            )
 
         with mock.patch.object(
             guard,
@@ -2266,15 +2546,33 @@ class ConfigTransactionTest(unittest.TestCase):
         real_rename_noreplace = guard._rename_noreplace
         rollback_write_count = 0
 
-        def fail_second_rollback_replace(source, destination):
+        def fail_second_rollback_replace(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+        ):
             nonlocal rollback_write_count
-            if destination in self.paths:
-                source_raw = Path(source).read_bytes()
+            is_target = any(
+                dir_fd_entry_matches_path(
+                    destination_dir_fd,
+                    destination_name,
+                    path,
+                )
+                for path in self.paths
+            )
+            if is_target:
+                source_raw = read_bytes_at(source_dir_fd, source_name)
                 if source_raw in self.original_bytes:
                     rollback_write_count += 1
                     if rollback_write_count == 2:
                         raise OSError("injected second rollback failure")
-            return real_rename_noreplace(source, destination)
+            return real_rename_noreplace(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+            )
 
         with mock.patch.object(
             guard,
@@ -2370,13 +2668,28 @@ class ConfigTransactionTest(unittest.TestCase):
         real_rename_noreplace = guard._rename_noreplace
         interrupted = False
 
-        def replace_first_config_then_interrupt(source, destination):
+        def replace_first_config_then_interrupt(
+            source_dir_fd,
+            source_name,
+            destination_dir_fd,
+            destination_name,
+        ):
             nonlocal interrupted
             is_first_config_commit = (
-                destination == self.paths[0]
-                and Path(source).read_bytes() == self.original_bytes[0]
+                dir_fd_entry_matches_path(
+                    destination_dir_fd,
+                    destination_name,
+                    self.paths[0],
+                )
+                and read_bytes_at(source_dir_fd, source_name)
+                == self.original_bytes[0]
             )
-            result = real_rename_noreplace(source, destination)
+            result = real_rename_noreplace(
+                source_dir_fd,
+                source_name,
+                destination_dir_fd,
+                destination_name,
+            )
             if is_first_config_commit and not interrupted:
                 interrupted = True
                 raise KeyboardInterrupt("injected rollback interrupt")

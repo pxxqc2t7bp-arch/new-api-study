@@ -11,9 +11,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import sys
-import tempfile
 import time
 from contextlib import contextmanager
 from copy import deepcopy
@@ -165,20 +165,48 @@ def _ensure_private_directory(path: Path, *, parents: bool = False) -> None:
     os.chmod(path, 0o700)
 
 
-def _rename_noreplace(source: Path, destination: Path) -> None:
+@contextmanager
+def _open_parent_directory(path: Path) -> Iterator[tuple[int, str]]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path.parent, flags)
+    try:
+        yield descriptor, path.name
+    finally:
+        os.close(descriptor)
+
+
+def _rename_noreplace(
+    source_dir_fd: int,
+    source_name: str,
+    destination_dir_fd: int,
+    destination_name: str,
+) -> None:
     """Atomically rename without replacing an existing destination."""
     libc = ctypes.CDLL(None, use_errno=True)
-    source_raw = os.fsencode(source)
-    destination_raw = os.fsencode(destination)
+    source_raw = os.fsencode(source_name)
+    destination_raw = os.fsencode(destination_name)
     if sys.platform == "darwin":
-        rename_call = libc.renamex_np
+        rename_call = libc.renameatx_np
         rename_call.argtypes = [
+            ctypes.c_int,
             ctypes.c_char_p,
+            ctypes.c_int,
             ctypes.c_char_p,
             ctypes.c_uint,
         ]
         rename_call.restype = ctypes.c_int
-        result = rename_call(source_raw, destination_raw, 0x00000004)
+        result = rename_call(
+            source_dir_fd,
+            source_raw,
+            destination_dir_fd,
+            destination_raw,
+            0x00000004,
+        )
     elif sys.platform.startswith("linux"):
         try:
             rename_call = libc.renameat2
@@ -195,9 +223,9 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
         ]
         rename_call.restype = ctypes.c_int
         result = rename_call(
-            -100,
+            source_dir_fd,
             source_raw,
-            -100,
+            destination_dir_fd,
             destination_raw,
             0x00000001,
         )
@@ -210,45 +238,164 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
         raise FileExistsError(
             error_number,
             os.strerror(error_number),
-            str(destination),
+            destination_name,
         )
     raise OSError(
         error_number,
         os.strerror(error_number),
-        str(source),
-        str(destination),
+        source_name,
+        destination_name,
+    )
+
+
+def _new_temporary_name(prefix: str) -> str:
+    return "%s%s" % (prefix, secrets.token_hex(8))
+
+
+def _create_temporary_file(
+    parent_dir_fd: int,
+    prefix: str,
+) -> tuple[int, str]:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    for _attempt in range(128):
+        name = _new_temporary_name(prefix)
+        try:
+            return os.open(name, flags, 0o600, dir_fd=parent_dir_fd), name
+        except FileExistsError:
+            continue
+    raise FileExistsError("unable to allocate a temporary file")
+
+
+def _observed_file_state_at(
+    parent_dir_fd: int,
+    name: str,
+    path: Path,
+    description: str = "configuration",
+) -> tuple[tuple[int, int], bytes, int]:
+    before = os.stat(name, dir_fd=parent_dir_fd, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError("%s drift detected: %s" % (description, path))
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(name, flags, dir_fd=parent_dir_fd)
+    try:
+        opened = os.fstat(descriptor)
+        opened_identity = (opened.st_dev, opened.st_ino)
+        before_identity = (before.st_dev, before.st_ino)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened_identity != before_identity
+        ):
+            raise RuntimeError(
+                "%s drift detected: %s" % (description, path)
+            )
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after_read = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = os.stat(name, dir_fd=parent_dir_fd, follow_symlinks=False)
+    after_identity = (after.st_dev, after.st_ino)
+    if (
+        not stat.S_ISREG(after_read.st_mode)
+        or (after_read.st_dev, after_read.st_ino) != opened_identity
+        or not stat.S_ISREG(after.st_mode)
+        or after_identity != opened_identity
+    ):
+        raise RuntimeError("%s drift detected: %s" % (description, path))
+    return opened_identity, b"".join(chunks), stat.S_IMODE(after.st_mode)
+
+
+def _entry_exists_at(parent_dir_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _restore_displaced(
+    parent_dir_fd: int,
+    displaced_name: str,
+    target_name: str,
+) -> None:
+    _rename_noreplace(
+        parent_dir_fd,
+        displaced_name,
+        parent_dir_fd,
+        target_name,
     )
 
 
 def _move_target_if_matches(
+    parent_dir_fd: int,
+    target_name: str,
     path: Path,
     expected_state: tuple[tuple[int, int], bytes, int],
-) -> Path:
-    displaced_descriptor, displaced_name = tempfile.mkstemp(
-        prefix=".%s.displaced." % path.name,
-        dir=str(path.parent),
+) -> str:
+    before = os.stat(
+        target_name,
+        dir_fd=parent_dir_fd,
+        follow_symlinks=False,
     )
-    os.close(displaced_descriptor)
-    displaced_path = Path(displaced_name)
-    displaced_path.unlink()
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError("target drift detected: %s" % path)
+    displaced_name = _new_temporary_name(
+        ".%s.displaced." % target_name
+    )
     move_error = None
     move_traceback = None
     try:
-        _rename_noreplace(path, displaced_path)
+        _rename_noreplace(
+            parent_dir_fd,
+            target_name,
+            parent_dir_fd,
+            displaced_name,
+        )
     except BaseException as exc:
         move_error = exc
         move_traceback = exc.__traceback__
     try:
-        displaced_state = _observed_file_state(displaced_path)
-    except BaseException:
+        displaced_state = _observed_file_state_at(
+            parent_dir_fd,
+            displaced_name,
+            path,
+        )
+    except BaseException as state_error:
+        if _entry_exists_at(parent_dir_fd, displaced_name):
+            try:
+                _restore_displaced(
+                    parent_dir_fd,
+                    displaced_name,
+                    target_name,
+                )
+            except FileExistsError:
+                pass
         if move_error is not None:
             raise move_error.with_traceback(move_traceback)
-        raise
+        raise state_error
     if displaced_state == expected_state and move_error is None:
-        return displaced_path
+        return displaced_name
 
     try:
-        _rename_noreplace(displaced_path, path)
+        _restore_displaced(
+            parent_dir_fd,
+            displaced_name,
+            target_name,
+        )
     except FileExistsError:
         pass
     if move_error is not None:
@@ -260,95 +407,149 @@ def _remove_if_matches(
     path: Path,
     expected_state: tuple[tuple[int, int], bytes, int],
 ) -> None:
-    displaced_path = _move_target_if_matches(path, expected_state)
-    try:
-        displaced_path.unlink()
-        _fsync_directory(path.parent)
-    except BaseException:
+    with _open_parent_directory(path) as (parent_dir_fd, target_name):
+        displaced_name = _move_target_if_matches(
+            parent_dir_fd,
+            target_name,
+            path,
+            expected_state,
+        )
         try:
-            displaced_path.lstat()
+            os.unlink(displaced_name, dir_fd=parent_dir_fd)
+            os.fsync(parent_dir_fd)
+        except BaseException:
+            if _entry_exists_at(parent_dir_fd, displaced_name):
+                try:
+                    _restore_displaced(
+                        parent_dir_fd,
+                        displaced_name,
+                        target_name,
+                    )
+                except FileExistsError:
+                    pass
+            raise
+        try:
+            os.stat(
+                target_name,
+                dir_fd=parent_dir_fd,
+                follow_symlinks=False,
+            )
         except FileNotFoundError:
-            pass
-        else:
-            try:
-                _rename_noreplace(displaced_path, path)
-            except FileExistsError:
-                pass
-        raise
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        return
-    raise RuntimeError("target drift detected: %s" % path)
+            return
+        raise RuntimeError("target drift detected: %s" % path)
 
 
 def atomic_write(
     path: Path,
     data: bytes,
-    mode: int,
+    mode: Optional[int],
     *,
     on_replace: Optional[Callable[[tuple[int, int]], None]] = None,
     expected_state: object = _UNCONDITIONAL_WRITE,
 ) -> None:
-    """Write bytes through a same-directory temporary file and replace."""
-    file_descriptor, temporary_name = tempfile.mkstemp(
-        prefix=".%s." % path.name,
-        dir=str(path.parent),
-    )
-    temporary_path = Path(temporary_name)
-    descriptor_open = True
-    try:
-        os.fchmod(file_descriptor, mode)
-        temporary_status = os.fstat(file_descriptor)
-        replacement_identity = (
-            temporary_status.st_dev,
-            temporary_status.st_ino,
-        )
-        with os.fdopen(file_descriptor, "wb") as handle:
-            descriptor_open = False
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if on_replace is not None:
-            on_replace(replacement_identity)
-        if expected_state is _UNCONDITIONAL_WRITE:
-            os.replace(temporary_path, path)
-        elif expected_state is None:
-            _rename_noreplace(temporary_path, path)
-        else:
-            displaced_path = _move_target_if_matches(path, expected_state)
-            committed = False
+    """Write bytes through an anchored same-directory temporary file."""
+    with _open_parent_directory(path) as (parent_dir_fd, target_name):
+        if mode is None:
             try:
-                _rename_noreplace(temporary_path, path)
-                committed = True
-            except BaseException:
+                target_status = os.stat(
+                    target_name,
+                    dir_fd=parent_dir_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                mode = 0o600
+            else:
+                mode = stat.S_IMODE(target_status.st_mode)
+        file_descriptor, temporary_name = _create_temporary_file(
+            parent_dir_fd,
+            ".%s." % target_name,
+        )
+        descriptor_open = True
+        try:
+            os.fchmod(file_descriptor, mode)
+            temporary_status = os.fstat(file_descriptor)
+            replacement_identity = (
+                temporary_status.st_dev,
+                temporary_status.st_ino,
+            )
+            with os.fdopen(file_descriptor, "wb") as handle:
+                descriptor_open = False
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if on_replace is not None:
+                on_replace(replacement_identity)
+            if expected_state is _UNCONDITIONAL_WRITE:
+                os.rename(
+                    temporary_name,
+                    target_name,
+                    src_dir_fd=parent_dir_fd,
+                    dst_dir_fd=parent_dir_fd,
+                )
+            elif expected_state is None:
+                _rename_noreplace(
+                    parent_dir_fd,
+                    temporary_name,
+                    parent_dir_fd,
+                    target_name,
+                )
+            else:
+                displaced_name = _move_target_if_matches(
+                    parent_dir_fd,
+                    target_name,
+                    path,
+                    expected_state,
+                )
+                committed = False
                 try:
-                    target_state = _observed_file_state(path)
-                except BaseException:
-                    target_state = None
-                if (
-                    target_state is not None
-                    and target_state[0] == replacement_identity
-                ):
+                    _rename_noreplace(
+                        parent_dir_fd,
+                        temporary_name,
+                        parent_dir_fd,
+                        target_name,
+                    )
                     committed = True
-                else:
+                except BaseException:
                     try:
-                        _rename_noreplace(displaced_path, path)
-                    except FileExistsError:
-                        pass
-                raise
-            finally:
-                if committed:
-                    try:
-                        displaced_path.unlink()
-                    except FileNotFoundError:
-                        pass
-        _fsync_directory(path.parent)
-    finally:
-        if descriptor_open:
-            os.close(file_descriptor)
-        if temporary_path.exists():
-            temporary_path.unlink()
+                        target_state = _observed_file_state_at(
+                            parent_dir_fd,
+                            target_name,
+                            path,
+                        )
+                    except BaseException:
+                        target_state = None
+                    if (
+                        target_state is not None
+                        and target_state[0] == replacement_identity
+                    ):
+                        committed = True
+                    else:
+                        try:
+                            _restore_displaced(
+                                parent_dir_fd,
+                                displaced_name,
+                                target_name,
+                            )
+                        except FileExistsError:
+                            pass
+                    raise
+                finally:
+                    if committed:
+                        try:
+                            os.unlink(
+                                displaced_name,
+                                dir_fd=parent_dir_fd,
+                            )
+                        except FileNotFoundError:
+                            pass
+            os.fsync(parent_dir_fd)
+        finally:
+            if descriptor_open:
+                os.close(file_descriptor)
+            try:
+                os.unlink(temporary_name, dir_fd=parent_dir_fd)
+            except FileNotFoundError:
+                pass
 
 
 def _write_private_file(path: Path, data: bytes) -> None:
@@ -1343,7 +1544,7 @@ def _write_report(
 ) -> str:
     raw = _encode_report(report)
     if expected_state is _UNCONDITIONAL_WRITE:
-        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+        mode = None
     elif expected_state is None:
         mode = 0o600
     else:
