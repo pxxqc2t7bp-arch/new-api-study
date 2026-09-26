@@ -193,6 +193,34 @@ class ResponsesFixtureTest(unittest.TestCase):
         self.assertFalse(probe.is_compaction_request(BODY))
         self.assertFalse(probe.is_compaction_request(b"not-json"))
 
+    def test_compaction_detection_requires_strict_object_with_array_input(self):
+        marker = (
+            "Your task is to create a detailed summary of the conversation "
+            "so far."
+        )
+        rejected = (
+            json.dumps([marker]).encode(),
+            json.dumps({"input": marker}).encode(),
+            json.dumps({"input": [], "metadata": marker}).encode(),
+            json.dumps({"input": [], "instructions": marker}).encode(),
+            (
+                '{"input":[{"content":%s}],"metadata":NaN}'
+                % json.dumps(marker)
+            ).encode(),
+            (
+                '{"input":[{"content":%s}],"metadata":Infinity}'
+                % json.dumps(marker)
+            ).encode(),
+            (
+                '{"input":[{"content":%s}],"metadata":-Infinity}'
+                % json.dumps(marker)
+            ).encode(),
+        )
+
+        for body in rejected:
+            with self.subTest(body=body):
+                self.assertFalse(probe.is_compaction_request(body))
+
 
 class FixtureStateTest(unittest.TestCase):
     def setUp(self):
@@ -324,6 +352,57 @@ class FixtureStateTest(unittest.TestCase):
             "automatic retry did not include fixture summary",
         )
 
+    def test_requires_retry_summary_marker_inside_input_subtree(self):
+        outside_input_values = (
+            ("metadata", {"probe": "fixture summary"}),
+            ("instructions", "fixture summary"),
+        )
+
+        for field, value in outside_input_values:
+            with self.subTest(field=field):
+                state = probe.FixtureState(history_turns=0)
+                state.handle_post(
+                    probe.RESPONSES_PATH,
+                    self.headers,
+                    BODY,
+                )
+                state.handle_post(
+                    probe.RESPONSES_PATH,
+                    self.headers,
+                    BODY,
+                )
+                state.handle_post(
+                    probe.RESPONSES_PATH,
+                    self.headers,
+                    compaction_body(),
+                )
+                retry = json.dumps(
+                    {
+                        "input": [
+                            {
+                                "type": "message",
+                                "content": "retry without summary",
+                            }
+                        ],
+                        field: value,
+                    }
+                ).encode()
+
+                response = state.handle_post(
+                    probe.RESPONSES_PATH,
+                    self.headers,
+                    retry,
+                )
+
+                self.assertEqual(response.status, 409)
+                self.assertFalse(state.passed)
+                self.assertFalse(state.reactive_compaction)
+                self.assertEqual(
+                    state.failure_reason,
+                    "automatic retry did not include fixture summary",
+                )
+                self.assertEqual(state.requests[-1]["item_count"], 1)
+
     def test_requires_automatic_retry_to_reduce_input_item_count(self):
         self.request()
         for _ in range(3):
@@ -351,6 +430,9 @@ class FixtureStateTest(unittest.TestCase):
             b"not-json",
             json.dumps(["not", "an", "object"]).encode(),
             json.dumps({"input": "not-an-array"}).encode(),
+            b'{"input":[],"metadata":NaN}',
+            b'{"input":[],"metadata":Infinity}',
+            b'{"input":[],"metadata":-Infinity}',
         )
 
         for phase in (
@@ -449,11 +531,19 @@ class FixtureStateTest(unittest.TestCase):
 
 
 class FakeProcess:
-    def __init__(self, *, communicate_outcomes=(), returncode=0):
+    def __init__(
+        self,
+        *,
+        communicate_outcomes=(),
+        wait_outcomes=(0,),
+        returncode=None,
+    ):
         self.pid = 4242
         self.returncode = returncode
         self.communicate_outcomes = list(communicate_outcomes)
+        self.wait_outcomes = list(wait_outcomes)
         self.communicate_timeouts = []
+        self.wait_timeouts = []
         self.communicate_calls = 0
 
     def communicate(self, timeout):
@@ -465,6 +555,14 @@ class FakeProcess:
                 raise outcome
             return outcome
         return "0.16.9\n", ""
+
+    def wait(self, timeout):
+        self.wait_timeouts.append(timeout)
+        outcome = self.wait_outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        self.returncode = outcome
+        return outcome
 
 
 class SubprocessTest(unittest.TestCase):
@@ -512,6 +610,7 @@ class SubprocessTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "0.16.9\n")
         self.assertEqual(process.communicate_timeouts, [30])
+        self.assertEqual(process.wait_timeouts, [5])
         self.assertTrue(calls[0][1]["start_new_session"])
         self.assertEqual(calls[0][1]["stdout"], subprocess.PIPE)
         self.assertEqual(calls[0][1]["stderr"], subprocess.PIPE)
@@ -541,6 +640,7 @@ class SubprocessTest(unittest.TestCase):
 
         self.assertEqual(killed, [(process.pid, signal.SIGKILL)])
         self.assertEqual(process.communicate_timeouts, [7, 5])
+        self.assertEqual(process.wait_timeouts, [5])
         message = str(raised.exception)
         self.assertNotIn(PROMPT_TEXT, message)
         self.assertNotIn("/private/tmp", message)
@@ -563,6 +663,7 @@ class SubprocessTest(unittest.TestCase):
         self.assertIs(raised.exception, interrupted)
         self.assertEqual(killed, [(process.pid, signal.SIGKILL)])
         self.assertEqual(process.communicate_timeouts, [7, 5])
+        self.assertEqual(process.wait_timeouts, [5])
 
     def test_generic_communicate_error_kills_and_attempts_one_bounded_reap(self):
         communicate_error = RuntimeError("fixture communicate error")
@@ -587,6 +688,43 @@ class SubprocessTest(unittest.TestCase):
         self.assertIs(raised.exception, communicate_error)
         self.assertEqual(killed, [(process.pid, signal.SIGKILL)])
         self.assertEqual(process.communicate_timeouts, [7, 5])
+        self.assertEqual(process.wait_timeouts, [5])
+
+    def test_cleanup_wait_failure_is_redacted_and_preserves_cause(self):
+        communicate_error = RuntimeError("private initial communicate failure")
+        cleanup_error = RuntimeError("private cleanup communicate failure")
+        wait_error = subprocess.TimeoutExpired(
+            ["/private/bin/node", PROMPT_TEXT],
+            5,
+        )
+        process = FakeProcess(
+            communicate_outcomes=(communicate_error, cleanup_error),
+            wait_outcomes=(wait_error,),
+        )
+        killed = []
+
+        with self.assertRaisesRegex(
+            probe.ProbeFailure,
+            "^ZCode subprocess cleanup failed$",
+        ) as raised:
+            probe.run_process(
+                ["node", "zcode.cjs", "--prompt", PROMPT_TEXT],
+                cwd=Path("/private/tmp/private-workspace"),
+                env={"HOME": "/private/tmp/private-home"},
+                timeout=7,
+                popen_factory=lambda argv, **kwargs: process,
+                killpg=lambda pid, sig: killed.append((pid, sig)),
+            )
+
+        self.assertIs(raised.exception.__cause__, wait_error)
+        self.assertIs(wait_error.__cause__, cleanup_error)
+        self.assertIs(cleanup_error.__cause__, communicate_error)
+        self.assertEqual(killed, [(process.pid, signal.SIGKILL)])
+        self.assertEqual(process.communicate_timeouts, [7, 5])
+        self.assertEqual(process.wait_timeouts, [5])
+        message = str(raised.exception)
+        self.assertNotIn(PROMPT_TEXT, message)
+        self.assertNotIn("/private/", message)
 
     def test_rejects_timeout_above_bound_before_spawning(self):
         spawned = []

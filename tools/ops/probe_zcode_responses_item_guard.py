@@ -284,22 +284,29 @@ def _strings(value: Any) -> Iterator[str]:
             yield from _strings(child)
 
 
-def is_compaction_request(body: bytes) -> bool:
-    try:
-        value = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    return any(COMPACTION_MARKER in value.lower() for value in _strings(value))
+def _reject_non_finite_json_constant(value: str) -> None:
+    raise ValueError("non-finite JSON constant is forbidden: %s" % value)
 
 
 def _request_object_with_array_input(body: bytes) -> Optional[dict[str, Any]]:
     try:
-        value = json.loads(body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        value = json.loads(
+            body,
+            parse_constant=_reject_non_finite_json_constant,
+        )
+    except (UnicodeDecodeError, ValueError):
         return None
     if not isinstance(value, dict) or not isinstance(value.get("input"), list):
         return None
     return value
+
+
+def is_compaction_request(body: bytes) -> bool:
+    request = _request_object_with_array_input(body)
+    return request is not None and _contains_marker(
+        request["input"],
+        COMPACTION_MARKER,
+    )
 
 
 def _contains_marker(value: Any, marker: str) -> bool:
@@ -496,7 +503,10 @@ class FixtureState:
 
             if self._phase == "ordinary_overflow":
                 assert request_value is not None
-                if _contains_marker(request_value, COMPACTION_MARKER):
+                if _contains_marker(
+                    request_value["input"],
+                    COMPACTION_MARKER,
+                ):
                     return self._fail(
                         "ordinary overflow request not observed",
                         409,
@@ -518,7 +528,10 @@ class FixtureState:
 
             if self._phase == "compaction_summary":
                 assert request_value is not None
-                if not _contains_marker(request_value, COMPACTION_MARKER):
+                if not _contains_marker(
+                    request_value["input"],
+                    COMPACTION_MARKER,
+                ):
                     return self._fail(
                         "compaction request not observed",
                         409,
@@ -538,13 +551,19 @@ class FixtureState:
                 assert request_value is not None
                 assert item_count is not None
                 assert self._ordinary_overflow_item_count is not None
-                if _contains_marker(request_value, COMPACTION_MARKER):
+                if _contains_marker(
+                    request_value["input"],
+                    COMPACTION_MARKER,
+                ):
                     return self._fail(
                         "automatic retry request not observed",
                         409,
                         "probe_order_mismatch",
                     )
-                if not _contains_marker(request_value, SUMMARY_MARKER):
+                if not _contains_marker(
+                    request_value["input"],
+                    SUMMARY_MARKER,
+                ):
                     return self._fail(
                         "automatic retry did not include fixture summary",
                         409,
@@ -729,9 +748,11 @@ def run_process(
         text=True,
         start_new_session=True,
     )
+    cleanup_timeout = min(5, timeout)
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except BaseException as exc:
+        cleanup_error: Optional[BaseException] = None
         try:
             killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -739,14 +760,31 @@ def run_process(
         except BaseException:
             pass
         try:
-            process.communicate(timeout=min(5, timeout))
-        except BaseException:
-            pass
+            process.communicate(timeout=cleanup_timeout)
+        except BaseException as caught_cleanup_error:
+            cleanup_error = caught_cleanup_error
+            cleanup_error.__cause__ = exc
+        try:
+            returncode = process.wait(timeout=cleanup_timeout)
+        except BaseException as wait_error:
+            wait_error.__cause__ = cleanup_error or exc
+            raise ProbeFailure(
+                "ZCode subprocess cleanup failed"
+            ) from wait_error
+        if returncode is None:
+            cause = cleanup_error or exc
+            raise ProbeFailure("ZCode subprocess cleanup failed") from cause
         if isinstance(exc, subprocess.TimeoutExpired):
             raise ProbeFailure("ZCode subprocess timed out") from exc
         raise
+    try:
+        returncode = process.wait(timeout=cleanup_timeout)
+    except BaseException as wait_error:
+        raise ProbeFailure("ZCode subprocess cleanup failed") from wait_error
+    if returncode is None:
+        raise ProbeFailure("ZCode subprocess cleanup failed")
     return ProcessResult(
-        returncode=process.returncode,
+        returncode=returncode,
         stdout=stdout,
         stderr=stderr,
     )
