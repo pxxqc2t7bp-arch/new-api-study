@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -32,7 +33,9 @@ func TestResolveResponsesInputItemLimit(t *testing.T) {
 		wantErr    bool
 	}{
 		{name: "default", want: 1000, wantSource: "ark_default"},
+		{name: "minimum client limit", header: "1", want: 1, wantSource: "client_opt_in"},
 		{name: "zcode soft limit", header: "900", want: 900, wantSource: "client_opt_in"},
+		{name: "maximum client limit", header: "1000", want: 1000, wantSource: "client_opt_in"},
 		{name: "zero", header: "0", wantErr: true},
 		{name: "negative", header: "-1", wantErr: true},
 		{name: "above hard limit", header: "1001", wantErr: true},
@@ -127,7 +130,7 @@ func TestArkResponsesInputItemLimit(t *testing.T) {
 	}
 }
 
-func TestPrepareResponsesRequestPassThroughItemLimit(t *testing.T) {
+func TestPrepareResponsesRequestItemLimit(t *testing.T) {
 	t.Run("hard limit rejects before reading body", func(t *testing.T) {
 		reader := &responsesInputFailReader{}
 		c, info, request := newResponsesInputItemLimitContext(
@@ -146,6 +149,42 @@ func TestPrepareResponsesRequestPassThroughItemLimit(t *testing.T) {
 		assert.Nil(t, closer)
 		requireResponsesInputItemLimitError(t, apiErr, 1001, 1000)
 		assert.False(t, reader.read, "oversized input must be rejected before body storage is read")
+	})
+
+	t.Run("default conversion hard limit rejects", func(t *testing.T) {
+		settings := model_setting.GetGlobalSettings()
+		originalPassThrough := settings.PassThroughRequestEnabled
+		settings.PassThroughRequestEnabled = false
+		t.Cleanup(func() {
+			settings.PassThroughRequestEnabled = originalPassThrough
+		})
+
+		reader := &responsesInputFailReader{}
+		c, info, request := newResponsesInputItemLimitContext(
+			t,
+			responsesInputItems(1001),
+			reader,
+			constant.ChannelTypeVolcEngine,
+			"https://ark.cn-beijing.volces.com/api/v3",
+			dto.ChannelOtherSettings{},
+		)
+		common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{})
+		t.Cleanup(func() {
+			common.CleanupBodyStorage(c)
+		})
+
+		adaptor, body, closer, apiErr := PrepareResponsesRequest(c, info, request)
+		if closer != nil {
+			t.Cleanup(func() {
+				assert.NoError(t, closer.Close())
+			})
+		}
+
+		assert.Nil(t, adaptor)
+		assert.Nil(t, body)
+		assert.Nil(t, closer)
+		requireResponsesInputItemLimitError(t, apiErr, 1001, 1000)
+		assert.False(t, reader.read, "oversized input must be rejected before default conversion")
 	})
 
 	t.Run("soft limit rejects and deletes header before reading body", func(t *testing.T) {
@@ -167,6 +206,37 @@ func TestPrepareResponsesRequestPassThroughItemLimit(t *testing.T) {
 		assert.Nil(t, closer)
 		requireResponsesInputItemLimitError(t, apiErr, 901, 900)
 		assert.False(t, reader.read, "oversized input must be rejected before body storage is read")
+		assert.Empty(t, c.Request.Header.Get(responsesInputItemSoftLimitHeaderForTest))
+	})
+
+	t.Run("invalid soft limit rejects and deletes header before reading body", func(t *testing.T) {
+		reader := &responsesInputFailReader{}
+		c, info, request := newResponsesInputItemLimitContext(
+			t,
+			responsesInputItems(1),
+			reader,
+			constant.ChannelTypeVolcEngine,
+			"https://ark.cn-beijing.volces.com/api/v3",
+			dto.ChannelOtherSettings{},
+		)
+		c.Request.Header.Set(responsesInputItemSoftLimitHeaderForTest, "0")
+		_, _, wantErr := resolveResponsesInputItemLimit("0")
+		require.Error(t, wantErr)
+
+		adaptor, body, closer, apiErr := PrepareResponsesRequest(c, info, request)
+
+		assert.Nil(t, adaptor)
+		assert.Nil(t, body)
+		assert.Nil(t, closer)
+		require.NotNil(t, apiErr)
+		assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+		assert.Equal(t, types.ErrorTypeOpenAIError, apiErr.GetErrorType())
+		assert.Equal(t, types.ErrorCodeInvalidRequest, apiErr.GetErrorCode())
+		assert.True(t, types.IsSkipRetryError(apiErr))
+		openAIError := apiErr.ToOpenAIError()
+		assert.Equal(t, "invalid_request_error", openAIError.Type)
+		assert.Equal(t, wantErr.Error(), openAIError.Message)
+		assert.False(t, reader.read, "invalid header must be rejected before body storage is read")
 		assert.Empty(t, c.Request.Header.Get(responsesInputItemSoftLimitHeaderForTest))
 	})
 
@@ -198,7 +268,7 @@ func TestPrepareResponsesRequestPassThroughItemLimit(t *testing.T) {
 		assert.False(t, reader.read, "oversized input must be rejected before body storage is read")
 	})
 
-	t.Run("accepted input bytes remain unchanged and header is deleted", func(t *testing.T) {
+	t.Run("soft limit persists across channel attempts", func(t *testing.T) {
 		input := responsesInputItems(900)
 		rawBody := responsesInputRequestBody(input)
 		c, info, request := newResponsesInputItemLimitContext(
@@ -214,15 +284,29 @@ func TestPrepareResponsesRequestPassThroughItemLimit(t *testing.T) {
 			common.CleanupBodyStorage(c)
 		})
 
-		_, body, closer, apiErr := PrepareResponsesRequest(c, info, request)
+		_, firstBody, firstCloser, apiErr := PrepareResponsesRequest(c, info, request)
 
 		require.Nil(t, apiErr)
-		require.NotNil(t, body)
-		require.NotNil(t, closer)
-		defer closer.Close()
-		got, err := io.ReadAll(body)
+		require.NotNil(t, firstBody)
+		require.NotNil(t, firstCloser)
+		got, err := io.ReadAll(firstBody)
 		require.NoError(t, err)
+		require.NoError(t, firstCloser.Close())
 		assert.Equal(t, rawBody, got)
+		assert.Empty(t, c.Request.Header.Get(responsesInputItemSoftLimitHeaderForTest))
+
+		request.Input = responsesInputItems(901)
+		adaptor, secondBody, secondCloser, apiErr := PrepareResponsesRequest(c, info, request)
+		if secondCloser != nil {
+			t.Cleanup(func() {
+				assert.NoError(t, secondCloser.Close())
+			})
+		}
+
+		assert.Nil(t, adaptor)
+		assert.Nil(t, secondBody)
+		assert.Nil(t, secondCloser)
+		requireResponsesInputItemLimitError(t, apiErr, 901, 900)
 		assert.Empty(t, c.Request.Header.Get(responsesInputItemSoftLimitHeaderForTest))
 	})
 
