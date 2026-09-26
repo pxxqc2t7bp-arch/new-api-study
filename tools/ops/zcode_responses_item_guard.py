@@ -418,7 +418,53 @@ def _sanitize_temporary_file(
             raise RuntimeError(
                 "temporary file identity verification failed"
             )
-        os.fchmod(descriptor, 0o600)
+        permission_errors = []
+        try:
+            os.fchmod(descriptor, 0o600)
+        except BaseException as fchmod_error:
+            permission_errors.append(fchmod_error)
+            try:
+                named_before_chmod = os.stat(
+                    name,
+                    dir_fd=parent_dir_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(named_before_chmod.st_mode)
+                    or (
+                        named_before_chmod.st_dev,
+                        named_before_chmod.st_ino,
+                    )
+                    != opened_identity
+                ):
+                    raise RuntimeError(
+                        "temporary file identity verification failed"
+                    )
+                os.chmod(
+                    name,
+                    0o600,
+                    dir_fd=parent_dir_fd,
+                    follow_symlinks=False,
+                )
+                named_after_chmod = os.stat(
+                    name,
+                    dir_fd=parent_dir_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(named_after_chmod.st_mode)
+                    or (
+                        named_after_chmod.st_dev,
+                        named_after_chmod.st_ino,
+                    )
+                    != opened_identity
+                    or stat.S_IMODE(named_after_chmod.st_mode) != 0o600
+                ):
+                    raise RuntimeError(
+                        "temporary file identity verification failed"
+                    )
+            except BaseException as chmod_error:
+                permission_errors.append(chmod_error)
         os.fsync(descriptor)
         remaining = opened.st_size
         zeroes = b"\0" * min(1 << 20, max(remaining, 1))
@@ -446,6 +492,23 @@ def _sanitize_temporary_file(
             raise RuntimeError(
                 "temporary file identity verification failed"
             )
+        fatal_error = next(
+            (
+                error
+                for error in permission_errors
+                if not isinstance(error, Exception)
+            ),
+            None,
+        )
+        if fatal_error is not None:
+            raise fatal_error.with_traceback(fatal_error.__traceback__)
+        if stat.S_IMODE(named.st_mode) != 0o600:
+            permission_error = (
+                permission_errors[-1] if permission_errors else None
+            )
+            raise RuntimeError(
+                "temporary file sanitization incomplete: mode is not 0600"
+            ) from permission_error
     finally:
         os.close(descriptor)
 
@@ -576,6 +639,10 @@ def _unlink_known_temporary_once(
         if temporary_state is not _UNKNOWN_FILE_STATE:
             errors.append(RuntimeError("temporary file drift detected"))
         return False
+    # The private random name, anchored dirfd, and inode precheck reduce
+    # accidental drift. POSIX has no conditional unlink-by-inode syscall, so
+    # a malicious same-UID process can still replace this entry between the
+    # precheck and unlink; another precheck cannot eliminate that race.
     try:
         os.unlink(temporary_name, dir_fd=parent_dir_fd)
     except FileNotFoundError:
@@ -654,7 +721,7 @@ def _sanitize_or_unlink_known_temporary(
         temporary_state is not _MISSING_FILE_STATE
         and temporary_state is not _UNKNOWN_FILE_STATE
         and temporary_state[0] == owned_state[0][0]
-        and temporary_state[2] in (owned_state[0][2], 0o600)
+        and temporary_state[2] == 0o600
         and temporary_state[1] == b""
     )
 
@@ -727,8 +794,11 @@ def _exchange_target_if_matches(
             path,
             "replacement",
         )
-    except BaseException:
+    except BaseException as state_error:
         committed_state = None
+        committed_error = state_error
+    else:
+        committed_error = None
     if committed_state == replacement_state:
         try:
             _rename_exchange(
@@ -749,6 +819,24 @@ def _exchange_target_if_matches(
                     % path
                 )
         except BaseException as recovery_error:
+            fatal_error = next(
+                (
+                    error
+                    for error in (
+                        exchange_error,
+                        verification_error,
+                        committed_error,
+                        recovery_error,
+                    )
+                    if error is not None
+                    and not isinstance(error, Exception)
+                ),
+                None,
+            )
+            if fatal_error is not None:
+                raise fatal_error.with_traceback(
+                    fatal_error.__traceback__
+                )
             raise RuntimeError(
                 "target exchange recovery failed: %s" % path
             ) from recovery_error
@@ -757,6 +845,11 @@ def _exchange_target_if_matches(
         raise exchange_error.with_traceback(exchange_traceback)
     if verification_error is not None:
         raise verification_error
+    if (
+        committed_error is not None
+        and not isinstance(committed_error, Exception)
+    ):
+        raise committed_error.with_traceback(committed_error.__traceback__)
     raise RuntimeError("target drift detected: %s" % path)
 
 
@@ -851,6 +944,7 @@ def _remove_if_matches(
                     pass
                 else:
                     temporary_cleanup_complete = True
+                    os.fsync(parent_dir_fd)
                 raise
             else:
                 temporary_cleanup_complete = True
