@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from unittest import mock
@@ -404,6 +405,39 @@ class ConfigTransactionTest(unittest.TestCase):
         self.assertEqual(report, self.expected_report("pending"))
         assert_safe_report(self, report)
 
+    def test_dry_run_output_obeys_stable_lock_directory_policy(self):
+        output = self.root / "ordinary-dry-run-report.json"
+
+        report = guard.execute(
+            self.paths,
+            apply=False,
+            backup_root=self.backup_root,
+            output_path=output,
+        )
+
+        self.assertEqual(
+            json.loads(output.read_text(encoding="ascii")),
+            report,
+        )
+        self.assertFalse(self.backup_root.exists())
+
+        lock_directory = (
+            self.backup_root / ".zcode-responses-item-guard"
+        )
+        for protected_output in (
+            lock_directory / "transaction.lock",
+            lock_directory / "reports" / "dry-run.json",
+        ):
+            with self.subTest(output=protected_output):
+                with self.assertRaisesRegex(ValueError, "transaction lock"):
+                    guard.execute(
+                        self.paths,
+                        apply=False,
+                        backup_root=self.backup_root,
+                        output_path=protected_output,
+                    )
+                self.assertFalse(self.backup_root.exists())
+
     def test_output_aliases_are_rejected_before_dry_run_or_apply(self):
         for apply in (False, True):
             for alias_kind in ("same-path", "symlink", "hardlink"):
@@ -461,6 +495,103 @@ class ConfigTransactionTest(unittest.TestCase):
                             modes,
                         )
                         self.assertFalse(backup_root.exists())
+
+    def test_apply_output_rejects_transaction_lock_aliases(self):
+        for alias_kind in ("exact", "child", "symlink", "hardlink"):
+            with self.subTest(alias=alias_kind):
+                with tempfile.TemporaryDirectory(
+                    dir=self.root
+                ) as temporary_directory:
+                    root = Path(temporary_directory)
+                    paths = [
+                        root / ".zcode" / "v2" / "config.json",
+                        root / ".zcode" / "cli" / "config.json",
+                    ]
+                    for path, config, mode in zip(
+                        paths,
+                        self.originals,
+                        self.original_modes,
+                    ):
+                        write_config(path, config, mode)
+                    before = [path.read_bytes() for path in paths]
+                    modes = [
+                        stat.S_IMODE(path.stat().st_mode) for path in paths
+                    ]
+                    backup_root = root / ".zcode" / "backups"
+                    lock_directory = (
+                        backup_root / ".zcode-responses-item-guard"
+                    )
+                    lock_path = lock_directory / "transaction.lock"
+                    if alias_kind == "exact":
+                        output = lock_path
+                    elif alias_kind == "child":
+                        output = lock_directory / "report.json"
+                    elif alias_kind == "symlink":
+                        output = root / ("%s-lock-output.json" % alias_kind)
+                        output.symlink_to(lock_path)
+                    else:
+                        with guard._transaction_lock(backup_root):
+                            pass
+                        output = root / "hardlink-lock-output.json"
+                        os.link(lock_path, output)
+                    lock_existed = lock_path.exists()
+                    lock_bytes = (
+                        lock_path.read_bytes() if lock_existed else None
+                    )
+                    lock_identity = (
+                        (
+                            lock_path.stat().st_dev,
+                            lock_path.stat().st_ino,
+                        )
+                        if lock_existed
+                        else None
+                    )
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "transaction lock",
+                    ):
+                        guard.execute(
+                            paths,
+                            apply=True,
+                            backup_root=backup_root,
+                            timestamp="20260926T120019Z",
+                            output_path=output,
+                        )
+
+                    self.assertEqual(
+                        [path.read_bytes() for path in paths],
+                        before,
+                    )
+                    self.assertEqual(
+                        [
+                            stat.S_IMODE(path.stat().st_mode)
+                            for path in paths
+                        ],
+                        modes,
+                    )
+                    self.assertFalse(
+                        (backup_root / "20260926T120019Z").exists()
+                    )
+                    if lock_existed:
+                        self.assertEqual(lock_path.read_bytes(), lock_bytes)
+                        self.assertEqual(
+                            (
+                                lock_path.stat().st_dev,
+                                lock_path.stat().st_ino,
+                            ),
+                            lock_identity,
+                        )
+                    else:
+                        self.assertFalse(backup_root.exists())
+                    if alias_kind == "child":
+                        self.assertFalse(output.exists())
+                    elif alias_kind == "symlink":
+                        self.assertTrue(output.is_symlink())
+                    elif alias_kind == "exact":
+                        self.assertFalse(output.exists())
+                    else:
+                        self.assertTrue(output.samefile(lock_path))
 
     def test_config_symlink_is_rejected_before_dry_run_or_apply(self):
         for apply in (False, True):
@@ -735,6 +866,144 @@ class ConfigTransactionTest(unittest.TestCase):
         self.assertEqual(
             stat.S_IMODE(lock_files[0].parent.stat().st_mode),
             0o700,
+        )
+
+    def test_lock_output_cannot_replace_lock_for_concurrent_transaction(self):
+        with guard._transaction_lock(self.backup_root):
+            pass
+        lock_directory = (
+            self.backup_root / ".zcode-responses-item-guard"
+        )
+        lock_path = lock_directory / "transaction.lock"
+        lock_bytes = lock_path.read_bytes()
+        lock_identity = (
+            lock_path.stat().st_dev,
+            lock_path.stat().st_ino,
+        )
+        first_output_parent = self.root / "first-output"
+        first_output_parent.mkdir()
+        first_output = first_output_parent / "transaction.lock"
+        first_output.write_bytes(b"ordinary output before validation\n")
+        first_body_finished = threading.Event()
+        first_lock_acquired = threading.Event()
+        release_first_lock = threading.Event()
+        second_entered = threading.Event()
+        first_errors = []
+        second_errors = []
+        first_validation_before_lock = []
+        real_transaction_lock = guard._transaction_lock
+        real_validate_output = guard._validate_transaction_output_path
+
+        @contextmanager
+        def track_transaction_lock(root, **kwargs):
+            with real_transaction_lock(root, **kwargs):
+                thread_name = threading.current_thread().name
+                if thread_name == "first-apply":
+                    first_lock_acquired.set()
+                else:
+                    second_entered.set()
+                try:
+                    yield
+                finally:
+                    if thread_name == "first-apply":
+                        first_body_finished.set()
+                        if not release_first_lock.wait(timeout=5):
+                            raise RuntimeError(
+                                "test timed out releasing first lock"
+                            )
+
+        def redirect_output_after_prelock_validation(root, output_path):
+            result = real_validate_output(root, output_path)
+            if (
+                threading.current_thread().name == "first-apply"
+                and output_path == first_output
+                and not first_validation_before_lock
+            ):
+                first_validation_before_lock.append(
+                    not first_lock_acquired.is_set()
+                )
+                first_output.unlink()
+                first_output_parent.rmdir()
+                first_output_parent.symlink_to(
+                    lock_directory,
+                    target_is_directory=True,
+                )
+            return result
+
+        def run_first_apply():
+            try:
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120022Z",
+                    output_path=first_output,
+                )
+            except BaseException as exc:
+                first_errors.append(exc)
+
+        def run_second_apply():
+            try:
+                guard.execute(
+                    self.paths,
+                    apply=True,
+                    backup_root=self.backup_root,
+                    timestamp="20260926T120023Z",
+                    output_path=self.root / "second-report.json",
+                )
+            except BaseException as exc:
+                second_errors.append(exc)
+
+        with mock.patch.object(
+            guard,
+            "_transaction_lock",
+            side_effect=track_transaction_lock,
+        ), mock.patch.object(
+            guard,
+            "_validate_transaction_output_path",
+            side_effect=redirect_output_after_prelock_validation,
+        ):
+            first_worker = threading.Thread(
+                target=run_first_apply,
+                name="first-apply",
+            )
+            second_worker = threading.Thread(
+                target=run_second_apply,
+                name="second-apply",
+            )
+            first_worker.start()
+            self.assertTrue(first_body_finished.wait(timeout=5))
+            try:
+                second_worker.start()
+                second_worker.join(timeout=5)
+                self.assertFalse(second_worker.is_alive())
+            finally:
+                release_first_lock.set()
+                first_worker.join(timeout=5)
+                if second_worker.is_alive():
+                    second_worker.join(timeout=5)
+
+        self.assertFalse(first_worker.is_alive())
+        self.assertFalse(second_worker.is_alive())
+        self.assertEqual(first_validation_before_lock, [True])
+        self.assertFalse(second_entered.is_set())
+        self.assertEqual(len(first_errors), 1)
+        self.assertIsInstance(first_errors[0], ValueError)
+        self.assertRegex(str(first_errors[0]), "transaction lock")
+        self.assertEqual(len(second_errors), 1)
+        self.assertIsInstance(second_errors[0], RuntimeError)
+        self.assertRegex(
+            str(second_errors[0]),
+            "configuration transaction is already active",
+        )
+        self.assertEqual(
+            [path.read_bytes() for path in self.paths],
+            self.original_bytes,
+        )
+        self.assertEqual(lock_path.read_bytes(), lock_bytes)
+        self.assertEqual(
+            (lock_path.stat().st_dev, lock_path.stat().st_ino),
+            lock_identity,
         )
 
     def test_backup_stops_before_copying_a_drifted_config(self):

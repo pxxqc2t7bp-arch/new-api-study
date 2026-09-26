@@ -398,6 +398,45 @@ def _validate_output_path(
             )
 
 
+def _transaction_lock_directory(root: Path) -> Path:
+    return root / ".zcode-responses-item-guard"
+
+
+def _validate_transaction_output_path(
+    root: Path,
+    output_path: Optional[Path],
+) -> None:
+    if output_path is None:
+        return
+    lock_directory = _transaction_lock_directory(root)
+    resolved_output = output_path.resolve(strict=False)
+    resolved_lock_directory = lock_directory.resolve(strict=False)
+    try:
+        resolved_output.relative_to(resolved_lock_directory)
+    except ValueError:
+        pass
+    else:
+        raise ValueError(
+            "output path must not alias the transaction lock directory"
+        )
+    if output_path.exists() and lock_directory.exists():
+        for current_root, directory_names, file_names in os.walk(
+            lock_directory,
+            followlinks=False,
+        ):
+            for name in directory_names + file_names:
+                protected_path = Path(current_root) / name
+                try:
+                    aliases_lock = output_path.samefile(protected_path)
+                except FileNotFoundError:
+                    continue
+                if aliases_lock:
+                    raise ValueError(
+                        "output path must not alias the transaction lock "
+                        "directory"
+                    )
+
+
 @contextmanager
 def _transaction_lock(
     root: Path,
@@ -415,7 +454,7 @@ def _transaction_lock(
             raise RuntimeError("backup root is not a directory")
         if stat.S_IMODE(root_status.st_mode) != 0o700:
             raise RuntimeError("backup root mode verification failed")
-    lock_directory = root / ".zcode-responses-item-guard"
+    lock_directory = _transaction_lock_directory(root)
     _ensure_private_directory(lock_directory)
     lock_path = lock_directory / "transaction.lock"
     flags = (
@@ -832,6 +871,10 @@ def _validate_rollback_output_path(
 ) -> None:
     if output_path is None:
         return
+    _validate_transaction_output_path(
+        backup_dir.parent,
+        output_path,
+    )
     resolved_output = output_path.resolve(strict=False)
     resolved_backup = backup_dir.resolve(strict=False)
     try:
@@ -840,33 +883,6 @@ def _validate_rollback_output_path(
         pass
     else:
         raise ValueError("output path must not be inside the backup directory")
-
-    lock_directory = backup_dir.parent / ".zcode-responses-item-guard"
-    resolved_lock_directory = lock_directory.resolve(strict=False)
-    try:
-        resolved_output.relative_to(resolved_lock_directory)
-    except ValueError:
-        pass
-    else:
-        raise ValueError(
-            "output path must not alias the transaction lock directory"
-        )
-    if output_path.exists() and lock_directory.exists():
-        for current_root, directory_names, file_names in os.walk(
-            lock_directory,
-            followlinks=False,
-        ):
-            for name in directory_names + file_names:
-                protected_path = Path(current_root) / name
-                try:
-                    aliases_lock = output_path.samefile(protected_path)
-                except FileNotFoundError:
-                    continue
-                if aliases_lock:
-                    raise ValueError(
-                        "output path must not alias the transaction lock "
-                        "directory"
-                    )
 
     protected_paths = [backup_dir / "manifest.json"]
     protected_paths.extend(
@@ -1031,21 +1047,26 @@ def execute(
         _snapshot(path, label) for path, label in zip(paths, labels)
     ]
     report = _build_report(snapshots, applied=apply)
+    root = backup_root or Path.home() / ".zcode" / "backups"
+    _validate_transaction_output_path(root, output_path)
     if not apply:
         if output_path is not None:
             _write_report(output_path, report)
         _emit_status(report, status_sink)
         return report
 
-    output_snapshot = (
-        _snapshot_output(output_path) if output_path is not None else None
-    )
     has_changes = any(snapshot["changed"] for snapshot in snapshots)
     backup_timestamp = timestamp or time.strftime(
         "%Y%m%dT%H%M%SZ", time.gmtime()
     )
-    root = backup_root or Path.home() / ".zcode" / "backups"
     with _transaction_lock(root):
+        _validate_transaction_output_path(root, output_path)
+        output_snapshot = (
+            _snapshot_output(output_path)
+            if output_path is not None
+            else None
+        )
+        _validate_transaction_output_path(root, output_path)
         backup_dir: Optional[Path] = None
         try:
             _verify_transaction_state(snapshots, set())
