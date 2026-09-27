@@ -1804,7 +1804,7 @@ WHERE id IN (4,66,96);
         database_state = json.loads(database_raw or "{}")
         if not isinstance(database_state, dict):
             raise RuntimeError("production database state is invalid")
-        machine_id = self.machine_id_path.read_bytes().strip()
+        machine_id = self.machine_id_path.read_bytes()
         return {
             "hostname": self._hostname(),
             "machine_id_sha256": hashlib.sha256(machine_id).hexdigest(),

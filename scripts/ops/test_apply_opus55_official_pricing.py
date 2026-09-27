@@ -7115,10 +7115,50 @@ class ProductionDependenciesTest(unittest.TestCase):
             ):
                 deps.validate_checksums("SHA256SUMS")
 
-    def test_capture_state_is_safe_and_includes_route_failure_window(
+    def test_capture_state_hashes_machine_id_file_bytes_verbatim(
         self,
     ) -> None:
         machine_id = b"machine-identity\n"
+        docker_state = {
+            "State": {
+                "Status": "running",
+                "Health": {"Status": "healthy"},
+            },
+            "RestartCount": 0,
+            "Config": {"Labels": {}},
+        }
+
+        def check_output(command, **kwargs):
+            if command == ["docker", "inspect", "new-api"]:
+                return json.dumps([docker_state])
+            return "{}"
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "root"
+            backups = pathlib.Path(directory) / "backups"
+            root.mkdir()
+            backups.mkdir()
+            machine_path = pathlib.Path(directory) / "machine-id"
+            machine_path.write_bytes(machine_id)
+            deps = pricing.ProductionDependencies(
+                self.args(backups / "run"),
+                root=root,
+                backup_root=backups,
+                machine_id_path=machine_path,
+                check_output=check_output,
+            )
+
+            state = deps.capture_state("before")
+
+        self.assertEqual(
+            hashlib.sha256(machine_id).hexdigest(),
+            state["machine_id_sha256"],
+        )
+
+    def test_capture_state_is_safe_and_includes_route_failure_window(
+        self,
+    ) -> None:
+        machine_id = b"machine-identity"
         docker_state = {
             "State": {
                 "Status": "running",
@@ -7177,7 +7217,7 @@ class ProductionDependenciesTest(unittest.TestCase):
             state = deps.capture_state("before")
 
         self.assertEqual(
-            hashlib.sha256(machine_id.strip()).hexdigest(),
+            hashlib.sha256(machine_id).hexdigest(),
             state["machine_id_sha256"],
         )
         self.assertEqual(database_state["route48"], state["route48"])
