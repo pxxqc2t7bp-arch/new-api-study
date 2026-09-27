@@ -4773,6 +4773,59 @@ class ProductionDependenciesTest(unittest.TestCase):
             headers,
         )
 
+    def test_http_request_connects_to_local_log_proxy(self) -> None:
+        connection_args: list[tuple[object, ...]] = []
+
+        class Response:
+            status = 200
+
+            def read(self):
+                return b"{}"
+
+            def getheader(self, name):
+                del name
+                return None
+
+            def getheaders(self):
+                return []
+
+        class Connection:
+            def __init__(self, host, port, timeout):
+                connection_args.append((host, port, timeout))
+
+            def request(self, method, path, body=None, headers=None):
+                del method, path, body, headers
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "root"
+            backups = pathlib.Path(directory) / "backups"
+            root.mkdir()
+            backups.mkdir()
+            deps = pricing.ProductionDependencies(
+                self.args(backups / "run"),
+                root=root,
+                backup_root=backups,
+                http_connection=Connection,
+            )
+
+            deps.request(
+                "GET",
+                pricing.PRICING_SNAPSHOT_PATH,
+                {},
+                timeout=17,
+            )
+
+        self.assertEqual(
+            [("127.0.0.1", 13000, 17)],
+            connection_args,
+        )
+
     def test_http_request_json_gzip_and_close(self) -> None:
         calls: list[tuple[object, ...]] = []
         response_body = json.dumps({"success": True}).encode()
@@ -4842,7 +4895,7 @@ class ProductionDependenciesTest(unittest.TestCase):
             result,
         )
         self.assertEqual(
-            ("connect", "127.0.0.1", 3000, 17),
+            ("connect", "127.0.0.1", 13000, 17),
             calls[0],
         )
         self.assertEqual(

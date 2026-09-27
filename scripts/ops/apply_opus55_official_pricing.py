@@ -68,6 +68,8 @@ PRICING_PATH = "/api/option/model_pricing"
 PRICING_SNAPSHOT_PATH = PRICING_PATH + "?model=" + MODEL
 PREVIEW_PATH = PRICING_PATH + "/preview"
 CANARY_PATH = "/v1/chat/completions"
+LOCAL_API_HOST = "127.0.0.1"
+LOCAL_API_PORT = 13000
 MUTATED_OPTION_KEYS = {
     "billing_setting.billing_expr": TARGET_EXPRESSION,
     "billing_setting.billing_mode": "tiered_expr",
@@ -2046,8 +2048,8 @@ WHERE id IN (4,66,96);
         timeout: int = 120,
     ) -> tuple[int, dict[str, str], bytes]:
         connection = self._http_connection(
-            "127.0.0.1",
-            3000,
+            LOCAL_API_HOST,
+            LOCAL_API_PORT,
             timeout=timeout,
         )
         operation_error: BaseException | None = None
