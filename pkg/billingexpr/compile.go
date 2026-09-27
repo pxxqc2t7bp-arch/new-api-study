@@ -24,11 +24,14 @@ const (
 )
 
 // ParseExprVersion extracts the version tag and body from an expression string.
-// Format: "v1:tier(...)" → version=1, body="tier(...)".
+// Format: "v2:tier(...)" → version=2, body="tier(...)".
 // No prefix defaults to DefaultExprVersion.
 func ParseExprVersion(exprStr string) (version int, body string) {
 	if strings.HasPrefix(exprStr, "v1:") {
 		return 1, exprStr[3:]
+	}
+	if strings.HasPrefix(exprStr, "v2:") {
+		return 2, exprStr[3:]
 	}
 	return DefaultExprVersion, exprStr
 }
@@ -102,7 +105,7 @@ func usesRequestProbe(node ast.Node) bool {
 			return false
 		}
 		switch identifier.Value {
-		case "param", "header", "hour", "minute", "weekday", "month", "day":
+		case "param", "header", "hour", "minute", "weekday", "month", "day", "unix":
 			return true
 		default:
 			return false
@@ -158,8 +161,17 @@ var compileEnvPrototypeV1 = map[string]any{
 	"floor":       math.Floor,
 }
 
+// v2 is a strict superset of v1 and adds a frozen Unix timestamp probe.
+var compileEnvPrototypeV2 = func() map[string]any {
+	env := maps.Clone(compileEnvPrototypeV1)
+	env["unix"] = func() int64 { return 0 }
+	return env
+}()
+
 func getCompileEnv(version int) map[string]any {
 	switch version {
+	case 2:
+		return compileEnvPrototypeV2
 	default:
 		return compileEnvPrototypeV1
 	}

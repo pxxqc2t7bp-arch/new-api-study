@@ -143,6 +143,7 @@ func runProgram(prog *vm.Program, requestRules []RequestRuleTrace, usedVars map[
 		"weekday": func(tz string) int { return int(timeInZone(evaluatedAt, tz).Weekday()) },
 		"month":   func(tz string) int { return int(timeInZone(evaluatedAt, tz).Month()) },
 		"day":     func(tz string) int { return timeInZone(evaluatedAt, tz).Day() },
+		"unix":    func() int64 { return evaluatedAt.Unix() },
 		"max":     math.Max,
 		"min":     math.Min,
 		"abs":     math.Abs,

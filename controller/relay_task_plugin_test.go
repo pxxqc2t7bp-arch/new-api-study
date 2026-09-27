@@ -945,12 +945,11 @@ func TestManagedTaskSubmissionUsesSharedFailoverBudget(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			events := []string{}
-			database := setupTaskSubmissionDatabase(t, true, &events)
-			require.NoError(t, database.AutoMigrate(
+			database := setupTaskSubmissionDatabase(t, true, &events,
 				&model.Channel{},
 				&model.Ability{},
 				&model.UpstreamManagedRoute{},
-			))
+			)
 
 			previousMemoryCache := common.MemoryCacheEnabled
 			previousRetries := common.RetryTimes

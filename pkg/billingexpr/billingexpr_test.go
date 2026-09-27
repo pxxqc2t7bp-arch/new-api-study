@@ -957,6 +957,33 @@ func TestV1RejectsUnixFunction(t *testing.T) {
 	assert.Contains(t, err.Error(), "unix")
 }
 
+func TestV2UnixFunctionUsesFrozenEvaluationTime(t *testing.T) {
+	const expression = `v2:tier("base", p) * (unix() < 200 ? 0.5 : 1)`
+
+	before, trace, err := billingexpr.RunExprWithRequest(
+		expression,
+		billingexpr.TokenParams{P: 100},
+		billingexpr.RequestInput{EvaluatedAtUnix: 100},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, float64(50), before)
+	assert.Equal(t, "base", trace.MatchedTier)
+	require.Len(t, trace.RequestRules, 1)
+	assert.True(t, trace.RequestRules[0].Matched)
+
+	after, trace, err := billingexpr.RunExprWithRequest(
+		expression,
+		billingexpr.TokenParams{P: 100},
+		billingexpr.RequestInput{EvaluatedAtUnix: 300},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, float64(100), after)
+	assert.Equal(t, "base", trace.MatchedTier)
+	require.Len(t, trace.RequestRules, 1)
+	assert.False(t, trace.RequestRules[0].Matched)
+	assert.Equal(t, 2, billingexpr.ExprVersion(expression))
+}
+
 func TestTimeFunctions_InvalidTimezone(t *testing.T) {
 	exprStr := `tier("default", p) * (hour("Invalid/Zone") >= 0 ? 1 : 2)`
 	cost, _, err := billingexpr.RunExpr(exprStr, billingexpr.TokenParams{P: 100})

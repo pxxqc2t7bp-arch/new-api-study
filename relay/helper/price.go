@@ -411,6 +411,11 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 			return hosttypes.PriceData{}, err
 		}
 	}
+	pricingTimeUnix := common.GetTimestamp()
+	if !info.StartTime.IsZero() {
+		pricingTimeUnix = info.StartTime.Unix()
+	}
+	requestInput.EvaluatedAtUnix = pricingTimeUnix
 
 	rawCost, trace, err := billingexpr.RunExprByHashWithRequest(exprStr, exprHash, billingexpr.TokenParams{
 		P:   float64(promptTokens),
@@ -458,6 +463,7 @@ func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billing
 		EstimatedFixedPrice:       trace.FixedPrice,
 		QuotaPerUnit:              common.QuotaPerUnit,
 		ExprVersion:               billingexpr.ExprVersion(exprStr),
+		PricingTimeUnix:           pricingTimeUnix,
 	}
 	info.TieredBillingSnapshot = snapshot
 	info.BillingRequestInput = &requestInput

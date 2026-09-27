@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -330,14 +331,16 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 	const alphaExpr = `tier("alpha", u("seconds") * 3)`
 	const betaExpr = `tier("beta", u("credits") * 5)`
 	const aliasExpr = `tier("alias", u("credits") * 7)`
+	const frozenExpr = `v2:unix() == 100 ? tier("frozen", u("seconds") * 3) : tier("wall_clock", u("seconds") * 30)`
 	for _, tc := range []struct {
-		name, plugin, model, mapping, modelExpr, mode, wantExpr string
-		variants                                                map[string]string
-		wantPriceError, profiled                                bool
+		name, plugin, model, mapping, modelExpr, mode, wantExpr, wantTier string
+		variants                                                          map[string]string
+		wantPriceError, profiled                                          bool
 	}{
 		{name: "executing plugin override", plugin: "billing-beta", model: "declared-model", modelExpr: baseExpr, mode: "tiered_expr", variants: map[string]string{"billing-alpha::declared-model": alphaExpr, "billing-beta::declared-model": betaExpr}, wantExpr: betaExpr},
 		{name: "override ignores model mode", plugin: "billing-beta", model: "declared-model", modelExpr: baseExpr, mode: "ratio", variants: map[string]string{"billing-beta::declared-model": betaExpr}, wantExpr: betaExpr},
 		{name: "model expression fallback", plugin: "billing-alpha", model: "declared-model", modelExpr: baseExpr, mode: "tiered_expr", wantExpr: baseExpr},
+		{name: "frozen v2 time reaches settlement", plugin: "billing-alpha", model: "declared-model", modelExpr: baseExpr, mode: "tiered_expr", variants: map[string]string{"billing-alpha::declared-model": frozenExpr}, wantExpr: frozenExpr, wantTier: "frozen"},
 		{name: "alias override precedes mapped override", plugin: "billing-beta", model: "alias-model", mapping: `{"alias-model":"declared-model"}`, modelExpr: baseExpr, mode: "tiered_expr", variants: map[string]string{"billing-beta::declared-model": betaExpr, "billing-beta::alias-model": aliasExpr}, wantExpr: aliasExpr},
 		{name: "mapped override precedes model fallback", plugin: "billing-beta", model: "alias-model", mapping: `{"alias-model":"declared-model"}`, modelExpr: baseExpr, mode: "tiered_expr", variants: map[string]string{"billing-beta::declared-model": betaExpr}, wantExpr: betaExpr},
 		{name: "unconfigured plugin cannot use another schema", plugin: "billing-beta", model: "declared-model", modelExpr: baseExpr, mode: "tiered_expr", wantPriceError: true},
@@ -379,6 +382,7 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 			info.UserGroup = "default"
 			info.UsingGroup = "default"
 			info.OriginModelName = tc.model
+			info.StartTime = time.Unix(100, 123)
 			plugin, ok := registry.Generation().Get(tc.plugin)
 			require.True(t, ok)
 			c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{Generation: registry.Generation(), Plugin: plugin})
@@ -391,6 +395,10 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 			}
 			require.NotNil(t, info.TieredBillingSnapshot, "submission error: %+v", taskErr)
 			assert.Equal(t, tc.wantExpr, info.TieredBillingSnapshot.ExprString)
+			assert.Equal(t, int64(100), info.TieredBillingSnapshot.PricingTimeUnix)
+			if tc.wantTier != "" {
+				assert.Equal(t, tc.wantTier, info.TieredBillingSnapshot.EstimatedTier)
+			}
 			assert.NotEqual(t, "model_price_error", taskErr.Code)
 			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{billing_setting.PluginBillingExprOption: `{}`, "billing_setting.billing_expr": `{}`}))
 			field := "seconds"
@@ -403,6 +411,9 @@ func TestSharedTaskBillingExpressionSelectionAndFrozenSettlement(t *testing.T) {
 			assert.Equal(t, float64(2), info.TieredBillingSnapshot.UsageFacts[field])
 			assert.Equal(t, 2*info.TieredBillingSnapshot.EstimatedQuotaAfterGroup, result.ActualQuotaAfterGroup)
 			assert.Equal(t, tc.wantExpr, info.TieredBillingSnapshot.ExprString)
+			if tc.wantTier != "" {
+				assert.Equal(t, tc.wantTier, result.MatchedTier)
+			}
 		})
 	}
 }

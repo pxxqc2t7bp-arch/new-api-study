@@ -171,7 +171,7 @@ func parseVolcenginePricing(
 	promotion := func(start, end int64) string {
 		return fmt.Sprintf(`unix() >= %d && unix() < %d`, start, end)
 	}
-	seedance25Expression := fmt.Sprintf(
+	seedance25Expression := "v2:" + fmt.Sprintf(
 		`%s == "1080p" ? (%s ? tier("promotion_1080p", %s ? %s : %s) : tier("list_1080p", %s ? %s : %s)) : tier("list_480p_720p", %s ? %s : %s)`,
 		resolution,
 		promotion(promotion25Start, promotion25End),
@@ -217,7 +217,7 @@ func parseVolcenginePricing(
 			),
 		},
 		"doubao-seedance-2-0-fast-260128": {
-			expression: fmt.Sprintf(
+			expression: "v2:" + fmt.Sprintf(
 				`%s ? tier("promotion", %s ? %s : %s) : tier("list", %s ? %s : %s)`,
 				promotion(promotion20Start, promotion20End),
 				video,
@@ -231,7 +231,7 @@ func parseVolcenginePricing(
 			validUntil: promotion20End,
 		},
 		"doubao-seedance-2-0-mini-260615": {
-			expression: fmt.Sprintf(
+			expression: "v2:" + fmt.Sprintf(
 				`%s ? tier("promotion", %s ? %s : %s) : tier("list", %s ? %s : %s)`,
 				promotion(promotion20Start, promotion20End),
 				video,

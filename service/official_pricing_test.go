@@ -2,15 +2,30 @@ package service
 
 import (
 	"context"
+	"io"
+	"maps"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
+	"github.com/QuantumNous/new-api/setting/config"
 
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+type officialPricingRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f officialPricingRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
 
 func TestParseOfficialPricingTables(t *testing.T) {
 	t.Run("parses a complete USD per million token table", func(t *testing.T) {
@@ -274,16 +289,35 @@ doubao-seedance-2.5 doubao-seedance-2.0-fast doubao-seedance-2.0-mini
 		map[string]string{
 			"doubao-seedance-2-5-260628":               "字节跳动",
 			"doubao-seedance-2-5-draft-preview-260828": "字节跳动",
+			"doubao-seedance-2-0-260128":               "字节跳动",
+			"doubao-seedance-2-0-fast-260128":          "字节跳动",
+			"doubao-seedance-2-0-mini-260615":          "字节跳动",
 		},
 		time.Now(),
 	)
 	require.NoError(t, err)
-	require.Len(t, prices, 2)
+	require.Len(t, prices, 5)
 
 	byModel := make(map[string]officialTokenPrice, len(prices))
 	for _, price := range prices {
 		byModel[price.ModelName] = price
 	}
+	for _, modelName := range []string{
+		"doubao-seedance-2-5-260628",
+		"doubao-seedance-2-5-draft-preview-260828",
+		"doubao-seedance-2-0-fast-260128",
+		"doubao-seedance-2-0-mini-260615",
+	} {
+		generated := officialPriceExpression(byModel[modelName])
+		assert.True(t, strings.HasPrefix(generated, "v2:"), modelName)
+		assert.Equal(t, 1, strings.Count(generated, "v2:"), modelName)
+		require.NoError(t, billing_setting.SmokeTestTaskExpr(generated, byModel[modelName].UsageSchema), modelName)
+	}
+	assert.False(t, strings.HasPrefix(
+		officialPriceExpression(byModel["doubao-seedance-2-0-260128"]),
+		"v2:",
+	))
+
 	expression := officialPriceExpression(byModel["doubao-seedance-2-5-260628"])
 	assert.Equal(
 		t,
@@ -291,8 +325,179 @@ doubao-seedance-2.5 doubao-seedance-2.0-fast doubao-seedance-2.0-mini
 		officialPriceExpression(byModel["doubao-seedance-2-5-draft-preview-260828"]),
 	)
 	_, err = billingexpr.CompileFromCache(expression)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unix")
+	require.NoError(t, err)
+
+	promotionStart := time.Date(2026, time.August, 14, 14, 0, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60)).Unix()
+	promotionEnd := time.Date(2026, time.September, 17, 14, 0, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60)).Unix()
+	usage := map[string]any{
+		"tokens":      1_000_000.0,
+		"resolution":  "1080p",
+		"video_input": "video",
+	}
+	for _, testCase := range []struct {
+		name      string
+		evaluated int64
+		wantTier  string
+		wantCNY   float64
+	}{
+		{name: "before promotion", evaluated: promotionStart - 1, wantTier: "list_1080p", wantCNY: 46},
+		{name: "inside promotion", evaluated: promotionStart, wantTier: "promotion_1080p", wantCNY: 33.12},
+		{name: "after promotion", evaluated: promotionEnd, wantTier: "list_1080p", wantCNY: 46},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			value, trace, runErr := billingexpr.RunExprWithRequest(
+				expression,
+				billingexpr.TokenParams{},
+				billingexpr.RequestInput{Usage: usage, EvaluatedAtUnix: testCase.evaluated},
+			)
+			require.NoError(t, runErr)
+			assert.InDelta(t, testCase.wantCNY/officialCNYPerUSD, value, 1e-9)
+			assert.Equal(t, testCase.wantTier, trace.MatchedTier)
+		})
+	}
+
+	snapshot := &billingexpr.BillingSnapshot{
+		BillingMode:      billing_setting.BillingModeTieredExpr,
+		BillingBasis:     billingexpr.BillingBasisTask,
+		ExprString:       expression,
+		ExprHash:         billingexpr.ExprHashString(expression),
+		ExprVersion:      billingexpr.ExprVersion(expression),
+		GroupRatio:       1,
+		QuotaPerUnit:     1,
+		PricingTimeUnix:  promotionStart,
+		TaskUsageBilling: true,
+	}
+	settled, _, err := EvaluateTaskCompletionUsage(snapshot, usage)
+	require.NoError(t, err)
+	assert.InDelta(t, 33.12/officialCNYPerUSD, settled.ActualQuotaBeforeGroup, 1e-9)
+	assert.Equal(t, "promotion_1080p", settled.MatchedTier)
+}
+
+func TestOfficialPricingSyncPersistsVolcengineV2ExpressionOnce(t *testing.T) {
+	const modelName = "doubao-seedance-2-5-260628"
+	body := []byte(`<html><body>
+doubao-seedance-2.5 doubao-seedance-2.0-fast doubao-seedance-2.0-mini
+70.00 46.00 37.00 23.00
+</body></html>`)
+
+	previousDB := model.DB
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate(
+		&model.Option{},
+		&model.Vendor{},
+		&model.Model{},
+		&model.UpstreamGroup{},
+		&model.UpstreamPriceEvidence{},
+		&model.Ability{},
+		&model.Channel{},
+	))
+	model.DB = database
+
+	previousHTTPClient := httpClient
+	previousSources := officialPricingSourceURLs
+	requests := 0
+	httpClient = &http.Client{Transport: officialPricingRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/html"}},
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+			Request:    request,
+		}, nil
+	})}
+	officialPricingSourceURLs = map[string][]string{
+		"volcengine": {"https://docs.volcengine.com/docs/82379/1544106?lang=zh"},
+	}
+	t.Setenv("UPSTREAM_PRICING_PROXY_URL", "")
+
+	savedConfig := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		savedConfig[key] = value
+		return nil
+	}))
+	common.OptionMapRWMutex.Lock()
+	previousOptionMap := common.OptionMap
+	common.OptionMap = maps.Clone(common.OptionMap)
+	if common.OptionMap == nil {
+		common.OptionMap = make(map[string]string)
+	}
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		model.DB = previousDB
+		httpClient = previousHTTPClient
+		officialPricingSourceURLs = previousSources
+		model.InvalidatePricingCache()
+		require.NoError(t, config.GlobalConfig.LoadFromDB(savedConfig))
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptionMap
+		common.OptionMapRWMutex.Unlock()
+	})
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode":    `{}`,
+		"billing_setting.billing_expr":    `{}`,
+		"group_ratio_setting.group_ratio": `{"default":1,"cxy":1}`,
+	}))
+
+	vendor := model.Vendor{Name: "字节跳动", Status: 1}
+	require.NoError(t, database.Create(&vendor).Error)
+	require.NoError(t, database.Create(&model.Model{
+		ModelName:    modelName,
+		VendorID:     vendor.Id,
+		Status:       1,
+		SyncOfficial: 1,
+	}).Error)
+
+	prices, err := parseVolcenginePricing(
+		officialPricingSourceURLs["volcengine"][0],
+		body,
+		map[string]string{modelName: "字节跳动"},
+		time.Unix(1_800_000_000, 0),
+	)
+	require.NoError(t, err)
+	require.Len(t, prices, 1)
+	validatedExpression := officialPriceExpression(prices[0])
+
+	first, err := RunOfficialPricingSync(t.Context(), time.Unix(1_800_000_000, 0))
+	require.NoError(t, err)
+	assert.Equal(t, OfficialPricingSyncSummary{
+		Fetched: 1,
+		Parsed:  1,
+		Applied: 1,
+	}, first)
+
+	second, err := RunOfficialPricingSync(t.Context(), time.Unix(1_800_000_001, 0))
+	require.NoError(t, err)
+	assert.Equal(t, OfficialPricingSyncSummary{
+		Fetched:   1,
+		Parsed:    1,
+		Unchanged: 1,
+	}, second)
+	assert.Equal(t, 2, requests)
+
+	var expressionOption model.Option
+	require.NoError(t, database.Where("key = ?", "billing_setting.billing_expr").First(&expressionOption).Error)
+	var persistedExpressions map[string]string
+	require.NoError(t, common.Unmarshal([]byte(expressionOption.Value), &persistedExpressions))
+	assert.Equal(t, validatedExpression, persistedExpressions[modelName])
+	assert.Equal(t, validatedExpression, func() string {
+		expression, _ := billing_setting.GetBillingExpr(modelName)
+		return expression
+	}())
+
+	var expressionRows int64
+	require.NoError(t, database.Model(&model.Option{}).
+		Where("key = ?", "billing_setting.billing_expr").
+		Count(&expressionRows).Error)
+	assert.Equal(t, int64(1), expressionRows)
+
+	var evidence []model.UpstreamPriceEvidence
+	require.NoError(t, database.Order("id").Find(&evidence).Error)
+	require.Len(t, evidence, 2)
+	assert.Equal(t, model.UpstreamPriceStatusApplied, evidence[0].Status)
+	assert.Equal(t, model.UpstreamPriceStatusUnchanged, evidence[1].Status)
+	assert.Empty(t, evidence[0].Error)
+	assert.Empty(t, evidence[1].Error)
 }
 
 func TestParseVolcenginePricingBuildsSeedreamRequestPrices(t *testing.T) {
@@ -322,6 +527,7 @@ doubao-seedream-4-5 doubao-seedream-4-0
 		byModel[price.ModelName] = price
 		assert.Equal(t, billingexpr.BillingBasisRequest, price.BillingBasis)
 		assert.Equal(t, "count", price.UsageSchema["image_count"].Unit)
+		assert.False(t, strings.HasPrefix(officialPriceExpression(price), "v2:"))
 	}
 	evaluate := func(modelName string, facts map[string]any) (float64, string) {
 		t.Helper()

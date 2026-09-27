@@ -16,13 +16,18 @@ The expression is the billing contract between the administrator and the system.
 
 4. **Upstream-agnostic** — The expression doesn't need to know whether the upstream API is OpenAI-format (prompt_tokens includes cache) or Claude-format (input_tokens excludes cache). The system normalizes token counts before evaluation based on the upstream response format.
 
-5. **Version-aware** — Expressions carry a version tag (`v1:`, default when omitted). The version controls the compile environment, token normalization, and quota conversion formula, enabling future evolution without breaking existing expressions.
+5. **Version-aware** — Expressions carry a version tag (`v1:` or `v2:`; v1 is the default when omitted). The version controls the compile environment, token normalization, and quota conversion formula, enabling future evolution without breaking existing expressions.
 
 ---
 
 ## Expression Language
 
 Powered by [expr-lang/expr](https://github.com/expr-lang/expr). Expressions are compiled, cached, and evaluated against a runtime environment.
+
+v2 is a strict superset of v1 and adds `unix()`. Time probes use one pricing
+timestamp captured at request pre-consume and retained in the billing snapshot,
+so estimate, retries, polling, and settlement cannot cross a pricing boundary.
+v1 expressions, including unprefixed expressions, reject `unix()`.
 
 ### Token Variables
 
@@ -172,6 +177,7 @@ OpenAI 已于 2026-05-12 下线 DALL·E 2/3；其校验、默认值和倍率保�
 | `weekday` | `weekday(tz) → int` | Day of week (0=Sunday, 6=Saturday) |
 | `month` | `month(tz) → int` | Month (1-12) |
 | `day` | `day(tz) → int` | Day of month (1-31) |
+| `unix` | `unix() → int64` | Frozen pricing timestamp in Unix seconds (v2 only) |
 | `max` | `max(a, b) → float64` | Math max |
 | `min` | `min(a, b) → float64` | Math min |
 | `abs` | `abs(x) → float64` | Absolute value |

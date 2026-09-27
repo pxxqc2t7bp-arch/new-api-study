@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -20,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -301,6 +303,9 @@ func TestPreConsumePolicyDatabaseMatrix(t *testing.T) {
 					}
 				})
 			}
+			require.Eventually(t, func() bool {
+				return gopool.WorkerCount() == 0
+			}, 5*time.Second, 10*time.Millisecond, "quota cache callbacks must drain before restoring global database flags")
 		})
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -69,6 +70,42 @@ func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {
 	require.Equal(t, "stream", info.TieredBillingSnapshot.EstimatedTier)
 	require.Equal(t, billing_setting.BillingModeTieredExpr, info.TieredBillingSnapshot.BillingMode)
 	require.Equal(t, common.QuotaPerUnit, info.TieredBillingSnapshot.QuotaPerUnit)
+}
+
+func TestModelPriceHelperTieredFreezesRequestStartTime(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	saved := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		saved[key] = value
+		return nil
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(saved))
+	})
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode":    `{"tiered-time-model":"tiered_expr"}`,
+		"billing_setting.billing_expr":    `{"tiered-time-model":"v2:unix() == 100 ? tier(\"frozen\", p) : tier(\"wall_clock\", p * 10)"}`,
+		"group_ratio_setting.group_ratio": `{"default":1}`,
+	}))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	info := &relaycommon.RelayInfo{
+		OriginModelName:     "tiered-time-model",
+		UserGroup:           "default",
+		UsingGroup:          "default",
+		StartTime:           time.Unix(100, 123),
+		BillingRequestInput: &billingexpr.RequestInput{},
+	}
+
+	_, err := ModelPriceHelper(ctx, info, 100, &types.TokenCountMeta{})
+	require.NoError(t, err)
+	require.NotNil(t, info.TieredBillingSnapshot)
+	require.NotNil(t, info.BillingRequestInput)
+	assert.Equal(t, int64(100), info.TieredBillingSnapshot.PricingTimeUnix)
+	assert.Equal(t, int64(100), info.BillingRequestInput.EvaluatedAtUnix)
+	assert.Equal(t, "frozen", info.TieredBillingSnapshot.EstimatedTier)
 }
 
 func TestFixedPricePreConsumeAndRealtimeRejection(t *testing.T) {
