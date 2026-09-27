@@ -365,6 +365,57 @@ git add \
 git commit -m "ops: apply targeted opus 5.5 official pricing"
 ```
 
+### Task 2A: Add a Pinned Official HTML Fallback
+
+**Files:**
+
+- Modify: `scripts/ops/apply_opus55_official_pricing.py`
+- Test: `scripts/ops/test_apply_opus55_official_pricing.py`
+
+- [ ] **Step 1: Write failing source-file validation tests**
+
+Add tests proving that `--official-source-file` requires
+`--official-source-sha256`, and that the input must be an absolute, private
+`0600`, single-link regular file owned by the current user. Cover a valid
+official HTML file plus hash, hash mismatch, symlink, hard link, oversized
+input, and an incomplete argument pair.
+
+- [ ] **Step 2: Run the focused tests and verify RED**
+
+```bash
+python3 -m unittest \
+  scripts.ops.test_apply_opus55_official_pricing.ProductionDependenciesTest
+```
+
+Expected: the new pinned-source tests fail because the CLI and secure reader do
+not exist.
+
+- [ ] **Step 3: Implement the minimal pinned-source adapter**
+
+Add paired optional CLI arguments:
+
+```text
+--official-source-file /absolute/path/to/raw-official-page.html
+--official-source-sha256 <64-lowercase-hex>
+```
+
+When supplied, `fetch(SOURCE_URL, 30)` must read the file with
+`O_RDONLY|O_NOFOLLOW`, verify owner, `0600` mode, link count one, a bounded
+maximum size, and the expected SHA-256, then return the raw bytes to
+`parse_official_page`. Do not accept normalized JSON or caller-supplied price
+fields. When omitted, retain the strict direct-fetch behavior.
+
+- [ ] **Step 4: Run the full verification**
+
+```bash
+python3 -m unittest scripts.ops.test_apply_opus55_official_pricing
+python3 -m py_compile \
+  scripts/ops/apply_opus55_official_pricing.py \
+  scripts/ops/test_apply_opus55_official_pricing.py
+```
+
+Expected: all tests pass.
+
 ### Task 3: Run Production Preflight and Apply Exactly Once
 
 **Files:**
@@ -380,7 +431,7 @@ Run read-only checks on `v100s` for:
 ```text
 hostname=xingyugpu
 machine_id_sha256=f131f2873ea46b3cea3d9388bd44bf30751e97c0a1b35ea1e87b8b94ac44ac8c
-revision=70127f55e020c9bf9a0af9d3acd2e7e15af167ef
+revision=39b86ed5925fbd199818fd1d6d3ea3c00adf0416
 runtime=running:healthy:restarts=0
 pricing_lock=absent
 deployment_lock=absent
@@ -393,27 +444,68 @@ opus55_version=44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a
 
 Stop without writing if any assertion differs.
 
-- [ ] **Step 2: Stream the verified script to `v100s` exactly once**
+- [ ] **Step 2: Prepare and pin the official HTML**
+
+Download `SOURCE_URL` on the trusted local workstation without modifying the
+response body, compute SHA-256, upload it to a unique path under
+`/data1/newapi-study/backups/`, set owner `root:root` and mode `0600`, and
+verify the remote hash equals the local hash.
+
+```bash
+source_url="https://platform.claude.com/docs/en/about-claude/pricing"
+run_stamp=$(date -u +%Y%m%dT%H%M%SZ)
+source_local="/tmp/claude-pricing-${run_stamp}.html"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  --user-agent 'newapi-pricing-audit/1' \
+  --output "$source_local" "$source_url"
+source_sha256=$(shasum -a 256 "$source_local" | awk '{print $1}')
+source_file="/data1/newapi-study/backups/claude-pricing-${source_sha256}.html"
+scp "$source_local" "v100s:/tmp/claude-pricing-${source_sha256}.html"
+ssh v100s \
+  install -o root -g root -m 0600 \
+  "/tmp/claude-pricing-${source_sha256}.html" "$source_file"
+ssh v100s rm -f "/tmp/claude-pricing-${source_sha256}.html"
+test "$source_sha256" = "$(
+  ssh v100s sha256sum "$source_file" | awk '{print $1}'
+)"
+```
+
+- [ ] **Step 3: Archive a proven pre-write failed lock, if present**
+
+If a prior attempt stopped before snapshot/PATCH, verify its summary says
+`write_outcome=not_committed`, no PATCH evidence exists, no canary was
+attempted, the current target snapshot is still empty, and its lock owner
+matches the failed output directory and run ID. Atomically rename that lock to
+`.pricing-change.failed.<run-id>` with no replacement and fsync
+`/opt/newapi-study`. Preserve the failed output directory and archived lock.
+
+- [ ] **Step 4: Stream the verified script to `v100s`**
 
 Run:
 
 ```bash
 run_stamp=$(date -u +%Y%m%dT%H%M%SZ)
 output_dir="/data1/newapi-study/backups/pre-opus55-pricing-${run_stamp}"
+source_file="/data1/newapi-study/backups/claude-pricing-${source_sha256}.html"
+current_revision=39b86ed5925fbd199818fd1d6d3ea3c00adf0416
 ssh -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
   v100s \
-  'cd /opt/newapi-study && python3 - \
-    --output-dir '"$output_dir"' \
-    --expected-revision 70127f55e020c9bf9a0af9d3acd2e7e15af167ef \
+  python3 - \
+    --output-dir "$output_dir" \
+    --expected-revision "$current_revision" \
     --existing-token-user-id 20 \
-    --existing-token-id 139' \
+    --existing-token-id 139 \
+    --official-source-file "$source_file" \
+    --official-source-sha256 "$source_sha256" \
   < scripts/ops/apply_opus55_official_pricing.py
 ```
 
-Do not rerun this command after a connection failure. Inspect the lock and
-one-model snapshot to determine the outcome.
+Do not rerun after the PATCH may have been attempted. Inspect the lock,
+artifacts, and one-model snapshot to determine the outcome. A proven
+pre-PATCH failure may be recovered only through Step 3 and a new output
+directory.
 
-- [ ] **Step 3: Evaluate the single canary**
+- [ ] **Step 5: Evaluate the single canary**
 
 Accepted local-pricing result:
 

@@ -77,8 +77,14 @@ an explicit price.
    deployment-lock absence, and unchanged status of channels 4, 66, and 96.
 3. Capture the current model-pricing snapshot, its CAS version, the relevant
    option-row hashes, and a PostgreSQL dump.
-4. Fetch the allowlisted Anthropic pricing page and require the exact
-   `Claude Opus 5.5` row with all five expected prices.
+4. Load the allowlisted Anthropic pricing page and require the exact
+   `Claude Opus 5.5` row with all five expected prices. The default path
+   fetches `SOURCE_URL` directly. If the production host is redirected by a
+   regional availability policy, an operator may download the unchanged HTML
+   from `SOURCE_URL` on the trusted local workstation, upload it as a private
+   regular file, and provide both its absolute path and SHA-256. The
+   production script must verify the file owner, `0600` mode, single-link
+   status, bounded size, and exact hash before parsing the HTML itself.
 5. Submit the proposed draft to
    `POST /api/option/model_pricing/preview`.
 6. Require the preview to compile to the exact expression above and report
@@ -97,15 +103,30 @@ an explicit price.
 11. Release the pricing lock only after the write outcome and all evidence
     paths are known.
 
-The API request uses an existing local root-session helper. Credentials remain
-inside the process and must not be printed, stored in the report, or passed on
-the command line.
+The script uses an inline local API and PostgreSQL adapter fixed to the
+production loopback proxy. Credentials remain inside the process and must not
+be printed, stored in the report, or passed on the command line.
+
+The pinned-source fallback accepts raw official HTML only. It must never accept
+a precomputed price object or normalized evidence as a substitute for parsing
+the official row. The source path and expected SHA-256 are recorded in the
+audit evidence without copying credentials or unrelated local data.
 
 ## Failure Handling
 
 ### Preflight Or Preview Failure
 
 Perform no write. Record the failure and leave production unchanged.
+
+If a known pre-write failure retains the pricing lock, retry is permitted only
+after all of the following are proven: the target snapshot is still the empty
+pre-change version, no PATCH evidence exists, no canary was attempted, and the
+lock owner matches the failed run and output directory. Preserve the failed
+run by atomically renaming its active lock to a unique
+`.pricing-change.failed.<run-id>` archive and fsyncing the parent directory.
+Never delete or overwrite the retained lock. The replacement run must use a
+new output directory and still permits at most one PATCH and one canary across
+all attempts.
 
 ### CAS Conflict
 
@@ -166,3 +187,6 @@ Do not roll back solely because the upstream canary returns the pre-existing
   with upstream provider availability.
 - Compose, database dump, pricing evidence, reports, and SHA-256 manifests are
   retained under the existing production audit directory.
+- When the pinned-source fallback is used, the production parser validates the
+  exact uploaded HTML bytes against the operator-supplied SHA-256 before any
+  pricing snapshot or PATCH request.
