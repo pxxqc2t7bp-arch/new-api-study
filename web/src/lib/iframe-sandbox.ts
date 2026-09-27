@@ -16,20 +16,28 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import type { Table } from '@tanstack/react-table'
+const SCRIPT_APP_SANDBOX =
+  'allow-scripts allow-forms allow-popups allow-presentation'
 
-import { DataTableBulkActions as BulkActionsToolbar } from '@/components/data-table'
-
-import type { User } from '../types'
-
-interface DataTableBulkActionsProps {
-  table: Table<User>
+export type ScriptAppIframeProps = {
+  sandbox: string
+  src: string | undefined
 }
 
-export function DataTableBulkActions({ table }: DataTableBulkActionsProps) {
-  return (
-    <BulkActionsToolbar table={table} entityName='user'>
-      {null}
-    </BulkActionsToolbar>
-  )
+export function getScriptAppIframeProps(src?: string): ScriptAppIframeProps {
+  if (!src) return { sandbox: SCRIPT_APP_SANDBOX, src: undefined }
+
+  try {
+    const target =
+      typeof window === 'undefined'
+        ? new URL(src)
+        : new URL(src, window.location.href)
+    if (target.protocol === 'http:' || target.protocol === 'https:') {
+      return { sandbox: SCRIPT_APP_SANDBOX, src }
+    }
+  } catch {
+    // Invalid targets remain unloaded.
+  }
+
+  return { sandbox: SCRIPT_APP_SANDBOX, src: undefined }
 }

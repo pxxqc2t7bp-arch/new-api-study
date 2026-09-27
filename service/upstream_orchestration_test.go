@@ -213,9 +213,9 @@ func TestManagedUpstreamRouteOverviewDatabaseFixtureRollsBack(t *testing.T) {
 	if runnerDialect == "" {
 		runnerDialect = string(common.DatabaseTypeSQLite)
 		t.Setenv("APP_PLUGIN_TEST_DIALECT", runnerDialect)
-		if os.Getenv("APP_PLUGIN_TEST_DSN") == "" {
-			t.Setenv("APP_PLUGIN_TEST_DSN", filepath.Join(t.TempDir(), "overview.db"))
-		}
+	}
+	if runnerDialect == string(common.DatabaseTypeSQLite) && os.Getenv("APP_PLUGIN_TEST_DSN") == "" {
+		t.Setenv("APP_PLUGIN_TEST_DSN", filepath.Join(t.TempDir(), "overview.db"))
 	}
 	require.Equal(t, runnerDialect, os.Getenv("APP_PLUGIN_TEST_DIALECT"))
 	require.NotEmpty(t, os.Getenv("APP_PLUGIN_TEST_DSN"))
