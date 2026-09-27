@@ -64,6 +64,7 @@ EXPECTED_MACHINE_ID_SHA256 = (
 )
 EXPECTED_ARCHITECTURE = "x86_64"
 HASH_CHUNK_SIZE = 4 * 1024 * 1024
+OFFICIAL_SOURCE_MAX_BYTES = 8 * 1024 * 1024
 PRICING_PATH = "/api/option/model_pricing"
 PRICING_SNAPSHOT_PATH = PRICING_PATH + "?model=" + MODEL
 PREVIEW_PATH = PRICING_PATH + "/preview"
@@ -114,6 +115,32 @@ REQUIRED_ARTIFACTS = PRE_PATCH_REQUIRED_ARTIFACTS | {
     "summary.json",
 }
 FINAL_OWNER_STATES = frozenset({"pending_release"})
+
+
+def _validate_official_source_options(
+    source_file: object,
+    source_sha256: object,
+) -> tuple[Path | None, str | None]:
+    if (source_file is None) != (source_sha256 is None):
+        raise ValueError(
+            "official source file and SHA-256 must be provided together"
+        )
+    if source_file is None:
+        return None, None
+    if (
+        not isinstance(source_file, str)
+        or not source_file
+        or not Path(source_file).is_absolute()
+    ):
+        raise ValueError("official source file must be an absolute path")
+    if (
+        not isinstance(source_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
+    ):
+        raise ValueError(
+            "official source SHA-256 must be 64 lowercase hex characters"
+        )
+    return Path(source_file), source_sha256
 
 
 class LockAcquireCleanupError(RuntimeError):
@@ -899,6 +926,47 @@ def execute_operation(deps: object) -> int:
         deps.dump_database()
 
         official = parse_official_page(deps.fetch(SOURCE_URL, 30))
+        source_metadata = deps.official_source_metadata()
+        if not isinstance(source_metadata, dict):
+            raise RuntimeError("official source metadata is invalid")
+        source_mode = source_metadata.get("source_mode")
+        if source_mode == "network":
+            if source_metadata != {
+                "source_mode": "network",
+                "source_url": SOURCE_URL,
+            }:
+                raise RuntimeError("network source metadata is invalid")
+        elif source_mode == "pinned_file":
+            source_path = source_metadata.get("source_path")
+            source_sha256 = source_metadata.get("source_sha256")
+            if (
+                set(source_metadata)
+                != {
+                    "source_url",
+                    "source_mode",
+                    "source_path",
+                    "source_sha256",
+                }
+                or source_metadata.get("source_url") != SOURCE_URL
+                or not isinstance(source_path, str)
+                or not Path(source_path).is_absolute()
+                or not isinstance(source_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
+                or source_sha256 != official["document_sha256"]
+            ):
+                raise RuntimeError("pinned source metadata is invalid")
+        else:
+            raise RuntimeError("official source mode is invalid")
+        official.pop("evidence_sha256")
+        official.update(source_metadata)
+        normalized_official = json.dumps(
+            official,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        official["evidence_sha256"] = hashlib.sha256(
+            normalized_official
+        ).hexdigest()
         deps.write_json("official-evidence.json", official)
 
         admin_headers = deps.root_headers()
@@ -1683,6 +1751,13 @@ class ProductionDependencies:
             or args.existing_token_id <= 1
         ):
             raise ValueError("dedicated token IDs must be greater than 1")
+        (
+            self._official_source_path,
+            self._official_source_sha256,
+        ) = _validate_official_source_options(
+            getattr(args, "official_source_file", None),
+            getattr(args, "official_source_sha256", None),
+        )
 
         self.expected_revision = args.expected_revision
         self.existing_token_user_id = args.existing_token_user_id
@@ -1694,6 +1769,7 @@ class ProductionDependencies:
         self._run = run
         self._check_output = check_output
         self._urlopen = urlopen
+        self._official_source_metadata: dict[str, object] | None = None
         self._http_connection = http_connection
         self.monotonic = monotonic
         self.compose_path = self.root / "docker-compose.yml"
@@ -2013,8 +2089,119 @@ WHERE id IN (4,66,96);
         self._make_file_durable(listing_path)
 
     def fetch(self, url: str, timeout: int) -> bytes:
+        self._official_source_metadata = None
         if url != SOURCE_URL or timeout != 30:
             raise RuntimeError("official pricing fetch contract mismatch")
+        if self._official_source_path is not None:
+            source_path = self._official_source_path
+            before_path_stat = os.lstat(source_path)
+            descriptor = os.open(
+                source_path,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+            )
+            try:
+                before_descriptor_stat = os.fstat(descriptor)
+                self._validate_private_file_stat(
+                    source_path,
+                    before_descriptor_stat,
+                )
+                if not (
+                    0 < before_descriptor_stat.st_size
+                    <= OFFICIAL_SOURCE_MAX_BYTES
+                ):
+                    raise RuntimeError(
+                        "official source file size is invalid"
+                    )
+                initial_identity = (
+                    before_descriptor_stat.st_dev,
+                    before_descriptor_stat.st_ino,
+                    before_descriptor_stat.st_mode,
+                    before_descriptor_stat.st_uid,
+                    before_descriptor_stat.st_nlink,
+                    before_descriptor_stat.st_size,
+                )
+                path_identity = (
+                    before_path_stat.st_dev,
+                    before_path_stat.st_ino,
+                    before_path_stat.st_mode,
+                    before_path_stat.st_uid,
+                    before_path_stat.st_nlink,
+                    before_path_stat.st_size,
+                )
+                if path_identity != initial_identity:
+                    raise RuntimeError(
+                        "official source path changed before reading"
+                    )
+
+                digest = hashlib.sha256()
+                chunks: list[bytes] = []
+                total_size = 0
+                while True:
+                    read_size = min(
+                        HASH_CHUNK_SIZE,
+                        OFFICIAL_SOURCE_MAX_BYTES - total_size + 1,
+                    )
+                    chunk = os.read(descriptor, read_size)
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    if total_size > OFFICIAL_SOURCE_MAX_BYTES:
+                        raise RuntimeError(
+                            "official source file size exceeds limit"
+                        )
+                    digest.update(chunk)
+                    chunks.append(chunk)
+
+                after_descriptor_stat = os.fstat(descriptor)
+                after_path_stat = os.lstat(source_path)
+                after_descriptor_identity = (
+                    after_descriptor_stat.st_dev,
+                    after_descriptor_stat.st_ino,
+                    after_descriptor_stat.st_mode,
+                    after_descriptor_stat.st_uid,
+                    after_descriptor_stat.st_nlink,
+                    after_descriptor_stat.st_size,
+                )
+                after_path_identity = (
+                    after_path_stat.st_dev,
+                    after_path_stat.st_ino,
+                    after_path_stat.st_mode,
+                    after_path_stat.st_uid,
+                    after_path_stat.st_nlink,
+                    after_path_stat.st_size,
+                )
+                if (
+                    after_descriptor_identity != initial_identity
+                    or after_path_identity != initial_identity
+                    or total_size != before_descriptor_stat.st_size
+                ):
+                    raise RuntimeError(
+                        "official source file changed while reading"
+                    )
+                self._validate_private_file_stat(
+                    source_path,
+                    after_descriptor_stat,
+                )
+                self._validate_private_file_stat(
+                    source_path,
+                    after_path_stat,
+                )
+                actual_sha256 = digest.hexdigest()
+                if actual_sha256 != self._official_source_sha256:
+                    raise RuntimeError(
+                        "official source file hash mismatch"
+                    )
+                body = b"".join(chunks)
+            finally:
+                os.close(descriptor)
+            self._official_source_metadata = {
+                "source_url": SOURCE_URL,
+                "source_mode": "pinned_file",
+                "source_path": str(source_path),
+                "source_sha256": actual_sha256,
+            }
+            return body
+
         request = urllib.request.Request(
             url,
             headers={"User-Agent": "newapi-pricing-audit/1"},
@@ -2024,7 +2211,19 @@ WHERE id IN (4,66,96);
             final_url = response.geturl()
             if status != 200 or final_url != SOURCE_URL:
                 raise RuntimeError("official pricing fetch failed")
-            return response.read()
+            body = response.read()
+        self._official_source_metadata = {
+            "source_mode": "network",
+            "source_url": SOURCE_URL,
+        }
+        return body
+
+    def official_source_metadata(self) -> dict[str, object]:
+        if self._official_source_metadata is None:
+            raise RuntimeError(
+                "official source metadata requested before successful fetch"
+            )
+        return dict(self._official_source_metadata)
 
     def root_headers(self) -> dict[str, str]:
         token = self._psql(
@@ -3215,7 +3414,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         type=int,
     )
-    return parser.parse_args(argv)
+    parser.add_argument("--official-source-file")
+    parser.add_argument("--official-source-sha256")
+    args = parser.parse_args(argv)
+    try:
+        _validate_official_source_options(
+            args.official_source_file,
+            args.official_source_sha256,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def main(

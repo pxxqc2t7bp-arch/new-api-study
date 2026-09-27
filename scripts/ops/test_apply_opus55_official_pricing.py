@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -183,6 +184,11 @@ class FakeDependencies:
         self.readback_error: BaseException | None = None
         self.snapshot_request_count = 0
         self.fetch_error: Exception | None = None
+        self.source_metadata: dict[str, object] = {
+            "source_mode": "network",
+            "source_url": pricing.SOURCE_URL,
+        }
+        self.official_source_fetched = False
         self.preview_result = api_response(
             {
                 "effective": dict(pricing.TARGET_PRICING),
@@ -276,7 +282,13 @@ class FakeDependencies:
         self.events.append("fetch:%s:%d" % (url, timeout))
         if self.fetch_error is not None:
             raise self.fetch_error
+        self.official_source_fetched = True
         return official_html()
+
+    def official_source_metadata(self) -> dict[str, object]:
+        if not self.official_source_fetched:
+            raise AssertionError("official source metadata requested before fetch")
+        return copy.deepcopy(self.source_metadata)
 
     def root_headers(self) -> dict[str, str]:
         self.events.append("root-headers")
@@ -1025,6 +1037,67 @@ class ExecuteOperationTest(unittest.TestCase):
             [pricing.patch_payload(pricing.EMPTY_VERSION)],
             deps.request_bodies["/api/option/model_pricing"],
         )
+
+    def test_pinned_source_metadata_is_bound_into_official_evidence(
+        self,
+    ) -> None:
+        deps = FakeDependencies()
+        source_sha256 = hashlib.sha256(official_html()).hexdigest()
+        deps.source_metadata = {
+            "source_url": pricing.SOURCE_URL,
+            "source_mode": "pinned_file",
+            "source_path": "/trusted/claude-pricing.html",
+            "source_sha256": source_sha256,
+        }
+
+        self.assertEqual(0, pricing.execute_operation(deps))
+
+        evidence = deps.json_artifacts["official-evidence.json"]
+        self.assertEqual("pinned_file", evidence["source_mode"])
+        self.assertEqual(
+            "/trusted/claude-pricing.html",
+            evidence["source_path"],
+        )
+        self.assertEqual(source_sha256, evidence["source_sha256"])
+        self.assertEqual(pricing.SOURCE_URL, evidence["source_url"])
+        normalized = json.dumps(
+            {
+                key: value
+                for key, value in evidence.items()
+                if key != "evidence_sha256"
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        self.assertEqual(
+            hashlib.sha256(normalized).hexdigest(),
+            evidence["evidence_sha256"],
+        )
+        self.assertNotIn(
+            official_html().decode().strip(),
+            json.dumps(evidence, sort_keys=True),
+        )
+
+    def test_direct_source_metadata_is_bound_into_official_evidence(
+        self,
+    ) -> None:
+        deps = FakeDependencies()
+
+        self.assertEqual(0, pricing.execute_operation(deps))
+
+        evidence = deps.json_artifacts["official-evidence.json"]
+        self.assertEqual(
+            {
+                "source_mode": "network",
+                "source_url": pricing.SOURCE_URL,
+            },
+            {
+                key: evidence[key]
+                for key in ("source_mode", "source_url")
+            },
+        )
+        self.assertNotIn("source_path", evidence)
+        self.assertNotIn("source_sha256", evidence)
 
     def test_deployment_marker_after_pricing_lock_retains_lock(self) -> None:
         deps = FakeDependencies()
@@ -3592,13 +3665,31 @@ class ExecuteOperationTest(unittest.TestCase):
 
 
 class ProductionDependenciesTest(unittest.TestCase):
-    def args(self, output_dir: pathlib.Path) -> types.SimpleNamespace:
+    def args(
+        self,
+        output_dir: pathlib.Path,
+        *,
+        official_source_file: str | None = None,
+        official_source_sha256: str | None = None,
+    ) -> types.SimpleNamespace:
         return types.SimpleNamespace(
             output_dir=str(output_dir),
             expected_revision=EXPECTED_REVISION,
             existing_token_user_id=20,
             existing_token_id=139,
+            official_source_file=official_source_file,
+            official_source_sha256=official_source_sha256,
         )
+
+    def private_source(
+        self,
+        directory: pathlib.Path,
+        body: bytes = official_html(),
+    ) -> tuple[pathlib.Path, str]:
+        source = directory / "official-pricing.html"
+        source.write_bytes(body)
+        source.chmod(0o600)
+        return source, hashlib.sha256(body).hexdigest()
 
     def write_protocol_artifacts(self, deps: object) -> set[str]:
         required = set(pricing.REQUIRED_ARTIFACTS)
@@ -4650,6 +4741,529 @@ class ProductionDependenciesTest(unittest.TestCase):
             "/data1/newapi-study/backups/cli-test",
             args.output_dir,
         )
+        self.assertIsNone(args.official_source_file)
+        self.assertIsNone(args.official_source_sha256)
+
+    def test_cli_accepts_only_a_complete_valid_pinned_source_pair(self) -> None:
+        base = [
+            "--output-dir",
+            "/data1/newapi-study/backups/cli-test",
+            "--expected-revision",
+            EXPECTED_REVISION,
+            "--existing-token-user-id",
+            "20",
+            "--existing-token-id",
+            "139",
+        ]
+        valid_hash = "a" * 64
+        invalid_cases = (
+            ["--official-source-file", "/tmp/official.html"],
+            ["--official-source-sha256", valid_hash],
+            [
+                "--official-source-file",
+                "relative/official.html",
+                "--official-source-sha256",
+                valid_hash,
+            ],
+            [
+                "--official-source-file",
+                "/tmp/official.html",
+                "--official-source-sha256",
+                "A" * 64,
+            ],
+            [
+                "--official-source-file",
+                "/tmp/official.html",
+                "--official-source-sha256",
+                "a" * 63,
+            ],
+            [
+                "--official-source-file",
+                "/tmp/official.html",
+                "--official-source-sha256",
+                "g" * 64,
+            ],
+        )
+        for extra in invalid_cases:
+            with (
+                self.subTest(extra=extra),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                pricing.parse_args(base + extra)
+
+        args = pricing.parse_args(
+            base
+            + [
+                "--official-source-file",
+                "/tmp/official.html",
+                "--official-source-sha256",
+                valid_hash,
+            ]
+        )
+
+        self.assertEqual("/tmp/official.html", args.official_source_file)
+        self.assertEqual(valid_hash, args.official_source_sha256)
+
+    def test_pinned_source_reads_verified_raw_html_without_network(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = pathlib.Path(directory)
+            root = base / "root"
+            backups = base / "backups"
+            root.mkdir()
+            backups.mkdir()
+            source, source_sha256 = self.private_source(base)
+            urlopen = mock.Mock(
+                side_effect=AssertionError("pinned mode must not use network")
+            )
+            deps = pricing.ProductionDependencies(
+                self.args(
+                    backups / "run",
+                    official_source_file=str(source),
+                    official_source_sha256=source_sha256,
+                ),
+                root=root,
+                backup_root=backups,
+                urlopen=urlopen,
+            )
+            read_sizes: list[int] = []
+            real_read = pricing.os.read
+
+            def bounded_read(descriptor: int, size: int) -> bytes:
+                read_sizes.append(size)
+                return real_read(descriptor, size)
+
+            with mock.patch.object(
+                pricing.os,
+                "read",
+                side_effect=bounded_read,
+            ):
+                body = deps.fetch(pricing.SOURCE_URL, 30)
+
+        self.assertEqual(official_html(), body)
+        self.assertEqual(
+            pricing.MODEL,
+            pricing.parse_official_page(body)["model"],
+        )
+        self.assertTrue(read_sizes)
+        self.assertTrue(
+            all(0 < size <= pricing.HASH_CHUNK_SIZE for size in read_sizes)
+        )
+        urlopen.assert_not_called()
+        self.assertEqual(
+            {
+                "source_url": pricing.SOURCE_URL,
+                "source_mode": "pinned_file",
+                "source_path": str(source),
+                "source_sha256": source_sha256,
+            },
+            deps.official_source_metadata(),
+        )
+
+    def test_pinned_source_rejects_fifo_without_blocking_or_fd_leak(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = pathlib.Path(directory)
+            root = base / "root"
+            backups = base / "backups"
+            root.mkdir()
+            backups.mkdir()
+            source = base / "official-pricing.html"
+            pricing.os.mkfifo(source, 0o600)
+            source.chmod(0o600)
+            urlopen = mock.Mock()
+            deps = pricing.ProductionDependencies(
+                self.args(
+                    backups / "run",
+                    official_source_file=str(source),
+                    official_source_sha256="0" * 64,
+                ),
+                root=root,
+                backup_root=backups,
+                urlopen=urlopen,
+            )
+            real_open = pricing.os.open
+            opened_source_descriptors: list[int] = []
+            failures: list[BaseException] = []
+            source_open_started = threading.Event()
+
+            def tracked_open(path, flags, *args, **kwargs):
+                is_source = pathlib.Path(path) == source
+                if is_source:
+                    source_open_started.set()
+                descriptor = real_open(path, flags, *args, **kwargs)
+                if is_source:
+                    opened_source_descriptors.append(descriptor)
+                return descriptor
+
+            def fetch_source() -> None:
+                try:
+                    deps.fetch(pricing.SOURCE_URL, 30)
+                except BaseException as exc:
+                    failures.append(exc)
+
+            worker = threading.Thread(target=fetch_source, daemon=True)
+            with mock.patch.object(
+                pricing.os,
+                "open",
+                side_effect=tracked_open,
+            ):
+                worker.start()
+                self.assertTrue(source_open_started.wait(timeout=1))
+                worker.join(timeout=0.2)
+                blocked_without_writer = worker.is_alive()
+                if blocked_without_writer:
+                    release_descriptor = real_open(
+                        source,
+                        pricing.os.O_RDWR | pricing.os.O_NONBLOCK,
+                    )
+                    pricing.os.close(release_descriptor)
+                    worker.join(timeout=1)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(1, len(failures))
+            self.assertIsInstance(failures[0], RuntimeError)
+            self.assertRegex(
+                str(failures[0]),
+                "private exclusive regular file",
+            )
+            self.assertEqual(1, len(opened_source_descriptors))
+            with self.assertRaises(OSError):
+                pricing.os.fstat(opened_source_descriptors[0])
+            self.assertFalse(
+                blocked_without_writer,
+                "pinned FIFO blocked before descriptor validation",
+            )
+            urlopen.assert_not_called()
+
+    def test_pinned_source_rejects_hash_mismatch_without_network(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = pathlib.Path(directory)
+            root = base / "root"
+            backups = base / "backups"
+            root.mkdir()
+            backups.mkdir()
+            source, _ = self.private_source(base)
+            urlopen = mock.Mock()
+            deps = pricing.ProductionDependencies(
+                self.args(
+                    backups / "run",
+                    official_source_file=str(source),
+                    official_source_sha256="0" * 64,
+                ),
+                root=root,
+                backup_root=backups,
+                urlopen=urlopen,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "hash"):
+                deps.fetch(pricing.SOURCE_URL, 30)
+
+        urlopen.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "before.*fetch"):
+            deps.official_source_metadata()
+
+    def test_pinned_source_rejects_unsafe_file_types_and_mode(self) -> None:
+        cases = ("symlink", "hardlink", "directory", "mode")
+        for unsafe_kind in cases:
+            with self.subTest(kind=unsafe_kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    base = pathlib.Path(directory)
+                    root = base / "root"
+                    backups = base / "backups"
+                    root.mkdir()
+                    backups.mkdir()
+                    source, source_sha256 = self.private_source(base)
+                    if unsafe_kind == "symlink":
+                        target = base / "target.html"
+                        source.replace(target)
+                        source.symlink_to(target)
+                    elif unsafe_kind == "hardlink":
+                        pricing.os.link(source, base / "second-link.html")
+                    elif unsafe_kind == "directory":
+                        source.unlink()
+                        source.mkdir()
+                    else:
+                        source.chmod(0o640)
+                    urlopen = mock.Mock()
+                    deps = pricing.ProductionDependencies(
+                        self.args(
+                            backups / "run",
+                            official_source_file=str(source),
+                            official_source_sha256=source_sha256,
+                        ),
+                        root=root,
+                        backup_root=backups,
+                        urlopen=urlopen,
+                    )
+
+                    with self.assertRaises((OSError, RuntimeError)):
+                        deps.fetch(pricing.SOURCE_URL, 30)
+
+                    urlopen.assert_not_called()
+
+    def test_pinned_source_rejects_wrong_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = pathlib.Path(directory)
+            root = base / "root"
+            backups = base / "backups"
+            root.mkdir()
+            backups.mkdir()
+            source, source_sha256 = self.private_source(base)
+            deps = pricing.ProductionDependencies(
+                self.args(
+                    backups / "run",
+                    official_source_file=str(source),
+                    official_source_sha256=source_sha256,
+                ),
+                root=root,
+                backup_root=backups,
+                urlopen=mock.Mock(),
+            )
+            with (
+                mock.patch.object(
+                    pricing.os,
+                    "getuid",
+                    return_value=pricing.os.getuid() + 1,
+                ),
+                self.assertRaisesRegex(RuntimeError, "private|owner"),
+            ):
+                deps.fetch(pricing.SOURCE_URL, 30)
+
+    def test_pinned_source_rejects_empty_and_oversized_files(self) -> None:
+        maximum_size = 8 * 1024 * 1024
+        for description, size in (("empty", 0), ("oversized", maximum_size + 1)):
+            with self.subTest(description=description):
+                with tempfile.TemporaryDirectory() as directory:
+                    base = pathlib.Path(directory)
+                    root = base / "root"
+                    backups = base / "backups"
+                    root.mkdir()
+                    backups.mkdir()
+                    source = base / "official-pricing.html"
+                    with source.open("wb") as handle:
+                        handle.truncate(size)
+                    source.chmod(0o600)
+                    urlopen = mock.Mock()
+                    deps = pricing.ProductionDependencies(
+                        self.args(
+                            backups / "run",
+                            official_source_file=str(source),
+                            official_source_sha256="0" * 64,
+                        ),
+                        root=root,
+                        backup_root=backups,
+                        urlopen=urlopen,
+                    )
+
+                    with self.assertRaisesRegex(RuntimeError, "size"):
+                        deps.fetch(pricing.SOURCE_URL, 30)
+
+                    urlopen.assert_not_called()
+
+    def test_pinned_source_rejects_path_exchange_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = pathlib.Path(directory)
+            root = base / "root"
+            backups = base / "backups"
+            root.mkdir()
+            backups.mkdir()
+            source, source_sha256 = self.private_source(base)
+            replacement = base / "replacement.html"
+            replacement.write_bytes(official_html())
+            replacement.chmod(0o600)
+            deps = pricing.ProductionDependencies(
+                self.args(
+                    backups / "run",
+                    official_source_file=str(source),
+                    official_source_sha256=source_sha256,
+                ),
+                root=root,
+                backup_root=backups,
+                urlopen=mock.Mock(),
+            )
+            real_read = pricing.os.read
+            exchanged = False
+
+            def exchange_after_read(descriptor: int, size: int) -> bytes:
+                nonlocal exchanged
+                chunk = real_read(descriptor, size)
+                if chunk and not exchanged:
+                    exchanged = True
+                    pricing.os.replace(replacement, source)
+                return chunk
+
+            with (
+                mock.patch.object(
+                    pricing.os,
+                    "read",
+                    side_effect=exchange_after_read,
+                ),
+                self.assertRaisesRegex(RuntimeError, "changed"),
+            ):
+                deps.fetch(pricing.SOURCE_URL, 30)
+
+    def test_pinned_source_rejects_size_change_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = pathlib.Path(directory)
+            root = base / "root"
+            backups = base / "backups"
+            root.mkdir()
+            backups.mkdir()
+            source, source_sha256 = self.private_source(base)
+            deps = pricing.ProductionDependencies(
+                self.args(
+                    backups / "run",
+                    official_source_file=str(source),
+                    official_source_sha256=source_sha256,
+                ),
+                root=root,
+                backup_root=backups,
+                urlopen=mock.Mock(),
+            )
+            real_read = pricing.os.read
+            changed = False
+
+            def append_after_read(descriptor: int, size: int) -> bytes:
+                nonlocal changed
+                chunk = real_read(descriptor, size)
+                if chunk and not changed:
+                    changed = True
+                    with source.open("ab") as handle:
+                        handle.write(b"x")
+                return chunk
+
+            with (
+                mock.patch.object(
+                    pricing.os,
+                    "read",
+                    side_effect=append_after_read,
+                ),
+                self.assertRaisesRegex(RuntimeError, "changed"),
+            ):
+                deps.fetch(pricing.SOURCE_URL, 30)
+
+    def test_pinned_source_read_error_fails_closed_without_network(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = pathlib.Path(directory)
+            root = base / "root"
+            backups = base / "backups"
+            root.mkdir()
+            backups.mkdir()
+            source, source_sha256 = self.private_source(base)
+            urlopen = mock.Mock()
+            deps = pricing.ProductionDependencies(
+                self.args(
+                    backups / "run",
+                    official_source_file=str(source),
+                    official_source_sha256=source_sha256,
+                ),
+                root=root,
+                backup_root=backups,
+                urlopen=urlopen,
+            )
+
+            with (
+                mock.patch.object(
+                    pricing.os,
+                    "read",
+                    side_effect=OSError("source read failed"),
+                ),
+                self.assertRaisesRegex(OSError, "source read failed"),
+            ):
+                deps.fetch(pricing.SOURCE_URL, 30)
+
+        urlopen.assert_not_called()
+
+    def test_direct_fetch_retains_strict_url_contract_and_metadata(
+        self,
+    ) -> None:
+        calls: list[tuple[object, int]] = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                del args
+
+            def geturl(self):
+                return pricing.SOURCE_URL
+
+            def read(self):
+                return official_html()
+
+        def urlopen(request, *, timeout):
+            calls.append((request, timeout))
+            return Response()
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = pathlib.Path(directory)
+            root = base / "root"
+            backups = base / "backups"
+            root.mkdir()
+            backups.mkdir()
+            deps = pricing.ProductionDependencies(
+                self.args(backups / "run"),
+                root=root,
+                backup_root=backups,
+                urlopen=urlopen,
+            )
+
+            self.assertEqual(
+                official_html(),
+                deps.fetch(pricing.SOURCE_URL, 30),
+            )
+
+        self.assertEqual(1, len(calls))
+        request, timeout = calls[0]
+        self.assertEqual(pricing.SOURCE_URL, request.full_url)
+        self.assertEqual("newapi-pricing-audit/1", request.get_header("User-agent"))
+        self.assertEqual(30, timeout)
+        self.assertEqual(
+            {
+                "source_mode": "network",
+                "source_url": pricing.SOURCE_URL,
+            },
+            deps.official_source_metadata(),
+        )
+
+    def test_direct_fetch_still_rejects_noncanonical_final_url(self) -> None:
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                del args
+
+            def geturl(self):
+                return pricing.SOURCE_URL + "/"
+
+            def read(self):
+                raise AssertionError("redirected response must not be read")
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = pathlib.Path(directory)
+            root = base / "root"
+            backups = base / "backups"
+            root.mkdir()
+            backups.mkdir()
+            deps = pricing.ProductionDependencies(
+                self.args(backups / "run"),
+                root=root,
+                backup_root=backups,
+                urlopen=lambda request, timeout: Response(),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "fetch failed"):
+                deps.fetch(pricing.SOURCE_URL, 30)
 
     def test_constructs_without_external_verification_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
