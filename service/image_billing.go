@@ -29,7 +29,10 @@ func PrepareImageBillingForRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 			usedVars["images_above_1_5k"] ||
 			usedVars["input_images"]
 		if !requestBilled {
-			return nil
+			if snap.GroupRatio == info.PriceData.GroupRatioInfo.GroupRatio {
+				return nil
+			}
+			return PrepareTieredBillingForSelectedGroup(c, info)
 		}
 		request := billingexpr.RequestInput{}
 		if info.BillingRequestInput != nil {

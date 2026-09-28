@@ -3,7 +3,10 @@ package helper
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
+	"mime"
+	"mime/multipart"
 	"regexp"
 	"strconv"
 	"strings"
@@ -48,6 +51,15 @@ type seedreamRequestProfile struct {
 	maxOutputs         int
 	maxReferenceImages int
 	layerDecomposition bool
+}
+
+// OutboundImageBilling contains only the final price-bearing image fields.
+// Request keeps the client model as billing identity; Input is safe to retain
+// because prompts, image bytes, and image URLs are excluded.
+type OutboundImageBilling struct {
+	Request *dto.ImageRequest
+	Input   billingexpr.RequestInput
+	Count   int
 }
 
 func seedreamProfile(model string) (seedreamRequestProfile, bool) {
@@ -169,9 +181,210 @@ func ResolveImageBillingRequestInput(c *gin.Context, info *relaycommon.RelayInfo
 	return input, nil
 }
 
-// ResolveOutboundSeedreamBillingRequestInput rebuilds the Seedream pricing
-// scalars from the exact JSON that will be sent upstream. It returns nil for
-// other image models so their existing billing paths remain unchanged.
+// ResolveOutboundImageBillingJSON rebuilds the billing view from the exact
+// JSON sent upstream while retaining the client model as billing identity.
+func ResolveOutboundImageBillingJSON(info *relaycommon.RelayInfo, outboundJSON []byte) (*OutboundImageBilling, error) {
+	if info == nil {
+		return nil, nil
+	}
+	incoming, ok := info.Request.(*dto.ImageRequest)
+	if !ok {
+		return nil, nil
+	}
+
+	var outbound struct {
+		N                  *uint           `json:"n"`
+		Size               string          `json:"size"`
+		Quality            string          `json:"quality"`
+		Image              json.RawMessage `json:"image"`
+		LayerDecomposition *bool           `json:"layer_decomposition"`
+		Parameters         json.RawMessage `json:"parameters"`
+	}
+	if err := common.Unmarshal(outboundJSON, &outbound); err != nil {
+		return nil, err
+	}
+
+	referenceImages := 0
+	if _, seedream := seedreamProfile(incoming.Model); seedream {
+		var err error
+		referenceImages, err = seedreamReferenceImageCount(outbound.Image)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var parameters *dto.ImageBillingParameters
+	if len(outbound.Parameters) > 0 && string(outbound.Parameters) != "null" {
+		parameters = &dto.ImageBillingParameters{}
+		if err := common.Unmarshal(outbound.Parameters, parameters); err != nil {
+			return nil, fmt.Errorf("invalid image parameters: %w", err)
+		}
+	}
+	return resolveOutboundImageBilling(info, &dto.ImageRequest{
+		Model:              incoming.Model,
+		N:                  outbound.N,
+		Size:               outbound.Size,
+		Quality:            outbound.Quality,
+		LayerDecomposition: outbound.LayerDecomposition,
+		BillingParameters:  parameters,
+	}, referenceImages)
+}
+
+// ResolveOutboundImageBillingMultipart rebuilds the billing view from the
+// final multipart body without retaining prompts or file contents.
+func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentType string, body io.Reader) (*OutboundImageBilling, error) {
+	if info == nil {
+		return nil, nil
+	}
+	incoming, ok := info.Request.(*dto.ImageRequest)
+	if !ok {
+		return nil, nil
+	}
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.EqualFold(mediaType, "multipart/form-data") || params["boundary"] == "" {
+		return nil, fmt.Errorf("invalid multipart content type")
+	}
+
+	outbound := &dto.ImageRequest{Model: incoming.Model}
+	referenceImages := 0
+	seen := map[string]bool{}
+	reader := multipart.NewReader(body, params["boundary"])
+	for {
+		part, nextErr := reader.NextPart()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			return nil, nextErr
+		}
+		name := part.FormName()
+		if name == "image" || name == "image[]" {
+			referenceImages++
+			_, err = io.Copy(io.Discard, part)
+			_ = part.Close()
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		switch name {
+		case "n", "size", "quality", "layer_decomposition", "parameters":
+			if seen[name] {
+				_, err = io.Copy(io.Discard, part)
+				_ = part.Close()
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+			seen[name] = true
+			value, valueErr := readMultipartBillingScalar(part)
+			_ = part.Close()
+			if valueErr != nil {
+				return nil, valueErr
+			}
+			switch name {
+			case "n":
+				parsed, parseErr := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
+				if parseErr != nil || parsed > dto.MaxImageN {
+					return nil, fmt.Errorf("n must be an integer between 1 and %d", dto.MaxImageN)
+				}
+				outbound.N = common.GetPointer(uint(parsed))
+			case "size":
+				outbound.Size = value
+			case "quality":
+				outbound.Quality = value
+			case "layer_decomposition":
+				parsed, parseErr := strconv.ParseBool(strings.TrimSpace(value))
+				if parseErr != nil {
+					return nil, fmt.Errorf("invalid layer_decomposition: %w", parseErr)
+				}
+				outbound.LayerDecomposition = common.GetPointer(parsed)
+			case "parameters":
+				parameters := &dto.ImageBillingParameters{}
+				if parseErr := common.Unmarshal([]byte(value), parameters); parseErr != nil {
+					return nil, fmt.Errorf("invalid image parameters: %w", parseErr)
+				}
+				outbound.BillingParameters = parameters
+			}
+		default:
+			_, err = io.Copy(io.Discard, part)
+			_ = part.Close()
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return resolveOutboundImageBilling(info, outbound, referenceImages)
+}
+
+func resolveOutboundImageBilling(info *relaycommon.RelayInfo, outbound *dto.ImageRequest, referenceImages int) (*OutboundImageBilling, error) {
+	incoming, ok := info.Request.(*dto.ImageRequest)
+	if !ok {
+		return nil, nil
+	}
+	profile, seedream := seedreamProfile(incoming.Model)
+	if outbound.N != nil && *outbound.N == 0 {
+		maxOutputs := dto.MaxImageN
+		if seedream {
+			maxOutputs = profile.maxOutputs
+		}
+		return nil, fmt.Errorf("n must be an integer between 1 and %d", maxOutputs)
+	}
+
+	billingRequest := &dto.ImageRequest{
+		Model:              incoming.Model,
+		N:                  outbound.N,
+		Size:               outbound.Size,
+		Quality:            outbound.Quality,
+		LayerDecomposition: outbound.LayerDecomposition,
+		BillingParameters:  outbound.BillingParameters,
+	}
+	if seedream && referenceImages > 0 {
+		references := make([]string, referenceImages)
+		for index := range references {
+			references[index] = "billing-reference"
+		}
+		encoded, err := common.Marshal(references)
+		if err != nil {
+			return nil, err
+		}
+		billingRequest.Image = encoded
+	}
+	count, err := billingRequest.ImageCount(false)
+	if err != nil {
+		return nil, err
+	}
+
+	input := billingexpr.RequestInput{Headers: cloneStringMap(info.RequestHeaders)}
+	if info.BillingRequestInput != nil {
+		input.Headers = cloneStringMap(info.BillingRequestInput.Headers)
+		input.EvaluatedAtUnix = info.BillingRequestInput.EvaluatedAtUnix
+	}
+	resolved, err := ResolveImageBillingRequestInput(nil, &relaycommon.RelayInfo{Request: billingRequest}, input)
+	if err != nil {
+		return nil, err
+	}
+	return &OutboundImageBilling{Request: billingRequest, Input: resolved, Count: count}, nil
+}
+
+func readMultipartBillingScalar(part io.Reader) (string, error) {
+	const maxBillingScalarBytes = 64 << 10
+	value, err := io.ReadAll(io.LimitReader(part, maxBillingScalarBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(value) > maxBillingScalarBytes {
+		return "", fmt.Errorf("multipart billing parameter exceeds %d bytes", maxBillingScalarBytes)
+	}
+	return string(value), nil
+}
+
+// ResolveOutboundSeedreamBillingRequestInput is retained for callers that only
+// need the Seedream scalar snapshot.
 func ResolveOutboundSeedreamBillingRequestInput(info *relaycommon.RelayInfo, outboundJSON []byte) (*billingexpr.RequestInput, error) {
 	if info == nil {
 		return nil, nil
@@ -180,40 +393,14 @@ func ResolveOutboundSeedreamBillingRequestInput(info *relaycommon.RelayInfo, out
 	if !ok {
 		return nil, nil
 	}
-	profile, seedream := seedreamProfile(incoming.Model)
-	if !seedream {
+	if _, seedream := seedreamProfile(incoming.Model); !seedream {
 		return nil, nil
 	}
-
-	var outbound struct {
-		N                  *uint           `json:"n"`
-		Size               string          `json:"size"`
-		Image              json.RawMessage `json:"image"`
-		LayerDecomposition *bool           `json:"layer_decomposition"`
-	}
-	if err := common.Unmarshal(outboundJSON, &outbound); err != nil {
+	resolved, err := ResolveOutboundImageBillingJSON(info, outboundJSON)
+	if err != nil || resolved == nil {
 		return nil, err
 	}
-	if outbound.N != nil && *outbound.N == 0 {
-		return nil, fmt.Errorf("n must be an integer between 1 and %d", profile.maxOutputs)
-	}
-
-	input := billingexpr.RequestInput{Headers: cloneStringMap(info.RequestHeaders)}
-	if info.BillingRequestInput != nil {
-		input.Headers = cloneStringMap(info.BillingRequestInput.Headers)
-		input.EvaluatedAtUnix = info.BillingRequestInput.EvaluatedAtUnix
-	}
-	resolved, err := ResolveImageBillingRequestInput(nil, &relaycommon.RelayInfo{Request: &dto.ImageRequest{
-		Model:              incoming.Model,
-		N:                  outbound.N,
-		Size:               outbound.Size,
-		Image:              outbound.Image,
-		LayerDecomposition: outbound.LayerDecomposition,
-	}}, input)
-	if err != nil {
-		return nil, err
-	}
-	return &resolved, nil
+	return &resolved.Input, nil
 }
 
 func BuildBillingExprRequestInputFromRequest(request dto.Request, headers map[string]string) (billingexpr.RequestInput, error) {

@@ -3,6 +3,7 @@ package helper
 import (
 	"bytes"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -188,4 +189,70 @@ func TestResolveIncomingBillingExprRequestInputFreezesSeedreamScalars(t *testing
 	require.NoError(t, err)
 	assert.Equal(t, billingexpr.BillingUnitRequest, trace.BillingUnit)
 	assert.InDelta(t, 210000, cost, 1e-9)
+}
+
+func TestResolveOutboundImageBillingJSONPreservesOriginIdentity(t *testing.T) {
+	info := &relaycommon.RelayInfo{
+		Request: &dto.ImageRequest{Model: "billing-origin-image"},
+	}
+	resolved, err := ResolveOutboundImageBillingJSON(info, []byte(`{
+		"model":"provider-image-alias",
+		"prompt":"secret prompt",
+		"n":2,
+		"size":"1024x1024",
+		"quality":"hd",
+		"parameters":{"n":3}
+	}`))
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, "billing-origin-image", resolved.Request.Model)
+	assert.Equal(t, 2, resolved.Count)
+	assert.Equal(t, "billing-origin-image", gjson.GetBytes(resolved.Input.Body, "model").String())
+	assert.Equal(t, int64(2), gjson.GetBytes(resolved.Input.Body, "n").Int())
+	assert.Equal(t, int64(3), gjson.GetBytes(resolved.Input.Body, "parameters.n").Int())
+	assert.NotContains(t, string(resolved.Input.Body), "secret")
+}
+
+func TestResolveOutboundImageBillingMultipartKeepsOnlySeedreamScalars(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("model", "provider-seedream-alias"))
+	require.NoError(t, writer.WriteField("prompt", "secret multipart prompt"))
+	require.NoError(t, writer.WriteField("n", "2"))
+	require.NoError(t, writer.WriteField("size", "1K"))
+	image, err := writer.CreateFormFile("image", "secret.png")
+	require.NoError(t, err)
+	_, err = image.Write([]byte("secret image bytes"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	info := &relaycommon.RelayInfo{
+		Request: &dto.ImageRequest{Model: "doubao-seedream-5-0-pro-260628"},
+	}
+	resolved, err := ResolveOutboundImageBillingMultipart(info, writer.FormDataContentType(), bytes.NewReader(body.Bytes()))
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, "doubao-seedream-5-0-pro-260628", resolved.Request.Model)
+	assert.Equal(t, 2, resolved.Count)
+	assert.Equal(t, float64(2), imageRequestScalar(t, resolved.Input, "ImagesUpTo1_5K"))
+	assert.Equal(t, float64(0), imageRequestScalar(t, resolved.Input, "ImagesAbove1_5K"))
+	assert.Equal(t, float64(1), imageRequestScalar(t, resolved.Input, "InputImages"))
+	encoded, err := common.Marshal(resolved)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "secret")
+	assert.NotContains(t, string(encoded), "image bytes")
+}
+
+func TestResolveOutboundImageBillingMultipartRejectsExplicitZero(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("model", "provider-seedream-alias"))
+	require.NoError(t, writer.WriteField("n", "0"))
+	require.NoError(t, writer.Close())
+
+	info := &relaycommon.RelayInfo{
+		Request: &dto.ImageRequest{Model: "doubao-seedream-5-0-pro-260628"},
+	}
+	_, err := ResolveOutboundImageBillingMultipart(info, writer.FormDataContentType(), bytes.NewReader(body.Bytes()))
+	require.ErrorContains(t, err, "n must be an integer between 1 and 15")
 }

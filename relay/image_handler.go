@@ -35,7 +35,10 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	if err != nil {
 		return types.NewError(fmt.Errorf("failed to copy request to ImageRequest: %w", err), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
-	billingRequest := request
+	billingRequest, err := common.DeepCopy(imageReq)
+	if err != nil {
+		return types.NewError(fmt.Errorf("failed to copy billing request to ImageRequest: %w", err), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
 
 	err = helper.ModelMappedHelper(c, info, request)
 	if err != nil {
@@ -54,6 +57,7 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 
 	var requestBody io.Reader
 	var jsonData []byte
+	var outboundBilling *helper.OutboundImageBilling
 
 	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled {
 		storage, err := common.GetBodyStorage(c)
@@ -61,6 +65,17 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 			return types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
 		if strings.Contains(c.Request.Header.Get("Content-Type"), "multipart/form-data") {
+			outboundBilling, err = helper.ResolveOutboundImageBillingMultipart(
+				info,
+				c.Request.Header.Get("Content-Type"),
+				common.NewReplayableBodyReader(storage),
+			)
+			if err != nil {
+				return types.NewErrorWithStatusCode(fmt.Errorf("invalid image billing parameters: %w", err), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+			if _, err = storage.Seek(0, io.SeekStart); err != nil {
+				return types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
 			requestBody = common.NewReplayableBodyReader(storage)
 		} else {
 			jsonData, err = storage.Bytes()
@@ -82,9 +97,17 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 		}
 		relaycommon.AppendRequestConversionFromRequest(info, convertedRequest)
 
-		switch convertedRequest.(type) {
+		switch converted := convertedRequest.(type) {
 		case *bytes.Buffer:
-			requestBody = convertedRequest.(io.Reader)
+			outboundBilling, err = helper.ResolveOutboundImageBillingMultipart(
+				info,
+				c.Request.Header.Get("Content-Type"),
+				bytes.NewReader(converted.Bytes()),
+			)
+			if err != nil {
+				return types.NewErrorWithStatusCode(fmt.Errorf("invalid image billing parameters: %w", err), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+			requestBody = converted
 		default:
 			jsonData, err = common.Marshal(convertedRequest)
 			if err != nil {
@@ -104,37 +127,9 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	if jsonData != nil {
 		// This is a different trust boundary from ingress: channel overrides
 		// and pass-through bodies can change the quantity actually submitted.
-		finalBillingInput, billingInputErr := helper.ResolveOutboundSeedreamBillingRequestInput(info, jsonData)
-		if billingInputErr != nil {
-			return types.NewErrorWithStatusCode(fmt.Errorf("invalid image billing parameters: %w", billingInputErr), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
-		}
-		if finalBillingInput != nil {
-			info.BillingRequestInput = finalBillingInput
-			imageCount = *finalBillingInput.ImageCount
-			finalRequest := &dto.ImageRequest{}
-			if decodeErr := common.Unmarshal(jsonData, finalRequest); decodeErr != nil {
-				return types.NewErrorWithStatusCode(fmt.Errorf("invalid image billing parameters: %w", decodeErr), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
-			}
-			// Billing identity remains the client model while all price-bearing
-			// scalar fields come from the exact validated outbound request.
-			finalRequest.Model = imageReq.Model
-			billingRequest = finalRequest
-		} else {
-			var outbound struct {
-				N *uint `json:"n"`
-			}
-			if decodeErr := common.Unmarshal(jsonData, &outbound); decodeErr != nil {
-				return types.NewErrorWithStatusCode(fmt.Errorf("invalid image billing parameters: %w", decodeErr), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
-			}
-			quantityRequest := dto.ImageRequest{N: outbound.N}
-			if quantityRequest.N == nil {
-				quantityRequest.N = common.GetPointer(uint(imageCount))
-			}
-			imageCount, err = quantityRequest.ImageCount(false)
-			if err != nil {
-				return types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
-			}
-			billingRequest.N = common.GetPointer(uint(imageCount))
+		outboundBilling, err = helper.ResolveOutboundImageBillingJSON(info, jsonData)
+		if err != nil {
+			return types.NewErrorWithStatusCode(fmt.Errorf("invalid image billing parameters: %w", err), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
 		logger.LogDebug(c, "image request body: %s", jsonData)
 		body, closer, bodyErr := relaycommon.NewOutboundJSONBody(jsonData)
@@ -143,6 +138,22 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 		}
 		defer closer.Close()
 		requestBody = body
+	}
+	if outboundBilling != nil {
+		billingRequest = outboundBilling.Request
+		imageCount = outboundBilling.Count
+		if info.Billing == nil || info.BillingRequestInput == nil {
+			info.BillingRequestInput = &outboundBilling.Input
+		} else {
+			info.BillingRequestInput.ImagesUpTo1_5K = outboundBilling.Input.ImagesUpTo1_5K
+			info.BillingRequestInput.ImagesAbove1_5K = outboundBilling.Input.ImagesAbove1_5K
+			info.BillingRequestInput.InputImages = outboundBilling.Input.InputImages
+			if outboundBilling.Input.ImagesUpTo1_5K != nil ||
+				outboundBilling.Input.ImagesAbove1_5K != nil ||
+				outboundBilling.Input.InputImages != nil {
+				info.BillingRequestInput.ImageCount = outboundBilling.Input.ImageCount
+			}
+		}
 	}
 	if info.Billing == nil {
 		originalRequest := info.Request
