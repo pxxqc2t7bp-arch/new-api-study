@@ -43,6 +43,12 @@ const (
 	qualityImageBillingOrderExpr   = `param("quality") == "hd" ? tier("hd", fixed(0.2)) : tier("standard", fixed(0.1))`
 	tokenImageBillingOrderModel    = "gpt-image-token-retry"
 	tokenImageBillingOrderExpr     = `tier("token", p * 100000 + c)`
+	geminiImageBillingOrderModel   = "imagen-billing-native"
+	geminiImageBillingOrderExpr    = `tier("gemini-native", fixed(0.1)) * image_count`
+	siliconImageBillingOrderModel  = "silicon-image-billing"
+	siliconImageBillingOrderExpr   = `(param("image_size") == "1024x768" ? tier("silicon-native", fixed(0.1)) : tier("silicon-fallback", fixed(0.01))) * image_count`
+	unknownImageBillingOrderModel  = "unknown-native-image"
+	unknownImageBillingOrderExpr   = `tier("unknown-native", fixed(0.1))`
 	seedreamBillingOrderMappedName = "provider-seedream-alias"
 )
 
@@ -101,10 +107,24 @@ func newSeedreamBillingOrderFixture(t *testing.T) *seedreamBillingOrderFixture {
 		mappedImageBillingOrderModel:  mappedImageBillingOrderExpr,
 		qualityImageBillingOrderModel: qualityImageBillingOrderExpr,
 		tokenImageBillingOrderModel:   tokenImageBillingOrderExpr,
+		geminiImageBillingOrderModel:  geminiImageBillingOrderExpr,
+		siliconImageBillingOrderModel: siliconImageBillingOrderExpr,
+		unknownImageBillingOrderModel: unknownImageBillingOrderExpr,
+	})
+	require.NoError(t, err)
+	billingModes, err := common.Marshal(map[string]string{
+		seedreamBillingOrderModel:     "tiered_expr",
+		gptImageBillingOrderModel:     "tiered_expr",
+		mappedImageBillingOrderModel:  "tiered_expr",
+		qualityImageBillingOrderModel: "tiered_expr",
+		tokenImageBillingOrderModel:   "tiered_expr",
+		geminiImageBillingOrderModel:  "tiered_expr",
+		siliconImageBillingOrderModel: "tiered_expr",
+		unknownImageBillingOrderModel: "tiered_expr",
 	})
 	require.NoError(t, err)
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-		"billing_setting.billing_mode": `{"` + seedreamBillingOrderModel + `":"tiered_expr","` + gptImageBillingOrderModel + `":"tiered_expr","` + mappedImageBillingOrderModel + `":"tiered_expr","` + qualityImageBillingOrderModel + `":"tiered_expr","` + tokenImageBillingOrderModel + `":"tiered_expr"}`,
+		"billing_setting.billing_mode": string(billingModes),
 		"billing_setting.billing_expr": string(expressions),
 	}))
 
@@ -181,6 +201,7 @@ type imageRelayOptions struct {
 	modelMapping  string
 	autoGroups    []string
 	crossGroup    bool
+	channelType   int
 }
 
 func (f *seedreamBillingOrderFixture) relayWithOptions(t *testing.T, options imageRelayOptions) *httptest.ResponseRecorder {
@@ -208,9 +229,13 @@ func (f *seedreamBillingOrderFixture) relayWithOptions(t *testing.T, options ima
 		common.SetContextKey(c, constant.ContextKeyTokenAutoGroups, options.autoGroups)
 	}
 	c.Set("token_quota", f.token.RemainQuota)
+	channelType := options.channelType
+	if channelType == 0 {
+		channelType = constant.ChannelTypeOpenAI
+	}
 	common.SetContextKey(c, constant.ContextKeyChannelId, 7_503)
 	common.SetContextKey(c, constant.ContextKeyChannelName, "seedream-billing-order")
-	common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+	common.SetContextKey(c, constant.ContextKeyChannelType, channelType)
 	common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, options.baseURL)
 	common.SetContextKey(c, constant.ContextKeyChannelKey, "local-test-key")
 	common.SetContextKey(c, constant.ContextKeyChannelAutoBan, false)
@@ -1102,6 +1127,243 @@ func TestRelayImagesRefreshesFinalOutboundInputBeforeRetryDispatch(t *testing.T)
 		require.Len(t, logs, 1, "one logical request must settle exactly once")
 		assert.Equal(t, retryQuota, logs[0].Quota)
 	})
+}
+
+func TestRelayGeminiNativeBillingViewRejectsBeforeDispatch(t *testing.T) {
+	previousCheckSensitive := setting.CheckSensitiveEnabled
+	previousCheckPrompt := setting.CheckSensitiveOnPromptEnabled
+	previousSensitiveWords := append([]string(nil), setting.SensitiveWords...)
+	setting.CheckSensitiveEnabled = true
+	setting.CheckSensitiveOnPromptEnabled = true
+	setting.SensitiveWords = []string{"test_sensitive"}
+	t.Cleanup(func() {
+		setting.CheckSensitiveEnabled = previousCheckSensitive
+		setting.CheckSensitiveOnPromptEnabled = previousCheckPrompt
+		setting.SensitiveWords = previousSensitiveWords
+	})
+
+	tests := []struct {
+		name       string
+		prompt     string
+		quota      int
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:   "nested sensitive prompt",
+			prompt: "test_sensitive nested gemini prompt",
+			quota:  500_000, wantStatus: http.StatusBadRequest,
+			wantCode: string(types.ErrorCodeSensitiveWordsDetected),
+		},
+		{
+			name:   "nested count exceeds balance",
+			prompt: "ordinary nested gemini prompt",
+			quota:  75_000, wantStatus: http.StatusForbidden,
+			wantCode: string(types.ErrorCodeInsufficientUserQuota),
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newSeedreamBillingOrderFixture(t)
+			fixture.user.Quota = testCase.quota
+			fixture.token.RemainQuota = testCase.quota
+			fixture.resetQuota(t, testCase.quota)
+			quotaMutations := recordUserQuotaMutations(t, fixture.db)
+			quotaMutations.Store(0)
+			var dispatches atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				dispatches.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"predictions":[{"bytesBase64Encoded":"eA=="}]}`)
+			}))
+			t.Cleanup(upstream.Close)
+
+			recorder := fixture.relayWithOptions(t, imageRelayOptions{
+				requestID:   "gemini-native-reject-" + strings.ReplaceAll(testCase.name, " ", "-"),
+				model:       geminiImageBillingOrderModel,
+				path:        "/v1/images/generations",
+				contentType: "application/json",
+				body: []byte(`{"model":"` + geminiImageBillingOrderModel +
+					`","prompt":"` + testCase.prompt + `","n":2,"size":"1536x1024","quality":"high"}`),
+				baseURL:     upstream.URL,
+				usingGroup:  "default",
+				tokenGroup:  "default",
+				channelType: constant.ChannelTypeGemini,
+			})
+
+			assert.Equal(t, testCase.wantStatus, recorder.Code, recorder.Body.String())
+			assert.Contains(t, recorder.Body.String(), testCase.wantCode)
+			assert.Zero(t, dispatches.Load(), "rejected native request must not reach the provider")
+			assert.Zero(t, quotaMutations.Load(), "rejected native request must not mutate quota")
+		})
+	}
+}
+
+func TestRelayGeminiNativeCountReservesAndSettlesBeforeDispatch(t *testing.T) {
+	fixture := newSeedreamBillingOrderFixture(t)
+	const initialQuota = 500_000
+	const expectedQuota = 100_000
+	fixture.user.Quota = initialQuota
+	fixture.token.RemainQuota = initialQuota
+	fixture.resetQuota(t, initialQuota)
+	quotaMutations := recordUserQuotaMutations(t, fixture.db)
+	quotaMutations.Store(0)
+
+	type dispatchSnapshot struct {
+		body       []byte
+		userQuota  int
+		tokenQuota int
+		err        error
+	}
+	dispatched := make(chan dispatchSnapshot, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		body, bodyErr := io.ReadAll(request.Body)
+		var user model.User
+		var token model.Token
+		userErr := fixture.db.First(&user, fixture.user.Id).Error
+		tokenErr := fixture.db.First(&token, fixture.token.Id).Error
+		dispatched <- dispatchSnapshot{
+			body: body, userQuota: user.Quota, tokenQuota: token.RemainQuota,
+			err: firstError(bodyErr, userErr, tokenErr),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"predictions":[{"bytesBase64Encoded":"eA=="},{"bytesBase64Encoded":"eQ=="}]}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	recorder := fixture.relayWithOptions(t, imageRelayOptions{
+		requestID:   "gemini-native-count",
+		model:       geminiImageBillingOrderModel,
+		path:        "/v1/images/generations",
+		contentType: "application/json",
+		body: []byte(`{"model":"` + geminiImageBillingOrderModel +
+			`","prompt":"ordinary nested gemini prompt","n":2,"size":"1536x1024","quality":"high"}`),
+		baseURL:     upstream.URL,
+		usingGroup:  "default",
+		tokenGroup:  "default",
+		channelType: constant.ChannelTypeGemini,
+	})
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Len(t, dispatched, 1)
+	snapshot := <-dispatched
+	require.NoError(t, snapshot.err)
+	assert.Equal(t, "ordinary nested gemini prompt", gjson.GetBytes(snapshot.body, "instances.0.prompt").String())
+	assert.Equal(t, int64(2), gjson.GetBytes(snapshot.body, "parameters.sampleCount").Int())
+	assert.Equal(t, "3:2", gjson.GetBytes(snapshot.body, "parameters.aspectRatio").String())
+	assert.Equal(t, "2K", gjson.GetBytes(snapshot.body, "parameters.imageSize").String())
+	assert.Equal(t, initialQuota-expectedQuota, snapshot.userQuota)
+	assert.Equal(t, initialQuota-expectedQuota, snapshot.tokenQuota)
+
+	var user model.User
+	var token model.Token
+	require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
+	require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
+	assert.Equal(t, initialQuota-expectedQuota, user.Quota)
+	assert.Equal(t, expectedQuota, user.UsedQuota)
+	assert.Equal(t, initialQuota-expectedQuota, token.RemainQuota)
+	assert.Equal(t, expectedQuota, token.UsedQuota)
+	assert.Equal(t, int32(1), quotaMutations.Load(), "native count must be reserved once before dispatch")
+}
+
+func TestRelaySiliconFlowNativeBillingParametersReserveAndSettle(t *testing.T) {
+	fixture := newSeedreamBillingOrderFixture(t)
+	const initialQuota = 500_000
+	const expectedQuota = 100_000
+	fixture.user.Quota = initialQuota
+	fixture.token.RemainQuota = initialQuota
+	fixture.resetQuota(t, initialQuota)
+	quotaMutations := recordUserQuotaMutations(t, fixture.db)
+	quotaMutations.Store(0)
+
+	type dispatchSnapshot struct {
+		body       []byte
+		userQuota  int
+		tokenQuota int
+		err        error
+	}
+	dispatched := make(chan dispatchSnapshot, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		body, bodyErr := io.ReadAll(request.Body)
+		var user model.User
+		var token model.Token
+		userErr := fixture.db.First(&user, fixture.user.Id).Error
+		tokenErr := fixture.db.First(&token, fixture.token.Id).Error
+		dispatched <- dispatchSnapshot{
+			body: body, userQuota: user.Quota, tokenQuota: token.RemainQuota,
+			err: firstError(bodyErr, userErr, tokenErr),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://output.invalid/one.png"},{"url":"https://output.invalid/two.png"}]}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	recorder := fixture.relayWithOptions(t, imageRelayOptions{
+		requestID:   "silicon-native-parameters",
+		model:       siliconImageBillingOrderModel,
+		path:        "/v1/images/generations",
+		contentType: "application/json",
+		body: []byte(`{"model":"` + siliconImageBillingOrderModel +
+			`","prompt":"silicon billing prompt","negative_prompt":"negative billing prompt","batch_size":2,"image_size":"1024x768","seed":42}`),
+		baseURL:     upstream.URL,
+		usingGroup:  "default",
+		tokenGroup:  "default",
+		channelType: constant.ChannelTypeSiliconFlow,
+	})
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Len(t, dispatched, 1)
+	snapshot := <-dispatched
+	require.NoError(t, snapshot.err)
+	assert.Equal(t, int64(2), gjson.GetBytes(snapshot.body, "batch_size").Int())
+	assert.Equal(t, "1024x768", gjson.GetBytes(snapshot.body, "image_size").String())
+	assert.Equal(t, int64(42), gjson.GetBytes(snapshot.body, "seed").Int())
+	assert.Equal(t, initialQuota-expectedQuota, snapshot.userQuota)
+	assert.Equal(t, initialQuota-expectedQuota, snapshot.tokenQuota)
+
+	var user model.User
+	var token model.Token
+	require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
+	require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
+	assert.Equal(t, initialQuota-expectedQuota, user.Quota)
+	assert.Equal(t, expectedQuota, user.UsedQuota)
+	assert.Equal(t, initialQuota-expectedQuota, token.RemainQuota)
+	assert.Equal(t, expectedQuota, token.UsedQuota)
+	assert.Equal(t, int32(1), quotaMutations.Load(), "native parameters must drive one reservation")
+}
+
+func TestRelayUnknownNativeImageShapeFailsClosedBeforeBillingAndDispatch(t *testing.T) {
+	fixture := newSeedreamBillingOrderFixture(t)
+	const initialQuota = 500_000
+	quotaMutations := recordUserQuotaMutations(t, fixture.db)
+	quotaMutations.Store(0)
+	var dispatches atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		dispatches.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"succeeded","output":["https://output.invalid/image.png"]}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	recorder := fixture.relayWithOptions(t, imageRelayOptions{
+		requestID:   "unknown-native-shape",
+		model:       unknownImageBillingOrderModel,
+		path:        "/v1/images/generations",
+		contentType: "application/json",
+		body: []byte(`{"model":"` + unknownImageBillingOrderModel +
+			`","prompt":"openai shape sent to dynamic native API","n":1}`),
+		baseURL:     upstream.URL,
+		usingGroup:  "default",
+		tokenGroup:  "default",
+		passThrough: true,
+		channelType: constant.ChannelTypeReplicate,
+	})
+
+	assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+	assert.Contains(t, recorder.Body.String(), "invalid_request")
+	assert.Zero(t, dispatches.Load(), "ambiguous native shape must not reach the provider")
+	assert.Zero(t, quotaMutations.Load(), "ambiguous native shape must not reserve or refund quota")
 }
 
 func TestRelaySeedreamValidRequestBillsOnceAroundProviderDispatch(t *testing.T) {

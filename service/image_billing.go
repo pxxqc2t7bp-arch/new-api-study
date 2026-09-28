@@ -18,12 +18,15 @@ import (
 
 // RefreshImageBillingRequestContext validates and estimates the final request
 // for a retry without creating a second billing session.
-func RefreshImageBillingRequestContext(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ImageRequest) *types.NewAPIError {
-	meta := request.GetTokenCountMeta()
+func RefreshImageBillingRequestContext(c *gin.Context, info *relaycommon.RelayInfo, promptTexts []string) *types.NewAPIError {
+	meta := &types.TokenCountMeta{
+		CombineText: strings.Join(promptTexts, "\n"),
+		MaxTokens:   1584,
+	}
 	if setting.ShouldCheckPromptSensitive() {
-		if contains, words := CheckSensitiveText(meta.CombineText); contains {
+		if contains, _ := CheckSensitiveText(meta.CombineText); contains {
 			RequestPolicy(c).AddEvent(PolicyEvent{ErrorCode: string(types.ErrorCodeSensitiveWordsDetected), ErrorSource: "local", Decision: PolicyDecision{Action: "stop", Reason: "local_rejection", Source: "global"}, Health: "unchanged"})
-			message := fmt.Sprintf("user sensitive words detected: %s", strings.Join(words, ", "))
+			message := "image prompt contains sensitive words"
 			logger.LogWarn(c, message)
 			return types.NewErrorWithStatusCode(errors.New(message), types.ErrorCodeSensitiveWordsDetected, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}

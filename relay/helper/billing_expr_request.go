@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -57,9 +59,10 @@ type seedreamRequestProfile struct {
 // Request keeps the client model as billing identity; Input is safe to retain
 // because prompts, image bytes, and image URLs are excluded.
 type OutboundImageBilling struct {
-	Request *dto.ImageRequest
-	Input   billingexpr.RequestInput
-	Count   int
+	Request     *dto.ImageRequest
+	PromptTexts []string
+	Input       billingexpr.RequestInput
+	Count       int
 }
 
 func seedreamProfile(model string) (seedreamRequestProfile, bool) {
@@ -168,6 +171,10 @@ func ResolveImageBillingRequestInput(c *gin.Context, info *relaycommon.RelayInfo
 		input.InputImages = &references
 		return input, nil
 	}
+	if input.ImageCount != nil && len(input.Body) > 0 {
+		input.ImageCount = &count
+		return input, nil
+	}
 	body := map[string]any{"model": request.Model, "n": count, "size": request.Size, "quality": request.Quality}
 	if request.BillingParameters != nil {
 		body["parameters"] = request.BillingParameters
@@ -183,7 +190,7 @@ func ResolveImageBillingRequestInput(c *gin.Context, info *relaycommon.RelayInfo
 
 // ResolveOutboundImageBillingJSON rebuilds the billing view from the exact
 // JSON sent upstream while retaining the client model as billing identity.
-func ResolveOutboundImageBillingJSON(info *relaycommon.RelayInfo, outboundJSON []byte) (*OutboundImageBilling, error) {
+func ResolveOutboundImageBillingJSON(info *relaycommon.RelayInfo, outboundJSON []byte, schemaConfirmed ...bool) (*OutboundImageBilling, error) {
 	if info == nil {
 		return nil, nil
 	}
@@ -191,56 +198,550 @@ func ResolveOutboundImageBillingJSON(info *relaycommon.RelayInfo, outboundJSON [
 	if !ok {
 		return nil, nil
 	}
-
-	var outbound struct {
-		N                  *uint           `json:"n"`
-		Prompt             string          `json:"prompt"`
-		Size               string          `json:"size"`
-		Quality            string          `json:"quality"`
-		Image              json.RawMessage `json:"image"`
-		LayerDecomposition *bool           `json:"layer_decomposition"`
-		Parameters         json.RawMessage `json:"parameters"`
+	if info.ChannelMeta == nil {
+		return nil, fmt.Errorf("image billing API type is required")
 	}
-	if err := common.Unmarshal(outboundJSON, &outbound); err != nil {
+
+	switch info.ApiType {
+	case constant.APITypeGemini, constant.APITypeVertexAi:
+		return resolveGeminiImageBilling(info, incoming, outboundJSON)
+	case constant.APITypeReplicate:
+		return resolveReplicateImageBilling(info, incoming, outboundJSON)
+	case constant.APITypeSiliconFlow:
+		return resolveSiliconFlowImageBilling(info, incoming, outboundJSON)
+	case constant.APITypeMiniMax:
+		return resolveMiniMaxImageBilling(info, incoming, outboundJSON)
+	case constant.APITypeJimeng:
+		return resolveJimengImageBilling(info, incoming, outboundJSON)
+	case constant.APITypeXai:
+		return resolveXAIImageBilling(info, incoming, outboundJSON)
+	default:
+		confirmed := len(schemaConfirmed) > 0 && schemaConfirmed[0]
+		if isOpenAIImageBillingAPIType(info.ApiType, confirmed) {
+			return resolveOpenAIImageBilling(info, incoming, outboundJSON)
+		}
+		return nil, fmt.Errorf("unsupported image billing schema for API type %d", info.ApiType)
+	}
+}
+
+func isOpenAIImageBillingAPIType(apiType int, schemaConfirmed bool) bool {
+	switch apiType {
+	case constant.APITypeOpenAI,
+		constant.APITypeZhipuV4,
+		constant.APITypeVolcEngine,
+		constant.APITypeOpenRouter,
+		constant.APITypeXinference,
+		constant.APITypeMoonshot,
+		constant.APITypeSub2API,
+		constant.APITypeNewAPI:
+		return true
+	case constant.APITypeAdvancedCustom:
+		return schemaConfirmed
+	default:
+		return false
+	}
+}
+
+func resolveOpenAIImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageRequest, outboundJSON []byte) (*OutboundImageBilling, error) {
+	object, err := imageBillingObject(outboundJSON, "OpenAI image request")
+	if err != nil {
 		return nil, err
 	}
+	prompt, err := optionalImageBillingString(object, "prompt", "prompt")
+	if err != nil {
+		return nil, err
+	}
+	count, err := imageBillingCount(object, "n", "n", true)
+	if err != nil {
+		return nil, err
+	}
+	body := canonicalImageBillingBody(incoming.Model, count)
+	err = copyImageBillingScalars(body, object,
+		"size", "quality", "response_format", "style", "background", "moderation",
+		"output_format", "output_compression", "partial_images", "stream",
+		"input_fidelity", "watermark", "layer_decomposition", "watermark_enabled",
+	)
+	if err != nil {
+		return nil, err
+	}
+	copyCanonicalStringAlias(body, "size", "resolution")
 
+	var parameters *dto.ImageBillingParameters
+	if raw, exists := object["parameters"]; exists && !isJSONNull(raw) {
+		parameterObject, objectErr := imageBillingObject(raw, "parameters")
+		if objectErr != nil {
+			return nil, objectErr
+		}
+		safeParameters := map[string]any{}
+		if copyErr := copyImageBillingScalars(safeParameters, parameterObject, "n", "prompt_extend"); copyErr != nil {
+			return nil, copyErr
+		}
+		parameters = &dto.ImageBillingParameters{}
+		if unmarshalErr := common.Unmarshal(raw, parameters); unmarshalErr != nil {
+			return nil, fmt.Errorf("invalid image parameters: %w", unmarshalErr)
+		}
+		if parameters.N != nil && *parameters.N > dto.MaxImageN {
+			return nil, fmt.Errorf("parameters.n must be an integer between 0 and %d", dto.MaxImageN)
+		}
+		if len(safeParameters) > 0 {
+			body["parameters"] = safeParameters
+		}
+	}
+
+	size, err := optionalImageBillingString(object, "size", "size")
+	if err != nil {
+		return nil, err
+	}
+	quality, err := optionalImageBillingString(object, "quality", "quality")
+	if err != nil {
+		return nil, err
+	}
+	layerDecomposition, err := optionalImageBillingBool(object, "layer_decomposition", "layer_decomposition")
+	if err != nil {
+		return nil, err
+	}
 	referenceImages := 0
 	if _, seedream := seedreamProfile(incoming.Model); seedream {
-		var err error
-		referenceImages, err = seedreamReferenceImageCount(outbound.Image)
+		referenceImages, err = seedreamReferenceImageCount(object["image"])
 		if err != nil {
 			return nil, err
 		}
 	}
-
-	var parameters *dto.ImageBillingParameters
-	if len(outbound.Parameters) > 0 && string(outbound.Parameters) != "null" {
-		parameters = &dto.ImageBillingParameters{}
-		if err := common.Unmarshal(outbound.Parameters, parameters); err != nil {
-			return nil, fmt.Errorf("invalid image parameters: %w", err)
-		}
+	var promptTexts []string
+	if prompt != "" {
+		promptTexts = append(promptTexts, prompt)
 	}
 	return resolveOutboundImageBilling(info, &dto.ImageRequest{
 		Model:              incoming.Model,
-		Prompt:             outbound.Prompt,
-		N:                  outbound.N,
-		Size:               outbound.Size,
-		Quality:            outbound.Quality,
-		LayerDecomposition: outbound.LayerDecomposition,
+		N:                  common.GetPointer(uint(count)),
+		Size:               size,
+		Quality:            quality,
+		LayerDecomposition: layerDecomposition,
 		BillingParameters:  parameters,
-	}, referenceImages)
+	}, referenceImages, body, promptTexts)
+}
+
+func resolveGeminiImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageRequest, outboundJSON []byte) (*OutboundImageBilling, error) {
+	object, err := imageBillingObject(outboundJSON, "Gemini image request")
+	if err != nil {
+		return nil, err
+	}
+	var instances []json.RawMessage
+	if raw, exists := object["instances"]; !exists || isJSONNull(raw) {
+		return nil, fmt.Errorf("instances[0].prompt is required")
+	} else if err = common.Unmarshal(raw, &instances); err != nil || len(instances) == 0 {
+		return nil, fmt.Errorf("instances[0].prompt is required")
+	}
+	instance, err := imageBillingObject(instances[0], "instances[0]")
+	if err != nil {
+		return nil, err
+	}
+	prompt, err := requiredImageBillingString(instance, "prompt", "instances[0].prompt")
+	if err != nil {
+		return nil, err
+	}
+	parametersRaw, exists := object["parameters"]
+	if !exists || isJSONNull(parametersRaw) {
+		return nil, fmt.Errorf("parameters.sampleCount is required")
+	}
+	parameters, err := imageBillingObject(parametersRaw, "parameters")
+	if err != nil {
+		return nil, err
+	}
+	count, err := imageBillingCount(parameters, "sampleCount", "parameters.sampleCount", false)
+	if err != nil {
+		return nil, err
+	}
+	safeParameters := map[string]any{}
+	if err = copyImageBillingScalars(safeParameters, parameters, "sampleCount", "aspectRatio", "imageSize", "personGeneration"); err != nil {
+		return nil, err
+	}
+	body := canonicalImageBillingBody(incoming.Model, count)
+	body["parameters"] = safeParameters
+	aspectRatio, err := optionalImageBillingString(parameters, "aspectRatio", "parameters.aspectRatio")
+	if err != nil {
+		return nil, err
+	}
+	imageSize, err := optionalImageBillingString(parameters, "imageSize", "parameters.imageSize")
+	if err != nil {
+		return nil, err
+	}
+	setCanonicalString(body, "size", aspectRatio)
+	setCanonicalString(body, "resolution", imageSize)
+	setCanonicalString(body, "quality", imageSize)
+	return resolveOutboundImageBilling(info, &dto.ImageRequest{
+		Model: incoming.Model, N: common.GetPointer(uint(count)), Size: aspectRatio, Quality: imageSize,
+	}, 0, body, []string{prompt})
+}
+
+func resolveReplicateImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageRequest, outboundJSON []byte) (*OutboundImageBilling, error) {
+	object, err := imageBillingObject(outboundJSON, "Replicate image request")
+	if err != nil {
+		return nil, err
+	}
+	inputRaw, exists := object["input"]
+	if !exists || isJSONNull(inputRaw) {
+		return nil, fmt.Errorf("input.prompt is required")
+	}
+	input, err := imageBillingObject(inputRaw, "input")
+	if err != nil {
+		return nil, err
+	}
+	prompt, err := requiredImageBillingString(input, "prompt", "input.prompt")
+	if err != nil {
+		return nil, err
+	}
+	count, err := imageBillingCount(input, "num_outputs", "input.num_outputs", false)
+	if err != nil {
+		return nil, err
+	}
+	safeInput := map[string]any{}
+	if err = copyImageBillingScalars(safeInput, input,
+		"num_outputs", "aspect_ratio", "width", "height", "prompt_upsampling", "output_format",
+	); err != nil {
+		return nil, err
+	}
+	body := canonicalImageBillingBody(incoming.Model, count)
+	body["input"] = safeInput
+	aspectRatio, err := optionalImageBillingString(input, "aspect_ratio", "input.aspect_ratio")
+	if err != nil {
+		return nil, err
+	}
+	size := aspectRatio
+	resolution := imageBillingDimensions(input)
+	if size == "" {
+		size = resolution
+	}
+	setCanonicalString(body, "size", size)
+	setCanonicalString(body, "resolution", resolution)
+	return resolveOutboundImageBilling(info, &dto.ImageRequest{
+		Model: incoming.Model, N: common.GetPointer(uint(count)), Size: size,
+	}, 0, body, []string{prompt})
+}
+
+func resolveSiliconFlowImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageRequest, outboundJSON []byte) (*OutboundImageBilling, error) {
+	object, err := imageBillingObject(outboundJSON, "SiliconFlow image request")
+	if err != nil {
+		return nil, err
+	}
+	prompt, err := requiredImageBillingString(object, "prompt", "prompt")
+	if err != nil {
+		return nil, err
+	}
+	promptTexts := []string{prompt}
+	if negativePrompt, promptErr := optionalImageBillingString(object, "negative_prompt", "negative_prompt"); promptErr != nil {
+		return nil, promptErr
+	} else if negativePrompt != "" {
+		promptTexts = append(promptTexts, negativePrompt)
+	}
+	count, err := imageBillingCount(object, "batch_size", "batch_size", false)
+	if err != nil {
+		return nil, err
+	}
+	body := canonicalImageBillingBody(incoming.Model, count)
+	if err = copyImageBillingScalars(body, object,
+		"batch_size", "image_size", "seed", "num_inference_steps", "guidance_scale", "cfg",
+	); err != nil {
+		return nil, err
+	}
+	if _, exists := body["batch_size"]; !exists {
+		body["batch_size"] = count
+	}
+	imageSize, err := optionalImageBillingString(object, "image_size", "image_size")
+	if err != nil {
+		return nil, err
+	}
+	setCanonicalString(body, "size", imageSize)
+	setCanonicalString(body, "resolution", imageSize)
+	return resolveOutboundImageBilling(info, &dto.ImageRequest{
+		Model: incoming.Model, N: common.GetPointer(uint(count)), Size: imageSize,
+	}, 0, body, promptTexts)
+}
+
+func resolveMiniMaxImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageRequest, outboundJSON []byte) (*OutboundImageBilling, error) {
+	object, err := imageBillingObject(outboundJSON, "MiniMax image request")
+	if err != nil {
+		return nil, err
+	}
+	prompt, err := requiredImageBillingString(object, "prompt", "prompt")
+	if err != nil {
+		return nil, err
+	}
+	count, err := imageBillingCount(object, "n", "n", true)
+	if err != nil {
+		return nil, err
+	}
+	body := canonicalImageBillingBody(incoming.Model, count)
+	if err = copyImageBillingScalars(body, object,
+		"n", "aspect_ratio", "response_format", "prompt_optimizer", "aigc_watermark",
+	); err != nil {
+		return nil, err
+	}
+	body["n"] = count
+	aspectRatio, err := optionalImageBillingString(object, "aspect_ratio", "aspect_ratio")
+	if err != nil {
+		return nil, err
+	}
+	setCanonicalString(body, "size", aspectRatio)
+	setCanonicalString(body, "resolution", aspectRatio)
+	return resolveOutboundImageBilling(info, &dto.ImageRequest{
+		Model: incoming.Model, N: common.GetPointer(uint(count)), Size: aspectRatio,
+	}, 0, body, []string{prompt})
+}
+
+func resolveJimengImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageRequest, outboundJSON []byte) (*OutboundImageBilling, error) {
+	object, err := imageBillingObject(outboundJSON, "Jimeng image request")
+	if err != nil {
+		return nil, err
+	}
+	prompt, err := requiredImageBillingString(object, "prompt", "prompt")
+	if err != nil {
+		return nil, err
+	}
+	const count = 1
+	body := canonicalImageBillingBody(incoming.Model, count)
+	if err = copyImageBillingNumbers(body, object, "", "width", "height"); err != nil {
+		return nil, err
+	}
+	if err = copyImageBillingBooleans(body, object, "", "use_pre_llm", "use_sr", "return_url"); err != nil {
+		return nil, err
+	}
+	if raw, exists := object["logo_info"]; exists && !isJSONNull(raw) {
+		logo, objectErr := imageBillingObject(raw, "logo_info")
+		if objectErr != nil {
+			return nil, objectErr
+		}
+		safeLogo := map[string]any{}
+		if copyErr := copyImageBillingBooleans(safeLogo, logo, "logo_info.", "add_logo"); copyErr != nil {
+			return nil, copyErr
+		}
+		if copyErr := copyImageBillingNumbers(safeLogo, logo, "logo_info.", "position", "language", "opacity"); copyErr != nil {
+			return nil, copyErr
+		}
+		if len(safeLogo) > 0 {
+			body["logo_info"] = safeLogo
+		}
+	}
+	resolution := imageBillingDimensions(object)
+	setCanonicalString(body, "size", resolution)
+	setCanonicalString(body, "resolution", resolution)
+	return resolveOutboundImageBilling(info, &dto.ImageRequest{
+		Model: incoming.Model, N: common.GetPointer(uint(count)), Size: resolution,
+	}, 0, body, []string{prompt})
+}
+
+func resolveXAIImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageRequest, outboundJSON []byte) (*OutboundImageBilling, error) {
+	object, err := imageBillingObject(outboundJSON, "xAI image request")
+	if err != nil {
+		return nil, err
+	}
+	prompt, err := requiredImageBillingString(object, "prompt", "prompt")
+	if err != nil {
+		return nil, err
+	}
+	count, err := imageBillingCount(object, "n", "n", true)
+	if err != nil {
+		return nil, err
+	}
+	body := canonicalImageBillingBody(incoming.Model, count)
+	if err = copyImageBillingScalars(body, object, "n", "response_format"); err != nil {
+		return nil, err
+	}
+	body["n"] = count
+	return resolveOutboundImageBilling(info, &dto.ImageRequest{
+		Model: incoming.Model, N: common.GetPointer(uint(count)),
+	}, 0, body, []string{prompt})
+}
+
+func imageBillingObject(raw []byte, name string) (map[string]json.RawMessage, error) {
+	var object map[string]json.RawMessage
+	if err := common.Unmarshal(raw, &object); err != nil {
+		return nil, fmt.Errorf("invalid %s: %w", name, err)
+	}
+	if object == nil {
+		return nil, fmt.Errorf("%s must be a JSON object", name)
+	}
+	return object, nil
+}
+
+func requiredImageBillingString(object map[string]json.RawMessage, key, path string) (string, error) {
+	raw, exists := object[key]
+	if !exists || isJSONNull(raw) {
+		return "", fmt.Errorf("%s is required", path)
+	}
+	var value string
+	if err := common.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("%s must be a string", path)
+	}
+	return value, nil
+}
+
+func optionalImageBillingString(object map[string]json.RawMessage, key, path string) (string, error) {
+	raw, exists := object[key]
+	if !exists || isJSONNull(raw) {
+		return "", nil
+	}
+	var value string
+	if err := common.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("%s must be a string", path)
+	}
+	return value, nil
+}
+
+func optionalImageBillingBool(object map[string]json.RawMessage, key, path string) (*bool, error) {
+	raw, exists := object[key]
+	if !exists || isJSONNull(raw) {
+		return nil, nil
+	}
+	var value bool
+	if err := common.Unmarshal(raw, &value); err != nil {
+		return nil, fmt.Errorf("%s must be a boolean", path)
+	}
+	return common.GetPointer(value), nil
+}
+
+func imageBillingCount(object map[string]json.RawMessage, key, path string, defaultOne bool) (int, error) {
+	raw, exists := object[key]
+	if !exists {
+		if defaultOne {
+			return 1, nil
+		}
+		return 0, fmt.Errorf("%s is required", path)
+	}
+	if isJSONNull(raw) {
+		return 0, fmt.Errorf("%s must be an integer between 1 and %d", path, dto.MaxImageN)
+	}
+	var number json.Number
+	if err := common.Unmarshal(raw, &number); err != nil {
+		return 0, fmt.Errorf("%s must be an integer between 1 and %d", path, dto.MaxImageN)
+	}
+	value, err := strconv.ParseUint(number.String(), 10, 64)
+	if err != nil || value < 1 || value > dto.MaxImageN {
+		return 0, fmt.Errorf("%s must be an integer between 1 and %d", path, dto.MaxImageN)
+	}
+	return int(value), nil
+}
+
+func copyImageBillingScalars(destination map[string]any, source map[string]json.RawMessage, keys ...string) error {
+	for _, key := range keys {
+		raw, exists := source[key]
+		if !exists || isJSONNull(raw) {
+			continue
+		}
+		value, err := imageBillingScalar(raw)
+		if err != nil {
+			return fmt.Errorf("%s must be a string, number, or boolean", key)
+		}
+		destination[key] = value
+	}
+	return nil
+}
+
+func copyImageBillingNumbers(destination map[string]any, source map[string]json.RawMessage, prefix string, keys ...string) error {
+	for _, key := range keys {
+		raw, exists := source[key]
+		if !exists || isJSONNull(raw) {
+			continue
+		}
+		value, err := imageBillingScalar(raw)
+		if err != nil {
+			return fmt.Errorf("%s%s must be a number", prefix, key)
+		}
+		if _, ok := value.(json.Number); !ok {
+			return fmt.Errorf("%s%s must be a number", prefix, key)
+		}
+		destination[key] = value
+	}
+	return nil
+}
+
+func copyImageBillingBooleans(destination map[string]any, source map[string]json.RawMessage, prefix string, keys ...string) error {
+	for _, key := range keys {
+		raw, exists := source[key]
+		if !exists || isJSONNull(raw) {
+			continue
+		}
+		value, err := imageBillingScalar(raw)
+		if err != nil {
+			return fmt.Errorf("%s%s must be a boolean", prefix, key)
+		}
+		if _, ok := value.(bool); !ok {
+			return fmt.Errorf("%s%s must be a boolean", prefix, key)
+		}
+		destination[key] = value
+	}
+	return nil
+}
+
+func imageBillingScalar(raw json.RawMessage) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	switch value.(type) {
+	case string, bool, json.Number:
+		return value, nil
+	default:
+		return nil, fmt.Errorf("not a scalar")
+	}
+}
+
+func canonicalImageBillingBody(model string, count int) map[string]any {
+	return map[string]any{"model": model, "n": count}
+}
+
+func copyCanonicalStringAlias(body map[string]any, sourceKey, destinationKey string) {
+	if value, ok := body[sourceKey].(string); ok && value != "" {
+		body[destinationKey] = value
+	}
+}
+
+func setCanonicalString(body map[string]any, key, value string) {
+	if value != "" {
+		body[key] = value
+	}
+}
+
+func imageBillingDimensions(object map[string]json.RawMessage) string {
+	width, widthOK := imageBillingPositiveInteger(object["width"])
+	height, heightOK := imageBillingPositiveInteger(object["height"])
+	if !widthOK || !heightOK {
+		return ""
+	}
+	return fmt.Sprintf("%dx%d", width, height)
+}
+
+func imageBillingPositiveInteger(raw json.RawMessage) (uint64, bool) {
+	if len(raw) == 0 || isJSONNull(raw) {
+		return 0, false
+	}
+	var number json.Number
+	if err := common.Unmarshal(raw, &number); err != nil {
+		return 0, false
+	}
+	value, err := strconv.ParseUint(number.String(), 10, 64)
+	return value, err == nil && value > 0
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return strings.TrimSpace(string(raw)) == "null"
 }
 
 // ResolveOutboundImageBillingMultipart rebuilds the billing view from the
 // final multipart body without retaining prompts or file contents.
-func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentType string, body io.Reader) (*OutboundImageBilling, error) {
+func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentType string, body io.Reader, schemaConfirmed ...bool) (*OutboundImageBilling, error) {
 	if info == nil {
 		return nil, nil
 	}
 	incoming, ok := info.Request.(*dto.ImageRequest)
 	if !ok {
 		return nil, nil
+	}
+	confirmed := len(schemaConfirmed) > 0 && schemaConfirmed[0]
+	if info.ChannelMeta == nil || !isOpenAIImageBillingAPIType(info.ApiType, confirmed) {
+		return nil, fmt.Errorf("unsupported multipart image billing schema")
 	}
 	mediaType, params, err := mime.ParseMediaType(contentType)
 	if err != nil {
@@ -330,10 +831,18 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 			}
 		}
 	}
-	return resolveOutboundImageBilling(info, outbound, referenceImages)
+	promptTexts := []string{outbound.Prompt}
+	outbound.Prompt = ""
+	return resolveOutboundImageBilling(info, outbound, referenceImages, nil, promptTexts)
 }
 
-func resolveOutboundImageBilling(info *relaycommon.RelayInfo, outbound *dto.ImageRequest, referenceImages int) (*OutboundImageBilling, error) {
+func resolveOutboundImageBilling(
+	info *relaycommon.RelayInfo,
+	outbound *dto.ImageRequest,
+	referenceImages int,
+	sanitizedBody map[string]any,
+	promptTexts []string,
+) (*OutboundImageBilling, error) {
 	incoming, ok := info.Request.(*dto.ImageRequest)
 	if !ok {
 		return nil, nil
@@ -349,7 +858,6 @@ func resolveOutboundImageBilling(info *relaycommon.RelayInfo, outbound *dto.Imag
 
 	billingRequest := &dto.ImageRequest{
 		Model:              incoming.Model,
-		Prompt:             outbound.Prompt,
 		N:                  outbound.N,
 		Size:               outbound.Size,
 		Quality:            outbound.Quality,
@@ -377,11 +885,47 @@ func resolveOutboundImageBilling(info *relaycommon.RelayInfo, outbound *dto.Imag
 		input.Headers = cloneStringMap(info.BillingRequestInput.Headers)
 		input.EvaluatedAtUnix = info.BillingRequestInput.EvaluatedAtUnix
 	}
-	resolved, err := ResolveImageBillingRequestInput(nil, &relaycommon.RelayInfo{Request: billingRequest}, input)
-	if err != nil {
-		return nil, err
+	var resolved billingexpr.RequestInput
+	if seedream {
+		resolved, err = ResolveImageBillingRequestInput(nil, &relaycommon.RelayInfo{Request: billingRequest}, input)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if sanitizedBody == nil {
+			sanitizedBody = canonicalImageBillingBody(incoming.Model, count)
+			setCanonicalString(sanitizedBody, "size", billingRequest.Size)
+			setCanonicalString(sanitizedBody, "resolution", billingRequest.Size)
+			setCanonicalString(sanitizedBody, "quality", billingRequest.Quality)
+			if parameters := billingRequest.BillingParameters; parameters != nil {
+				safeParameters := map[string]any{}
+				if parameters.N != nil {
+					safeParameters["n"] = *parameters.N
+				}
+				if parameters.PromptExtend != nil {
+					safeParameters["prompt_extend"] = *parameters.PromptExtend
+				}
+				if len(safeParameters) > 0 {
+					sanitizedBody["parameters"] = safeParameters
+				}
+			}
+		}
+		sanitizedBody["model"] = incoming.Model
+		sanitizedBody["n"] = count
+		encoded, marshalErr := common.Marshal(sanitizedBody)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		input.Body = encoded
+		input.ImageCount = common.GetPointer(count)
+		resolved = input
 	}
-	return &OutboundImageBilling{Request: billingRequest, Input: resolved, Count: count}, nil
+	return &OutboundImageBilling{
+		Request:     billingRequest,
+		PromptTexts: append([]string(nil), promptTexts...),
+		Input:       resolved,
+		Count:       count,
+	}, nil
 }
 
 func readMultipartBillingScalar(part io.Reader) (string, error) {
