@@ -47,6 +47,7 @@ type officialTokenPrice struct {
 	Unit                 string                               `json:"unit,omitempty"`
 	BillingBasis         string                               `json:"billing_basis,omitempty"`
 	Expression           string                               `json:"expression,omitempty"`
+	PluginExpression     string                               `json:"plugin_expression,omitempty"`
 	ValidFrom            int64                                `json:"valid_from,omitempty"`
 	ValidUntil           int64                                `json:"valid_until,omitempty"`
 	UsageSchema          map[string]jsplugin.UsageFieldSchema `json:"-"`
@@ -135,15 +136,14 @@ func RunOfficialPricingSync(ctx context.Context, now time.Time) (OfficialPricing
 
 	modes := billing_setting.GetBillingModeCopy()
 	expressions := billing_setting.GetBillingExprCopy()
+	pluginExpressions := billing_setting.GetPluginBillingExprCopy()
 	evidence := make([]model.UpstreamPriceEvidence, 0, len(prices))
 	acceptedPrices := make([]officialTokenPrice, 0, len(prices))
 	for _, price := range prices {
 		expression := officialPriceExpression(price)
-		var expressionErr error
-		if price.BillingBasis == billingexpr.BillingBasisTask {
-			expressionErr = billing_setting.SmokeTestTaskExpr(expression, price.UsageSchema)
-		} else {
-			expressionErr = billing_setting.SmokeTestExpr(expression)
+		expressionErr := smokeTestOfficialModelExpression(expression, price.BillingBasis, price.UsageSchema)
+		if expressionErr == nil && price.PluginExpression != "" {
+			expressionErr = billing_setting.SmokeTestTaskExpr(price.PluginExpression, price.UsageSchema)
 		}
 		if expressionErr != nil {
 			summary.Rejected++
@@ -151,7 +151,9 @@ func RunOfficialPricingSync(ctx context.Context, now time.Time) (OfficialPricing
 			continue
 		}
 		previous := expressions[price.ModelName]
-		if previous == expression && modes[price.ModelName] == billing_setting.BillingModeTieredExpr {
+		pluginKey := billing_setting.PluginBillingExprKey("doubao", price.ModelName)
+		pluginUnchanged := price.PluginExpression == "" || pluginExpressions[pluginKey] == price.PluginExpression
+		if previous == expression && modes[price.ModelName] == billing_setting.BillingModeTieredExpr && pluginUnchanged {
 			summary.Unchanged++
 			acceptedPrices = append(acceptedPrices, price)
 			evidence = append(evidence, newOfficialPriceEvidence(price, previous, expression, model.UpstreamPriceStatusUnchanged, nil, now))
@@ -159,6 +161,9 @@ func RunOfficialPricingSync(ctx context.Context, now time.Time) (OfficialPricing
 		}
 		modes[price.ModelName] = billing_setting.BillingModeTieredExpr
 		expressions[price.ModelName] = expression
+		if price.PluginExpression != "" {
+			pluginExpressions[pluginKey] = price.PluginExpression
+		}
 		summary.Applied++
 		acceptedPrices = append(acceptedPrices, price)
 		evidence = append(evidence, newOfficialPriceEvidence(price, previous, expression, model.UpstreamPriceStatusApplied, nil, now))
@@ -171,10 +176,15 @@ func RunOfficialPricingSync(ctx context.Context, now time.Time) (OfficialPricing
 	if err != nil {
 		return summary, err
 	}
+	pluginExpressionJSON, err := common.Marshal(pluginExpressions)
+	if err != nil {
+		return summary, err
+	}
 	if summary.Applied > 0 {
 		if err := model.UpdateOptionsBulk(map[string]string{
-			"billing_setting.billing_mode": string(modeJSON),
-			"billing_setting.billing_expr": string(expressionJSON),
+			"billing_setting.billing_mode":          string(modeJSON),
+			"billing_setting.billing_expr":          string(expressionJSON),
+			billing_setting.PluginBillingExprOption: string(pluginExpressionJSON),
 		}); err != nil {
 			return summary, err
 		}
@@ -193,6 +203,36 @@ func RunOfficialPricingSync(ctx context.Context, now time.Time) (OfficialPricing
 		}
 	}
 	return summary, nil
+}
+
+func smokeTestOfficialModelExpression(expression, basis string, usageSchema map[string]jsplugin.UsageFieldSchema) error {
+	if basis == billingexpr.BillingBasisTask {
+		return billing_setting.SmokeTestTaskExpr(expression, usageSchema)
+	}
+	used := billingexpr.UsedVars(expression)
+	if !used["images_up_to_1_5k"] && !used["images_above_1_5k"] && !used["input_images"] {
+		return billing_setting.SmokeTestExpr(expression)
+	}
+	if len(billingexpr.UsedUsageKeys(expression)) > 0 {
+		return fmt.Errorf("request expression cannot reference task usage")
+	}
+	scalar := func(value float64) *float64 { return &value }
+	requests := []billingexpr.RequestInput{
+		{ImagesUpTo1_5K: scalar(0), ImagesAbove1_5K: scalar(0), InputImages: scalar(0)},
+		{ImagesUpTo1_5K: scalar(billingexpr.MaxRequestImageOutputs), ImagesAbove1_5K: scalar(0), InputImages: scalar(billingexpr.MaxRequestInputImages)},
+		{ImagesUpTo1_5K: scalar(0), ImagesAbove1_5K: scalar(billingexpr.MaxRequestImageOutputs), InputImages: scalar(billingexpr.MaxRequestInputImages)},
+		{ImagesUpTo1_5K: scalar(1), ImagesAbove1_5K: scalar(1), InputImages: scalar(1)},
+	}
+	for _, request := range requests {
+		result, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, request)
+		if err != nil {
+			return err
+		}
+		if math.IsNaN(result) || math.IsInf(result, 0) || result < 0 {
+			return fmt.Errorf("request expression result must be finite and non-negative, got %f", result)
+		}
+	}
+	return nil
 }
 
 func ensureOfficialModelMetadata(price officialTokenPrice) error {
@@ -217,9 +257,9 @@ func ensureOfficialModelMetadata(price officialTokenPrice) error {
 		return err
 	}
 	endpointMap := map[string]string{
-		"openai":         "/v1/chat/completions",
+		"openai":          "/v1/chat/completions",
 		"openai-response": "/v1/responses",
-		"anthropic":      "/v1/messages",
+		"anthropic":       "/v1/messages",
 	}
 	if strings.HasPrefix(price.ModelName, "doubao-seedance-") {
 		endpointMap = map[string]string{
@@ -229,7 +269,7 @@ func ensureOfficialModelMetadata(price officialTokenPrice) error {
 	} else if strings.HasPrefix(price.ModelName, "doubao-seedream-") {
 		endpointMap = map[string]string{
 			"image-generation": "/v1/images/generations",
-			"openai-response":   "/v1/responses",
+			"openai-response":  "/v1/responses",
 		}
 	}
 	endpoints, _ := common.Marshal(endpointMap)

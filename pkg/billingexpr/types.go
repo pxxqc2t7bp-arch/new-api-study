@@ -11,6 +11,9 @@ const (
 	BillingBasisToken   = "token"
 	BillingBasisRequest = "request"
 	BillingBasisTask    = "task"
+
+	MaxRequestImageOutputs = 17
+	MaxRequestInputImages  = 14
 )
 
 type RequestInput struct {
@@ -18,6 +21,11 @@ type RequestInput struct {
 	Body            []byte
 	Usage           map[string]any
 	EvaluatedAtUnix int64
+	// Seedream request billing retains only validated scalar counts. Raw image
+	// values, prompts and request bodies must never be copied into these fields.
+	ImagesUpTo1_5K  *float64
+	ImagesAbove1_5K *float64
+	InputImages     *float64
 	// ImageCount is a validated billing quantity, separate from the frozen
 	// request's n. Settlement can replace it with the actual returned count.
 	ImageCount *int

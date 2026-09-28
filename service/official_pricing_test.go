@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
+	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 
@@ -26,6 +27,32 @@ type officialPricingRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f officialPricingRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
+}
+
+func officialPluginExpressionForTest(t *testing.T, price officialTokenPrice) string {
+	t.Helper()
+	require.NotEmpty(t, price.PluginExpression)
+	return price.PluginExpression
+}
+
+func officialRequestInputForTest(t *testing.T, lower, higher, inputs float64) billingexpr.RequestInput {
+	t.Helper()
+	return billingexpr.RequestInput{
+		ImagesUpTo1_5K:  &lower,
+		ImagesAbove1_5K: &higher,
+		InputImages:     &inputs,
+	}
+}
+
+func realDoubaoUsageSchemaForTest(t *testing.T, modelName string) map[string]jsplugin.UsageFieldSchema {
+	t.Helper()
+	source, err := builtinplugins.Source("doubao")
+	require.NoError(t, err)
+	plugin, err := jsplugin.CompilePlugin(source, jsplugin.Options{Key: "doubao"})
+	require.NoError(t, err)
+	schema, _ := plugin.Meta.UsageForModel(modelName)
+	require.NotEmpty(t, schema)
+	return schema
 }
 
 func TestParseOfficialPricingTables(t *testing.T) {
@@ -435,9 +462,10 @@ doubao-seedance-2.5 doubao-seedance-2.0-fast doubao-seedance-2.0-mini
 		common.OptionMapRWMutex.Unlock()
 	})
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-		"billing_setting.billing_mode":    `{}`,
-		"billing_setting.billing_expr":    `{}`,
-		"group_ratio_setting.group_ratio": `{"default":1,"cxy":1}`,
+		"billing_setting.billing_mode":          `{}`,
+		"billing_setting.billing_expr":          `{}`,
+		billing_setting.PluginBillingExprOption: `{}`,
+		"group_ratio_setting.group_ratio":       `{"default":1,"cxy":1}`,
 	}))
 
 	vendor := model.Vendor{Name: "字节跳动", Status: 1}
@@ -504,6 +532,7 @@ doubao-seedance-2.5 doubao-seedance-2.0-fast doubao-seedance-2.0-mini
 func TestOfficialPricingSyncPersistsSeedreamExpressionsByBillingBasis(t *testing.T) {
 	const (
 		proModelName     = "doubao-seedream-5-0-pro-260628"
+		proAlias         = "doubao-seedream-5-0-pro"
 		requestModelName = "doubao-seedream-4-0-20260415"
 	)
 	body := []byte(`<html><body>
@@ -564,14 +593,15 @@ doubao-seedream-4-5 doubao-seedream-4-0
 		common.OptionMapRWMutex.Unlock()
 	})
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-		"billing_setting.billing_mode":    `{}`,
-		"billing_setting.billing_expr":    `{}`,
-		"group_ratio_setting.group_ratio": `{"default":1,"cxy":1}`,
+		"billing_setting.billing_mode":          `{}`,
+		"billing_setting.billing_expr":          `{}`,
+		billing_setting.PluginBillingExprOption: `{}`,
+		"group_ratio_setting.group_ratio":       `{"default":1,"cxy":1}`,
 	}))
 
 	vendor := model.Vendor{Name: "字节跳动", Status: 1}
 	require.NoError(t, database.Create(&vendor).Error)
-	for _, modelName := range []string{proModelName, requestModelName} {
+	for _, modelName := range []string{proModelName, proAlias, requestModelName} {
 		require.NoError(t, database.Create(&model.Model{
 			ModelName:    modelName,
 			VendorID:     vendor.Id,
@@ -585,47 +615,57 @@ doubao-seedream-4-5 doubao-seedream-4-0
 		body,
 		map[string]string{
 			proModelName:     "字节跳动",
+			proAlias:         "字节跳动",
 			requestModelName: "字节跳动",
 		},
 		time.Unix(1_800_000_000, 0),
 	)
 	require.NoError(t, err)
-	require.Len(t, prices, 2)
+	require.Len(t, prices, 3)
 	byModel := make(map[string]officialTokenPrice, len(prices))
 	for _, price := range prices {
 		byModel[price.ModelName] = price
 	}
 	proExpression := officialPriceExpression(byModel[proModelName])
+	proPluginExpression := officialPluginExpressionForTest(t, byModel[proModelName])
+	proAliasExpression := officialPriceExpression(byModel[proAlias])
+	proAliasPluginExpression := officialPluginExpressionForTest(t, byModel[proAlias])
 	requestExpression := officialPriceExpression(byModel[requestModelName])
-	assert.Equal(t, billingexpr.BillingBasisTask, byModel[proModelName].BillingBasis)
+	requestPluginExpression := officialPluginExpressionForTest(t, byModel[requestModelName])
+	assert.Equal(t, proModelName, byModel[proAlias].CanonicalModel)
+	assert.Equal(t, proExpression, proAliasExpression)
+	assert.Equal(t, proPluginExpression, proAliasPluginExpression)
+	assert.Equal(t, billingexpr.BillingBasisRequest, byModel[proModelName].BillingBasis)
 	assert.Equal(t, billingexpr.BillingBasisRequest, byModel[requestModelName].BillingBasis)
-	require.NoError(t, billing_setting.SmokeTestTaskExpr(proExpression, byModel[proModelName].UsageSchema))
-	require.Error(t, billing_setting.SmokeTestExpr(proExpression))
+	require.NoError(t, billing_setting.SmokeTestTaskExpr(proPluginExpression, byModel[proModelName].UsageSchema))
+	require.NoError(t, billing_setting.SmokeTestTaskExpr(requestPluginExpression, byModel[requestModelName].UsageSchema))
+	_, _, runErr := billingexpr.RunExprWithRequest(
+		proExpression,
+		billingexpr.TokenParams{},
+		officialRequestInputForTest(t, 1, 1, 2),
+	)
+	require.NoError(t, runErr)
 	require.NoError(t, billing_setting.SmokeTestExpr(requestExpression))
-	require.Error(t, billing_setting.SmokeTestTaskExpr(requestExpression, byModel[requestModelName].UsageSchema))
 
 	summary, err := RunOfficialPricingSync(t.Context(), time.Unix(1_800_000_000, 0))
 	require.NoError(t, err)
 
 	var evidence []model.UpstreamPriceEvidence
 	require.NoError(t, database.Order("id").Find(&evidence).Error)
-	require.Len(t, evidence, 2)
+	require.Len(t, evidence, 3)
 	evidenceByModel := make(map[string]model.UpstreamPriceEvidence, len(evidence))
 	for _, item := range evidence {
 		evidenceByModel[item.ModelName] = item
 	}
-	for modelName, billingBasis := range map[string]string{
-		proModelName:     billingexpr.BillingBasisTask,
-		requestModelName: billingexpr.BillingBasisRequest,
-	} {
+	for _, modelName := range []string{proModelName, proAlias, requestModelName} {
 		assert.Equal(t, model.UpstreamPriceStatusApplied, evidenceByModel[modelName].Status)
-		assert.Equal(t, billingBasis, evidenceByModel[modelName].BillingBasis)
+		assert.Equal(t, billingexpr.BillingBasisRequest, evidenceByModel[modelName].BillingBasis)
 		assert.Empty(t, evidenceByModel[modelName].Error)
 	}
 	assert.Equal(t, OfficialPricingSyncSummary{
 		Fetched: 1,
-		Parsed:  2,
-		Applied: 2,
+		Parsed:  3,
+		Applied: 3,
 	}, summary)
 
 	var expressionOption model.Option
@@ -633,7 +673,24 @@ doubao-seedream-4-5 doubao-seedream-4-0
 	var persistedExpressions map[string]string
 	require.NoError(t, common.Unmarshal([]byte(expressionOption.Value), &persistedExpressions))
 	assert.Equal(t, proExpression, persistedExpressions[proModelName])
+	assert.Equal(t, proAliasExpression, persistedExpressions[proAlias])
 	assert.Equal(t, requestExpression, persistedExpressions[requestModelName])
+
+	var pluginExpressionOption model.Option
+	require.NoError(t, database.Where("key = ?", billing_setting.PluginBillingExprOption).First(&pluginExpressionOption).Error)
+	var persistedPluginExpressions map[string]string
+	require.NoError(t, common.Unmarshal([]byte(pluginExpressionOption.Value), &persistedPluginExpressions))
+	assert.Equal(t, proPluginExpression, persistedPluginExpressions[billing_setting.PluginBillingExprKey("doubao", proModelName)])
+	assert.Equal(t, proAliasPluginExpression, persistedPluginExpressions[billing_setting.PluginBillingExprKey("doubao", proAlias)])
+	assert.Equal(t, requestPluginExpression, persistedPluginExpressions[billing_setting.PluginBillingExprKey("doubao", requestModelName)])
+
+	ordinaryExpression, ordinaryExists := billing_setting.GetBillingExpr(proAlias)
+	require.True(t, ordinaryExists)
+	taskExpression, taskExists := billing_setting.ResolveTaskBillingExpr("doubao", proAlias, proModelName)
+	require.True(t, taskExists)
+	assert.Equal(t, proAliasExpression, ordinaryExpression)
+	assert.Equal(t, proAliasPluginExpression, taskExpression)
+	assert.NotEqual(t, ordinaryExpression, taskExpression)
 }
 
 func TestParseVolcenginePricingBuildsSeedreamPricesByBillingBasis(t *testing.T) {
@@ -658,29 +715,14 @@ doubao-seedream-4-5 doubao-seedream-4-0
 	require.NoError(t, err)
 	require.Len(t, prices, 5)
 
-	imageUsageSchema := map[string]jsplugin.UsageFieldSchema{
-		"image_count":           {Type: "number", Unit: "count"},
-		"resolution":            {Enum: []string{"1K", "2K", "3K", "4K"}},
-		"reference_image_count": {Type: "number", Unit: "count"},
-	}
+	imageUsageSchema := realDoubaoUsageSchemaForTest(t, "doubao-seedream-5-0-pro-260628")
 	byModel := make(map[string]officialTokenPrice, len(prices))
 	for _, price := range prices {
 		byModel[price.ModelName] = price
 		assert.Equal(t, imageUsageSchema, price.UsageSchema, price.ModelName)
 		assert.False(t, strings.HasPrefix(officialPriceExpression(price), "v2:"))
-	}
-	assert.Equal(
-		t,
-		billingexpr.BillingBasisTask,
-		byModel["doubao-seedream-5-0-pro-260628"].BillingBasis,
-	)
-	for _, modelName := range []string{
-		"doubao-seedream-5-0-260128",
-		"doubao-seedream-4-5-251128",
-		"doubao-seedream-4-0-250828",
-		"doubao-seedream-4-0-20260415",
-	} {
-		assert.Equal(t, billingexpr.BillingBasisRequest, byModel[modelName].BillingBasis, modelName)
+		assert.NotEmpty(t, officialPluginExpressionForTest(t, price), price.ModelName)
+		assert.Equal(t, billingexpr.BillingBasisRequest, price.BillingBasis, price.ModelName)
 	}
 
 	one := 1
@@ -695,32 +737,33 @@ doubao-seedream-4-5 doubao-seedream-4-0
 	assert.InDelta(t, 0.20/officialCNYPerUSD, *requestTrace.FixedPrice, 1e-10)
 	assert.Equal(t, *requestTrace.FixedPrice*1_000_000, requestCost)
 
-	evaluate := func(modelName string, facts map[string]any) (float64, string) {
-		t.Helper()
-		value, trace, runErr := billingexpr.RunExprWithRequest(
-			officialPriceExpression(byModel[modelName]),
-			billingexpr.TokenParams{},
-			billingexpr.RequestInput{Usage: facts},
-		)
-		require.NoError(t, runErr)
-		return value, trace.MatchedTier
-	}
+	proRequestExpression := officialPriceExpression(byModel["doubao-seedream-5-0-pro-260628"])
+	value, trace, runErr := billingexpr.RunExprWithRequest(
+		proRequestExpression,
+		billingexpr.TokenParams{},
+		officialRequestInputForTest(t, 4, 1, 3),
+	)
+	require.NoError(t, runErr)
+	assert.Equal(t, billingexpr.BillingUnitRequest, trace.BillingUnit)
+	require.NotNil(t, trace.FixedPrice)
+	assert.InDelta(t, (4*0.30+0.60+2*0.02)/officialCNYPerUSD, *trace.FixedPrice, 1e-10)
+	assert.InDelta(t, *trace.FixedPrice*1_000_000, value, 1e-9)
 
-	value, tier := evaluate("doubao-seedream-5-0-pro-260628", map[string]any{
-		"image_count":           2.0,
-		"resolution":            "1K",
-		"reference_image_count": 3.0,
-	})
-	assert.InDelta(t, (2*0.30+2*0.02)/officialCNYPerUSD, value, 1e-9)
-	assert.Equal(t, "up_to_1_5k", tier)
-
-	value, tier = evaluate("doubao-seedream-5-0-pro-260628", map[string]any{
-		"image_count":           1.0,
-		"resolution":            "4K",
-		"reference_image_count": 1.0,
-	})
-	assert.InDelta(t, 0.60/officialCNYPerUSD, value, 1e-9)
-	assert.Equal(t, "over_1_5k", tier)
+	proTaskExpression := officialPluginExpressionForTest(t, byModel["doubao-seedream-5-0-pro-260628"])
+	require.NoError(t, billing_setting.SmokeTestTaskExpr(proTaskExpression, imageUsageSchema))
+	value, trace, runErr = billingexpr.RunExprWithRequest(
+		proTaskExpression,
+		billingexpr.TokenParams{},
+		billingexpr.RequestInput{Usage: map[string]any{
+			"images_up_to_1_5k":   4.0,
+			"images_above_1_5k":   1.0,
+			"input_images":        3.0,
+			"layer_decomposition": true,
+		}},
+	)
+	require.NoError(t, runErr)
+	assert.InDelta(t, (4*0.30+0.60+2*0.02)/officialCNYPerUSD, value, 1e-9)
+	assert.Equal(t, "per_image", trace.MatchedTier)
 
 	three := 3
 	for modelName, cnyPerImage := range map[string]float64{
@@ -740,5 +783,171 @@ doubao-seedream-4-5 doubao-seedream-4-0
 		assert.InDelta(t, cnyPerImage/officialCNYPerUSD, *trace.FixedPrice, 1e-10, modelName)
 		assert.Equal(t, *trace.FixedPrice*1_000_000*float64(three), value, modelName)
 		assert.Equal(t, "per_image", trace.MatchedTier, modelName)
+
+		taskExpression := officialPluginExpressionForTest(t, byModel[modelName])
+		require.NoError(t, billing_setting.SmokeTestTaskExpr(taskExpression, imageUsageSchema), modelName)
+		taskValue, taskTrace, taskErr := billingexpr.RunExprWithRequest(
+			taskExpression,
+			billingexpr.TokenParams{},
+			billingexpr.RequestInput{Usage: map[string]any{
+				"images_up_to_1_5k":   2.0,
+				"images_above_1_5k":   1.0,
+				"input_images":        4.0,
+				"layer_decomposition": true,
+			}},
+		)
+		require.NoError(t, taskErr, modelName)
+		assert.InDelta(t, 3*cnyPerImage/officialCNYPerUSD, taskValue, 1e-9, modelName)
+		assert.Equal(t, "per_image", taskTrace.MatchedTier, modelName)
 	}
+}
+
+func TestParseVolcenginePricingUpdatesOnlyExactSeedreamAliasesAndCanonicals(t *testing.T) {
+	body := []byte(`<html><body>
+doubao-seedream-5-0-pro doubao-seedream-5-0
+doubao-seedream-4-5 doubao-seedream-4-0
+0.30 0.22 0.25 0.20
+</body></html>`)
+	allowed := map[string]string{
+		"doubao-seedream-4-0":             "字节跳动",
+		"doubao-seedream-4-0-20260415":    "字节跳动",
+		"doubao-seedream-4-0-250828":      "字节跳动",
+		"doubao-seedream-4-5":             "字节跳动",
+		"doubao-seedream-4-5-251128":      "字节跳动",
+		"doubao-seedream-5-0":             "字节跳动",
+		"doubao-seedream-5-0-pro":         "字节跳动",
+		"doubao-seedream-5-0-pro-unknown": "字节跳动",
+		"doubao-seedream-5-0-other-alias": "字节跳动",
+	}
+
+	prices, err := parseVolcenginePricing(
+		"https://docs.volcengine.com/docs/82379/1544106?lang=zh",
+		body,
+		allowed,
+		time.Now(),
+	)
+	require.NoError(t, err)
+	require.Len(t, prices, 7)
+
+	byModel := make(map[string]officialTokenPrice, len(prices))
+	for _, price := range prices {
+		byModel[price.ModelName] = price
+	}
+	for alias, canonical := range map[string]string{
+		"doubao-seedream-4-0":     "doubao-seedream-4-0-20260415",
+		"doubao-seedream-4-5":     "doubao-seedream-4-5-251128",
+		"doubao-seedream-5-0":     "doubao-seedream-5-0-260128",
+		"doubao-seedream-5-0-pro": "doubao-seedream-5-0-pro-260628",
+	} {
+		require.Contains(t, byModel, alias)
+		assert.Equal(t, canonical, byModel[alias].CanonicalModel)
+	}
+	assert.Equal(t, "doubao-seedream-4-0-250828", byModel["doubao-seedream-4-0-250828"].CanonicalModel)
+	assert.NotContains(t, byModel, "doubao-seedream-5-0-pro-unknown")
+	assert.NotContains(t, byModel, "doubao-seedream-5-0-other-alias")
+}
+
+func TestOfficialPricingSyncRollsBackAllSeedreamBillingOptionsOnDBFailure(t *testing.T) {
+	const modelName = "doubao-seedream-5-0-pro-260628"
+	body := []byte(`<html><body>
+doubao-seedream-5-0-pro doubao-seedream-5-0
+doubao-seedream-4-5 doubao-seedream-4-0
+0.30 0.22 0.25 0.20
+</body></html>`)
+
+	previousDB := model.DB
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate(
+		&model.Option{},
+		&model.Vendor{},
+		&model.Model{},
+		&model.UpstreamGroup{},
+		&model.UpstreamPriceEvidence{},
+		&model.Ability{},
+		&model.Channel{},
+	))
+	model.DB = database
+
+	previousHTTPClient := httpClient
+	previousSources := officialPricingSourceURLs
+	httpClient = &http.Client{Transport: officialPricingRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/html"}},
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+			Request:    request,
+		}, nil
+	})}
+	officialPricingSourceURLs = map[string][]string{
+		"volcengine": {"https://docs.volcengine.com/docs/82379/1544106?lang=zh"},
+	}
+	t.Setenv("UPSTREAM_PRICING_PROXY_URL", "")
+
+	savedConfig := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		savedConfig[key] = value
+		return nil
+	}))
+	common.OptionMapRWMutex.Lock()
+	previousOptionMap := common.OptionMap
+	common.OptionMap = maps.Clone(common.OptionMap)
+	if common.OptionMap == nil {
+		common.OptionMap = make(map[string]string)
+	}
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		model.DB = previousDB
+		httpClient = previousHTTPClient
+		officialPricingSourceURLs = previousSources
+		model.InvalidatePricingCache()
+		require.NoError(t, config.GlobalConfig.LoadFromDB(savedConfig))
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptionMap
+		common.OptionMapRWMutex.Unlock()
+	})
+
+	initial := map[string]string{
+		"billing_setting.billing_mode":          `{"sentinel":"tiered_expr"}`,
+		"billing_setting.billing_expr":          `{"sentinel":"tier(\"sentinel\",p)"}`,
+		billing_setting.PluginBillingExprOption: `{"doubao::sentinel":"tier(\"sentinel\",u(\"images_up_to_1_5k\"))"}`,
+	}
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode":          initial["billing_setting.billing_mode"],
+		"billing_setting.billing_expr":          initial["billing_setting.billing_expr"],
+		billing_setting.PluginBillingExprOption: initial[billing_setting.PluginBillingExprOption],
+		"group_ratio_setting.group_ratio":       `{"default":1,"cxy":1}`,
+	}))
+	for key, value := range initial {
+		require.NoError(t, database.Create(&model.Option{Key: key, Value: value}).Error)
+	}
+
+	vendor := model.Vendor{Name: "字节跳动", Status: 1}
+	require.NoError(t, database.Create(&vendor).Error)
+	require.NoError(t, database.Create(&model.Model{
+		ModelName: modelName, VendorID: vendor.Id, Status: 1, SyncOfficial: 1,
+	}).Error)
+	require.NoError(t, database.Exec(`
+		CREATE TRIGGER fail_seedream_plugin_option
+		BEFORE UPDATE OF value ON options
+		WHEN NEW.key = 'billing_setting.plugin_billing_expr'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected option failure');
+		END
+	`).Error)
+
+	_, err = RunOfficialPricingSync(t.Context(), time.Unix(1_800_000_000, 0))
+	require.ErrorContains(t, err, "injected option failure")
+	for key, want := range initial {
+		var option model.Option
+		require.NoError(t, database.Where("key = ?", key).First(&option).Error)
+		assert.JSONEq(t, want, option.Value, key)
+	}
+	_, modelExpressionExists := billing_setting.GetBillingExpr(modelName)
+	assert.False(t, modelExpressionExists)
+	_, pluginExpressionExists := billing_setting.GetPluginBillingExpr("doubao", modelName)
+	assert.False(t, pluginExpressionExists)
+	var evidenceCount int64
+	require.NoError(t, database.Model(&model.UpstreamPriceEvidence{}).Count(&evidenceCount).Error)
+	assert.Zero(t, evidenceCount)
 }

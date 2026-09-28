@@ -11,6 +11,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func setRequestScalar(t *testing.T, input *billingexpr.RequestInput, fieldName string, value float64) {
+	t.Helper()
+	scalar := value
+	switch fieldName {
+	case "ImagesUpTo1_5K":
+		input.ImagesUpTo1_5K = &scalar
+	case "ImagesAbove1_5K":
+		input.ImagesAbove1_5K = &scalar
+	case "InputImages":
+		input.InputImages = &scalar
+	default:
+		t.Fatalf("unknown request scalar field %s", fieldName)
+	}
+}
+
 func TestFixedPriceBranches(t *testing.T) {
 	const expression = `(len <= 32000 ? tier("short", fixed(0.01)) : tier("long", p * 2 + c * 8)) * (param("fast") == true ? 2 : 1)`
 	for _, tc := range []struct {
@@ -39,6 +54,112 @@ func TestFixedPriceBranches(t *testing.T) {
 		_, _, err := billingexpr.RunExprWithRequest(`tier("image", fixed(0.04)) * image_count`, billingexpr.TokenParams{}, billingexpr.RequestInput{ImageCount: &count})
 		require.ErrorContains(t, err, "image_count")
 	}
+}
+
+func TestDynamicFixedPriceAllowsOnlyValidatedRequestScalarArithmetic(t *testing.T) {
+	const expression = `tier("seedream", fixed(images_up_to_1_5k * 0.1 + images_above_1_5k * 0.2 + max(input_images - 1, 0) * 0.01))`
+	require.NoError(t, func() error {
+		_, err := billingexpr.CompileFromCache(expression)
+		return err
+	}())
+
+	input := billingexpr.RequestInput{}
+	setRequestScalar(t, &input, "ImagesUpTo1_5K", 2)
+	setRequestScalar(t, &input, "ImagesAbove1_5K", 1)
+	setRequestScalar(t, &input, "InputImages", 3)
+	cost, trace, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, input)
+	require.NoError(t, err)
+	assert.InDelta(t, 420000, cost, 1e-9)
+	assert.Equal(t, billingexpr.BillingUnitRequest, trace.BillingUnit)
+	require.NotNil(t, trace.FixedPrice)
+	assert.InDelta(t, 0.42, *trace.FixedPrice, 1e-12)
+}
+
+func TestDynamicFixedPriceRejectsNonRequestScalarDependencies(t *testing.T) {
+	for _, expression := range []string{
+		`tier("bad", fixed(p * 0.1))`,
+		`tier("bad", fixed(c * 0.1))`,
+		`tier("bad", fixed(len * 0.1))`,
+		`tier("bad", fixed(cr * 0.1))`,
+		`tier("bad", fixed(image_count * 0.1))`,
+		`tier("bad", fixed(u("images_up_to_1_5k") * 0.1))`,
+		`tier("bad", fixed(param("n") * 0.1))`,
+		`tier("bad", fixed(header("x-price") == "1" ? 1 : 0))`,
+		`tier("bad", fixed(hour("UTC") * 0.1))`,
+		`v2:tier("bad", fixed(unix() * 0.1))`,
+		`tier("bad", fixed(abs(images_up_to_1_5k) * 0.1))`,
+		`tier("bad", fixed(images_up_to_1_5k / 2))`,
+		`tier("bad", images_up_to_1_5k * 0.1)`,
+	} {
+		t.Run(expression, func(t *testing.T) {
+			_, err := billingexpr.CompileFromCache(expression)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestDynamicFixedPriceFailsClosedForInvalidRequestScalars(t *testing.T) {
+	const expression = `tier("seedream", fixed(images_up_to_1_5k * 0.1 + images_above_1_5k * 0.2 + max(input_images - 1, 0) * 0.01))`
+	valid := func(t *testing.T) billingexpr.RequestInput {
+		t.Helper()
+		input := billingexpr.RequestInput{}
+		setRequestScalar(t, &input, "ImagesUpTo1_5K", 1)
+		setRequestScalar(t, &input, "ImagesAbove1_5K", 0)
+		setRequestScalar(t, &input, "InputImages", 0)
+		return input
+	}
+
+	t.Run("missing", func(t *testing.T) {
+		input := valid(t)
+		input.InputImages = nil
+		_, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, input)
+		require.ErrorContains(t, err, "input_images")
+	})
+	for _, testCase := range []struct {
+		name      string
+		fieldName string
+		value     float64
+		want      string
+	}{
+		{name: "negative", fieldName: "ImagesUpTo1_5K", value: -1, want: "images_up_to_1_5k"},
+		{name: "output above provider bound", fieldName: "ImagesAbove1_5K", value: 18, want: "images_above_1_5k"},
+		{name: "references above provider bound", fieldName: "InputImages", value: 15, want: "input_images"},
+		{name: "fractional", fieldName: "InputImages", value: 1.5, want: "input_images"},
+		{name: "nan", fieldName: "ImagesUpTo1_5K", value: math.NaN(), want: "images_up_to_1_5k"},
+		{name: "infinity", fieldName: "ImagesAbove1_5K", value: math.Inf(1), want: "images_above_1_5k"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			input := valid(t)
+			setRequestScalar(t, &input, testCase.fieldName, testCase.value)
+			_, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, input)
+			require.ErrorContains(t, err, testCase.want)
+		})
+	}
+
+	t.Run("combined outputs above provider bound", func(t *testing.T) {
+		input := valid(t)
+		setRequestScalar(t, &input, "ImagesUpTo1_5K", 10)
+		setRequestScalar(t, &input, "ImagesAbove1_5K", 8)
+		_, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, input)
+		require.ErrorContains(t, err, "request image outputs")
+	})
+
+	t.Run("negative evaluated amount", func(t *testing.T) {
+		const negative = `tier("bad", fixed(images_up_to_1_5k - images_above_1_5k))`
+		input := valid(t)
+		setRequestScalar(t, &input, "ImagesUpTo1_5K", 0)
+		setRequestScalar(t, &input, "ImagesAbove1_5K", 1)
+		_, _, err := billingexpr.RunExprWithRequest(negative, billingexpr.TokenParams{}, input)
+		require.ErrorContains(t, err, "fixed price")
+	})
+
+	t.Run("infinite evaluated amount", func(t *testing.T) {
+		const infinite = `tier("bad", fixed(images_up_to_1_5k * 1e308))`
+		input := valid(t)
+		setRequestScalar(t, &input, "ImagesUpTo1_5K", 17)
+		_, _, err := billingexpr.RunExprWithRequest(infinite, billingexpr.TokenParams{}, input)
+		require.ErrorContains(t, err, "fixed price")
+	})
 }
 
 func TestFixedPriceRejectsInvalidLeavesIncludingUnselectedBranches(t *testing.T) {

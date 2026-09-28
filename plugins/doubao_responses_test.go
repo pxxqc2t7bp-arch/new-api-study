@@ -12,11 +12,13 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	builtinplugins "github.com/QuantumNous/new-api/plugins"
 	"github.com/QuantumNous/new-api/relay"
 	taskplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -822,6 +824,60 @@ func TestDoubaoImageResults(t *testing.T) {
 		request := map[string]any{"model": pro, "prompt": "a cat", "image": []any{"https://cdn.example/a.png", "https://cdn.example/b.png", "https://cdn.example/c.png"}, "size": "1K"}
 		immediate := parseResponse(t, pro, request, referenceBody)
 		assert.Equal(t, map[string]any{"images_up_to_1_5k": float64(1), "images_above_1_5k": float64(0), "input_images": float64(2)}, immediate.UsageFacts)
+	})
+
+	t.Run("real schema and completion facts evaluate every Seedream task price", func(t *testing.T) {
+		schema, _ := plugin.Meta.UsageForModel(pro)
+		require.ElementsMatch(t, []string{"images_up_to_1_5k", "images_above_1_5k", "input_images", "layer_decomposition"}, keysOf(schema))
+		layerFacts := parseResponse(
+			t,
+			pro,
+			map[string]any{"model": pro, "image": first, "layer_decomposition": true, "size": "auto"},
+			layerBody,
+		).UsageFacts
+		referenceFacts := parseResponse(
+			t,
+			pro,
+			map[string]any{"model": pro, "image": []any{first, second}, "size": "1K"},
+			referenceBody,
+		).UsageFacts
+		expressions := map[string]struct {
+			expression string
+			facts      map[string]any
+			wantCNY    float64
+		}{
+			"doubao-seedream-4-0": {
+				expression: `tier("per_image", (u("images_up_to_1_5k") + u("images_above_1_5k")) * 0.20 / 7.3)`,
+				facts:      layerFacts,
+				wantCNY:    3 * 0.20,
+			},
+			"doubao-seedream-4-5": {
+				expression: `tier("per_image", (u("images_up_to_1_5k") + u("images_above_1_5k")) * 0.25 / 7.3)`,
+				facts:      layerFacts,
+				wantCNY:    3 * 0.25,
+			},
+			"doubao-seedream-5-0": {
+				expression: `tier("per_image", (u("images_up_to_1_5k") + u("images_above_1_5k")) * 0.22 / 7.3)`,
+				facts:      layerFacts,
+				wantCNY:    3 * 0.22,
+			},
+			"doubao-seedream-5-0-pro": {
+				expression: `tier("per_image", u("images_up_to_1_5k") * 0.30 / 7.3 + u("images_above_1_5k") * 0.60 / 7.3 + max(u("input_images") - 1, 0) * 0.02 / 7.3)`,
+				facts:      referenceFacts,
+				wantCNY:    0.30 + 0.02,
+			},
+		}
+		for name, testCase := range expressions {
+			require.NoError(t, billing_setting.SmokeTestTaskExpr(testCase.expression, schema), name)
+			value, trace, err := billingexpr.RunExprWithRequest(
+				testCase.expression,
+				billingexpr.TokenParams{},
+				billingexpr.RequestInput{Usage: testCase.facts},
+			)
+			require.NoError(t, err, name)
+			assert.InDelta(t, testCase.wantCNY/7.3, value, 1e-12, name)
+			assert.Equal(t, "per_image", trace.MatchedTier, name)
+		}
 	})
 
 	t.Run("invalid completion counts retain the reservation", func(t *testing.T) {
