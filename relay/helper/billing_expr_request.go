@@ -235,7 +235,7 @@ func isOpenAIImageBillingAPIType(apiType int, schemaConfirmed bool) bool {
 		constant.APITypeSub2API,
 		constant.APITypeNewAPI:
 		return true
-	case constant.APITypeAdvancedCustom:
+	case constant.APITypeAdvancedCustom, constant.APITypeTencent:
 		return schemaConfirmed
 	default:
 		return false
@@ -328,9 +328,9 @@ func resolveGeminiImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageR
 	}
 	var instances []json.RawMessage
 	if raw, exists := object["instances"]; !exists || isJSONNull(raw) {
-		return nil, fmt.Errorf("instances[0].prompt is required")
-	} else if err = common.Unmarshal(raw, &instances); err != nil || len(instances) == 0 {
-		return nil, fmt.Errorf("instances[0].prompt is required")
+		return nil, fmt.Errorf("instances must contain exactly one item")
+	} else if err = common.Unmarshal(raw, &instances); err != nil || len(instances) != 1 {
+		return nil, fmt.Errorf("instances must contain exactly one item")
 	}
 	instance, err := imageBillingObject(instances[0], "instances[0]")
 	if err != nil {
@@ -391,6 +391,12 @@ func resolveReplicateImageBilling(info *relaycommon.RelayInfo, incoming *dto.Ima
 	if err != nil {
 		return nil, err
 	}
+	promptTexts := []string{prompt}
+	if negativePrompt, promptErr := optionalImageBillingString(input, "negative_prompt", "input.negative_prompt"); promptErr != nil {
+		return nil, promptErr
+	} else if negativePrompt != "" {
+		promptTexts = append(promptTexts, negativePrompt)
+	}
 	count, err := imageBillingCount(input, "num_outputs", "input.num_outputs", false)
 	if err != nil {
 		return nil, err
@@ -416,7 +422,7 @@ func resolveReplicateImageBilling(info *relaycommon.RelayInfo, incoming *dto.Ima
 	setCanonicalString(body, "resolution", resolution)
 	return resolveOutboundImageBilling(info, &dto.ImageRequest{
 		Model: incoming.Model, N: common.GetPointer(uint(count)), Size: size,
-	}, 0, body, []string{prompt})
+	}, 0, body, promptTexts)
 }
 
 func resolveSiliconFlowImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageRequest, outboundJSON []byte) (*OutboundImageBilling, error) {
@@ -753,6 +759,7 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 
 	outbound := &dto.ImageRequest{Model: incoming.Model}
 	referenceImages := 0
+	sanitizedBody := map[string]any{}
 	seen := map[string]bool{}
 	reader := multipart.NewReader(body, params["boundary"])
 	for {
@@ -774,7 +781,10 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 			continue
 		}
 		switch name {
-		case "prompt", "n", "size", "quality", "layer_decomposition", "parameters":
+		case "prompt", "n", "size", "quality", "response_format", "style",
+			"background", "moderation", "output_format", "output_compression",
+			"partial_images", "stream", "input_fidelity", "watermark",
+			"layer_decomposition", "watermark_enabled", "parameters":
 			if seen[name] {
 				_, err = io.Copy(io.Discard, part)
 				_ = part.Close()
@@ -808,20 +818,36 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 				outbound.N = common.GetPointer(uint(parsed))
 			case "size":
 				outbound.Size = value
+				sanitizedBody["size"] = value
+				sanitizedBody["resolution"] = value
 			case "quality":
 				outbound.Quality = value
+				sanitizedBody["quality"] = value
 			case "layer_decomposition":
 				parsed, parseErr := strconv.ParseBool(strings.TrimSpace(value))
 				if parseErr != nil {
 					return nil, fmt.Errorf("invalid layer_decomposition: %w", parseErr)
 				}
 				outbound.LayerDecomposition = common.GetPointer(parsed)
+				sanitizedBody["layer_decomposition"] = parsed
 			case "parameters":
 				parameters := &dto.ImageBillingParameters{}
 				if parseErr := common.Unmarshal([]byte(value), parameters); parseErr != nil {
 					return nil, fmt.Errorf("invalid image parameters: %w", parseErr)
 				}
 				outbound.BillingParameters = parameters
+				safeParameters := map[string]any{}
+				if parameters.N != nil {
+					safeParameters["n"] = *parameters.N
+				}
+				if parameters.PromptExtend != nil {
+					safeParameters["prompt_extend"] = *parameters.PromptExtend
+				}
+				if len(safeParameters) > 0 {
+					sanitizedBody["parameters"] = safeParameters
+				}
+			default:
+				sanitizedBody[name] = value
 			}
 		default:
 			_, err = io.Copy(io.Discard, part)
@@ -833,7 +859,7 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 	}
 	promptTexts := []string{outbound.Prompt}
 	outbound.Prompt = ""
-	return resolveOutboundImageBilling(info, outbound, referenceImages, nil, promptTexts)
+	return resolveOutboundImageBilling(info, outbound, referenceImages, sanitizedBody, promptTexts)
 }
 
 func resolveOutboundImageBilling(

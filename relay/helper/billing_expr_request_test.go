@@ -290,6 +290,7 @@ func TestResolveOutboundImageBillingJSONUsesExplicitNativeSchemas(t *testing.T) 
 			payload: `{
 				"input":{
 					"prompt":"replicate secret",
+					"negative_prompt":"replicate negative secret",
 					"num_outputs":4,
 					"aspect_ratio":"16:9",
 					"width":1024,
@@ -300,7 +301,7 @@ func TestResolveOutboundImageBillingJSONUsesExplicitNativeSchemas(t *testing.T) 
 					"Extra":"must-not-survive"
 				}
 			}`,
-			wantPrompts: []string{"replicate secret"},
+			wantPrompts: []string{"replicate secret", "replicate negative secret"},
 			assertBody: func(t *testing.T, body []byte) {
 				assert.Equal(t, int64(4), gjson.GetBytes(body, "n").Int())
 				assert.Equal(t, int64(4), gjson.GetBytes(body, "input.num_outputs").Int())
@@ -526,17 +527,19 @@ func TestResolveImageBillingRequestInputPreservesFinalNativeScalars(t *testing.T
 }
 
 func TestResolveOutboundImageBillingJSONAcceptsConfirmedOpenAIDelegation(t *testing.T) {
-	resolved, err := ResolveOutboundImageBillingJSON(
-		outboundImageBillingInfo(constant.APITypeAdvancedCustom, "billing-origin"),
-		[]byte(`{"model":"mapped","prompt":"transient","n":2,"quality":"high"}`),
-		true,
-	)
-	require.NoError(t, err)
-	require.NotNil(t, resolved)
-	assert.Equal(t, 2, resolved.Count)
-	assert.Equal(t, "billing-origin", gjson.GetBytes(resolved.Input.Body, "model").String())
-	assert.Equal(t, "high", gjson.GetBytes(resolved.Input.Body, "quality").String())
-	assert.False(t, gjson.GetBytes(resolved.Input.Body, "prompt").Exists())
+	for _, apiType := range []int{constant.APITypeAdvancedCustom, constant.APITypeTencent} {
+		resolved, err := ResolveOutboundImageBillingJSON(
+			outboundImageBillingInfo(apiType, "billing-origin"),
+			[]byte(`{"model":"mapped","prompt":"transient","n":2,"quality":"high"}`),
+			true,
+		)
+		require.NoError(t, err)
+		require.NotNil(t, resolved)
+		assert.Equal(t, 2, resolved.Count)
+		assert.Equal(t, "billing-origin", gjson.GetBytes(resolved.Input.Body, "model").String())
+		assert.Equal(t, "high", gjson.GetBytes(resolved.Input.Body, "quality").String())
+		assert.False(t, gjson.GetBytes(resolved.Input.Body, "prompt").Exists())
+	}
 }
 
 func TestResolveOutboundImageBillingJSONFailsClosedForUnknownOrInvalidShape(t *testing.T) {
@@ -557,6 +560,11 @@ func TestResolveOutboundImageBillingJSONFailsClosedForUnknownOrInvalidShape(t *t
 			wantError: "unsupported image billing schema",
 		},
 		{
+			name: "unconfirmed Tencent API type", apiType: constant.APITypeTencent,
+			payload:   `{"prompt":"secret","n":1}`,
+			wantError: "unsupported image billing schema",
+		},
+		{
 			name: "Replicate missing count", apiType: constant.APITypeReplicate,
 			payload:   `{"input":{"prompt":"secret"}}`,
 			wantError: "input.num_outputs is required",
@@ -565,6 +573,16 @@ func TestResolveOutboundImageBillingJSONFailsClosedForUnknownOrInvalidShape(t *t
 			name: "Gemini missing nested shape", apiType: constant.APITypeGemini,
 			payload:   `{"prompt":"secret","n":1}`,
 			wantError: "instances",
+		},
+		{
+			name: "Gemini zero instances", apiType: constant.APITypeGemini,
+			payload:   `{"instances":[],"parameters":{"sampleCount":1}}`,
+			wantError: "exactly one",
+		},
+		{
+			name: "Vertex multiple instances", apiType: constant.APITypeVertexAi,
+			payload:   `{"instances":[{"prompt":"one"},{"prompt":"two"}],"parameters":{"sampleCount":1}}`,
+			wantError: "exactly one",
 		},
 		{
 			name: "Gemini zero count", apiType: constant.APITypeGemini,
@@ -652,6 +670,82 @@ func TestResolveOutboundImageBillingMultipartKeepsOnlySeedreamScalars(t *testing
 	require.NoError(t, err)
 	assert.NotContains(t, string(encoded), "secret")
 	assert.NotContains(t, string(encoded), "image bytes")
+}
+
+func TestResolveOutboundImageBillingMultipartKeepsOnlyAllowedOpenAIScalars(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for key, value := range map[string]string{
+		"model":              "mapped-model",
+		"prompt":             "secret multipart prompt",
+		"n":                  "2",
+		"size":               "1536x1024",
+		"quality":            "high",
+		"response_format":    "url",
+		"style":              "vivid",
+		"background":         "transparent",
+		"moderation":         "low",
+		"output_format":      "webp",
+		"output_compression": "90",
+		"partial_images":     "1",
+		"stream":             "true",
+		"input_fidelity":     "high",
+		"watermark":          "false",
+		"watermark_enabled":  "true",
+		"image_url":          "https://secret.invalid/input.png",
+		"b64_json":           "c2VjcmV0",
+		"Extra":              "must-not-survive",
+	} {
+		require.NoError(t, writer.WriteField(key, value))
+	}
+	for _, field := range []string{"image", "mask", "file"} {
+		part, err := writer.CreateFormFile(field, "secret.png")
+		require.NoError(t, err)
+		_, err = part.Write([]byte("secret file bytes"))
+		require.NoError(t, err)
+	}
+	require.NoError(t, writer.Close())
+
+	resolved, err := ResolveOutboundImageBillingMultipart(
+		outboundImageBillingInfo(constant.APITypeOpenAI, "billing-origin"),
+		writer.FormDataContentType(),
+		bytes.NewReader(body.Bytes()),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, 2, resolved.Count)
+	assert.Equal(t, []string{"secret multipart prompt"}, outboundPromptTexts(t, resolved))
+	for key, want := range map[string]string{
+		"size":               "1536x1024",
+		"quality":            "high",
+		"response_format":    "url",
+		"style":              "vivid",
+		"background":         "transparent",
+		"moderation":         "low",
+		"output_format":      "webp",
+		"output_compression": "90",
+		"partial_images":     "1",
+		"stream":             "true",
+		"input_fidelity":     "high",
+		"watermark":          "false",
+		"watermark_enabled":  "true",
+	} {
+		assert.Equal(t, want, gjson.GetBytes(resolved.Input.Body, key).String(), key)
+	}
+	assert.Equal(t, "1536x1024", gjson.GetBytes(resolved.Input.Body, "resolution").String())
+	for _, path := range []string{"prompt", "image", "mask", "file", "image_url", "b64_json", "Extra"} {
+		assert.False(t, gjson.GetBytes(resolved.Input.Body, path).Exists(), path)
+	}
+	assert.NotContains(t, string(resolved.Input.Body), "secret")
+
+	cost, trace, err := billingexpr.RunExprWithRequest(
+		`param("background") == "transparent" && param("output_format") == "webp" && param("output_compression") == "90" && param("input_fidelity") == "high" ? tier("safe", fixed(0.2)) : tier("fallback", fixed(0.01))`,
+		billingexpr.TokenParams{},
+		resolved.Input,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "safe", trace.MatchedTier)
+	assert.InDelta(t, 200_000, cost, 1e-9)
 }
 
 func TestResolveOutboundImageBillingMultipartRejectsExplicitZero(t *testing.T) {
