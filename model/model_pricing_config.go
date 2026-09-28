@@ -26,10 +26,11 @@ import (
 type PricingValues map[string]any
 
 type ModelPricingChange struct {
-	ModelName       string        `json:"model_name"`
-	ExpectedVersion string        `json:"expected_version"`
-	Pricing         PricingValues `json:"pricing"`
-	Reset           bool          `json:"reset,omitempty"`
+	ModelName              string            `json:"model_name"`
+	ExpectedVersion        string            `json:"expected_version"`
+	Pricing                PricingValues     `json:"pricing"`
+	Reset                  bool              `json:"reset,omitempty"`
+	PluginValidationModels map[string]string `json:"-"`
 }
 
 type ModelPricingEntry struct {
@@ -229,7 +230,7 @@ func PreviewModelPricing(name string, draft PricingValues) (PricingValues, error
 	if err != nil {
 		return nil, err
 	}
-	if err := validateModelPricing(name, draft, modelPricingValues(values, name)); err != nil {
+	if err := validateModelPricing(name, draft, modelPricingValues(values, name), nil); err != nil {
 		return nil, err
 	}
 	replaceModelPricing(values, name, draft)
@@ -369,12 +370,12 @@ func ValidateModelPricing(name string, values PricingValues) error {
 	if expression, ok := billing_setting.GetBillingExpr(name); ok {
 		previous["billing_setting.billing_expr"] = expression
 	}
-	return validateModelPricing(name, values, previous)
+	return validateModelPricing(name, values, previous, nil)
 }
 
 // Writes pass the locked database snapshot here, so allowing an unchanged stale
 // override cannot bypass validation through an out-of-date process-local cache.
-func validateModelPricing(name string, values, previous PricingValues) error {
+func validateModelPricing(name string, values, previous PricingValues, pluginValidationModels map[string]string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("model name is required")
 	}
@@ -392,14 +393,18 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 			if !ok || strings.TrimSpace(expression) == "" {
 				return fmt.Errorf("model %s: plugin %s: billing expression is required", name, key)
 			}
+			pluginModel := name
+			if validationModel := strings.TrimSpace(pluginValidationModels[key]); validationModel != "" {
+				pluginModel = validationModel
+			}
 			plugin, exists := generation.Get(key)
-			if !exists || !slices.Contains(plugin.Meta.Models, name) {
+			if !exists || !slices.Contains(plugin.Meta.Models, pluginModel) {
 				if previousVariants[key] == expression {
 					continue
 				}
 				return fmt.Errorf("model %s: plugin %s does not declare this model", name, key)
 			}
-			schema, _ := plugin.Meta.UsageForModel(name)
+			schema, _ := plugin.Meta.UsageForModel(pluginModel)
 			if err := billing_setting.SmokeTestTaskExpr(expression, schema); err != nil {
 				return fmt.Errorf("model %s: plugin %s: %w", name, key, err)
 			}
@@ -440,14 +445,16 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 					}
 				}
 			} else if target, resolved := ResolveTaskModelAlias(generation, name); resolved {
-				if plugin, ok := generation.Get(target.PluginKey); ok {
+				if _, overridden := variants[target.PluginKey]; overridden {
+					err = smokeTestModelRequestExpr(expression)
+				} else if plugin, ok := generation.Get(target.PluginKey); ok {
 					schema, _ := plugin.Meta.UsageForModel(target.Declared)
 					err = billing_setting.SmokeTestTaskExpr(expression, schema)
 				} else {
-					err = billing_setting.SmokeTestExpr(expression)
+					err = smokeTestModelRequestExpr(expression)
 				}
 			} else if previous[key] != expression || len(billingexpr.UsedUsageKeys(expression)) == 0 {
-				err = billing_setting.SmokeTestExpr(expression)
+				err = smokeTestModelRequestExpr(expression)
 			}
 			// With no remaining plugin, an unchanged stored usage expression has
 			// no schema to test. Preserve it so removing stale overrides or saving
@@ -467,6 +474,29 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 			if _, builtin := billing_setting.GetBuiltinBillingExpr(name); !builtin {
 				return errors.New("billing expression is required")
 			}
+		}
+	}
+	return nil
+}
+
+func smokeTestModelRequestExpr(expression string) error {
+	used := billingexpr.UsedVars(expression)
+	if !used["images_up_to_1_5k"] && !used["images_above_1_5k"] && !used["input_images"] {
+		return billing_setting.SmokeTestExpr(expression)
+	}
+	if len(billingexpr.UsedUsageKeys(expression)) > 0 {
+		return errors.New("request expression cannot reference task usage")
+	}
+	scalar := func(value float64) *float64 { return &value }
+	requests := []billingexpr.RequestInput{
+		{ImagesUpTo1_5K: scalar(0), ImagesAbove1_5K: scalar(0), InputImages: scalar(0)},
+		{ImagesUpTo1_5K: scalar(billingexpr.MaxRequestImageOutputs), ImagesAbove1_5K: scalar(0), InputImages: scalar(billingexpr.MaxRequestInputImages)},
+		{ImagesUpTo1_5K: scalar(0), ImagesAbove1_5K: scalar(billingexpr.MaxRequestImageOutputs), InputImages: scalar(billingexpr.MaxRequestInputImages)},
+		{ImagesUpTo1_5K: scalar(1), ImagesAbove1_5K: scalar(1), InputImages: scalar(1)},
+	}
+	for _, request := range requests {
+		if _, _, err := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, request); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -497,7 +527,7 @@ func UpdateModelPricing(changes []ModelPricingChange) error {
 			if change.Reset {
 				pricing = modelPricingValues(defaults, change.ModelName)
 			}
-			if err := validateModelPricing(change.ModelName, pricing, previous); err != nil {
+			if err := validateModelPricing(change.ModelName, pricing, previous, change.PluginValidationModels); err != nil {
 				return err
 			}
 			replaceModelPricing(values, change.ModelName, pricing)
@@ -538,7 +568,7 @@ func UpdateModelPricingOptions(updates map[string]string) error {
 			values[key] = entries
 		}
 		for name := range names {
-			if err := validateModelPricing(name, modelPricingValues(values, name), modelPricingValues(previous, name)); err != nil {
+			if err := validateModelPricing(name, modelPricingValues(values, name), modelPricingValues(previous, name), nil); err != nil {
 				return err
 			}
 		}

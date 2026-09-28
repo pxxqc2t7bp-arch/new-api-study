@@ -13,9 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// PrepareImageBillingForRequest reserves the effective outbound image quantity
-// before each attempt, including channel retries and parameter overrides. The
-// client request body stays frozen; only the independent quantity is refreshed.
+// PrepareImageBillingForRequest reserves the effective outbound image billing
+// inputs before each attempt, including channel retries and parameter overrides.
 func PrepareImageBillingForRequest(c *gin.Context, info *relaycommon.RelayInfo, count int) *types.NewAPIError {
 	if count < 1 || count > dto.MaxImageN {
 		return types.NewErrorWithStatusCode(fmt.Errorf("image_count must be an integer between 1 and %d", dto.MaxImageN), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
@@ -24,8 +23,12 @@ func PrepareImageBillingForRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 	var quota int
 	var err error
 	if snap := info.TieredBillingSnapshot; snap != nil && snap.BillingMode == "tiered_expr" {
-		// Token-only image expressions must not acquire a quantity multiplier.
-		if snap.EstimatedImageCount == nil {
+		usedVars := billingexpr.UsedVarsByHash(snap.ExprString, snap.ExprHash)
+		requestBilled := usedVars["image_count"] ||
+			usedVars["images_up_to_1_5k"] ||
+			usedVars["images_above_1_5k"] ||
+			usedVars["input_images"]
+		if !requestBilled {
 			return nil
 		}
 		request := billingexpr.RequestInput{}

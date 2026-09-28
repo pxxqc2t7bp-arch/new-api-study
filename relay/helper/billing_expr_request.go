@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
 	"regexp"
@@ -126,9 +127,9 @@ func ResolveImageBillingRequestInput(c *gin.Context, info *relaycommon.RelayInfo
 		if count > profile.maxOutputs {
 			return input, fmt.Errorf("n must be an integer between 1 and %d", profile.maxOutputs)
 		}
-		referenceImages, err := seedreamReferenceImageCount(request.Image)
-		if err != nil {
-			return input, err
+		referenceImages, referenceErr := seedreamReferenceImageCount(request.Image)
+		if referenceErr != nil {
+			return input, referenceErr
 		}
 		if referenceImages > profile.maxReferenceImages {
 			return input, fmt.Errorf("at most %d reference images are supported", profile.maxReferenceImages)
@@ -168,6 +169,49 @@ func ResolveImageBillingRequestInput(c *gin.Context, info *relaycommon.RelayInfo
 	return input, nil
 }
 
+// ResolveOutboundSeedreamBillingRequestInput rebuilds the Seedream pricing
+// scalars from the exact JSON that will be sent upstream. It returns nil for
+// other image models so their existing billing paths remain unchanged.
+func ResolveOutboundSeedreamBillingRequestInput(info *relaycommon.RelayInfo, outboundJSON []byte) (*billingexpr.RequestInput, error) {
+	if info == nil {
+		return nil, nil
+	}
+	incoming, ok := info.Request.(*dto.ImageRequest)
+	if !ok {
+		return nil, nil
+	}
+	if _, seedream := seedreamProfile(incoming.Model); !seedream {
+		return nil, nil
+	}
+
+	var outbound struct {
+		N                  *uint           `json:"n"`
+		Size               string          `json:"size"`
+		Image              json.RawMessage `json:"image"`
+		LayerDecomposition *bool           `json:"layer_decomposition"`
+	}
+	if err := common.Unmarshal(outboundJSON, &outbound); err != nil {
+		return nil, err
+	}
+
+	input := billingexpr.RequestInput{Headers: cloneStringMap(info.RequestHeaders)}
+	if info.BillingRequestInput != nil {
+		input.Headers = cloneStringMap(info.BillingRequestInput.Headers)
+		input.EvaluatedAtUnix = info.BillingRequestInput.EvaluatedAtUnix
+	}
+	resolved, err := ResolveImageBillingRequestInput(nil, &relaycommon.RelayInfo{Request: &dto.ImageRequest{
+		Model:              incoming.Model,
+		N:                  outbound.N,
+		Size:               outbound.Size,
+		Image:              outbound.Image,
+		LayerDecomposition: outbound.LayerDecomposition,
+	}}, input)
+	if err != nil {
+		return nil, err
+	}
+	return &resolved, nil
+}
+
 func BuildBillingExprRequestInputFromRequest(request dto.Request, headers map[string]string) (billingexpr.RequestInput, error) {
 	input := billingexpr.RequestInput{
 		Headers: cloneStringMap(headers),
@@ -200,7 +244,8 @@ func readIncomingBillingExprBody(c *gin.Context) ([]byte, error) {
 
 func cloneRequestInput(src billingexpr.RequestInput) billingexpr.RequestInput {
 	input := billingexpr.RequestInput{
-		Headers: cloneStringMap(src.Headers),
+		Headers:         cloneStringMap(src.Headers),
+		EvaluatedAtUnix: src.EvaluatedAtUnix,
 	}
 	if src.ImageCount != nil {
 		count := *src.ImageCount
@@ -223,9 +268,7 @@ func cloneRequestInput(src billingexpr.RequestInput) billingexpr.RequestInput {
 	}
 	if len(src.Usage) > 0 {
 		input.Usage = make(map[string]any, len(src.Usage))
-		for key, value := range src.Usage {
-			input.Usage[key] = value
-		}
+		maps.Copy(input.Usage, src.Usage)
 	}
 	return input
 }

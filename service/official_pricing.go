@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"mime"
 	"net/http"
@@ -92,6 +93,10 @@ var officialPriceNumberPattern = regexp.MustCompile(`(?i)(?:USD\s*)?\$?\s*([0-9]
 var officialLongContextPattern = regexp.MustCompile(`(?i)(?:>=|>)\s*([0-9]+(?:\.[0-9]+)?)\s*k`)
 
 func RunOfficialPricingSync(ctx context.Context, now time.Time) (OfficialPricingSyncSummary, error) {
+	return runOfficialPricingSyncWithBeforeCommit(ctx, now, nil)
+}
+
+func runOfficialPricingSyncWithBeforeCommit(ctx context.Context, now time.Time, beforeCommit func() error) (OfficialPricingSyncSummary, error) {
 	var summary OfficialPricingSyncSummary
 	for _, group := range []string{"default", "cxy"} {
 		if math.Abs(ratio_setting.GetGroupRatio(group)-1) > 1e-9 {
@@ -134,60 +139,79 @@ func RunOfficialPricingSync(ctx context.Context, now time.Time) (OfficialPricing
 		return summary, nil
 	}
 
-	modes := billing_setting.GetBillingModeCopy()
-	expressions := billing_setting.GetBillingExprCopy()
-	pluginExpressions := billing_setting.GetPluginBillingExprCopy()
+	modelNames := make([]string, 0, len(prices))
+	for _, price := range prices {
+		modelNames = append(modelNames, price.ModelName)
+	}
+	pricingSnapshot, err := model.GetModelPricingSnapshot(modelNames)
+	if err != nil {
+		return summary, err
+	}
+	pricingEntries := make(map[string]model.ModelPricingEntry, len(pricingSnapshot.Entries))
+	for _, entry := range pricingSnapshot.Entries {
+		pricingEntries[entry.ModelName] = entry
+	}
+
 	evidence := make([]model.UpstreamPriceEvidence, 0, len(prices))
 	acceptedPrices := make([]officialTokenPrice, 0, len(prices))
+	changes := make([]model.ModelPricingChange, 0, len(prices))
 	for _, price := range prices {
+		entry := pricingEntries[price.ModelName]
 		expression := officialPriceExpression(price)
 		expressionErr := smokeTestOfficialModelExpression(expression, price.BillingBasis, price.UsageSchema)
 		if expressionErr == nil && price.PluginExpression != "" {
 			expressionErr = billing_setting.SmokeTestTaskExpr(price.PluginExpression, price.UsageSchema)
 		}
+		previous, _ := entry.Effective["billing_setting.billing_expr"].(string)
 		if expressionErr != nil {
 			summary.Rejected++
-			evidence = append(evidence, newOfficialPriceEvidence(price, expressions[price.ModelName], expression, model.UpstreamPriceStatusRejected, expressionErr, now))
+			evidence = append(evidence, newOfficialPriceEvidence(price, previous, expression, model.UpstreamPriceStatusRejected, expressionErr, now))
 			continue
 		}
-		previous := expressions[price.ModelName]
-		pluginKey := billing_setting.PluginBillingExprKey("doubao", price.ModelName)
-		pluginUnchanged := price.PluginExpression == "" || pluginExpressions[pluginKey] == price.PluginExpression
-		if previous == expression && modes[price.ModelName] == billing_setting.BillingModeTieredExpr && pluginUnchanged {
+		mode, _ := entry.Effective["billing_setting.billing_mode"].(string)
+		configuredPlugins, _ := entry.Configured[billing_setting.PluginBillingExprOption].(map[string]any)
+		pluginExpression, _ := configuredPlugins["doubao"].(string)
+		pluginUnchanged := price.PluginExpression == "" || pluginExpression == price.PluginExpression
+		if previous == expression && mode == billing_setting.BillingModeTieredExpr && pluginUnchanged {
 			summary.Unchanged++
 			acceptedPrices = append(acceptedPrices, price)
 			evidence = append(evidence, newOfficialPriceEvidence(price, previous, expression, model.UpstreamPriceStatusUnchanged, nil, now))
 			continue
 		}
-		modes[price.ModelName] = billing_setting.BillingModeTieredExpr
-		expressions[price.ModelName] = expression
+
+		draft := maps.Clone(entry.Configured)
+		draft["billing_setting.billing_mode"] = billing_setting.BillingModeTieredExpr
+		draft["billing_setting.billing_expr"] = expression
 		if price.PluginExpression != "" {
-			pluginExpressions[pluginKey] = price.PluginExpression
+			plugins := maps.Clone(configuredPlugins)
+			if plugins == nil {
+				plugins = make(map[string]any)
+			}
+			plugins["doubao"] = price.PluginExpression
+			draft[billing_setting.PluginBillingExprOption] = plugins
 		}
-		summary.Applied++
+		change := model.ModelPricingChange{
+			ModelName:       price.ModelName,
+			ExpectedVersion: entry.Version,
+			Pricing:         draft,
+		}
+		if price.PluginExpression != "" && price.CanonicalModel != "" {
+			change.PluginValidationModels = map[string]string{"doubao": price.CanonicalModel}
+		}
+		changes = append(changes, change)
 		acceptedPrices = append(acceptedPrices, price)
 		evidence = append(evidence, newOfficialPriceEvidence(price, previous, expression, model.UpstreamPriceStatusApplied, nil, now))
 	}
-	modeJSON, err := common.Marshal(modes)
-	if err != nil {
-		return summary, err
-	}
-	expressionJSON, err := common.Marshal(expressions)
-	if err != nil {
-		return summary, err
-	}
-	pluginExpressionJSON, err := common.Marshal(pluginExpressions)
-	if err != nil {
-		return summary, err
-	}
-	if summary.Applied > 0 {
-		if err := model.UpdateOptionsBulk(map[string]string{
-			"billing_setting.billing_mode":          string(modeJSON),
-			"billing_setting.billing_expr":          string(expressionJSON),
-			billing_setting.PluginBillingExprOption: string(pluginExpressionJSON),
-		}); err != nil {
+	if len(changes) > 0 {
+		if beforeCommit != nil {
+			if err := beforeCommit(); err != nil {
+				return summary, err
+			}
+		}
+		if err := model.UpdateModelPricing(changes); err != nil {
 			return summary, err
 		}
+		summary.Applied = len(changes)
 	}
 	for _, price := range acceptedPrices {
 		if err := ensureOfficialModelMetadata(price); err != nil {

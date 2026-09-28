@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -527,6 +528,173 @@ doubao-seedance-2.5 doubao-seedance-2.0-fast doubao-seedance-2.0-mini
 	assert.Equal(t, model.UpstreamPriceStatusUnchanged, evidence[1].Status)
 	assert.Empty(t, evidence[0].Error)
 	assert.Empty(t, evidence[1].Error)
+}
+
+func TestOfficialPricingSyncPreservesConcurrentAdminUpdates(t *testing.T) {
+	const (
+		officialModel  = "gpt-test"
+		unrelatedModel = "admin-unrelated"
+	)
+	body := []byte(`
+		<table>
+			<caption>USD per 1M tokens</caption>
+			<tr><th>Model</th><th>Input</th><th>Cached input</th><th>Output</th></tr>
+			<tr><td>gpt-test</td><td>$1.25</td><td>$0.25</td><td>$5.00</td></tr>
+		</table>`)
+	parsed, err := parseOfficialPricingTables(
+		"openai",
+		"https://openai.com/api/pricing/",
+		body,
+		map[string]string{officialModel: "openai"},
+		nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, parsed, 1)
+	officialExpression := officialPriceExpression(parsed[0])
+
+	for _, tc := range []struct {
+		name             string
+		adminModel       string
+		wantConflict     bool
+		wantApplied      int
+		wantEvidenceRows int64
+	}{
+		{name: "same model conflicts", adminModel: officialModel, wantConflict: true},
+		{name: "unrelated model is preserved", adminModel: unrelatedModel, wantApplied: 1, wantEvidenceRows: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			previousDB := model.DB
+			database, openErr := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+			require.NoError(t, openErr)
+			require.NoError(t, database.AutoMigrate(
+				&model.Option{},
+				&model.Vendor{},
+				&model.Model{},
+				&model.UpstreamGroup{},
+				&model.UpstreamPriceEvidence{},
+				&model.Ability{},
+				&model.Channel{},
+			))
+			model.DB = database
+
+			previousHTTPClient := httpClient
+			previousSources := officialPricingSourceURLs
+			httpClient = &http.Client{Transport: officialPricingRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/html"}},
+					Body:       io.NopCloser(strings.NewReader(string(body))),
+					Request:    request,
+				}, nil
+			})}
+			officialPricingSourceURLs = map[string][]string{
+				"openai": {"https://openai.com/api/pricing/"},
+			}
+			t.Setenv("UPSTREAM_PRICING_PROXY_URL", "")
+
+			savedConfig := map[string]string{}
+			require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+				savedConfig[key] = value
+				return nil
+			}))
+			common.OptionMapRWMutex.Lock()
+			previousOptionMap := common.OptionMap
+			common.OptionMap = maps.Clone(common.OptionMap)
+			if common.OptionMap == nil {
+				common.OptionMap = make(map[string]string)
+			}
+			common.OptionMapRWMutex.Unlock()
+			t.Cleanup(func() {
+				model.DB = previousDB
+				httpClient = previousHTTPClient
+				officialPricingSourceURLs = previousSources
+				model.InvalidatePricingCache()
+				require.NoError(t, config.GlobalConfig.LoadFromDB(savedConfig))
+				common.OptionMapRWMutex.Lock()
+				common.OptionMap = previousOptionMap
+				common.OptionMapRWMutex.Unlock()
+			})
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+				"billing_setting.billing_mode":          `{}`,
+				"billing_setting.billing_expr":          `{}`,
+				billing_setting.PluginBillingExprOption: `{}`,
+				"group_ratio_setting.group_ratio":       `{"default":1,"cxy":1}`,
+			}))
+
+			vendor := model.Vendor{Name: "openai", Status: 1}
+			require.NoError(t, database.Create(&vendor).Error)
+			for _, modelName := range []string{officialModel, unrelatedModel} {
+				syncOfficial := 0
+				if modelName == officialModel {
+					syncOfficial = 1
+				}
+				require.NoError(t, database.Create(&model.Model{
+					ModelName: modelName, VendorID: vendor.Id, Status: 1,
+					SyncOfficial: syncOfficial,
+				}).Error)
+			}
+
+			adminExpression := `tier("admin", p * 9 + c * 36)`
+			beforeCommit := func() error {
+				snapshot, snapshotErr := model.GetModelPricingSnapshot([]string{tc.adminModel})
+				if snapshotErr != nil {
+					return snapshotErr
+				}
+				if len(snapshot.Entries) != 1 {
+					return fmt.Errorf("expected one admin pricing entry, got %d", len(snapshot.Entries))
+				}
+				done := make(chan error, 1)
+				go func() {
+					done <- model.UpdateModelPricing([]model.ModelPricingChange{{
+						ModelName:       tc.adminModel,
+						ExpectedVersion: snapshot.Entries[0].Version,
+						Pricing: model.PricingValues{
+							"billing_setting.billing_mode": billing_setting.BillingModeTieredExpr,
+							"billing_setting.billing_expr": adminExpression,
+						},
+					}})
+				}()
+				select {
+				case updateErr := <-done:
+					return updateErr
+				case <-time.After(5 * time.Second):
+					return fmt.Errorf("concurrent admin pricing update timed out")
+				}
+			}
+
+			summary, syncErr := runOfficialPricingSyncWithBeforeCommit(
+				t.Context(),
+				time.Unix(1_800_000_000, 0),
+				beforeCommit,
+			)
+			if tc.wantConflict {
+				require.ErrorIs(t, syncErr, model.ErrModelPricingConflict)
+			} else {
+				require.NoError(t, syncErr)
+			}
+			assert.Equal(t, tc.wantApplied, summary.Applied)
+
+			snapshot, snapshotErr := model.GetModelPricingSnapshot([]string{officialModel, unrelatedModel})
+			require.NoError(t, snapshotErr)
+			entries := make(map[string]model.ModelPricingEntry, len(snapshot.Entries))
+			for _, entry := range snapshot.Entries {
+				entries[entry.ModelName] = entry
+			}
+			assert.Equal(t, adminExpression, entries[tc.adminModel].Configured["billing_setting.billing_expr"])
+			if tc.wantConflict {
+				assert.NotEqual(t, officialExpression, entries[officialModel].Configured["billing_setting.billing_expr"])
+			} else {
+				assert.Equal(t, officialExpression, entries[officialModel].Configured["billing_setting.billing_expr"])
+			}
+
+			var evidence []model.UpstreamPriceEvidence
+			require.NoError(t, database.Order("id").Find(&evidence).Error)
+			assert.Len(t, evidence, int(tc.wantEvidenceRows))
+			for _, item := range evidence {
+				assert.Equal(t, model.UpstreamPriceStatusApplied, item.Status)
+			}
+		})
+	}
 }
 
 func TestOfficialPricingSyncPersistsSeedreamExpressionsByBillingBasis(t *testing.T) {

@@ -45,11 +45,13 @@ func (*imageReservation) NeedsRefund() bool          { return false }
 
 type seedreamSettlementRecorder struct {
 	preConsumedQuota int
+	reserveCalls     int
 	settleCalls      int
 	settledQuota     int
 }
 
 func (s *seedreamSettlementRecorder) Reserve(quota int) error {
+	s.reserveCalls++
 	s.preConsumedQuota = max(s.preConsumedQuota, quota)
 	return nil
 }
@@ -142,6 +144,236 @@ func TestSeedreamLayerDecompositionOutboundMatchesFrozenSettlement(t *testing.T)
 	require.NoError(t, service.SettleBilling(c, info, settledQuota))
 	assert.Equal(t, 1, settler.settleCalls)
 	assert.Equal(t, expectedQuota, settler.settledQuota)
+}
+
+func TestSeedreamFinalOutboundOverridesMatchReservationAndSettlement(t *testing.T) {
+	service.InitHttpClient()
+	const (
+		modelName = "doubao-seedream-5-0-pro-260628"
+		expr      = `tier("per_image", fixed(images_up_to_1_5k * 0.04109589041 + images_above_1_5k * 0.08219178082 + max(input_images - 1, 0) * 0.002739726027))`
+	)
+	tests := []struct {
+		name             string
+		body             string
+		overridePath     string
+		overrideValue    any
+		wantOutboundJSON string
+		wantLower        float64
+		wantHigher       float64
+		wantInputs       float64
+		wantImageCount   int
+		wantFixedPrice   float64
+	}{
+		{
+			name:             "n",
+			body:             `{"model":"` + modelName + `","prompt":"sensitive prompt","n":1,"size":"1K"}`,
+			overridePath:     "n",
+			overrideValue:    4,
+			wantOutboundJSON: `4`,
+			wantLower:        4,
+			wantImageCount:   4,
+			wantFixedPrice:   4 * 0.04109589041,
+		},
+		{
+			name:             "size",
+			body:             `{"model":"` + modelName + `","prompt":"sensitive prompt","n":2,"size":"1K"}`,
+			overridePath:     "size",
+			overrideValue:    "2K",
+			wantOutboundJSON: `"2K"`,
+			wantHigher:       2,
+			wantImageCount:   2,
+			wantFixedPrice:   2 * 0.08219178082,
+		},
+		{
+			name:             "image",
+			body:             `{"model":"` + modelName + `","prompt":"sensitive prompt","size":"1K","image":"https://private.invalid/original.png"}`,
+			overridePath:     "image",
+			overrideValue:    []any{"https://private.invalid/a.png", "data:image/png;base64,cHJpdmF0ZQ==", "https://private.invalid/c.png"},
+			wantOutboundJSON: `["https://private.invalid/a.png","data:image/png;base64,cHJpdmF0ZQ==","https://private.invalid/c.png"]`,
+			wantLower:        1,
+			wantInputs:       3,
+			wantImageCount:   1,
+			wantFixedPrice:   0.04109589041 + 2*0.002739726027,
+		},
+		{
+			name:             "layer_decomposition",
+			body:             `{"model":"` + modelName + `","prompt":"sensitive prompt","size":"2K","image":"https://private.invalid/original.png","layer_decomposition":false}`,
+			overridePath:     "layer_decomposition",
+			overrideValue:    true,
+			wantOutboundJSON: `true`,
+			wantHigher:       17,
+			wantInputs:       1,
+			wantImageCount:   17,
+			wantFixedPrice:   17 * 0.08219178082,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			type outboundCapture struct {
+				body []byte
+				err  error
+			}
+			received := make(chan outboundCapture, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				body, readErr := io.ReadAll(request.Body)
+				received <- outboundCapture{body: body, err: readErr}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = io.WriteString(w, `{"error":{"message":"fixture upstream failure","type":"upstream_error"}}`)
+			}))
+			t.Cleanup(upstream.Close)
+
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(tc.body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeVolcEngine)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, modelName)
+			common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{
+				"operations": []any{
+					map[string]any{"path": tc.overridePath, "mode": "set", "value": tc.overrideValue},
+					map[string]any{"path": "vendor_private", "mode": "set", "value": map[string]any{"secret": "must-not-freeze"}},
+				},
+			})
+
+			request, err := helper.GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesGenerations)
+			require.NoError(t, err)
+			info := &relaycommon.RelayInfo{
+				Request:         request,
+				OriginModelName: modelName,
+				RelayMode:       relayconstant.RelayModeImagesGenerations,
+				RequestURLPath:  c.Request.URL.Path,
+				PriceData: hosttypes.PriceData{
+					GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1},
+				},
+			}
+			input, err := helper.ResolveImageBillingRequestInput(c, info, billingexpr.RequestInput{
+				Headers:         map[string]string{"X-Billing-Test": "kept"},
+				Body:            []byte(tc.body),
+				EvaluatedAtUnix: 1_800_000_000,
+			})
+			require.NoError(t, err)
+			initialCost, initialTrace, err := billingexpr.RunExprWithRequest(expr, billingexpr.TokenParams{}, input)
+			require.NoError(t, err)
+			initialQuota := billingexpr.QuotaRound(initialCost / 1_000_000 * common.QuotaPerUnit)
+			settler := &seedreamSettlementRecorder{preConsumedQuota: initialQuota}
+			info.BillingRequestInput = &input
+			info.Billing = settler
+			info.UserQuota = int(10 * common.QuotaPerUnit)
+			info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{
+				BillingMode:              "tiered_expr",
+				ExprString:               expr,
+				ExprHash:                 billingexpr.ExprHashString(expr),
+				GroupRatio:               1,
+				QuotaPerUnit:             float64(common.QuotaPerUnit),
+				EstimatedImageCount:      initialTrace.ImageCount,
+				EstimatedQuotaAfterGroup: initialQuota,
+				EstimatedBillingUnit:     initialTrace.BillingUnit,
+				EstimatedFixedPrice:      initialTrace.FixedPrice,
+				PricingTimeUnix:          input.EvaluatedAtUnix,
+			}
+
+			apiErr := ImageHelper(c, info)
+			require.NotNil(t, apiErr)
+			assert.Equal(t, http.StatusBadGateway, apiErr.StatusCode)
+			require.Len(t, received, 1)
+			captured := <-received
+			require.NoError(t, captured.err)
+			outbound := captured.body
+			assert.JSONEq(t, tc.wantOutboundJSON, gjson.GetBytes(outbound, tc.overridePath).Raw)
+			assert.Equal(t, "must-not-freeze", gjson.GetBytes(outbound, "vendor_private.secret").String())
+
+			require.NotNil(t, info.BillingRequestInput)
+			assert.Empty(t, info.BillingRequestInput.Body)
+			assert.Empty(t, info.BillingRequestInput.Usage)
+			assert.Equal(t, int64(1_800_000_000), info.BillingRequestInput.EvaluatedAtUnix)
+			assert.Equal(t, "kept", info.BillingRequestInput.Headers["X-Billing-Test"])
+			require.NotNil(t, info.BillingRequestInput.ImagesUpTo1_5K)
+			require.NotNil(t, info.BillingRequestInput.ImagesAbove1_5K)
+			require.NotNil(t, info.BillingRequestInput.InputImages)
+			assert.Equal(t, tc.wantLower, *info.BillingRequestInput.ImagesUpTo1_5K)
+			assert.Equal(t, tc.wantHigher, *info.BillingRequestInput.ImagesAbove1_5K)
+			assert.Equal(t, tc.wantInputs, *info.BillingRequestInput.InputImages)
+			require.NotNil(t, info.BillingRequestInput.ImageCount)
+			assert.Equal(t, tc.wantImageCount, *info.BillingRequestInput.ImageCount)
+			frozenJSON, err := common.Marshal(info.BillingRequestInput)
+			require.NoError(t, err)
+			for _, forbidden := range []string{"sensitive prompt", "private.invalid", "base64", "vendor_private", "must-not-freeze"} {
+				assert.NotContains(t, string(frozenJSON), forbidden)
+			}
+
+			expectedQuota := billingexpr.QuotaRound(tc.wantFixedPrice * common.QuotaPerUnit)
+			assert.Equal(t, expectedQuota, info.PriceData.QuotaToPreConsume)
+			assert.Equal(t, expectedQuota, settler.preConsumedQuota)
+			assert.Equal(t, 1, settler.reserveCalls)
+			assert.Equal(t, expectedQuota, info.FinalPreConsumedQuota)
+
+			ok, settledQuota, result := service.TryTieredSettle(info, billingexpr.TokenParams{})
+			require.True(t, ok)
+			require.NotNil(t, result)
+			assert.Equal(t, expectedQuota, settledQuota)
+			require.NoError(t, service.SettleBilling(c, info, settledQuota))
+			assert.Equal(t, 1, settler.settleCalls)
+			assert.Equal(t, expectedQuota, settler.settledQuota)
+		})
+	}
+}
+
+func TestSeedreamInvalidFinalOverridesFailBeforeDispatch(t *testing.T) {
+	service.InitHttpClient()
+	const modelName = "doubao-seedream-5-0-pro-260628"
+	tests := []struct {
+		name          string
+		body          string
+		overridePath  string
+		overrideValue any
+	}{
+		{name: "invalid image type", body: `{"model":"` + modelName + `","size":"1K"}`, overridePath: "image", overrideValue: map[string]any{"url": "https://private.invalid/a.png"}},
+		{name: "layer requires one image", body: `{"model":"` + modelName + `","size":"1K","image":["a","b"]}`, overridePath: "layer_decomposition", overrideValue: true},
+		{name: "layer must be boolean", body: `{"model":"` + modelName + `","size":"1K","image":"a"}`, overridePath: "layer_decomposition", overrideValue: "true"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dispatched := make(chan struct{}, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				dispatched <- struct{}{}
+				w.WriteHeader(http.StatusBadGateway)
+			}))
+			t.Cleanup(upstream.Close)
+
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(tc.body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeVolcEngine)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, modelName)
+			common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{
+				"operations": []any{map[string]any{"path": tc.overridePath, "mode": "set", "value": tc.overrideValue}},
+			})
+
+			request, err := helper.GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesGenerations)
+			require.NoError(t, err)
+			info := &relaycommon.RelayInfo{
+				Request:         request,
+				OriginModelName: modelName,
+				RelayMode:       relayconstant.RelayModeImagesGenerations,
+				RequestURLPath:  c.Request.URL.Path,
+				Billing:         &imageReservation{limit: int(10 * common.QuotaPerUnit)},
+				PriceData: hosttypes.PriceData{
+					UsePrice:       true,
+					ModelPrice:     0.30 / 7.3,
+					GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: 1},
+				},
+			}
+
+			apiErr := ImageHelper(c, info)
+			require.NotNil(t, apiErr)
+			assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+			assert.True(t, types.IsSkipRetryError(apiErr))
+			assert.Empty(t, dispatched)
+		})
+	}
 }
 
 func TestSeedreamLayerDecompositionRequiresBooleanJSON(t *testing.T) {

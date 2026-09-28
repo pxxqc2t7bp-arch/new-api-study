@@ -103,19 +103,28 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	if jsonData != nil {
 		// This is a different trust boundary from ingress: channel overrides
 		// and pass-through bodies can change the quantity actually submitted.
-		var outbound struct {
-			N *uint `json:"n"`
-		}
-		if err := common.Unmarshal(jsonData, &outbound); err != nil {
+		finalBillingInput, err := helper.ResolveOutboundSeedreamBillingRequestInput(info, jsonData)
+		if err != nil {
 			return types.NewErrorWithStatusCode(fmt.Errorf("invalid image billing parameters: %w", err), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
-		quantityRequest := dto.ImageRequest{N: outbound.N}
-		if quantityRequest.N == nil {
-			quantityRequest.N = common.GetPointer(uint(imageCount))
-		}
-		imageCount, err = quantityRequest.ImageCount(false)
-		if err != nil {
-			return types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		if finalBillingInput != nil {
+			info.BillingRequestInput = finalBillingInput
+			imageCount = *finalBillingInput.ImageCount
+		} else {
+			var outbound struct {
+				N *uint `json:"n"`
+			}
+			if err := common.Unmarshal(jsonData, &outbound); err != nil {
+				return types.NewErrorWithStatusCode(fmt.Errorf("invalid image billing parameters: %w", err), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+			quantityRequest := dto.ImageRequest{N: outbound.N}
+			if quantityRequest.N == nil {
+				quantityRequest.N = common.GetPointer(uint(imageCount))
+			}
+			imageCount, err = quantityRequest.ImageCount(false)
+			if err != nil {
+				return types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
 		}
 		logger.LogDebug(c, "image request body: %s", jsonData)
 		body, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
