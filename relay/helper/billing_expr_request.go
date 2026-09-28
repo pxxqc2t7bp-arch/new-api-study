@@ -51,12 +51,11 @@ func ResolveIncomingBillingExprRequestInput(c *gin.Context, info *relaycommon.Re
 const seedreamLowerTierMaxPixels = 2_610_000
 
 const (
-	maxImageBillingScalarBytes  = 128
-	maxImageDimension           = 65_535
-	maxImageBillingInteger      = 1_000_000
-	maxExactJSONInteger         = 9_007_199_254_740_991
-	maxImageBillingNumber       = 1_000_000
-	minEncodedImagePayloadChars = 64
+	maxImageBillingScalarBytes = 128
+	maxImageDimension          = 65_535
+	maxImageBillingInteger     = 1_000_000
+	maxExactJSONInteger        = 9_007_199_254_740_991
+	maxImageBillingNumber      = 1_000_000
 )
 
 var (
@@ -883,7 +882,7 @@ func looksLikeEncodedImageBillingPayload(value string) bool {
 		if err != nil || len(decoded) == 0 {
 			continue
 		}
-		if imageBillingDecodedPayloadHasImageMagic(decoded) || len(value) >= minEncodedImagePayloadChars {
+		if imageBillingDecodedPayloadHasImageMagic(decoded) {
 			return true
 		}
 	}

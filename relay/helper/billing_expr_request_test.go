@@ -2,6 +2,7 @@ package helper
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -885,12 +886,8 @@ func TestResolveOutboundImageBillingJSONRejectsSensitiveAllowedScalar(t *testing
 		{name: "data URI", payload: `{"prompt":"secret","n":1,"style":"data:image/png;base64,c2VjcmV0"}`},
 		{name: "URL", payload: `{"prompt":"secret","n":1,"style":"https://secret.invalid/image.png"}`},
 		{name: "base64 image", payload: `{"prompt":"secret","n":1,"style":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"}`},
-		{name: "long encoded blob", payload: fmt.Sprintf(
-			`{"prompt":"secret","n":1,"style":"%s"}`,
-			strings.Repeat("a", 96),
-		)},
 		{name: "control character", payload: `{"prompt":"secret","n":1,"style":"high\nsecret"}`},
-		{name: "overlong", payload: fmt.Sprintf(
+		{name: "overlong blob", payload: fmt.Sprintf(
 			`{"prompt":"secret","n":1,"style":"%s"}`,
 			strings.Repeat("a", maxImageBillingScalarBytes+1),
 		)},
@@ -907,24 +904,47 @@ func TestResolveOutboundImageBillingJSONRejectsSensitiveAllowedScalar(t *testing
 	}
 }
 
-func TestResolveOutboundImageBillingJSONAllowsShortIdentifiersThatDecodeAsBase64(t *testing.T) {
-	for _, identifier := range []string{"webp", "aaaaaaaa", "c2VjcmV0"} {
-		t.Run(identifier, func(t *testing.T) {
+func TestResolveOutboundImageBillingJSONAllowsBoundedIdentifiersThatDecodeAsBase64(t *testing.T) {
+	tests := []struct {
+		field string
+		value string
+	}{
+		{field: "style", value: strings.Repeat("a", 64)},
+		{field: "background", value: strings.Repeat("a", 96)},
+		{field: "moderation", value: "webp"},
+		{field: "output_format", value: "future_safe_format"},
+		{field: "input_fidelity", value: "c2VjcmV0"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.field, func(t *testing.T) {
 			resolved, err := ResolveOutboundImageBillingJSON(
 				outboundImageBillingInfo(constant.APITypeOpenAI, "billing-origin"),
-				fmt.Appendf(nil, `{"prompt":"secret","n":1,"style":%q}`, identifier),
+				fmt.Appendf(nil, `{"prompt":"secret","n":1,%q:%q}`, testCase.field, testCase.value),
 			)
 			require.NoError(t, err)
 			require.NotNil(t, resolved)
-			assert.Equal(t, identifier, gjson.GetBytes(resolved.Input.Body, "style").String())
+			assert.Equal(t, testCase.value, gjson.GetBytes(resolved.Input.Body, testCase.field).String())
 		})
 	}
 }
 
-func TestValidateImageBillingStringRejectsLongEncodedBlob(t *testing.T) {
-	value := strings.Repeat("a", 96)
-	_, err := validateImageBillingString(value, "style")
-	require.ErrorContains(t, err, "bounded non-sensitive string")
+func TestValidateImageBillingStringRejectsBase64ImageMagic(t *testing.T) {
+	tests := []struct {
+		name  string
+		magic []byte
+	}{
+		{name: "PNG", magic: []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}},
+		{name: "JPEG", magic: []byte{0xff, 0xd8, 0xff}},
+		{name: "GIF", magic: []byte("GIF89a")},
+		{name: "WebP", magic: []byte{'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'E', 'B', 'P'}},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			value := base64.RawURLEncoding.EncodeToString(testCase.magic)
+			_, err := validateImageBillingString(value, "style")
+			require.ErrorContains(t, err, "bounded non-sensitive string")
+		})
+	}
 }
 
 func TestResolveOutboundImageBillingMultipartRejectsFileContentAsScalar(t *testing.T) {
