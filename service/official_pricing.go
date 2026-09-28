@@ -154,7 +154,9 @@ func runOfficialPricingSyncWithBeforeCommit(ctx context.Context, now time.Time, 
 
 	evidence := make([]model.UpstreamPriceEvidence, 0, len(prices))
 	acceptedPrices := make([]officialTokenPrice, 0, len(prices))
-	changes := make([]model.ModelPricingChange, 0, len(prices))
+	acceptedChanges := make([]model.ModelPricingChange, 0, len(prices))
+	appliedCount := 0
+	unchangedCount := 0
 	for _, price := range prices {
 		entry := pricingEntries[price.ModelName]
 		expression := officialPriceExpression(price)
@@ -172,23 +174,27 @@ func runOfficialPricingSyncWithBeforeCommit(ctx context.Context, now time.Time, 
 		configuredPlugins, _ := entry.Configured[billing_setting.PluginBillingExprOption].(map[string]any)
 		pluginExpression, _ := configuredPlugins["doubao"].(string)
 		pluginUnchanged := price.PluginExpression == "" || pluginExpression == price.PluginExpression
-		if previous == expression && mode == billing_setting.BillingModeTieredExpr && pluginUnchanged {
-			summary.Unchanged++
-			acceptedPrices = append(acceptedPrices, price)
-			evidence = append(evidence, newOfficialPriceEvidence(price, previous, expression, model.UpstreamPriceStatusUnchanged, nil, now))
-			continue
-		}
-
+		unchanged := previous == expression && mode == billing_setting.BillingModeTieredExpr && pluginUnchanged
 		draft := maps.Clone(entry.Configured)
-		draft["billing_setting.billing_mode"] = billing_setting.BillingModeTieredExpr
-		draft["billing_setting.billing_expr"] = expression
-		if price.PluginExpression != "" {
-			plugins := maps.Clone(configuredPlugins)
-			if plugins == nil {
-				plugins = make(map[string]any)
+		status := model.UpstreamPriceStatusUnchanged
+		if unchanged {
+			unchangedCount++
+		} else {
+			appliedCount++
+			status = model.UpstreamPriceStatusApplied
+			if draft == nil {
+				draft = make(model.PricingValues)
 			}
-			plugins["doubao"] = price.PluginExpression
-			draft[billing_setting.PluginBillingExprOption] = plugins
+			draft["billing_setting.billing_mode"] = billing_setting.BillingModeTieredExpr
+			draft["billing_setting.billing_expr"] = expression
+			if price.PluginExpression != "" {
+				plugins := maps.Clone(configuredPlugins)
+				if plugins == nil {
+					plugins = make(map[string]any)
+				}
+				plugins["doubao"] = price.PluginExpression
+				draft[billing_setting.PluginBillingExprOption] = plugins
+			}
 		}
 		change := model.ModelPricingChange{
 			ModelName:       price.ModelName,
@@ -198,20 +204,25 @@ func runOfficialPricingSyncWithBeforeCommit(ctx context.Context, now time.Time, 
 		if price.PluginExpression != "" && price.CanonicalModel != "" {
 			change.PluginValidationModels = map[string]string{"doubao": price.CanonicalModel}
 		}
-		changes = append(changes, change)
+		acceptedChanges = append(acceptedChanges, change)
 		acceptedPrices = append(acceptedPrices, price)
-		evidence = append(evidence, newOfficialPriceEvidence(price, previous, expression, model.UpstreamPriceStatusApplied, nil, now))
+		evidence = append(evidence, newOfficialPriceEvidence(price, previous, expression, status, nil, now))
 	}
-	if len(changes) > 0 {
+	if len(acceptedChanges) > 0 {
 		if beforeCommit != nil {
 			if err := beforeCommit(); err != nil {
 				return summary, err
 			}
 		}
-		if err := model.UpdateModelPricing(changes); err != nil {
+		if err := model.UpdateModelPricingWithEvidence(acceptedChanges, evidence); err != nil {
 			return summary, err
 		}
-		summary.Applied = len(changes)
+		summary.Applied = appliedCount
+		summary.Unchanged = unchangedCount
+	} else if len(evidence) > 0 {
+		if err := model.DB.CreateInBatches(&evidence, 50).Error; err != nil {
+			return summary, err
+		}
 	}
 	for _, price := range acceptedPrices {
 		if err := ensureOfficialModelMetadata(price); err != nil {
@@ -220,11 +231,6 @@ func runOfficialPricingSyncWithBeforeCommit(ctx context.Context, now time.Time, 
 	}
 	if len(acceptedPrices) > 0 {
 		model.RefreshPricing()
-	}
-	if len(evidence) > 0 {
-		if err := model.DB.CreateInBatches(&evidence, 50).Error; err != nil {
-			return summary, err
-		}
 	}
 	return summary, nil
 }

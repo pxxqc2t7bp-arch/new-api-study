@@ -503,6 +503,21 @@ func smokeTestModelRequestExpr(expression string) error {
 }
 
 func UpdateModelPricing(changes []ModelPricingChange) error {
+	return updateModelPricing(changes, nil)
+}
+
+// UpdateModelPricingWithEvidence commits official pricing evidence in the same
+// validated transaction as its model pricing snapshots.
+func UpdateModelPricingWithEvidence(changes []ModelPricingChange, evidence []UpstreamPriceEvidence) error {
+	return updateModelPricing(changes, func(tx *gorm.DB) error {
+		if len(evidence) == 0 {
+			return nil
+		}
+		return tx.CreateInBatches(&evidence, 50).Error
+	})
+}
+
+func updateModelPricing(changes []ModelPricingChange, afterPricing func(*gorm.DB) error) error {
 	if len(changes) == 0 {
 		return errors.New("select model pricing changes before saving")
 	}
@@ -516,7 +531,7 @@ func UpdateModelPricing(changes []ModelPricingChange) error {
 			return ErrModelPricingConflict
 		}
 	}
-	return mutateModelPricingOptions(func(_ *gorm.DB, values map[string]map[string]any) error {
+	return mutateModelPricingOptions(func(tx *gorm.DB, values map[string]map[string]any) error {
 		defaults := defaultPricingMaps()
 		for _, change := range changes {
 			previous := modelPricingValues(values, change.ModelName)
@@ -531,6 +546,9 @@ func UpdateModelPricing(changes []ModelPricingChange) error {
 				return err
 			}
 			replaceModelPricing(values, change.ModelName, pricing)
+		}
+		if afterPricing != nil {
+			return afterPricing(tx)
 		}
 		return nil
 	})

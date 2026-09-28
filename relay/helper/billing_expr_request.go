@@ -180,7 +180,8 @@ func ResolveOutboundSeedreamBillingRequestInput(info *relaycommon.RelayInfo, out
 	if !ok {
 		return nil, nil
 	}
-	if _, seedream := seedreamProfile(incoming.Model); !seedream {
+	profile, seedream := seedreamProfile(incoming.Model)
+	if !seedream {
 		return nil, nil
 	}
 
@@ -192,6 +193,9 @@ func ResolveOutboundSeedreamBillingRequestInput(info *relaycommon.RelayInfo, out
 	}
 	if err := common.Unmarshal(outboundJSON, &outbound); err != nil {
 		return nil, err
+	}
+	if outbound.N != nil && *outbound.N == 0 {
+		return nil, fmt.Errorf("n must be an integer between 1 and %d", profile.maxOutputs)
 	}
 
 	input := billingexpr.RequestInput{Headers: cloneStringMap(info.RequestHeaders)}

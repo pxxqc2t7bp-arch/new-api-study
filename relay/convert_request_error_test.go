@@ -328,7 +328,10 @@ func TestSeedreamInvalidFinalOverridesFailBeforeDispatch(t *testing.T) {
 		body          string
 		overridePath  string
 		overrideValue any
+		passThrough   bool
 	}{
+		{name: "converted n zero", body: `{"model":"` + modelName + `","size":"1K","n":1}`, overridePath: "n", overrideValue: 0},
+		{name: "pass-through n zero", body: `{"model":"` + modelName + `","size":"1K","n":0}`, passThrough: true},
 		{name: "invalid image type", body: `{"model":"` + modelName + `","size":"1K"}`, overridePath: "image", overrideValue: map[string]any{"url": "https://private.invalid/a.png"}},
 		{name: "layer requires one image", body: `{"model":"` + modelName + `","size":"1K","image":["a","b"]}`, overridePath: "layer_decomposition", overrideValue: true},
 		{name: "layer must be boolean", body: `{"model":"` + modelName + `","size":"1K","image":"a"}`, overridePath: "layer_decomposition", overrideValue: "true"},
@@ -348,18 +351,22 @@ func TestSeedreamInvalidFinalOverridesFailBeforeDispatch(t *testing.T) {
 			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeVolcEngine)
 			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, upstream.URL)
 			common.SetContextKey(c, constant.ContextKeyOriginalModel, modelName)
-			common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{
-				"operations": []any{map[string]any{"path": tc.overridePath, "mode": "set", "value": tc.overrideValue}},
-			})
+			common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{PassThroughBodyEnabled: tc.passThrough})
+			if tc.overridePath != "" {
+				common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{
+					"operations": []any{map[string]any{"path": tc.overridePath, "mode": "set", "value": tc.overrideValue}},
+				})
+			}
 
 			request, err := helper.GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesGenerations)
 			require.NoError(t, err)
+			reservation := &imageReservation{limit: int(10 * common.QuotaPerUnit)}
 			info := &relaycommon.RelayInfo{
 				Request:         request,
 				OriginModelName: modelName,
 				RelayMode:       relayconstant.RelayModeImagesGenerations,
 				RequestURLPath:  c.Request.URL.Path,
-				Billing:         &imageReservation{limit: int(10 * common.QuotaPerUnit)},
+				Billing:         reservation,
 				PriceData: hosttypes.PriceData{
 					UsePrice:       true,
 					ModelPrice:     0.30 / 7.3,
@@ -372,6 +379,7 @@ func TestSeedreamInvalidFinalOverridesFailBeforeDispatch(t *testing.T) {
 			assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
 			assert.True(t, types.IsSkipRetryError(apiErr))
 			assert.Empty(t, dispatched)
+			assert.Zero(t, reservation.held)
 		})
 	}
 }
