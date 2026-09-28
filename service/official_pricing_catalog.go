@@ -295,8 +295,10 @@ func parseVolcenginePricing(
 		billingBasis := billingexpr.BillingBasisTask
 		usageSchema := videoUsageSchema
 		if strings.HasPrefix(modelName, "doubao-seedream-") {
-			billingBasis = billingexpr.BillingBasisRequest
 			usageSchema = imageUsageSchema
+			if modelName != "doubao-seedream-5-0-pro-260628" {
+				billingBasis = billingexpr.BillingBasisRequest
+			}
 		}
 		prices = append(prices, officialTokenPrice{
 			Vendor:         "volcengine",
