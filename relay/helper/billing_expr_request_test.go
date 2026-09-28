@@ -703,9 +703,14 @@ func TestResolveOutboundImageBillingJSONFailsClosedForUnknownOrInvalidShape(t *t
 			wantError: "stream",
 		},
 		{
-			name: "OpenAI compression above range", apiType: constant.APITypeOpenAI,
-			payload:   `{"prompt":"secret","n":1,"output_compression":101}`,
+			name: "OpenAI compression above safety bound", apiType: constant.APITypeOpenAI,
+			payload:   `{"prompt":"secret","n":1,"output_compression":1000001}`,
 			wantError: "output_compression",
+		},
+		{
+			name: "OpenAI partial images above safety bound", apiType: constant.APITypeOpenAI,
+			payload:   `{"prompt":"secret","n":1,"partial_images":1000001}`,
+			wantError: "partial_images",
 		},
 	}
 
@@ -744,31 +749,6 @@ func TestResolveOutboundImageBillingJSONRejectsProtocolInvalidScalars(t *testing
 			wantError: "response_format",
 		},
 		{
-			name: "OpenAI style", apiType: constant.APITypeOpenAI,
-			payload:   `{"prompt":"secret","n":1,"style":"photographic"}`,
-			wantError: "style",
-		},
-		{
-			name: "OpenAI background", apiType: constant.APITypeOpenAI,
-			payload:   `{"prompt":"secret","n":1,"background":"blue"}`,
-			wantError: "background",
-		},
-		{
-			name: "OpenAI moderation", apiType: constant.APITypeOpenAI,
-			payload:   `{"prompt":"secret","n":1,"moderation":"strict"}`,
-			wantError: "moderation",
-		},
-		{
-			name: "OpenAI output format", apiType: constant.APITypeOpenAI,
-			payload:   `{"prompt":"secret","n":1,"output_format":"gif"}`,
-			wantError: "output_format",
-		},
-		{
-			name: "OpenAI input fidelity", apiType: constant.APITypeOpenAI,
-			payload:   `{"prompt":"secret","n":1,"input_fidelity":"medium"}`,
-			wantError: "input_fidelity",
-		},
-		{
 			name: "Gemini image size", apiType: constant.APITypeGemini,
 			payload:   `{"instances":[{"prompt":"secret"}],"parameters":{"sampleCount":1,"imageSize":"3K"}}`,
 			wantError: "parameters.imageSize",
@@ -777,11 +757,6 @@ func TestResolveOutboundImageBillingJSONRejectsProtocolInvalidScalars(t *testing
 			name: "Gemini aspect ratio shape", apiType: constant.APITypeGemini,
 			payload:   `{"instances":[{"prompt":"secret"}],"parameters":{"sampleCount":1,"aspectRatio":"not-a-ratio"}}`,
 			wantError: "parameters.aspectRatio",
-		},
-		{
-			name: "Gemini person generation", apiType: constant.APITypeGemini,
-			payload:   `{"instances":[{"prompt":"secret"}],"parameters":{"sampleCount":1,"personGeneration":"sometimes"}}`,
-			wantError: "parameters.personGeneration",
 		},
 		{
 			name: "Replicate aspect ratio", apiType: constant.APITypeReplicate,
@@ -823,11 +798,6 @@ func TestResolveOutboundImageBillingJSONRejectsProtocolInvalidScalars(t *testing
 			payload:   `{"prompt":"secret","width":256,"height":769}`,
 			wantError: "height",
 		},
-		{
-			name: "xAI response format", apiType: constant.APITypeXai,
-			payload:   `{"prompt":"secret","n":1,"response_format":"raw"}`,
-			wantError: "response_format",
-		},
 	}
 
 	for _, testCase := range tests {
@@ -842,18 +812,86 @@ func TestResolveOutboundImageBillingJSONRejectsProtocolInvalidScalars(t *testing
 	}
 }
 
+func TestResolveOutboundImageBillingJSONAllowsSafeUnknownScalarsWithoutSourceEnums(t *testing.T) {
+	tests := []struct {
+		name       string
+		apiType    int
+		payload    string
+		assertBody func(t *testing.T, body []byte)
+	}{
+		{
+			name:    "OpenAI",
+			apiType: constant.APITypeOpenAI,
+			payload: `{
+				"prompt":"secret",
+				"n":1,
+				"style":"photographic",
+				"background":"blue",
+				"moderation":"strict",
+				"output_format":"gif",
+				"input_fidelity":"medium",
+				"output_compression":101,
+				"partial_images":4
+			}`,
+			assertBody: func(t *testing.T, body []byte) {
+				assert.Equal(t, "photographic", gjson.GetBytes(body, "style").String())
+				assert.Equal(t, "blue", gjson.GetBytes(body, "background").String())
+				assert.Equal(t, "strict", gjson.GetBytes(body, "moderation").String())
+				assert.Equal(t, "gif", gjson.GetBytes(body, "output_format").String())
+				assert.Equal(t, "medium", gjson.GetBytes(body, "input_fidelity").String())
+				assert.Equal(t, int64(101), gjson.GetBytes(body, "output_compression").Int())
+				assert.Equal(t, int64(4), gjson.GetBytes(body, "partial_images").Int())
+			},
+		},
+		{
+			name:    "Gemini person generation",
+			apiType: constant.APITypeGemini,
+			payload: `{
+				"instances":[{"prompt":"secret"}],
+				"parameters":{"sampleCount":1,"personGeneration":"sometimes"}
+			}`,
+			assertBody: func(t *testing.T, body []byte) {
+				assert.Equal(t, "sometimes", gjson.GetBytes(body, "parameters.personGeneration").String())
+			},
+		},
+		{
+			name:    "xAI response format",
+			apiType: constant.APITypeXai,
+			payload: `{"prompt":"secret","n":1,"response_format":"raw"}`,
+			assertBody: func(t *testing.T, body []byte) {
+				assert.Equal(t, "raw", gjson.GetBytes(body, "response_format").String())
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			resolved, err := ResolveOutboundImageBillingJSON(
+				outboundImageBillingInfo(testCase.apiType, "billing-origin"),
+				[]byte(testCase.payload),
+			)
+			require.NoError(t, err)
+			require.NotNil(t, resolved)
+			testCase.assertBody(t, resolved.Input.Body)
+		})
+	}
+}
+
 func TestResolveOutboundImageBillingJSONRejectsSensitiveAllowedScalar(t *testing.T) {
 	tests := []struct {
 		name    string
 		payload string
 	}{
-		{name: "data URI", payload: `{"prompt":"secret","n":1,"output_compression":"data:image/png;base64,c2VjcmV0"}`},
-		{name: "URL", payload: `{"prompt":"secret","n":1,"quality":"https://secret.invalid/image.png"}`},
-		{name: "short base64", payload: `{"prompt":"secret","n":1,"quality":"c2VjcmV0"}`},
-		{name: "base64", payload: `{"prompt":"secret","n":1,"quality":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"}`},
-		{name: "control character", payload: `{"prompt":"secret","n":1,"quality":"high\nsecret"}`},
+		{name: "data URI", payload: `{"prompt":"secret","n":1,"style":"data:image/png;base64,c2VjcmV0"}`},
+		{name: "URL", payload: `{"prompt":"secret","n":1,"style":"https://secret.invalid/image.png"}`},
+		{name: "base64 image", payload: `{"prompt":"secret","n":1,"style":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"}`},
+		{name: "long encoded blob", payload: fmt.Sprintf(
+			`{"prompt":"secret","n":1,"style":"%s"}`,
+			strings.Repeat("a", 96),
+		)},
+		{name: "control character", payload: `{"prompt":"secret","n":1,"style":"high\nsecret"}`},
 		{name: "overlong", payload: fmt.Sprintf(
-			`{"prompt":"secret","n":1,"quality":"%s"}`,
+			`{"prompt":"secret","n":1,"style":"%s"}`,
 			strings.Repeat("a", maxImageBillingScalarBytes+1),
 		)},
 	}
@@ -869,14 +907,24 @@ func TestResolveOutboundImageBillingJSONRejectsSensitiveAllowedScalar(t *testing
 	}
 }
 
-func TestResolveOutboundImageBillingJSONAllowsKnownShortWordThatDecodesAsBase64(t *testing.T) {
-	resolved, err := ResolveOutboundImageBillingJSON(
-		outboundImageBillingInfo(constant.APITypeReplicate, "billing-origin"),
-		[]byte(`{"input":{"prompt":"secret","num_outputs":1,"output_format":"webp"}}`),
-	)
-	require.NoError(t, err)
-	require.NotNil(t, resolved)
-	assert.Equal(t, "webp", gjson.GetBytes(resolved.Input.Body, "input.output_format").String())
+func TestResolveOutboundImageBillingJSONAllowsShortIdentifiersThatDecodeAsBase64(t *testing.T) {
+	for _, identifier := range []string{"webp", "aaaaaaaa", "c2VjcmV0"} {
+		t.Run(identifier, func(t *testing.T) {
+			resolved, err := ResolveOutboundImageBillingJSON(
+				outboundImageBillingInfo(constant.APITypeOpenAI, "billing-origin"),
+				fmt.Appendf(nil, `{"prompt":"secret","n":1,"style":%q}`, identifier),
+			)
+			require.NoError(t, err)
+			require.NotNil(t, resolved)
+			assert.Equal(t, identifier, gjson.GetBytes(resolved.Input.Body, "style").String())
+		})
+	}
+}
+
+func TestValidateImageBillingStringRejectsLongEncodedBlob(t *testing.T) {
+	value := strings.Repeat("a", 96)
+	_, err := validateImageBillingString(value, "style")
+	require.ErrorContains(t, err, "bounded non-sensitive string")
 }
 
 func TestResolveOutboundImageBillingMultipartRejectsFileContentAsScalar(t *testing.T) {
@@ -1041,6 +1089,49 @@ func TestResolveOutboundImageBillingJSONAndMultipartShareScalarSemantics(t *test
 	}
 }
 
+func TestResolveOutboundImageBillingJSONAndMultipartShareUnknownScalarSemantics(t *testing.T) {
+	jsonBilling, err := ResolveOutboundImageBillingJSON(
+		outboundImageBillingInfo(constant.APITypeOpenAI, "billing-origin"),
+		[]byte(`{
+			"prompt":"secret",
+			"n":1,
+			"style":"photographic",
+			"output_compression":101,
+			"partial_images":4
+		}`),
+	)
+	require.NoError(t, err)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("prompt", "secret"))
+	require.NoError(t, writer.WriteField("n", "1"))
+	require.NoError(t, writer.WriteField("style", "photographic"))
+	require.NoError(t, writer.WriteField("output_compression", "101"))
+	require.NoError(t, writer.WriteField("partial_images", "4"))
+	require.NoError(t, writer.Close())
+	multipartBilling, err := ResolveOutboundImageBillingMultipart(
+		outboundImageBillingInfo(constant.APITypeOpenAI, "billing-origin"),
+		writer.FormDataContentType(),
+		bytes.NewReader(body.Bytes()),
+	)
+	require.NoError(t, err)
+
+	for name, resolved := range map[string]*OutboundImageBilling{
+		"JSON":      jsonBilling,
+		"multipart": multipartBilling,
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.NotNil(t, resolved)
+			assert.Equal(t, "photographic", gjson.GetBytes(resolved.Input.Body, "style").String())
+			assert.Equal(t, gjson.Number, gjson.GetBytes(resolved.Input.Body, "output_compression").Type)
+			assert.Equal(t, int64(101), gjson.GetBytes(resolved.Input.Body, "output_compression").Int())
+			assert.Equal(t, gjson.Number, gjson.GetBytes(resolved.Input.Body, "partial_images").Type)
+			assert.Equal(t, int64(4), gjson.GetBytes(resolved.Input.Body, "partial_images").Int())
+		})
+	}
+}
+
 func TestResolveOutboundImageBillingMultipartRejectsNonJSONBooleanSyntax(t *testing.T) {
 	for _, field := range []string{"stream", "watermark", "layer_decomposition", "watermark_enabled"} {
 		for _, value := range []string{"1", "t", "TRUE", "False"} {
@@ -1063,16 +1154,11 @@ func TestResolveOutboundImageBillingMultipartRejectsNonJSONBooleanSyntax(t *test
 	}
 }
 
-func TestResolveOutboundImageBillingMultipartRejectsProtocolInvalidEnums(t *testing.T) {
+func TestResolveOutboundImageBillingMultipartRejectsSourceConstrainedEnums(t *testing.T) {
 	for field, value := range map[string]string{
 		"size":            "not-a-size",
 		"quality":         "not-a-quality",
 		"response_format": "raw",
-		"style":           "photographic",
-		"background":      "blue",
-		"moderation":      "strict",
-		"output_format":   "gif",
-		"input_fidelity":  "medium",
 	} {
 		t.Run(field, func(t *testing.T) {
 			var body bytes.Buffer

@@ -51,11 +51,12 @@ func ResolveIncomingBillingExprRequestInput(c *gin.Context, info *relaycommon.Re
 const seedreamLowerTierMaxPixels = 2_610_000
 
 const (
-	maxImageBillingScalarBytes = 128
-	maxImageDimension          = 65_535
-	maxImageBillingInteger     = 1_000_000
-	maxExactJSONInteger        = 9_007_199_254_740_991
-	maxImageBillingNumber      = 1_000_000
+	maxImageBillingScalarBytes  = 128
+	maxImageDimension           = 65_535
+	maxImageBillingInteger      = 1_000_000
+	maxExactJSONInteger         = 9_007_199_254_740_991
+	maxImageBillingNumber       = 1_000_000
+	minEncodedImagePayloadChars = 64
 )
 
 var (
@@ -70,13 +71,7 @@ var (
 	imageBillingSizeValues          = []string{"auto", "1K", "1.5K", "2K", "3K", "4K"}
 	openAIImageQualityValues        = []string{"auto", "high", "medium", "low", "hd", "standard"}
 	openAIImageResponseFormatValues = []string{"url", "b64_json"}
-	openAIImageStyleValues          = []string{"vivid", "natural"}
-	openAIImageBackgroundValues     = []string{"auto", "opaque", "transparent"}
-	openAIImageModerationValues     = []string{"auto", "low"}
-	openAIImageOutputFormatValues   = []string{"png", "jpeg", "webp"}
-	openAIImageInputFidelityValues  = []string{"low", "high"}
 	geminiImageSizeValues           = []string{"1K", "2K"}
-	geminiPersonGenerationValues    = []string{"allow_adult", "dont_allow"}
 	replicateAspectRatioValues      = []string{"1:1", "16:9", "9:16", "3:2", "2:3", "4:5", "5:4", "3:4", "4:3", "custom"}
 	miniMaxAspectRatioValues        = []string{"1:1", "16:9", "4:3", "3:2", "2:3", "3:4", "9:16", "21:9"}
 	miniMaxResponseFormatValues     = []string{"url", "base64"}
@@ -297,10 +292,10 @@ func resolveOpenAIImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageR
 			return nil, err
 		}
 	}
-	if err = copyImageBillingIntegers(body, object, "", 0, 100, "output_compression"); err != nil {
+	if err = copyImageBillingIntegers(body, object, "", 0, maxImageBillingInteger, "output_compression"); err != nil {
 		return nil, err
 	}
-	if err = copyImageBillingIntegers(body, object, "", 0, 3, "partial_images"); err != nil {
+	if err = copyImageBillingIntegers(body, object, "", 0, maxImageBillingInteger, "partial_images"); err != nil {
 		return nil, err
 	}
 	if err = copyImageBillingBooleans(body, object, "",
@@ -407,7 +402,7 @@ func resolveGeminiImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageR
 	for key, validator := range map[string]imageBillingStringValidator{
 		"aspectRatio":      validateImageBillingAspectRatio,
 		"imageSize":        imageBillingEnumValidator(geminiImageSizeValues),
-		"personGeneration": imageBillingEnumValidator(geminiPersonGenerationValues),
+		"personGeneration": validateImageBillingString,
 	} {
 		if err = copyValidatedImageBillingString(safeParameters, parameters, key, "parameters."+key, validator); err != nil {
 			return nil, err
@@ -661,7 +656,7 @@ func resolveXAIImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageRequ
 	body := canonicalImageBillingBody(incoming.Model, count)
 	if err = copyValidatedImageBillingString(
 		body, object, "response_format", "response_format",
-		imageBillingEnumValidator(openAIImageResponseFormatValues),
+		validateImageBillingString,
 	); err != nil {
 		return nil, err
 	}
@@ -804,16 +799,8 @@ func validateOpenAIImageBillingString(value, path string) (string, error) {
 		return imageBillingEnumValidator(openAIImageQualityValues)(value, path)
 	case "response_format":
 		return imageBillingEnumValidator(openAIImageResponseFormatValues)(value, path)
-	case "style":
-		return imageBillingEnumValidator(openAIImageStyleValues)(value, path)
-	case "background":
-		return imageBillingEnumValidator(openAIImageBackgroundValues)(value, path)
-	case "moderation":
-		return imageBillingEnumValidator(openAIImageModerationValues)(value, path)
-	case "output_format":
-		return imageBillingEnumValidator(openAIImageOutputFormatValues)(value, path)
-	case "input_fidelity":
-		return imageBillingEnumValidator(openAIImageInputFidelityValues)(value, path)
+	case "style", "background", "moderation", "output_format", "input_fidelity":
+		return validateImageBillingString(value, path)
 	default:
 		return "", fmt.Errorf("unsupported image billing string %s", path)
 	}
@@ -896,23 +883,11 @@ func looksLikeEncodedImageBillingPayload(value string) bool {
 		if err != nil || len(decoded) == 0 {
 			continue
 		}
-		if imageBillingDecodedPayloadIsPrintable(decoded) || imageBillingDecodedPayloadHasImageMagic(decoded) {
+		if imageBillingDecodedPayloadHasImageMagic(decoded) || len(value) >= minEncodedImagePayloadChars {
 			return true
 		}
 	}
 	return false
-}
-
-func imageBillingDecodedPayloadIsPrintable(decoded []byte) bool {
-	if len(decoded) < 4 {
-		return false
-	}
-	for _, value := range decoded {
-		if value < 0x20 || value > 0x7e {
-			return false
-		}
-	}
-	return true
 }
 
 func imageBillingDecodedPayloadHasImageMagic(decoded []byte) bool {
@@ -1252,13 +1227,17 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 				}
 				sanitizedBody[name] = parsed
 			case "output_compression":
-				parsed, parseErr := imageBillingInteger(json.RawMessage(strings.TrimSpace(value)), name, 0, 100)
+				parsed, parseErr := imageBillingInteger(
+					json.RawMessage(strings.TrimSpace(value)), name, 0, maxImageBillingInteger,
+				)
 				if parseErr != nil {
 					return nil, parseErr
 				}
 				sanitizedBody[name] = parsed
 			case "partial_images":
-				parsed, parseErr := imageBillingInteger(json.RawMessage(strings.TrimSpace(value)), name, 0, 3)
+				parsed, parseErr := imageBillingInteger(
+					json.RawMessage(strings.TrimSpace(value)), name, 0, maxImageBillingInteger,
+				)
 				if parseErr != nil {
 					return nil, parseErr
 				}
