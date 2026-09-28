@@ -175,8 +175,12 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}()
 
-	if newAPIError = relay.PrepareRequestBilling(c, relayInfo); newAPIError != nil {
-		return
+	deferImageBilling := relayInfo.RelayMode == relayconstant.RelayModeImagesGenerations ||
+		relayInfo.RelayMode == relayconstant.RelayModeImagesEdits
+	if !deferImageBilling {
+		if newAPIError = relay.PrepareRequestBilling(c, relayInfo); newAPIError != nil {
+			return
+		}
 	}
 	defer func() {
 		if newAPIError != nil {
@@ -264,9 +268,11 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 			}
 		}
 		addUsedChannel(c, channel)
-		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
-			newAPIError = billingErr
-			break
+		if !deferImageBilling {
+			if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
+				newAPIError = billingErr
+				break
+			}
 		}
 
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
