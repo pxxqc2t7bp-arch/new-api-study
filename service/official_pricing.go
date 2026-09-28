@@ -140,7 +140,7 @@ func RunOfficialPricingSync(ctx context.Context, now time.Time) (OfficialPricing
 	for _, price := range prices {
 		expression := officialPriceExpression(price)
 		var expressionErr error
-		if price.BillingBasis == billingexpr.BillingBasisTask || price.BillingBasis == billingexpr.BillingBasisRequest {
+		if price.BillingBasis == billingexpr.BillingBasisTask {
 			expressionErr = billing_setting.SmokeTestTaskExpr(expression, price.UsageSchema)
 		} else {
 			expressionErr = billing_setting.SmokeTestExpr(expression)

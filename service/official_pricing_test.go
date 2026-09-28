@@ -500,6 +500,112 @@ doubao-seedance-2.5 doubao-seedance-2.0-fast doubao-seedance-2.0-mini
 	assert.Empty(t, evidence[1].Error)
 }
 
+func TestOfficialPricingSyncPersistsRequestBilledSeedreamExpression(t *testing.T) {
+	const modelName = "doubao-seedream-4-0-20260415"
+	body := []byte(`<html><body>
+doubao-seedream-5-0-pro doubao-seedream-5-0
+doubao-seedream-4-5 doubao-seedream-4-0
+0.30 0.22 0.25 0.20
+</body></html>`)
+
+	previousDB := model.DB
+	database, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate(
+		&model.Option{},
+		&model.Vendor{},
+		&model.Model{},
+		&model.UpstreamGroup{},
+		&model.UpstreamPriceEvidence{},
+		&model.Ability{},
+		&model.Channel{},
+	))
+	model.DB = database
+
+	previousHTTPClient := httpClient
+	previousSources := officialPricingSourceURLs
+	httpClient = &http.Client{Transport: officialPricingRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/html"}},
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+			Request:    request,
+		}, nil
+	})}
+	officialPricingSourceURLs = map[string][]string{
+		"volcengine": {"https://docs.volcengine.com/docs/82379/1544106?lang=zh"},
+	}
+	t.Setenv("UPSTREAM_PRICING_PROXY_URL", "")
+
+	savedConfig := map[string]string{}
+	require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+		savedConfig[key] = value
+		return nil
+	}))
+	common.OptionMapRWMutex.Lock()
+	previousOptionMap := common.OptionMap
+	common.OptionMap = maps.Clone(common.OptionMap)
+	if common.OptionMap == nil {
+		common.OptionMap = make(map[string]string)
+	}
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		model.DB = previousDB
+		httpClient = previousHTTPClient
+		officialPricingSourceURLs = previousSources
+		model.InvalidatePricingCache()
+		require.NoError(t, config.GlobalConfig.LoadFromDB(savedConfig))
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptionMap
+		common.OptionMapRWMutex.Unlock()
+	})
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode":    `{}`,
+		"billing_setting.billing_expr":    `{}`,
+		"group_ratio_setting.group_ratio": `{"default":1,"cxy":1}`,
+	}))
+
+	vendor := model.Vendor{Name: "字节跳动", Status: 1}
+	require.NoError(t, database.Create(&vendor).Error)
+	require.NoError(t, database.Create(&model.Model{
+		ModelName:    modelName,
+		VendorID:     vendor.Id,
+		Status:       1,
+		SyncOfficial: 1,
+	}).Error)
+
+	prices, err := parseVolcenginePricing(
+		officialPricingSourceURLs["volcengine"][0],
+		body,
+		map[string]string{modelName: "字节跳动"},
+		time.Unix(1_800_000_000, 0),
+	)
+	require.NoError(t, err)
+	require.Len(t, prices, 1)
+	assert.Equal(t, billingexpr.BillingBasisRequest, prices[0].BillingBasis)
+	validatedExpression := officialPriceExpression(prices[0])
+	require.NoError(t, billing_setting.SmokeTestExpr(validatedExpression))
+
+	summary, err := RunOfficialPricingSync(t.Context(), time.Unix(1_800_000_000, 0))
+	require.NoError(t, err)
+
+	var evidence model.UpstreamPriceEvidence
+	require.NoError(t, database.Where("model_name = ?", modelName).First(&evidence).Error)
+	require.Empty(t, evidence.Error)
+	assert.Equal(t, model.UpstreamPriceStatusApplied, evidence.Status)
+	assert.Equal(t, OfficialPricingSyncSummary{
+		Fetched: 1,
+		Parsed:  1,
+		Applied: 1,
+	}, summary)
+
+	var expressionOption model.Option
+	require.NoError(t, database.Where("key = ?", "billing_setting.billing_expr").First(&expressionOption).Error)
+	var persistedExpressions map[string]string
+	require.NoError(t, common.Unmarshal([]byte(expressionOption.Value), &persistedExpressions))
+	assert.Equal(t, validatedExpression, persistedExpressions[modelName])
+}
+
 func TestParseVolcenginePricingBuildsSeedreamRequestPrices(t *testing.T) {
 	body := []byte(`<html><body>
 doubao-seedream-5-0-pro doubao-seedream-5-0
@@ -529,6 +635,19 @@ doubao-seedream-4-5 doubao-seedream-4-0
 		assert.Equal(t, "count", price.UsageSchema["image_count"].Unit)
 		assert.False(t, strings.HasPrefix(officialPriceExpression(price), "v2:"))
 	}
+
+	one := 1
+	requestCost, requestTrace, runErr := billingexpr.RunExprWithRequest(
+		officialPriceExpression(byModel["doubao-seedream-4-0-20260415"]),
+		billingexpr.TokenParams{},
+		billingexpr.RequestInput{ImageCount: &one},
+	)
+	require.NoError(t, runErr)
+	assert.Equal(t, billingexpr.BillingUnitRequest, requestTrace.BillingUnit)
+	require.NotNil(t, requestTrace.FixedPrice)
+	assert.InDelta(t, 0.20/officialCNYPerUSD, *requestTrace.FixedPrice, 1e-10)
+	assert.Equal(t, *requestTrace.FixedPrice*1_000_000, requestCost)
+
 	evaluate := func(modelName string, facts map[string]any) (float64, string) {
 		t.Helper()
 		value, trace, runErr := billingexpr.RunExprWithRequest(
@@ -556,18 +675,23 @@ doubao-seedream-4-5 doubao-seedream-4-0
 	assert.InDelta(t, 0.60/officialCNYPerUSD, value, 1e-9)
 	assert.Equal(t, "over_1_5k", tier)
 
+	three := 3
 	for modelName, cnyPerImage := range map[string]float64{
 		"doubao-seedream-5-0-260128":   0.22,
 		"doubao-seedream-4-5-251128":   0.25,
 		"doubao-seedream-4-0-250828":   0.20,
 		"doubao-seedream-4-0-20260415": 0.20,
 	} {
-		value, tier = evaluate(modelName, map[string]any{
-			"image_count":           3.0,
-			"resolution":            "2K",
-			"reference_image_count": 4.0,
-		})
-		assert.InDelta(t, 3*cnyPerImage/officialCNYPerUSD, value, 1e-9, modelName)
-		assert.Equal(t, "per_image", tier, modelName)
+		value, trace, runErr := billingexpr.RunExprWithRequest(
+			officialPriceExpression(byModel[modelName]),
+			billingexpr.TokenParams{},
+			billingexpr.RequestInput{ImageCount: &three},
+		)
+		require.NoError(t, runErr, modelName)
+		assert.Equal(t, billingexpr.BillingUnitRequest, trace.BillingUnit, modelName)
+		require.NotNil(t, trace.FixedPrice, modelName)
+		assert.InDelta(t, cnyPerImage/officialCNYPerUSD, *trace.FixedPrice, 1e-10, modelName)
+		assert.Equal(t, *trace.FixedPrice*1_000_000*float64(three), value, modelName)
+		assert.Equal(t, "per_image", trace.MatchedTier, modelName)
 	}
 }

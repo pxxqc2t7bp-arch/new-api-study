@@ -166,6 +166,9 @@ func parseVolcenginePricing(
 	imageCost := func(count string, cny float64) string {
 		return fmt.Sprintf(`%s * %.10g`, count, cny/officialCNYPerUSD)
 	}
+	requestImageCost := func(cny float64) string {
+		return fmt.Sprintf(`tier("per_image", fixed(%.10g)) * image_count`, cny/officialCNYPerUSD)
+	}
 	video := `u("video_input") == "video"`
 	resolution := `u("resolution")`
 	promotion := func(start, end int64) string {
@@ -261,16 +264,16 @@ func parseVolcenginePricing(
 			),
 		},
 		"doubao-seedream-5-0-260128": {
-			expression: fmt.Sprintf(`tier("per_image", %s)`, imageCost(`u("image_count")`, 0.22)),
+			expression: requestImageCost(0.22),
 		},
 		"doubao-seedream-4-5-251128": {
-			expression: fmt.Sprintf(`tier("per_image", %s)`, imageCost(`u("image_count")`, 0.25)),
+			expression: requestImageCost(0.25),
 		},
 		"doubao-seedream-4-0-250828": {
-			expression: fmt.Sprintf(`tier("per_image", %s)`, imageCost(`u("image_count")`, 0.20)),
+			expression: requestImageCost(0.20),
 		},
 		"doubao-seedream-4-0-20260415": {
-			expression: fmt.Sprintf(`tier("per_image", %s)`, imageCost(`u("image_count")`, 0.20)),
+			expression: requestImageCost(0.20),
 		},
 	}
 
