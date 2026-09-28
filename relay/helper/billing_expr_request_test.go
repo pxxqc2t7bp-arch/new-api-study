@@ -2,11 +2,13 @@ package helper
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -393,6 +395,7 @@ func TestResolveOutboundImageBillingJSONSupportsRemainingNativeSchemas(t *testin
 			payload: `{
 				"req_key":"mapped-model",
 				"prompt":"jimeng secret",
+				"seed":-1,
 				"width":1024,
 				"height":768,
 				"use_pre_llm":true,
@@ -406,6 +409,7 @@ func TestResolveOutboundImageBillingJSONSupportsRemainingNativeSchemas(t *testin
 			assertBody: func(t *testing.T, body []byte) {
 				assert.Equal(t, "billing-origin", gjson.GetBytes(body, "model").String())
 				assert.Equal(t, int64(1), gjson.GetBytes(body, "n").Int())
+				assert.Equal(t, int64(-1), gjson.GetBytes(body, "seed").Int())
 				assert.Equal(t, "1024x768", gjson.GetBytes(body, "resolution").String())
 				assert.True(t, gjson.GetBytes(body, "logo_info.add_logo").Bool())
 				assert.InDelta(t, 0.5, gjson.GetBytes(body, "logo_info.opacity").Float(), 1e-9)
@@ -629,17 +633,117 @@ func TestResolveOutboundImageBillingJSONFailsClosedForUnknownOrInvalidShape(t *t
 			payload:   `{"prompt":"secret","n":1.5}`,
 			wantError: "integer",
 		},
+		{
+			name: "Gemini unsafe aspect ratio", apiType: constant.APITypeGemini,
+			payload:   `{"instances":[{"prompt":"secret"}],"parameters":{"sampleCount":1,"aspectRatio":"https://secret.invalid/image.png"}}`,
+			wantError: "parameters.aspectRatio",
+		},
+		{
+			name: "Replicate zero width", apiType: constant.APITypeReplicate,
+			payload:   `{"input":{"prompt":"secret","num_outputs":1,"width":0,"height":768}}`,
+			wantError: "input.width",
+		},
+		{
+			name: "Replicate string boolean", apiType: constant.APITypeReplicate,
+			payload:   `{"input":{"prompt":"secret","num_outputs":1,"prompt_upsampling":"true"}}`,
+			wantError: "input.prompt_upsampling",
+		},
+		{
+			name: "SiliconFlow fractional seed", apiType: constant.APITypeSiliconFlow,
+			payload:   `{"prompt":"secret","batch_size":1,"seed":1.5}`,
+			wantError: "seed",
+		},
+		{
+			name: "SiliconFlow non finite guidance", apiType: constant.APITypeSiliconFlow,
+			payload:   `{"prompt":"secret","batch_size":1,"guidance_scale":1e309}`,
+			wantError: "guidance_scale",
+		},
+		{
+			name: "MiniMax string watermark", apiType: constant.APITypeMiniMax,
+			payload:   `{"prompt":"secret","n":1,"aigc_watermark":"false"}`,
+			wantError: "aigc_watermark",
+		},
+		{
+			name: "Jimeng fractional width", apiType: constant.APITypeJimeng,
+			payload:   `{"prompt":"secret","width":512.5,"height":768}`,
+			wantError: "width",
+		},
+		{
+			name: "Jimeng string seed", apiType: constant.APITypeJimeng,
+			payload:   `{"prompt":"secret","seed":"-1","width":512,"height":768}`,
+			wantError: "seed",
+		},
+		{
+			name: "xAI unsafe response format", apiType: constant.APITypeXai,
+			payload:   `{"prompt":"secret","n":1,"response_format":"data:image/png;base64,c2VjcmV0"}`,
+			wantError: "response_format",
+		},
+		{
+			name: "OpenAI string stream", apiType: constant.APITypeOpenAI,
+			payload:   `{"prompt":"secret","n":1,"stream":"true"}`,
+			wantError: "stream",
+		},
+		{
+			name: "OpenAI compression above range", apiType: constant.APITypeOpenAI,
+			payload:   `{"prompt":"secret","n":1,"output_compression":101}`,
+			wantError: "output_compression",
+		},
 	}
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			_, err := ResolveOutboundImageBillingJSON(
+			resolved, err := ResolveOutboundImageBillingJSON(
 				outboundImageBillingInfo(testCase.apiType, "billing-origin"),
 				[]byte(testCase.payload),
 			)
 			require.ErrorContains(t, err, testCase.wantError)
+			assert.Nil(t, resolved)
 		})
 	}
+}
+
+func TestResolveOutboundImageBillingJSONRejectsSensitiveAllowedScalar(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{name: "data URI", payload: `{"prompt":"secret","n":1,"output_compression":"data:image/png;base64,c2VjcmV0"}`},
+		{name: "URL", payload: `{"prompt":"secret","n":1,"quality":"https://secret.invalid/image.png"}`},
+		{name: "base64", payload: `{"prompt":"secret","n":1,"quality":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"}`},
+		{name: "control character", payload: `{"prompt":"secret","n":1,"quality":"high\nsecret"}`},
+		{name: "overlong", payload: fmt.Sprintf(
+			`{"prompt":"secret","n":1,"quality":"%s"}`,
+			strings.Repeat("a", maxImageBillingScalarBytes+1),
+		)},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			resolved, err := ResolveOutboundImageBillingJSON(
+				outboundImageBillingInfo(constant.APITypeOpenAI, "billing-origin"),
+				[]byte(testCase.payload),
+			)
+			require.Error(t, err)
+			assert.Nil(t, resolved, "rejected sensitive scalars must not produce retained billing input")
+		})
+	}
+}
+
+func TestResolveOutboundImageBillingMultipartRejectsFileContentAsScalar(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("output_format", "secret.txt")
+	require.NoError(t, err)
+	_, err = part.Write([]byte("webp"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	resolved, err := ResolveOutboundImageBillingMultipart(
+		outboundImageBillingInfo(constant.APITypeOpenAI, "billing-origin"),
+		writer.FormDataContentType(),
+		bytes.NewReader(body.Bytes()),
+	)
+	require.ErrorContains(t, err, "file content")
+	assert.Nil(t, resolved)
 }
 
 func TestResolveOutboundImageBillingMultipartKeepsOnlySeedreamScalars(t *testing.T) {
@@ -716,22 +820,22 @@ func TestResolveOutboundImageBillingMultipartKeepsOnlyAllowedOpenAIScalars(t *te
 	assert.Equal(t, 2, resolved.Count)
 	assert.Equal(t, []string{"secret multipart prompt"}, outboundPromptTexts(t, resolved))
 	for key, want := range map[string]string{
-		"size":               "1536x1024",
-		"quality":            "high",
-		"response_format":    "url",
-		"style":              "vivid",
-		"background":         "transparent",
-		"moderation":         "low",
-		"output_format":      "webp",
-		"output_compression": "90",
-		"partial_images":     "1",
-		"stream":             "true",
-		"input_fidelity":     "high",
-		"watermark":          "false",
-		"watermark_enabled":  "true",
+		"size":            "1536x1024",
+		"quality":         "high",
+		"response_format": "url",
+		"style":           "vivid",
+		"background":      "transparent",
+		"moderation":      "low",
+		"output_format":   "webp",
+		"input_fidelity":  "high",
 	} {
 		assert.Equal(t, want, gjson.GetBytes(resolved.Input.Body, key).String(), key)
 	}
+	assert.Equal(t, int64(90), gjson.GetBytes(resolved.Input.Body, "output_compression").Int())
+	assert.Equal(t, int64(1), gjson.GetBytes(resolved.Input.Body, "partial_images").Int())
+	assert.True(t, gjson.GetBytes(resolved.Input.Body, "stream").Bool())
+	assert.False(t, gjson.GetBytes(resolved.Input.Body, "watermark").Bool())
+	assert.True(t, gjson.GetBytes(resolved.Input.Body, "watermark_enabled").Bool())
 	assert.Equal(t, "1536x1024", gjson.GetBytes(resolved.Input.Body, "resolution").String())
 	for _, path := range []string{"prompt", "image", "mask", "file", "image_url", "b64_json", "Extra"} {
 		assert.False(t, gjson.GetBytes(resolved.Input.Body, path).Exists(), path)
@@ -739,13 +843,166 @@ func TestResolveOutboundImageBillingMultipartKeepsOnlyAllowedOpenAIScalars(t *te
 	assert.NotContains(t, string(resolved.Input.Body), "secret")
 
 	cost, trace, err := billingexpr.RunExprWithRequest(
-		`param("background") == "transparent" && param("output_format") == "webp" && param("output_compression") == "90" && param("input_fidelity") == "high" ? tier("safe", fixed(0.2)) : tier("fallback", fixed(0.01))`,
+		`param("stream") == true && param("output_compression") == 90 ? tier("safe", fixed(0.2)) : tier("fallback", fixed(0.01))`,
 		billingexpr.TokenParams{},
 		resolved.Input,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, "safe", trace.MatchedTier)
 	assert.InDelta(t, 200_000, cost, 1e-9)
+}
+
+func TestResolveOutboundImageBillingJSONAndMultipartShareScalarSemantics(t *testing.T) {
+	jsonBilling, err := ResolveOutboundImageBillingJSON(
+		outboundImageBillingInfo(constant.APITypeOpenAI, "billing-origin"),
+		[]byte(`{"prompt":"secret","n":1,"stream":true,"output_compression":90}`),
+	)
+	require.NoError(t, err)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	require.NoError(t, writer.WriteField("prompt", "secret"))
+	require.NoError(t, writer.WriteField("n", "1"))
+	require.NoError(t, writer.WriteField("stream", "true"))
+	require.NoError(t, writer.WriteField("output_compression", "90"))
+	require.NoError(t, writer.Close())
+	multipartBilling, err := ResolveOutboundImageBillingMultipart(
+		outboundImageBillingInfo(constant.APITypeOpenAI, "billing-origin"),
+		writer.FormDataContentType(),
+		bytes.NewReader(body.Bytes()),
+	)
+	require.NoError(t, err)
+
+	const expression = `param("stream") == true && param("output_compression") == 90 ? tier("safe", fixed(0.2)) : tier("fallback", fixed(0.01))`
+	for name, resolved := range map[string]*OutboundImageBilling{
+		"JSON":      jsonBilling,
+		"multipart": multipartBilling,
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.NotNil(t, resolved)
+			assert.Equal(t, gjson.True, gjson.GetBytes(resolved.Input.Body, "stream").Type)
+			assert.Equal(t, gjson.Number, gjson.GetBytes(resolved.Input.Body, "output_compression").Type)
+			cost, trace, runErr := billingexpr.RunExprWithRequest(expression, billingexpr.TokenParams{}, resolved.Input)
+			require.NoError(t, runErr)
+			assert.Equal(t, "safe", trace.MatchedTier)
+			assert.InDelta(t, 200_000, cost, 1e-9)
+		})
+	}
+}
+
+func TestResolveOutboundImageBillingMultipartCountsIndexedSeedreamFiles(t *testing.T) {
+	buildBody := func(t *testing.T, fields map[string]string, imageFields ...string) ([]byte, string) {
+		t.Helper()
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		for name, value := range fields {
+			require.NoError(t, writer.WriteField(name, value))
+		}
+		for index, name := range imageFields {
+			part, err := writer.CreateFormFile(name, fmt.Sprintf("secret-%d.png", index))
+			require.NoError(t, err)
+			_, err = part.Write([]byte("secret image bytes"))
+			require.NoError(t, err)
+		}
+		require.NoError(t, writer.Close())
+		return body.Bytes(), writer.FormDataContentType()
+	}
+
+	t.Run("two indexed references include extra price", func(t *testing.T) {
+		body, contentType := buildBody(t, map[string]string{"n": "1", "size": "1K"}, "image[0]", "image[1]")
+		resolved, err := ResolveOutboundImageBillingMultipart(
+			outboundImageBillingInfo(constant.APITypeOpenAI, "doubao-seedream-5-0-pro-260628"),
+			contentType,
+			bytes.NewReader(body),
+		)
+		require.NoError(t, err)
+		require.NotNil(t, resolved)
+		assert.Equal(t, float64(2), imageRequestScalar(t, resolved.Input, "InputImages"))
+		cost, _, err := billingexpr.RunExprWithRequest(
+			`tier("seedream", fixed(images_up_to_1_5k * 0.1 + max(input_images - 1, 0) * 0.01))`,
+			billingexpr.TokenParams{},
+			resolved.Input,
+		)
+		require.NoError(t, err)
+		assert.InDelta(t, 110_000, cost, 1e-9)
+	})
+
+	t.Run("one indexed reference permits layer decomposition", func(t *testing.T) {
+		body, contentType := buildBody(t, map[string]string{
+			"n": "1", "size": "1K", "layer_decomposition": "true",
+		}, "image[0]")
+		resolved, err := ResolveOutboundImageBillingMultipart(
+			outboundImageBillingInfo(constant.APITypeOpenAI, "doubao-seedream-5-0-pro-260628"),
+			contentType,
+			bytes.NewReader(body),
+		)
+		require.NoError(t, err)
+		require.NotNil(t, resolved)
+		assert.Equal(t, 17, resolved.Count)
+		require.NotNil(t, resolved.Input.ImageCount)
+		assert.Equal(t, 17, *resolved.Input.ImageCount)
+	})
+
+	t.Run("two indexed references reject layer decomposition", func(t *testing.T) {
+		body, contentType := buildBody(t, map[string]string{
+			"n": "1", "size": "1K", "layer_decomposition": "true",
+		}, "image[0]", "image[1]")
+		resolved, err := ResolveOutboundImageBillingMultipart(
+			outboundImageBillingInfo(constant.APITypeOpenAI, "doubao-seedream-5-0-pro-260628"),
+			contentType,
+			bytes.NewReader(body),
+		)
+		require.ErrorContains(t, err, "exactly one")
+		assert.Nil(t, resolved)
+	})
+
+	for _, imageFields := range [][]string{
+		{"image[1]"},
+		{"image[01]"},
+		{"image[bad]"},
+		{"image[0]", "image[0]"},
+		{"image", "image[0]"},
+	} {
+		name := strings.Join(imageFields, "+")
+		t.Run("rejects ambiguous "+name, func(t *testing.T) {
+			body, contentType := buildBody(t, map[string]string{"n": "1"}, imageFields...)
+			resolved, err := ResolveOutboundImageBillingMultipart(
+				outboundImageBillingInfo(constant.APITypeOpenAI, "doubao-seedream-5-0-pro-260628"),
+				contentType,
+				bytes.NewReader(body),
+			)
+			require.ErrorContains(t, err, "image")
+			assert.Nil(t, resolved)
+		})
+	}
+}
+
+func TestResolveOutboundImageBillingSeedreamLayerCountUsesEffectiveOutputs(t *testing.T) {
+	resolved, err := ResolveOutboundImageBillingJSON(
+		outboundImageBillingInfo(constant.APITypeOpenAI, "doubao-seedream-5-0-pro-260628"),
+		[]byte(`{
+			"prompt":"secret",
+			"n":1,
+			"size":"1K",
+			"image":"https://secret.invalid/reference.png",
+			"layer_decomposition":true
+		}`),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, 17, resolved.Count)
+	require.NotNil(t, resolved.Input.ImageCount)
+	assert.Equal(t, 17, *resolved.Input.ImageCount)
+
+	cost, trace, err := billingexpr.RunExprWithRequest(
+		`tier("layer", fixed(0.01)) * image_count`,
+		billingexpr.TokenParams{},
+		resolved.Input,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, trace.ImageCount)
+	assert.Equal(t, 17, *trace.ImageCount)
+	assert.InDelta(t, 170_000, cost, 1e-9)
 }
 
 func TestResolveOutboundImageBillingMultipartRejectsExplicitZero(t *testing.T) {

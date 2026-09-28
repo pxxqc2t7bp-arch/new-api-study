@@ -44,7 +44,9 @@ const (
 	tokenImageBillingOrderModel     = "gpt-image-token-retry"
 	tokenImageBillingOrderExpr      = `tier("token", p * 100000 + c)`
 	multipartImageBillingOrderModel = "gpt-image-multipart-safe-scalars"
-	multipartImageBillingOrderExpr  = `param("background") == "transparent" && param("output_format") == "webp" && param("output_compression") == "90" && param("input_fidelity") == "high" ? tier("safe", fixed(0.2)) : tier("fallback", fixed(0.01))`
+	multipartImageBillingOrderExpr  = `param("stream") == true && param("output_compression") == 90 ? tier("safe", fixed(0.2)) : tier("fallback", fixed(0.01))`
+	seedreamLayerBillingOrderModel  = "doubao-seedream-5-0-pro"
+	seedreamLayerBillingOrderExpr   = `tier("layer", fixed(0.01)) * image_count`
 	geminiImageBillingOrderModel    = "imagen-billing-native"
 	geminiImageBillingOrderExpr     = `tier("gemini-native", fixed(0.1)) * image_count`
 	siliconImageBillingOrderModel   = "silicon-image-billing"
@@ -110,6 +112,7 @@ func newSeedreamBillingOrderFixture(t *testing.T) *seedreamBillingOrderFixture {
 		qualityImageBillingOrderModel:   qualityImageBillingOrderExpr,
 		tokenImageBillingOrderModel:     tokenImageBillingOrderExpr,
 		multipartImageBillingOrderModel: multipartImageBillingOrderExpr,
+		seedreamLayerBillingOrderModel:  seedreamLayerBillingOrderExpr,
 		geminiImageBillingOrderModel:    geminiImageBillingOrderExpr,
 		siliconImageBillingOrderModel:   siliconImageBillingOrderExpr,
 		unknownImageBillingOrderModel:   unknownImageBillingOrderExpr,
@@ -122,6 +125,7 @@ func newSeedreamBillingOrderFixture(t *testing.T) *seedreamBillingOrderFixture {
 		qualityImageBillingOrderModel:   "tiered_expr",
 		tokenImageBillingOrderModel:     "tiered_expr",
 		multipartImageBillingOrderModel: "tiered_expr",
+		seedreamLayerBillingOrderModel:  "tiered_expr",
 		geminiImageBillingOrderModel:    "tiered_expr",
 		siliconImageBillingOrderModel:   "tiered_expr",
 		unknownImageBillingOrderModel:   "tiered_expr",
@@ -708,6 +712,7 @@ func TestRelayOpenAIMultipartUsesFinalSafeScalarsForBilling(t *testing.T) {
 				"output_format":      "webp",
 				"output_compression": "90",
 				"input_fidelity":     "high",
+				"stream":             "true",
 				"image_url":          "https://secret.invalid/input.png",
 				"Extra":              "must-not-survive",
 			} {
@@ -774,6 +779,317 @@ func TestRelayOpenAIMultipartUsesFinalSafeScalarsForBilling(t *testing.T) {
 			assert.Equal(t, int32(1), quotaMutations.Load(), "multipart request must use one billing session")
 		})
 	}
+}
+
+func TestRelayOpenAIJSONAndMultipartScalarTypesReserveAndSettleEqually(t *testing.T) {
+	var multipartBody bytes.Buffer
+	writer := multipart.NewWriter(&multipartBody)
+	for key, value := range map[string]string{
+		"model":              multipartImageBillingOrderModel,
+		"prompt":             "secret multipart billing prompt",
+		"n":                  "1",
+		"stream":             "true",
+		"output_compression": "90",
+	} {
+		require.NoError(t, writer.WriteField(key, value))
+	}
+	image, err := writer.CreateFormFile("image", "secret.png")
+	require.NoError(t, err)
+	_, err = image.Write([]byte("secret image bytes"))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	tests := []struct {
+		name        string
+		path        string
+		contentType string
+		body        []byte
+	}{
+		{
+			name:        "JSON",
+			path:        "/v1/images/generations",
+			contentType: "application/json",
+			body: []byte(`{"model":"` + multipartImageBillingOrderModel +
+				`","prompt":"secret JSON billing prompt","n":1,"stream":true,"output_compression":90}`),
+		},
+		{
+			name:        "multipart",
+			path:        "/v1/images/edits",
+			contentType: writer.FormDataContentType(),
+			body:        multipartBody.Bytes(),
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newSeedreamBillingOrderFixture(t)
+			const initialQuota = 500_000
+			const expectedQuota = 100_000
+			fixture.user.Quota = initialQuota
+			fixture.token.RemainQuota = initialQuota
+			fixture.resetQuota(t, initialQuota)
+			quotaMutations := recordUserQuotaMutations(t, fixture.db)
+			quotaMutations.Store(0)
+
+			type dispatchSnapshot struct {
+				userQuota   int
+				tokenQuota  int
+				stream      string
+				compression string
+				contentType string
+				err         error
+			}
+			dispatched := make(chan dispatchSnapshot, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				var user model.User
+				var token model.Token
+				userErr := fixture.db.First(&user, fixture.user.Id).Error
+				tokenErr := fixture.db.First(&token, fixture.token.Id).Error
+				snapshot := dispatchSnapshot{
+					userQuota: user.Quota, tokenQuota: token.RemainQuota,
+					contentType: request.Header.Get("Content-Type"),
+					err:         firstError(userErr, tokenErr),
+				}
+				if strings.Contains(snapshot.contentType, "multipart/form-data") {
+					formErr := request.ParseMultipartForm(32 << 20)
+					snapshot.err = firstError(snapshot.err, formErr)
+					snapshot.stream = request.FormValue("stream")
+					snapshot.compression = request.FormValue("output_compression")
+				} else {
+					body, bodyErr := io.ReadAll(request.Body)
+					snapshot.err = firstError(snapshot.err, bodyErr)
+					snapshot.stream = gjson.GetBytes(body, "stream").Raw
+					snapshot.compression = gjson.GetBytes(body, "output_compression").Raw
+				}
+				dispatched <- snapshot
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://output.invalid/image.png"}]}`)
+			}))
+			t.Cleanup(upstream.Close)
+
+			requestID := "openai-scalar-semantics-" + strings.ToLower(testCase.name)
+			recorder := fixture.relayWithOptions(t, imageRelayOptions{
+				requestID: requestID, model: multipartImageBillingOrderModel,
+				path: testCase.path, contentType: testCase.contentType, body: testCase.body,
+				baseURL: upstream.URL, usingGroup: "default", tokenGroup: "default",
+				passThrough: true,
+			})
+
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			require.Len(t, dispatched, 1)
+			snapshot := <-dispatched
+			require.NoError(t, snapshot.err)
+			assert.Equal(t, "true", snapshot.stream)
+			assert.Equal(t, "90", snapshot.compression)
+			assert.Equal(t, initialQuota-expectedQuota, snapshot.userQuota)
+			assert.Equal(t, initialQuota-expectedQuota, snapshot.tokenQuota)
+
+			var user model.User
+			var token model.Token
+			require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
+			require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
+			assert.Equal(t, initialQuota-expectedQuota, user.Quota)
+			assert.Equal(t, expectedQuota, user.UsedQuota)
+			assert.Equal(t, initialQuota-expectedQuota, token.RemainQuota)
+			assert.Equal(t, expectedQuota, token.UsedQuota)
+			assert.Equal(t, int32(1), quotaMutations.Load(), "equal reserve and settlement need one quota mutation")
+
+			var logs []model.Log
+			require.NoError(t, model.LOG_DB.
+				Where("request_id = ? AND type = ?", requestID, model.LogTypeConsume).
+				Find(&logs).Error)
+			require.Len(t, logs, 1)
+			assert.Equal(t, expectedQuota, logs[0].Quota)
+		})
+	}
+}
+
+func TestRelayOpenAIRejectsSensitiveAllowedScalarBeforeBillingAndDispatch(t *testing.T) {
+	fixture := newSeedreamBillingOrderFixture(t)
+	quotaMutations := recordUserQuotaMutations(t, fixture.db)
+	quotaMutations.Store(0)
+	var dispatches atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		dispatches.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(upstream.Close)
+
+	recorder := fixture.relayWithOptions(t, imageRelayOptions{
+		requestID: "openai-sensitive-scalar", model: multipartImageBillingOrderModel,
+		path: "/v1/images/generations", contentType: "application/json",
+		body: []byte(`{"model":"` + multipartImageBillingOrderModel +
+			`","prompt":"billing fixture","n":1,"output_compression":"data:image/png;base64,c2VjcmV0"}`),
+		baseURL: upstream.URL, usingGroup: "default", tokenGroup: "default", passThrough: true,
+	})
+
+	assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+	assert.Contains(t, recorder.Body.String(), "output_compression")
+	assert.NotContains(t, recorder.Body.String(), "c2VjcmV0")
+	assert.Zero(t, dispatches.Load(), "sensitive scalar must be rejected locally")
+	assert.Zero(t, quotaMutations.Load(), "sensitive scalar must not reserve or refund quota")
+}
+
+func TestRelaySeedreamIndexedReferencesAffectBillingAndLayerCardinality(t *testing.T) {
+	buildBody := func(t *testing.T, layered bool, imageFields ...string) ([]byte, string) {
+		t.Helper()
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		require.NoError(t, writer.WriteField("model", seedreamBillingOrderModel))
+		require.NoError(t, writer.WriteField("prompt", "secret multipart prompt"))
+		require.NoError(t, writer.WriteField("n", "1"))
+		require.NoError(t, writer.WriteField("size", "1K"))
+		if layered {
+			require.NoError(t, writer.WriteField("layer_decomposition", "true"))
+		}
+		for index, field := range imageFields {
+			image, err := writer.CreateFormFile(field, fmt.Sprintf("secret-%d.png", index))
+			require.NoError(t, err)
+			_, err = image.Write([]byte("secret image bytes"))
+			require.NoError(t, err)
+		}
+		require.NoError(t, writer.Close())
+		return body.Bytes(), writer.FormDataContentType()
+	}
+
+	t.Run("two references include the extra input price", func(t *testing.T) {
+		fixture := newSeedreamBillingOrderFixture(t)
+		const initialQuota = 500_000
+		expectedQuota := billingexpr.QuotaRound((0.04109589041 + 0.002739726027) * common.QuotaPerUnit)
+		fixture.user.Quota = initialQuota
+		fixture.token.RemainQuota = initialQuota
+		fixture.resetQuota(t, initialQuota)
+		quotaMutations := recordUserQuotaMutations(t, fixture.db)
+		quotaMutations.Store(0)
+
+		type dispatchSnapshot struct {
+			userQuota, tokenQuota int
+			err                   error
+		}
+		dispatched := make(chan dispatchSnapshot, 1)
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			var user model.User
+			var token model.Token
+			userErr := fixture.db.First(&user, fixture.user.Id).Error
+			tokenErr := fixture.db.First(&token, fixture.token.Id).Error
+			dispatched <- dispatchSnapshot{
+				userQuota: user.Quota, tokenQuota: token.RemainQuota,
+				err: firstError(userErr, tokenErr),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://output.invalid/image.png"}]}`)
+		}))
+		t.Cleanup(upstream.Close)
+		body, contentType := buildBody(t, false, "image[0]", "image[1]")
+
+		recorder := fixture.relayWithOptions(t, imageRelayOptions{
+			requestID: "seedream-indexed-references", model: seedreamBillingOrderModel,
+			path: "/v1/images/edits", contentType: contentType, body: body,
+			baseURL: upstream.URL, usingGroup: "default", tokenGroup: "default", passThrough: true,
+		})
+
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		require.Len(t, dispatched, 1)
+		snapshot := <-dispatched
+		require.NoError(t, snapshot.err)
+		assert.Equal(t, initialQuota-expectedQuota, snapshot.userQuota)
+		assert.Equal(t, initialQuota-expectedQuota, snapshot.tokenQuota)
+		var user model.User
+		require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
+		assert.Equal(t, expectedQuota, user.UsedQuota)
+		assert.Equal(t, int32(1), quotaMutations.Load())
+	})
+
+	t.Run("two references reject layer decomposition", func(t *testing.T) {
+		fixture := newSeedreamBillingOrderFixture(t)
+		quotaMutations := recordUserQuotaMutations(t, fixture.db)
+		quotaMutations.Store(0)
+		var dispatches atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			dispatches.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		t.Cleanup(upstream.Close)
+		body, contentType := buildBody(t, true, "image[0]", "image[1]")
+
+		recorder := fixture.relayWithOptions(t, imageRelayOptions{
+			requestID: "seedream-indexed-layer-reject", model: seedreamBillingOrderModel,
+			path: "/v1/images/edits", contentType: contentType, body: body,
+			baseURL: upstream.URL, usingGroup: "default", tokenGroup: "default", passThrough: true,
+		})
+
+		assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+		assert.Contains(t, recorder.Body.String(), "exactly one")
+		assert.Zero(t, dispatches.Load())
+		assert.Zero(t, quotaMutations.Load())
+	})
+}
+
+func TestRelaySeedreamLayerDecompositionUsesSeventeenForReserveAndFallbackSettlement(t *testing.T) {
+	fixture := newSeedreamBillingOrderFixture(t)
+	const initialQuota = 500_000
+	expectedQuota := billingexpr.QuotaRound(17 * 0.01 * common.QuotaPerUnit)
+	fixture.user.Quota = initialQuota
+	fixture.token.RemainQuota = initialQuota
+	fixture.resetQuota(t, initialQuota)
+	quotaMutations := recordUserQuotaMutations(t, fixture.db)
+	quotaMutations.Store(0)
+
+	type dispatchSnapshot struct {
+		userQuota, tokenQuota int
+		err                   error
+	}
+	dispatched := make(chan dispatchSnapshot, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var user model.User
+		var token model.Token
+		userErr := fixture.db.First(&user, fixture.user.Id).Error
+		tokenErr := fixture.db.First(&token, fixture.token.Id).Error
+		dispatched <- dispatchSnapshot{
+			userQuota: user.Quota, tokenQuota: token.RemainQuota,
+			err: firstError(userErr, tokenErr),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"created":1,"data":[]}`)
+	}))
+	t.Cleanup(upstream.Close)
+	requestID := "seedream-layer-seventeen"
+
+	recorder := fixture.relayWithOptions(t, imageRelayOptions{
+		requestID: requestID, model: seedreamLayerBillingOrderModel,
+		path: "/v1/images/generations", contentType: "application/json",
+		body: []byte(`{"model":"` + seedreamLayerBillingOrderModel +
+			`","prompt":"secret prompt","n":1,"size":"1K","image":"https://secret.invalid/reference.png","layer_decomposition":true}`),
+		baseURL: upstream.URL, usingGroup: "default", tokenGroup: "default", passThrough: true,
+	})
+
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Len(t, dispatched, 1)
+	snapshot := <-dispatched
+	require.NoError(t, snapshot.err)
+	assert.Equal(t, initialQuota-expectedQuota, snapshot.userQuota)
+	assert.Equal(t, initialQuota-expectedQuota, snapshot.tokenQuota)
+
+	var user model.User
+	var token model.Token
+	require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
+	require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
+	assert.Equal(t, initialQuota-expectedQuota, user.Quota)
+	assert.Equal(t, expectedQuota, user.UsedQuota)
+	assert.Equal(t, initialQuota-expectedQuota, token.RemainQuota)
+	assert.Equal(t, expectedQuota, token.UsedQuota)
+	assert.Equal(t, int32(1), quotaMutations.Load(), "fallback settlement must retain the seventeen-image reservation")
+
+	var logs []model.Log
+	require.NoError(t, model.LOG_DB.
+		Where("request_id = ? AND type = ?", requestID, model.LogTypeConsume).
+		Find(&logs).Error)
+	require.Len(t, logs, 1)
+	assert.Equal(t, expectedQuota, logs[0].Quota)
+	var other map[string]any
+	require.NoError(t, common.UnmarshalJsonStr(logs[0].Other, &other))
+	assert.Equal(t, float64(17), other["image_count"])
+	assert.NotContains(t, logs[0].Other, "secret")
 }
 
 func TestRelayMappedImageUsesOriginModelInBillingExpression(t *testing.T) {
