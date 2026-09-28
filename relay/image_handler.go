@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -19,6 +21,15 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+type twoPhaseImageRequestAdaptor interface {
+	PrepareImageRequest(*gin.Context, *relaycommon.RelayInfo, dto.ImageRequest) (any, error)
+	FinalizeImageRequest(*gin.Context, *relaycommon.RelayInfo, []byte) (any, error)
+}
+
+type imageSubmissionStartedError interface {
+	ImageSubmissionStarted() bool
+}
 
 func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
 	hadBillingSession := info.Billing != nil
@@ -81,6 +92,7 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	var jsonData []byte
 	var outboundBilling *helper.OutboundImageBilling
 	outboundSchemaConfirmed := false
+	var finalizer twoPhaseImageRequestAdaptor
 	var err error
 
 	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled {
@@ -108,7 +120,14 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 			}
 		}
 	} else {
-		convertedRequest, convertErr := adaptor.ConvertImageRequest(c, info, *request)
+		var convertedRequest any
+		var convertErr error
+		if candidate, ok := adaptor.(twoPhaseImageRequestAdaptor); ok && info.RelayMode == relayconstant.RelayModeImagesEdits {
+			finalizer = candidate
+			convertedRequest, convertErr = candidate.PrepareImageRequest(c, info, *request)
+		} else {
+			convertedRequest, convertErr = adaptor.ConvertImageRequest(c, info, *request)
+		}
 		if convertErr != nil {
 			// An adaptor that already classified its rejection (status code
 			// and retry policy) keeps that classification instead of being
@@ -147,22 +166,32 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 					return newAPIErrorFromParamOverride(err)
 				}
 			}
-
 		}
 	}
 	if jsonData != nil {
+		jsonData, err = helper.MaterializeOutboundImageBillingDefaults(info, jsonData, outboundSchemaConfirmed)
+		if err != nil {
+			return types.NewErrorWithStatusCode(fmt.Errorf("invalid image billing parameters: %w", err), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+		if finalizer != nil {
+			var preparedPayload map[string]any
+			if err = common.Unmarshal(jsonData, &preparedPayload); err != nil {
+				return types.NewErrorWithStatusCode(fmt.Errorf("invalid prepared image request: %w", err), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+			preparedInput, ok := preparedPayload["input"].(map[string]any)
+			if !ok {
+				return types.NewErrorWithStatusCode(errors.New("invalid prepared image request: input is required"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+			if _, exists := preparedInput["image_prompt"]; exists {
+				return types.NewErrorWithStatusCode(errors.New("invalid prepared image request: input.image_prompt is reserved for finalization"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+		}
 		// This is a different trust boundary from ingress: channel overrides
 		// and pass-through bodies can change the quantity actually submitted.
 		outboundBilling, err = helper.ResolveOutboundImageBillingJSON(info, jsonData, outboundSchemaConfirmed)
 		if err != nil {
 			return types.NewErrorWithStatusCode(fmt.Errorf("invalid image billing parameters: %w", err), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 		}
-		body, closer, bodyErr := relaycommon.NewOutboundJSONBody(jsonData)
-		if bodyErr != nil {
-			return types.NewError(bodyErr, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
-		}
-		defer closer.Close()
-		requestBody = body
 	}
 	if outboundBilling == nil {
 		return types.NewErrorWithStatusCode(errors.New("final image billing view is unavailable"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
@@ -199,10 +228,101 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 		return billingErr
 	}
 
+	retainReservation := func() *types.NewAPIError {
+		if info.Billing == nil {
+			return nil
+		}
+		if settleErr := info.Billing.Settle(info.Billing.GetPreConsumedQuota()); settleErr != nil {
+			return types.NewErrorWithStatusCode(
+				fmt.Errorf("failed to retain image reservation after provider submission: %w", settleErr),
+				types.ErrorCodeDoRequestFailed,
+				http.StatusInternalServerError,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		return nil
+	}
+	postReservationUploadStarted := false
+	if finalizer != nil {
+		finalizedRequest, finalizeErr := finalizer.FinalizeImageRequest(c, info, jsonData)
+		if finalizeErr != nil {
+			var submitted imageSubmissionStartedError
+			if errors.As(finalizeErr, &submitted) && submitted.ImageSubmissionStarted() {
+				if billingErr := retainReservation(); billingErr != nil {
+					return billingErr
+				}
+			}
+			var apiErr *types.NewAPIError
+			if errors.As(finalizeErr, &apiErr) {
+				return apiErr
+			}
+			return types.NewError(finalizeErr, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		finalizedJSON, finalizeErr := common.Marshal(finalizedRequest)
+		if finalizeErr != nil {
+			if billingErr := retainReservation(); billingErr != nil {
+				return billingErr
+			}
+			return types.NewError(finalizeErr, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+
+		var preparedPayload map[string]any
+		var finalizedPayload map[string]any
+		if finalizeErr = common.Unmarshal(jsonData, &preparedPayload); finalizeErr == nil {
+			finalizeErr = common.Unmarshal(finalizedJSON, &finalizedPayload)
+		}
+		if finalizeErr == nil && !reflect.DeepEqual(preparedPayload, finalizedPayload) {
+			finalizedInput, ok := finalizedPayload["input"].(map[string]any)
+			if !ok {
+				finalizeErr = errors.New("finalized image request input is unavailable")
+			} else if imagePrompt, ok := finalizedInput["image_prompt"].(string); !ok || strings.TrimSpace(imagePrompt) == "" {
+				finalizeErr = errors.New("finalized image request must add a non-empty input.image_prompt URL")
+			} else {
+				delete(finalizedInput, "image_prompt")
+				if !reflect.DeepEqual(preparedPayload, finalizedPayload) {
+					finalizeErr = errors.New("finalized image request changed validated fields")
+				} else {
+					postReservationUploadStarted = true
+				}
+			}
+		}
+		if finalizeErr != nil {
+			if billingErr := retainReservation(); billingErr != nil {
+				return billingErr
+			}
+			return types.NewErrorWithStatusCode(
+				finalizeErr,
+				types.ErrorCodeConvertRequestFailed,
+				http.StatusInternalServerError,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+		jsonData = finalizedJSON
+	}
+	if jsonData != nil {
+		body, closer, bodyErr := relaycommon.NewOutboundJSONBody(jsonData)
+		if bodyErr != nil {
+			if postReservationUploadStarted {
+				if billingErr := retainReservation(); billingErr != nil {
+					return billingErr
+				}
+			}
+			return types.NewError(bodyErr, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		}
+		defer closer.Close()
+		requestBody = body
+	}
+
 	statusCodeMappingStr := c.GetString("status_code_mapping")
 
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
+		if postReservationUploadStarted {
+			if billingErr := retainReservation(); billingErr != nil {
+				return billingErr
+			}
+			return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+		}
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}
 	var httpResp *http.Response
@@ -217,6 +337,9 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 				newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
 				// reset status code 重置状态码
 				service.ResetStatusCode(newAPIError, statusCodeMappingStr)
+				if postReservationUploadStarted {
+					types.ErrOptionWithSkipRetry()(newAPIError)
+				}
 				return newAPIError
 			}
 		}
@@ -226,6 +349,12 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	if newAPIError != nil {
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
+		if postReservationUploadStarted {
+			if billingErr := retainReservation(); billingErr != nil {
+				return billingErr
+			}
+			types.ErrOptionWithSkipRetry()(newAPIError)
+		}
 		return newAPIError
 	}
 

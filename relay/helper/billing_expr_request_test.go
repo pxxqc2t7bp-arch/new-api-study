@@ -370,6 +370,164 @@ func TestResolveOutboundImageBillingJSONUsesExplicitNativeSchemas(t *testing.T) 
 	}
 }
 
+func TestResolveOutboundImageBillingJSONDefaultsMissingConfirmedNativeCount(t *testing.T) {
+	tests := []struct {
+		name      string
+		apiType   int
+		payload   string
+		countPath string
+	}{
+		{
+			name:      "Replicate",
+			apiType:   constant.APITypeReplicate,
+			payload:   `{"input":{"prompt":"replicate prompt"}}`,
+			countPath: "input.num_outputs",
+		},
+		{
+			name:      "SiliconFlow",
+			apiType:   constant.APITypeSiliconFlow,
+			payload:   `{"prompt":"silicon prompt"}`,
+			countPath: "batch_size",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			resolved, err := ResolveOutboundImageBillingJSON(
+				outboundImageBillingInfo(testCase.apiType, "billing-origin"),
+				[]byte(testCase.payload),
+				true,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, resolved)
+			assert.Equal(t, 1, resolved.Count)
+			assert.Equal(t, int64(1), gjson.GetBytes(resolved.Input.Body, testCase.countPath).Int())
+		})
+	}
+}
+
+func TestMaterializeOutboundImageBillingDefaultsOnlyForConfirmedMissingCount(t *testing.T) {
+	tests := []struct {
+		name            string
+		apiType         int
+		payload         string
+		schemaConfirmed bool
+		countPath       string
+		wantExists      bool
+		wantNull        bool
+	}{
+		{
+			name: "confirmed Replicate", apiType: constant.APITypeReplicate,
+			payload:         `{"input":{"prompt":"replicate prompt"}}`,
+			schemaConfirmed: true, countPath: "input.num_outputs", wantExists: true,
+		},
+		{
+			name: "unconfirmed Replicate", apiType: constant.APITypeReplicate,
+			payload:         `{"input":{"prompt":"replicate prompt"}}`,
+			schemaConfirmed: false, countPath: "input.num_outputs",
+		},
+		{
+			name: "explicit Replicate null", apiType: constant.APITypeReplicate,
+			payload:         `{"input":{"prompt":"replicate prompt","num_outputs":null}}`,
+			schemaConfirmed: true, countPath: "input.num_outputs", wantExists: true, wantNull: true,
+		},
+		{
+			name: "confirmed SiliconFlow", apiType: constant.APITypeSiliconFlow,
+			payload:         `{"prompt":"silicon prompt"}`,
+			schemaConfirmed: true, countPath: "batch_size", wantExists: true,
+		},
+		{
+			name: "unconfirmed SiliconFlow", apiType: constant.APITypeSiliconFlow,
+			payload:         `{"prompt":"silicon prompt"}`,
+			schemaConfirmed: false, countPath: "batch_size",
+		},
+		{
+			name: "explicit SiliconFlow null", apiType: constant.APITypeSiliconFlow,
+			payload:         `{"prompt":"silicon prompt","batch_size":null}`,
+			schemaConfirmed: true, countPath: "batch_size", wantExists: true, wantNull: true,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			materialized, err := MaterializeOutboundImageBillingDefaults(
+				outboundImageBillingInfo(testCase.apiType, "billing-origin"),
+				[]byte(testCase.payload),
+				testCase.schemaConfirmed,
+			)
+			require.NoError(t, err)
+			count := gjson.GetBytes(materialized, testCase.countPath)
+			assert.Equal(t, testCase.wantExists, count.Exists())
+			assert.Equal(t, testCase.wantNull, count.Type == gjson.Null && count.Exists())
+			if testCase.wantExists && !testCase.wantNull {
+				assert.Equal(t, int64(1), count.Int())
+			}
+		})
+	}
+}
+
+func TestResolveOutboundImageBillingJSONConfirmedNativeCountRejectsExplicitInvalidValues(t *testing.T) {
+	tests := []struct {
+		name      string
+		apiType   int
+		payload   string
+		wantError string
+	}{
+		{
+			name: "Replicate null", apiType: constant.APITypeReplicate,
+			payload:   `{"input":{"prompt":"replicate prompt","num_outputs":null}}`,
+			wantError: "between 1 and 128",
+		},
+		{
+			name: "Replicate zero", apiType: constant.APITypeReplicate,
+			payload:   `{"input":{"prompt":"replicate prompt","num_outputs":0}}`,
+			wantError: "between 1 and 128",
+		},
+		{
+			name: "Replicate string", apiType: constant.APITypeReplicate,
+			payload:   `{"input":{"prompt":"replicate prompt","num_outputs":"1"}}`,
+			wantError: "integer between 1 and 128",
+		},
+		{
+			name: "Replicate above limit", apiType: constant.APITypeReplicate,
+			payload:   `{"input":{"prompt":"replicate prompt","num_outputs":129}}`,
+			wantError: "between 1 and 128",
+		},
+		{
+			name: "SiliconFlow null", apiType: constant.APITypeSiliconFlow,
+			payload:   `{"prompt":"silicon prompt","batch_size":null}`,
+			wantError: "between 1 and 128",
+		},
+		{
+			name: "SiliconFlow zero", apiType: constant.APITypeSiliconFlow,
+			payload:   `{"prompt":"silicon prompt","batch_size":0}`,
+			wantError: "between 1 and 128",
+		},
+		{
+			name: "SiliconFlow string", apiType: constant.APITypeSiliconFlow,
+			payload:   `{"prompt":"silicon prompt","batch_size":"1"}`,
+			wantError: "integer between 1 and 128",
+		},
+		{
+			name: "SiliconFlow above limit", apiType: constant.APITypeSiliconFlow,
+			payload:   `{"prompt":"silicon prompt","batch_size":129}`,
+			wantError: "between 1 and 128",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			resolved, err := ResolveOutboundImageBillingJSON(
+				outboundImageBillingInfo(testCase.apiType, "billing-origin"),
+				[]byte(testCase.payload),
+				true,
+			)
+			require.ErrorContains(t, err, testCase.wantError)
+			assert.Nil(t, resolved)
+		})
+	}
+}
+
 func TestResolveOutboundImageBillingJSONSupportsRemainingNativeSchemas(t *testing.T) {
 	tests := []struct {
 		name        string

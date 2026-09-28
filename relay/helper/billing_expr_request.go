@@ -228,6 +228,12 @@ func ResolveOutboundImageBillingJSON(info *relaycommon.RelayInfo, outboundJSON [
 	if info.ChannelMeta == nil {
 		return nil, fmt.Errorf("image billing API type is required")
 	}
+	confirmed := len(schemaConfirmed) > 0 && schemaConfirmed[0]
+	var err error
+	outboundJSON, err = MaterializeOutboundImageBillingDefaults(info, outboundJSON, confirmed)
+	if err != nil {
+		return nil, err
+	}
 
 	switch info.ApiType {
 	case constant.APITypeGemini, constant.APITypeVertexAi:
@@ -243,12 +249,55 @@ func ResolveOutboundImageBillingJSON(info *relaycommon.RelayInfo, outboundJSON [
 	case constant.APITypeXai:
 		return resolveXAIImageBilling(info, incoming, outboundJSON)
 	default:
-		confirmed := len(schemaConfirmed) > 0 && schemaConfirmed[0]
 		if isOpenAIImageBillingAPIType(info.ApiType, confirmed) {
 			return resolveOpenAIImageBilling(info, incoming, outboundJSON)
 		}
 		return nil, fmt.Errorf("unsupported image billing schema for API type %d", info.ApiType)
 	}
+}
+
+// MaterializeOutboundImageBillingDefaults writes provider count defaults only
+// for payloads that are known to have been produced by the matching adaptor.
+func MaterializeOutboundImageBillingDefaults(info *relaycommon.RelayInfo, outboundJSON []byte, schemaConfirmed bool) ([]byte, error) {
+	if info == nil || info.ChannelMeta == nil || !schemaConfirmed {
+		return outboundJSON, nil
+	}
+
+	switch info.ApiType {
+	case constant.APITypeReplicate, constant.APITypeSiliconFlow:
+	default:
+		return outboundJSON, nil
+	}
+	object, err := imageBillingObject(outboundJSON, "image request")
+	if err != nil {
+		return nil, err
+	}
+	switch info.ApiType {
+	case constant.APITypeReplicate:
+		inputRaw, exists := object["input"]
+		if !exists || isJSONNull(inputRaw) {
+			return outboundJSON, nil
+		}
+		input, inputErr := imageBillingObject(inputRaw, "input")
+		if inputErr != nil {
+			return nil, inputErr
+		}
+		if _, exists = input["num_outputs"]; exists {
+			return outboundJSON, nil
+		}
+		input["num_outputs"] = json.RawMessage("1")
+		encodedInput, marshalErr := common.Marshal(input)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		object["input"] = encodedInput
+	case constant.APITypeSiliconFlow:
+		if _, exists := object["batch_size"]; exists {
+			return outboundJSON, nil
+		}
+		object["batch_size"] = json.RawMessage("1")
+	}
+	return common.Marshal(object)
 }
 
 func isOpenAIImageBillingAPIType(apiType int, schemaConfirmed bool) bool {
