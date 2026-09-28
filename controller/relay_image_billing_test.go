@@ -2160,6 +2160,134 @@ func TestRelayReplicateEditPredictionUnknownDoesNotUploadAgainOrRefund(t *testin
 	assert.Equal(t, int32(1), quotaMutations.Load(), "prediction unknown after upload must retain the reservation")
 }
 
+func TestRelayReplicateEditPredictionHTTPFailureDoesNotRetryOrRefund(t *testing.T) {
+	previousErrorLogEnabled := constant.ErrorLogEnabled
+	constant.ErrorLogEnabled = true
+	t.Cleanup(func() {
+		constant.ErrorLogEnabled = previousErrorLogEnabled
+	})
+
+	for _, statusCode := range []int{http.StatusBadGateway, http.StatusUnprocessableEntity} {
+		t.Run(fmt.Sprintf("status_%d", statusCode), func(t *testing.T) {
+			const firstGroup = "replicate-prediction-http-failure"
+			const retryGroup = "replicate-prediction-http-retry"
+			configureImageBillingGroups(
+				t,
+				`{"default":1,"`+firstGroup+`":1,"`+retryGroup+`":1}`,
+				`{"default":"Default","`+firstGroup+`":"Replicate","`+retryGroup+`":"Retry"}`,
+			)
+			fixture := newSeedreamBillingOrderFixture(t)
+			previousRetries := common.RetryTimes
+			common.RetryTimes = 1
+			t.Cleanup(func() {
+				common.RetryTimes = previousRetries
+			})
+
+			const initialQuota = 500_000
+			const expectedQuota = 50_000
+			requestID := fmt.Sprintf("replicate-edit-prediction-http-%d", statusCode)
+			quotaMutations := recordUserQuotaMutations(t, fixture.db)
+			quotaMutations.Store(0)
+			var uploads atomic.Int32
+			var predictions atomic.Int32
+			firstUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				switch {
+				case request.URL.Path == "/v1/files":
+					uploads.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"urls":{"get":"https://files.invalid/input.png"}}`)
+				case strings.HasSuffix(request.URL.Path, "/predictions"):
+					predictions.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(statusCode)
+					_, _ = io.WriteString(w, `{"error":{"message":"prediction rejected","type":"upstream_error","code":"prediction_failed"}}`)
+				default:
+					http.NotFound(w, request)
+				}
+			}))
+			t.Cleanup(firstUpstream.Close)
+
+			var retryRequests atomic.Int32
+			retryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				retryRequests.Add(1)
+				switch {
+				case request.URL.Path == "/v1/files":
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"urls":{"get":"https://files.invalid/retry.png"}}`)
+				case strings.HasSuffix(request.URL.Path, "/predictions"):
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"status":"succeeded","output":["https://output.invalid/retry.png"]}`)
+				default:
+					http.NotFound(w, request)
+				}
+			}))
+			t.Cleanup(retryUpstream.Close)
+			priority := int64(0)
+			weight := uint(100)
+			autoBan := 0
+			retryBaseURL := retryUpstream.URL
+			channel := &model.Channel{
+				Name: "image-retry-" + retryGroup, Key: "local-test-key", Type: constant.ChannelTypeReplicate,
+				Status: common.ChannelStatusEnabled, Group: retryGroup, Models: gptImageBillingOrderModel, BaseURL: &retryBaseURL,
+				Priority: &priority, Weight: &weight, AutoBan: &autoBan,
+			}
+			require.NoError(t, fixture.db.Create(channel).Error)
+			require.NoError(t, fixture.db.Create(&model.Ability{
+				Group: retryGroup, Model: gptImageBillingOrderModel, ChannelId: channel.Id, Enabled: true,
+				Priority: &priority, Weight: weight,
+			}).Error)
+
+			body, contentType := imageBillingMultipartBody(t, gptImageBillingOrderModel, "1")
+			recorder := fixture.relayWithOptions(t, imageRelayOptions{
+				requestID:   requestID,
+				model:       gptImageBillingOrderModel,
+				path:        "/v1/images/edits",
+				contentType: contentType,
+				body:        body,
+				baseURL:     firstUpstream.URL,
+				usingGroup:  firstGroup,
+				tokenGroup:  "auto",
+				autoGroups:  []string{firstGroup, retryGroup},
+				crossGroup:  true,
+				channelType: constant.ChannelTypeReplicate,
+			})
+
+			assert.Equal(t, statusCode, recorder.Code, recorder.Body.String())
+			assert.Equal(t, int32(1), uploads.Load())
+			assert.Equal(t, int32(1), predictions.Load())
+			assert.Zero(t, retryRequests.Load(), "prediction HTTP failure after upload must not use another channel")
+			require.Never(t, func() bool {
+				var user model.User
+				var token model.Token
+				if fixture.db.First(&user, fixture.user.Id).Error != nil ||
+					fixture.db.First(&token, fixture.token.Id).Error != nil {
+					return false
+				}
+				return user.Quota == initialQuota || token.RemainQuota == initialQuota
+			}, 300*time.Millisecond, 10*time.Millisecond)
+			assert.Equal(t, int32(1), quotaMutations.Load(), "prediction HTTP failure after upload must retain the reservation")
+
+			var user model.User
+			var token model.Token
+			require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
+			require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
+			assert.Equal(t, initialQuota-expectedQuota, user.Quota)
+			assert.Equal(t, initialQuota-expectedQuota, token.RemainQuota)
+
+			var consumeLogs int64
+			require.NoError(t, model.LOG_DB.Model(&model.Log{}).
+				Where("request_id = ? AND type = ?", requestID, model.LogTypeConsume).
+				Count(&consumeLogs).Error)
+			assert.Zero(t, consumeLogs, "failed prediction must not emit a success consume log")
+			var errorLogs int64
+			require.NoError(t, model.LOG_DB.Model(&model.Log{}).
+				Where("request_id = ? AND type = ?", requestID, model.LogTypeError).
+				Count(&errorLogs).Error)
+			assert.Equal(t, int64(1), errorLogs, "failed prediction must retain an error audit log")
+		})
+	}
+}
+
 func TestRelayReplicateRetryPromptEstimateDoesNotPolluteNextAttempt(t *testing.T) {
 	const firstGroup = "replicate-prompt"
 	const retryGroup = "openai-prompt"

@@ -338,6 +338,9 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 				// reset status code 重置状态码
 				service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 				if postReservationUploadStarted {
+					if billingErr := retainReservation(); billingErr != nil {
+						return billingErr
+					}
 					types.ErrOptionWithSkipRetry()(newAPIError)
 				}
 				return newAPIError
