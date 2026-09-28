@@ -39,6 +39,10 @@ const (
 	mappedImageBillingOrderModel   = "billing-origin-image"
 	mappedImageBillingOrderAlias   = "provider-image-alias"
 	mappedImageBillingOrderExpr    = `param("model") == "billing-origin-image" ? tier("origin", fixed(0.01)) : tier("mapped", fixed(0.2))`
+	qualityImageBillingOrderModel  = "gpt-image-quality-retry"
+	qualityImageBillingOrderExpr   = `param("quality") == "hd" ? tier("hd", fixed(0.2)) : tier("standard", fixed(0.1))`
+	tokenImageBillingOrderModel    = "gpt-image-token-retry"
+	tokenImageBillingOrderExpr     = `tier("token", p * 100000 + c)`
 	seedreamBillingOrderMappedName = "provider-seedream-alias"
 )
 
@@ -92,13 +96,15 @@ func newSeedreamBillingOrderFixture(t *testing.T) *seedreamBillingOrderFixture {
 	})
 
 	expressions, err := common.Marshal(map[string]string{
-		seedreamBillingOrderModel:    seedreamBillingOrderExpr,
-		gptImageBillingOrderModel:    gptImageBillingOrderExpr,
-		mappedImageBillingOrderModel: mappedImageBillingOrderExpr,
+		seedreamBillingOrderModel:     seedreamBillingOrderExpr,
+		gptImageBillingOrderModel:     gptImageBillingOrderExpr,
+		mappedImageBillingOrderModel:  mappedImageBillingOrderExpr,
+		qualityImageBillingOrderModel: qualityImageBillingOrderExpr,
+		tokenImageBillingOrderModel:   tokenImageBillingOrderExpr,
 	})
 	require.NoError(t, err)
 	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
-		"billing_setting.billing_mode": `{"` + seedreamBillingOrderModel + `":"tiered_expr","` + gptImageBillingOrderModel + `":"tiered_expr","` + mappedImageBillingOrderModel + `":"tiered_expr"}`,
+		"billing_setting.billing_mode": `{"` + seedreamBillingOrderModel + `":"tiered_expr","` + gptImageBillingOrderModel + `":"tiered_expr","` + mappedImageBillingOrderModel + `":"tiered_expr","` + qualityImageBillingOrderModel + `":"tiered_expr","` + tokenImageBillingOrderModel + `":"tiered_expr"}`,
 		"billing_setting.billing_expr": string(expressions),
 	}))
 
@@ -222,13 +228,17 @@ func (f *seedreamBillingOrderFixture) relayWithOptions(t *testing.T, options ima
 	return recorder
 }
 
-func imageBillingMultipartBody(t *testing.T, modelName, n string) ([]byte, string) {
+func imageBillingMultipartBody(t *testing.T, modelName, n string, prompts ...string) ([]byte, string) {
 	t.Helper()
 
+	prompt := "billing fixture"
+	if len(prompts) > 0 {
+		prompt = prompts[0]
+	}
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	require.NoError(t, writer.WriteField("model", modelName))
-	require.NoError(t, writer.WriteField("prompt", "billing fixture"))
+	require.NoError(t, writer.WriteField("prompt", prompt))
 	require.NoError(t, writer.WriteField("size", "1K"))
 	require.NoError(t, writer.WriteField("n", n))
 	image, err := writer.CreateFormFile("image", "fixture.png")
@@ -255,7 +265,7 @@ func configureImageBillingGroups(t *testing.T, ratios string, usable string) {
 	})
 }
 
-func (f *seedreamBillingOrderFixture) createRetryChannel(t *testing.T, group, modelName, baseURL string) {
+func (f *seedreamBillingOrderFixture) createRetryChannel(t *testing.T, group, modelName, baseURL string, paramOverrides ...string) {
 	t.Helper()
 
 	priority := int64(0)
@@ -265,6 +275,9 @@ func (f *seedreamBillingOrderFixture) createRetryChannel(t *testing.T, group, mo
 		Name: "image-retry-" + group, Key: "local-test-key", Type: constant.ChannelTypeOpenAI,
 		Status: common.ChannelStatusEnabled, Group: group, Models: modelName, BaseURL: &baseURL,
 		Priority: &priority, Weight: &weight, AutoBan: &autoBan,
+	}
+	if len(paramOverrides) > 0 {
+		channel.ParamOverride = &paramOverrides[0]
 	}
 	require.NoError(t, f.db.Create(channel).Error)
 	require.NoError(t, f.db.Create(&model.Ability{
@@ -733,6 +746,362 @@ func TestRelayImagesRefreshesTieredGroupBeforeEachDispatch(t *testing.T) {
 			assert.Equal(t, testCase.wantConsumeQuota, logs[0].Quota)
 		})
 	}
+}
+
+func TestRelayImagesRejectsFinalSensitivePromptBeforeBillingAndDispatch(t *testing.T) {
+	previousCheckSensitive := setting.CheckSensitiveEnabled
+	previousCheckPrompt := setting.CheckSensitiveOnPromptEnabled
+	previousSensitiveWords := append([]string(nil), setting.SensitiveWords...)
+	setting.CheckSensitiveEnabled = true
+	setting.CheckSensitiveOnPromptEnabled = true
+	setting.SensitiveWords = []string{"test_sensitive"}
+	t.Cleanup(func() {
+		setting.CheckSensitiveEnabled = previousCheckSensitive
+		setting.CheckSensitiveOnPromptEnabled = previousCheckPrompt
+		setting.SensitiveWords = previousSensitiveWords
+	})
+
+	multipartBody, multipartContentType := imageBillingMultipartBody(
+		t,
+		gptImageBillingOrderModel,
+		"1",
+		"test_sensitive multipart prompt",
+	)
+	tests := []struct {
+		name        string
+		path        string
+		contentType string
+		body        []byte
+		passThrough bool
+	}{
+		{
+			name:        "JSON converted request",
+			path:        "/v1/images/generations",
+			contentType: "application/json",
+			body:        []byte(`{"model":"` + gptImageBillingOrderModel + `","prompt":"test_sensitive json prompt","n":1}`),
+		},
+		{
+			name:        "multipart pass-through",
+			path:        "/v1/images/edits",
+			contentType: multipartContentType,
+			body:        multipartBody,
+			passThrough: true,
+		},
+		{
+			name:        "multipart converted buffer",
+			path:        "/v1/images/edits",
+			contentType: multipartContentType,
+			body:        multipartBody,
+		},
+	}
+
+	for index, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newSeedreamBillingOrderFixture(t)
+			quotaMutations := recordUserQuotaMutations(t, fixture.db)
+			quotaMutations.Store(0)
+			var dispatches atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				dispatches.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://output.invalid/image.png"}]}`)
+			}))
+			t.Cleanup(upstream.Close)
+
+			recorder := fixture.relayWithOptions(t, imageRelayOptions{
+				requestID:   fmt.Sprintf("image-sensitive-%d", index),
+				model:       gptImageBillingOrderModel,
+				path:        testCase.path,
+				contentType: testCase.contentType,
+				body:        testCase.body,
+				baseURL:     upstream.URL,
+				usingGroup:  "default",
+				tokenGroup:  "default",
+				passThrough: testCase.passThrough,
+			})
+
+			assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+			assert.Contains(t, recorder.Body.String(), string(types.ErrorCodeSensitiveWordsDetected))
+			assert.Zero(t, dispatches.Load(), "sensitive final prompt must not reach the provider")
+			assert.Zero(t, quotaMutations.Load(), "sensitive final prompt must not reserve or refund quota")
+		})
+	}
+}
+
+func TestRelayTokenPricedImageRejectsInsufficientQuotaBeforeDispatch(t *testing.T) {
+	fixture := newSeedreamBillingOrderFixture(t)
+	previousCountTokens := constant.CountToken
+	constant.CountToken = true
+	t.Cleanup(func() { constant.CountToken = previousCountTokens })
+	service.InitTokenEncoders()
+	fixture.user.Quota = 1
+	fixture.token.RemainQuota = 1
+	fixture.resetQuota(t, 1)
+	quotaMutations := recordUserQuotaMutations(t, fixture.db)
+	quotaMutations.Store(0)
+
+	var dispatches atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		dispatches.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://output.invalid/image.png"}]}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	recorder := fixture.relayWithOptions(t, imageRelayOptions{
+		requestID:   "image-token-insufficient",
+		model:       tokenImageBillingOrderModel,
+		path:        "/v1/images/generations",
+		contentType: "application/json",
+		body:        []byte(`{"model":"` + tokenImageBillingOrderModel + `","prompt":"ordinary billing prompt","n":1}`),
+		baseURL:     upstream.URL,
+		usingGroup:  "default",
+		tokenGroup:  "default",
+	})
+
+	assert.Equal(t, http.StatusForbidden, recorder.Code, recorder.Body.String())
+	assert.Zero(t, dispatches.Load(), "insufficient token-priced request must not reach the provider")
+	assert.Zero(t, quotaMutations.Load(), "failed reservation must not mutate quota")
+}
+
+func TestRelayImagesRefreshesFinalOutboundInputBeforeRetryDispatch(t *testing.T) {
+	t.Run("quality override", func(t *testing.T) {
+		const firstGroup = "image-standard"
+		const retryGroup = "image-hd"
+		configureImageBillingGroups(
+			t,
+			`{"default":1,"`+firstGroup+`":1,"`+retryGroup+`":1}`,
+			`{"default":"Default","`+firstGroup+`":"Standard","`+retryGroup+`":"HD"}`,
+		)
+		fixture := newSeedreamBillingOrderFixture(t)
+		previousRetries := common.RetryTimes
+		common.RetryTimes = 1
+		t.Cleanup(func() { common.RetryTimes = previousRetries })
+		const initialQuota = 500_000
+		const standardQuota = 50_000
+		const hdQuota = 100_000
+		fixture.user.Quota = initialQuota
+		fixture.token.RemainQuota = initialQuota
+		fixture.resetQuota(t, initialQuota)
+
+		type dispatchSnapshot struct {
+			quality    string
+			userQuota  int
+			tokenQuota int
+			err        error
+		}
+		firstDispatch := make(chan dispatchSnapshot, 1)
+		firstUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			body, bodyErr := io.ReadAll(request.Body)
+			var user model.User
+			var token model.Token
+			userErr := fixture.db.First(&user, fixture.user.Id).Error
+			tokenErr := fixture.db.First(&token, fixture.token.Id).Error
+			firstDispatch <- dispatchSnapshot{
+				quality:    gjson.GetBytes(body, "quality").String(),
+				userQuota:  user.Quota,
+				tokenQuota: token.RemainQuota,
+				err:        firstError(bodyErr, userErr, tokenErr),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":{"message":"retry fixture","type":"server_error"}}`)
+		}))
+		t.Cleanup(firstUpstream.Close)
+
+		retryDispatch := make(chan dispatchSnapshot, 1)
+		retryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			body, bodyErr := io.ReadAll(request.Body)
+			var user model.User
+			var token model.Token
+			userErr := fixture.db.First(&user, fixture.user.Id).Error
+			tokenErr := fixture.db.First(&token, fixture.token.Id).Error
+			retryDispatch <- dispatchSnapshot{
+				quality:    gjson.GetBytes(body, "quality").String(),
+				userQuota:  user.Quota,
+				tokenQuota: token.RemainQuota,
+				err:        firstError(bodyErr, userErr, tokenErr),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://output.invalid/image.png"}]}`)
+		}))
+		t.Cleanup(retryUpstream.Close)
+		fixture.createRetryChannel(
+			t,
+			retryGroup,
+			qualityImageBillingOrderModel,
+			retryUpstream.URL,
+			`{"operations":[{"path":"quality","mode":"set","value":"hd"}]}`,
+		)
+
+		recorder := fixture.relayWithOptions(t, imageRelayOptions{
+			requestID:   "image-quality-retry",
+			model:       qualityImageBillingOrderModel,
+			path:        "/v1/images/generations",
+			contentType: "application/json",
+			body:        []byte(`{"model":"` + qualityImageBillingOrderModel + `","prompt":"billing fixture","quality":"standard","n":1}`),
+			baseURL:     firstUpstream.URL,
+			usingGroup:  firstGroup,
+			tokenGroup:  "auto",
+			autoGroups:  []string{firstGroup, retryGroup},
+			crossGroup:  true,
+		})
+
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		require.Len(t, firstDispatch, 1)
+		require.Len(t, retryDispatch, 1)
+		first := <-firstDispatch
+		retry := <-retryDispatch
+		require.NoError(t, first.err)
+		require.NoError(t, retry.err)
+		assert.Equal(t, "standard", first.quality)
+		assert.Equal(t, initialQuota-standardQuota, first.userQuota)
+		assert.Equal(t, initialQuota-standardQuota, first.tokenQuota)
+		assert.Equal(t, "hd", retry.quality)
+		assert.Equal(t, initialQuota-hdQuota, retry.userQuota)
+		assert.Equal(t, initialQuota-hdQuota, retry.tokenQuota)
+
+		var user model.User
+		var token model.Token
+		require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
+		require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
+		assert.Equal(t, initialQuota-hdQuota, user.Quota)
+		assert.Equal(t, hdQuota, user.UsedQuota)
+		assert.Equal(t, initialQuota-hdQuota, token.RemainQuota)
+		assert.Equal(t, hdQuota, token.UsedQuota)
+
+		var logs []model.Log
+		require.NoError(t, model.LOG_DB.
+			Where("request_id = ? AND type = ?", "image-quality-retry", model.LogTypeConsume).
+			Find(&logs).Error)
+		require.Len(t, logs, 1, "one logical request must settle exactly once")
+		assert.Equal(t, hdQuota, logs[0].Quota)
+	})
+
+	t.Run("prompt override", func(t *testing.T) {
+		const firstGroup = "image-short-prompt"
+		const retryGroup = "image-long-prompt"
+		const firstPrompt = "short prompt"
+		const retryPrompt = "this is a substantially longer image prompt used for retry token billing"
+		configureImageBillingGroups(
+			t,
+			`{"default":1,"`+firstGroup+`":1,"`+retryGroup+`":1}`,
+			`{"default":"Default","`+firstGroup+`":"Short","`+retryGroup+`":"Long"}`,
+		)
+		fixture := newSeedreamBillingOrderFixture(t)
+		previousRetries := common.RetryTimes
+		previousCountTokens := constant.CountToken
+		common.RetryTimes = 1
+		constant.CountToken = true
+		t.Cleanup(func() {
+			common.RetryTimes = previousRetries
+			constant.CountToken = previousCountTokens
+		})
+
+		service.InitTokenEncoders()
+		firstTokens := service.CountTokenInput(firstPrompt, tokenImageBillingOrderModel)
+		retryTokens := service.CountTokenInput(retryPrompt, tokenImageBillingOrderModel)
+		require.Greater(t, retryTokens, firstTokens)
+		firstQuota := billingexpr.QuotaRound(float64(firstTokens) * 100_000 / 1_000_000 * common.QuotaPerUnit)
+		retryQuota := billingexpr.QuotaRound(float64(retryTokens) * 100_000 / 1_000_000 * common.QuotaPerUnit)
+		initialQuota := retryQuota + 500_000
+		fixture.user.Quota = initialQuota
+		fixture.token.RemainQuota = initialQuota
+		fixture.resetQuota(t, initialQuota)
+
+		type dispatchSnapshot struct {
+			prompt     string
+			userQuota  int
+			tokenQuota int
+			err        error
+		}
+		firstDispatch := make(chan dispatchSnapshot, 1)
+		firstUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			body, bodyErr := io.ReadAll(request.Body)
+			var user model.User
+			var token model.Token
+			userErr := fixture.db.First(&user, fixture.user.Id).Error
+			tokenErr := fixture.db.First(&token, fixture.token.Id).Error
+			firstDispatch <- dispatchSnapshot{
+				prompt:     gjson.GetBytes(body, "prompt").String(),
+				userQuota:  user.Quota,
+				tokenQuota: token.RemainQuota,
+				err:        firstError(bodyErr, userErr, tokenErr),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":{"message":"retry fixture","type":"server_error"}}`)
+		}))
+		t.Cleanup(firstUpstream.Close)
+
+		retryDispatch := make(chan dispatchSnapshot, 1)
+		retryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			body, bodyErr := io.ReadAll(request.Body)
+			var user model.User
+			var token model.Token
+			userErr := fixture.db.First(&user, fixture.user.Id).Error
+			tokenErr := fixture.db.First(&token, fixture.token.Id).Error
+			retryDispatch <- dispatchSnapshot{
+				prompt:     gjson.GetBytes(body, "prompt").String(),
+				userQuota:  user.Quota,
+				tokenQuota: token.RemainQuota,
+				err:        firstError(bodyErr, userErr, tokenErr),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://output.invalid/image.png"}]}`)
+		}))
+		t.Cleanup(retryUpstream.Close)
+		fixture.createRetryChannel(
+			t,
+			retryGroup,
+			tokenImageBillingOrderModel,
+			retryUpstream.URL,
+			`{"operations":[{"path":"prompt","mode":"set","value":"`+retryPrompt+`"}]}`,
+		)
+
+		recorder := fixture.relayWithOptions(t, imageRelayOptions{
+			requestID:   "image-prompt-retry",
+			model:       tokenImageBillingOrderModel,
+			path:        "/v1/images/generations",
+			contentType: "application/json",
+			body:        []byte(`{"model":"` + tokenImageBillingOrderModel + `","prompt":"` + firstPrompt + `","n":1}`),
+			baseURL:     firstUpstream.URL,
+			usingGroup:  firstGroup,
+			tokenGroup:  "auto",
+			autoGroups:  []string{firstGroup, retryGroup},
+			crossGroup:  true,
+		})
+
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		require.Len(t, firstDispatch, 1)
+		require.Len(t, retryDispatch, 1)
+		first := <-firstDispatch
+		retry := <-retryDispatch
+		require.NoError(t, first.err)
+		require.NoError(t, retry.err)
+		assert.Equal(t, firstPrompt, first.prompt)
+		assert.Equal(t, initialQuota-firstQuota, first.userQuota)
+		assert.Equal(t, initialQuota-firstQuota, first.tokenQuota)
+		assert.Equal(t, retryPrompt, retry.prompt)
+		assert.Equal(t, initialQuota-retryQuota, retry.userQuota)
+		assert.Equal(t, initialQuota-retryQuota, retry.tokenQuota)
+
+		var user model.User
+		var token model.Token
+		require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
+		require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
+		assert.Equal(t, initialQuota-retryQuota, user.Quota)
+		assert.Equal(t, retryQuota, user.UsedQuota)
+		assert.Equal(t, initialQuota-retryQuota, token.RemainQuota)
+		assert.Equal(t, retryQuota, token.UsedQuota)
+
+		var logs []model.Log
+		require.NoError(t, model.LOG_DB.
+			Where("request_id = ? AND type = ?", "image-prompt-retry", model.LogTypeConsume).
+			Find(&logs).Error)
+		require.Len(t, logs, 1, "one logical request must settle exactly once")
+		assert.Equal(t, retryQuota, logs[0].Quota)
+	})
 }
 
 func TestRelaySeedreamValidRequestBillsOnceAroundProviderDispatch(t *testing.T) {

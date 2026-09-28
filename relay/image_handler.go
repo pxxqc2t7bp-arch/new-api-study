@@ -22,6 +22,15 @@ import (
 )
 
 func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
+	hadBillingSession := info.Billing != nil
+	previousBillingRequestInput := info.BillingRequestInput
+	retainFailedAttemptBillingInput := false
+	defer func() {
+		if newAPIError != nil && hadBillingSession && !retainFailedAttemptBillingInput {
+			info.BillingRequestInput = previousBillingRequestInput
+		}
+	}()
+
 	info.InitChannelMeta(c)
 	info.BillingImageCount = nil
 	info.ImageRequestCount = 0
@@ -142,18 +151,11 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	if outboundBilling != nil {
 		billingRequest = outboundBilling.Request
 		imageCount = outboundBilling.Count
-		if info.Billing == nil || info.BillingRequestInput == nil {
-			info.BillingRequestInput = &outboundBilling.Input
-		} else {
-			info.BillingRequestInput.ImagesUpTo1_5K = outboundBilling.Input.ImagesUpTo1_5K
-			info.BillingRequestInput.ImagesAbove1_5K = outboundBilling.Input.ImagesAbove1_5K
-			info.BillingRequestInput.InputImages = outboundBilling.Input.InputImages
-			if outboundBilling.Input.ImagesUpTo1_5K != nil ||
-				outboundBilling.Input.ImagesAbove1_5K != nil ||
-				outboundBilling.Input.InputImages != nil {
-				info.BillingRequestInput.ImageCount = outboundBilling.Input.ImageCount
-			}
-		}
+		info.BillingRequestInput = &outboundBilling.Input
+		retainFailedAttemptBillingInput = len(outboundBilling.Input.Body) == 0
+	}
+	if billingErr := service.RefreshImageBillingRequestContext(c, info, billingRequest); billingErr != nil {
+		return billingErr
 	}
 	if info.Billing == nil {
 		originalRequest := info.Request
@@ -207,11 +209,11 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 		imageN = common.QuotaRound(count)
 	}
 
-	if usage.(*dto.Usage).TotalTokens == 0 {
-		usage.(*dto.Usage).TotalTokens = 1
-	}
 	if usage.(*dto.Usage).PromptTokens == 0 {
-		usage.(*dto.Usage).PromptTokens = 1
+		usage.(*dto.Usage).PromptTokens = max(info.GetEstimatePromptTokens(), 1)
+	}
+	if usage.(*dto.Usage).TotalTokens == 0 {
+		usage.(*dto.Usage).TotalTokens = usage.(*dto.Usage).PromptTokens + usage.(*dto.Usage).CompletionTokens
 	}
 
 	quality := request.Quality

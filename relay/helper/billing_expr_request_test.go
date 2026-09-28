@@ -194,6 +194,11 @@ func TestResolveIncomingBillingExprRequestInputFreezesSeedreamScalars(t *testing
 func TestResolveOutboundImageBillingJSONPreservesOriginIdentity(t *testing.T) {
 	info := &relaycommon.RelayInfo{
 		Request: &dto.ImageRequest{Model: "billing-origin-image"},
+		BillingRequestInput: &billingexpr.RequestInput{
+			Headers:         map[string]string{"X-Frozen": "yes"},
+			Body:            []byte(`{"quality":"standard"}`),
+			EvaluatedAtUnix: 123,
+		},
 	}
 	resolved, err := ResolveOutboundImageBillingJSON(info, []byte(`{
 		"model":"provider-image-alias",
@@ -206,11 +211,16 @@ func TestResolveOutboundImageBillingJSONPreservesOriginIdentity(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resolved)
 	assert.Equal(t, "billing-origin-image", resolved.Request.Model)
+	assert.Equal(t, "secret prompt", resolved.Request.Prompt)
 	assert.Equal(t, 2, resolved.Count)
+	assert.Equal(t, "yes", resolved.Input.Headers["X-Frozen"])
+	assert.Equal(t, int64(123), resolved.Input.EvaluatedAtUnix)
 	assert.Equal(t, "billing-origin-image", gjson.GetBytes(resolved.Input.Body, "model").String())
 	assert.Equal(t, int64(2), gjson.GetBytes(resolved.Input.Body, "n").Int())
+	assert.Equal(t, "hd", gjson.GetBytes(resolved.Input.Body, "quality").String())
 	assert.Equal(t, int64(3), gjson.GetBytes(resolved.Input.Body, "parameters.n").Int())
 	assert.NotContains(t, string(resolved.Input.Body), "secret")
+	assert.NotContains(t, string(resolved.Input.Body), "prompt")
 }
 
 func TestResolveOutboundImageBillingMultipartKeepsOnlySeedreamScalars(t *testing.T) {
@@ -233,11 +243,12 @@ func TestResolveOutboundImageBillingMultipartKeepsOnlySeedreamScalars(t *testing
 	require.NoError(t, err)
 	require.NotNil(t, resolved)
 	assert.Equal(t, "doubao-seedream-5-0-pro-260628", resolved.Request.Model)
+	assert.Equal(t, "secret multipart prompt", resolved.Request.Prompt)
 	assert.Equal(t, 2, resolved.Count)
 	assert.Equal(t, float64(2), imageRequestScalar(t, resolved.Input, "ImagesUpTo1_5K"))
 	assert.Equal(t, float64(0), imageRequestScalar(t, resolved.Input, "ImagesAbove1_5K"))
 	assert.Equal(t, float64(1), imageRequestScalar(t, resolved.Input, "InputImages"))
-	encoded, err := common.Marshal(resolved)
+	encoded, err := common.Marshal(resolved.Input)
 	require.NoError(t, err)
 	assert.NotContains(t, string(encoded), "secret")
 	assert.NotContains(t, string(encoded), "image bytes")

@@ -4,14 +4,40 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting"
 	"github.com/gin-gonic/gin"
 )
+
+// RefreshImageBillingRequestContext validates and estimates the final request
+// for a retry without creating a second billing session.
+func RefreshImageBillingRequestContext(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ImageRequest) *types.NewAPIError {
+	meta := request.GetTokenCountMeta()
+	if setting.ShouldCheckPromptSensitive() {
+		if contains, words := CheckSensitiveText(meta.CombineText); contains {
+			RequestPolicy(c).AddEvent(PolicyEvent{ErrorCode: string(types.ErrorCodeSensitiveWordsDetected), ErrorSource: "local", Decision: PolicyDecision{Action: "stop", Reason: "local_rejection", Source: "global"}, Health: "unchanged"})
+			message := fmt.Sprintf("user sensitive words detected: %s", strings.Join(words, ", "))
+			logger.LogWarn(c, message)
+			return types.NewErrorWithStatusCode(errors.New(message), types.ErrorCodeSensitiveWordsDetected, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+	}
+	tokens, err := EstimateRequestToken(c, meta, info)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeCountTokenFailed)
+	}
+	info.SetEstimatePromptTokens(tokens)
+	if snap := info.TieredBillingSnapshot; snap != nil && snap.BillingMode == "tiered_expr" {
+		snap.EstimatedPromptTokens = tokens
+	}
+	return nil
+}
 
 // PrepareImageBillingForRequest reserves the effective outbound image billing
 // inputs before each attempt, including channel retries and parameter overrides.
@@ -23,17 +49,6 @@ func PrepareImageBillingForRequest(c *gin.Context, info *relaycommon.RelayInfo, 
 	var quota int
 	var err error
 	if snap := info.TieredBillingSnapshot; snap != nil && snap.BillingMode == "tiered_expr" {
-		usedVars := billingexpr.UsedVarsByHash(snap.ExprString, snap.ExprHash)
-		requestBilled := usedVars["image_count"] ||
-			usedVars["images_up_to_1_5k"] ||
-			usedVars["images_above_1_5k"] ||
-			usedVars["input_images"]
-		if !requestBilled {
-			if snap.GroupRatio == info.PriceData.GroupRatioInfo.GroupRatio {
-				return nil
-			}
-			return PrepareTieredBillingForSelectedGroup(c, info)
-		}
 		request := billingexpr.RequestInput{}
 		if info.BillingRequestInput != nil {
 			request = *info.BillingRequestInput

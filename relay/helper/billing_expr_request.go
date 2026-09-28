@@ -194,6 +194,7 @@ func ResolveOutboundImageBillingJSON(info *relaycommon.RelayInfo, outboundJSON [
 
 	var outbound struct {
 		N                  *uint           `json:"n"`
+		Prompt             string          `json:"prompt"`
 		Size               string          `json:"size"`
 		Quality            string          `json:"quality"`
 		Image              json.RawMessage `json:"image"`
@@ -222,6 +223,7 @@ func ResolveOutboundImageBillingJSON(info *relaycommon.RelayInfo, outboundJSON [
 	}
 	return resolveOutboundImageBilling(info, &dto.ImageRequest{
 		Model:              incoming.Model,
+		Prompt:             outbound.Prompt,
 		N:                  outbound.N,
 		Size:               outbound.Size,
 		Quality:            outbound.Quality,
@@ -271,7 +273,7 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 			continue
 		}
 		switch name {
-		case "n", "size", "quality", "layer_decomposition", "parameters":
+		case "prompt", "n", "size", "quality", "layer_decomposition", "parameters":
 			if seen[name] {
 				_, err = io.Copy(io.Discard, part)
 				_ = part.Close()
@@ -281,12 +283,22 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 				continue
 			}
 			seen[name] = true
-			value, valueErr := readMultipartBillingScalar(part)
+			var value string
+			var valueErr error
+			if name == "prompt" {
+				var prompt []byte
+				prompt, valueErr = io.ReadAll(part)
+				value = string(prompt)
+			} else {
+				value, valueErr = readMultipartBillingScalar(part)
+			}
 			_ = part.Close()
 			if valueErr != nil {
 				return nil, valueErr
 			}
 			switch name {
+			case "prompt":
+				outbound.Prompt = value
 			case "n":
 				parsed, parseErr := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
 				if parseErr != nil || parsed > dto.MaxImageN {
@@ -337,6 +349,7 @@ func resolveOutboundImageBilling(info *relaycommon.RelayInfo, outbound *dto.Imag
 
 	billingRequest := &dto.ImageRequest{
 		Model:              incoming.Model,
+		Prompt:             outbound.Prompt,
 		N:                  outbound.N,
 		Size:               outbound.Size,
 		Quality:            outbound.Quality,
