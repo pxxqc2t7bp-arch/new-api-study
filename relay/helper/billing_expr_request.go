@@ -87,18 +87,6 @@ func seedreamReferenceImageCount(raw []byte) (int, error) {
 	return len(multiple), nil
 }
 
-func seedreamLayerDecomposition(request *dto.ImageRequest) (bool, error) {
-	raw, exists := request.Extra["layer_decomposition"]
-	if !exists {
-		return false, nil
-	}
-	var enabled bool
-	if err := common.Unmarshal(raw, &enabled); err != nil {
-		return false, fmt.Errorf("layer_decomposition must be a boolean")
-	}
-	return enabled, nil
-}
-
 func seedreamSizeIsLowerTier(size string) bool {
 	switch strings.ToUpper(strings.TrimSpace(size)) {
 	case "1K", "1.5K":
@@ -145,10 +133,7 @@ func ResolveImageBillingRequestInput(c *gin.Context, info *relaycommon.RelayInfo
 		if referenceImages > profile.maxReferenceImages {
 			return input, fmt.Errorf("at most %d reference images are supported", profile.maxReferenceImages)
 		}
-		layered, err := seedreamLayerDecomposition(request)
-		if err != nil {
-			return input, err
-		}
+		layered := request.LayerDecomposition != nil && *request.LayerDecomposition
 		if layered {
 			if !profile.layerDecomposition {
 				return input, fmt.Errorf("layer_decomposition is not supported by this model")

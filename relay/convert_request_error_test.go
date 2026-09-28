@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
+	"github.com/QuantumNous/new-api/relay/channel/volcengine"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -41,6 +42,120 @@ func (s *imageReservation) GetPreConsumedQuota() int { return s.held }
 func (*imageReservation) Settle(int) error           { return nil }
 func (*imageReservation) Refund(*gin.Context)        {}
 func (*imageReservation) NeedsRefund() bool          { return false }
+
+type seedreamSettlementRecorder struct {
+	preConsumedQuota int
+	settleCalls      int
+	settledQuota     int
+}
+
+func (s *seedreamSettlementRecorder) Reserve(quota int) error {
+	s.preConsumedQuota = max(s.preConsumedQuota, quota)
+	return nil
+}
+
+func (s *seedreamSettlementRecorder) GetPreConsumedQuota() int {
+	return s.preConsumedQuota
+}
+
+func (s *seedreamSettlementRecorder) Settle(quota int) error {
+	s.settleCalls++
+	s.settledQuota = quota
+	return nil
+}
+
+func (*seedreamSettlementRecorder) Refund(*gin.Context) {}
+func (*seedreamSettlementRecorder) NeedsRefund() bool   { return false }
+
+func TestSeedreamLayerDecompositionOutboundMatchesFrozenSettlement(t *testing.T) {
+	const (
+		modelName = "doubao-seedream-5-0-pro-260628"
+		expr      = `tier("per_image", fixed(images_up_to_1_5k * 0.04109589041 + images_above_1_5k * 0.08219178082 + max(input_images - 1, 0) * 0.002739726027))`
+	)
+	body := `{
+		"model":"` + modelName + `",
+		"prompt":"a red observatory",
+		"size":"1K",
+		"image":"https://input.example/reference.png",
+		"layer_decomposition":true,
+		"vendor_private":{"must":"stay omitted"}
+	}`
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	request, err := helper.GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesGenerations)
+	require.NoError(t, err)
+	info := &relaycommon.RelayInfo{
+		Request:         request,
+		OriginModelName: modelName,
+		RelayMode:       relayconstant.RelayModeImagesGenerations,
+	}
+	input, err := helper.ResolveImageBillingRequestInput(c, info, billingexpr.RequestInput{Body: []byte(body)})
+	require.NoError(t, err)
+	require.NotNil(t, input.ImagesUpTo1_5K)
+	require.NotNil(t, input.ImagesAbove1_5K)
+	require.NotNil(t, input.InputImages)
+	assert.Equal(t, float64(17), *input.ImagesUpTo1_5K)
+	assert.Equal(t, float64(0), *input.ImagesAbove1_5K)
+	assert.Equal(t, float64(1), *input.InputImages)
+	assert.Empty(t, input.Body)
+	frozenJSON, err := common.Marshal(input)
+	require.NoError(t, err)
+	assert.NotContains(t, string(frozenJSON), "observatory")
+	assert.NotContains(t, string(frozenJSON), "reference.png")
+
+	converted, err := (&volcengine.Adaptor{}).ConvertImageRequest(c, info, *request)
+	require.NoError(t, err)
+	outboundJSON, err := common.Marshal(converted)
+	require.NoError(t, err)
+	assert.True(t, gjson.GetBytes(outboundJSON, "layer_decomposition").Exists())
+	assert.True(t, gjson.GetBytes(outboundJSON, "layer_decomposition").Bool())
+	assert.False(t, gjson.GetBytes(outboundJSON, "vendor_private").Exists())
+
+	expectedFixedPrice := 17 * 0.04109589041
+	expectedQuota := billingexpr.QuotaRound(expectedFixedPrice * float64(common.QuotaPerUnit))
+	settler := &seedreamSettlementRecorder{preConsumedQuota: expectedQuota}
+	info.BillingRequestInput = &input
+	info.TieredBillingSnapshot = &billingexpr.BillingSnapshot{
+		BillingMode:              "tiered_expr",
+		ExprString:               expr,
+		ExprHash:                 billingexpr.ExprHashString(expr),
+		GroupRatio:               1,
+		QuotaPerUnit:             float64(common.QuotaPerUnit),
+		EstimatedQuotaAfterGroup: expectedQuota,
+		EstimatedBillingUnit:     billingexpr.BillingUnitRequest,
+		EstimatedFixedPrice:      common.GetPointer(expectedFixedPrice),
+	}
+	info.FinalPreConsumedQuota = expectedQuota
+	info.UserQuota = expectedQuota + common.QuotaRemindThreshold
+	info.Billing = settler
+
+	directResult, err := billingexpr.ComputeTieredQuotaWithRequest(info.TieredBillingSnapshot, billingexpr.TokenParams{}, input)
+	require.NoError(t, err)
+	assert.Equal(t, expectedQuota, directResult.ActualQuotaAfterGroup)
+	ok, settledQuota, result := service.TryTieredSettle(info, billingexpr.TokenParams{})
+	require.True(t, ok)
+	require.NotNil(t, result)
+	assert.Equal(t, expectedQuota, settledQuota)
+	assert.Equal(t, billingexpr.BillingUnitRequest, result.BillingUnit)
+	require.NoError(t, service.SettleBilling(c, info, settledQuota))
+	assert.Equal(t, 1, settler.settleCalls)
+	assert.Equal(t, expectedQuota, settler.settledQuota)
+}
+
+func TestSeedreamLayerDecompositionRequiresBooleanJSON(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/v1/images/generations",
+		strings.NewReader(`{"model":"doubao-seedream-5-0-pro-260628","image":"https://input.example/reference.png","layer_decomposition":"true"}`),
+	)
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	_, err := helper.GetAndValidOpenAIImageRequest(c, relayconstant.RelayModeImagesGenerations)
+	require.ErrorContains(t, err, "cannot unmarshal")
+}
 
 func TestImageRequestReservesFinalQuantityBeforeUpstream(t *testing.T) {
 	service.InitHttpClient()
