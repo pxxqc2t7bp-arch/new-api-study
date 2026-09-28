@@ -38,6 +38,21 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	if !ok {
 		return types.NewErrorWithStatusCode(fmt.Errorf("invalid request type, expected dto.ImageRequest, got %T", info.Request), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
+	if strings.Contains(c.Request.Header.Get("Content-Type"), "multipart/form-data") {
+		form := c.Request.MultipartForm
+		if form == nil {
+			var parseErr error
+			form, parseErr = common.ParseMultipartFormReusable(c)
+			if parseErr != nil {
+				return types.NewErrorWithStatusCode(fmt.Errorf("invalid image multipart request: %w", parseErr), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+			c.Request.MultipartForm = form
+			c.Request.PostForm = form.Value
+		}
+		if fieldErr := helper.ValidateImageMultipartFileFields(form); fieldErr != nil {
+			return types.NewErrorWithStatusCode(fieldErr, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		}
+	}
 
 	request, copyErr := common.DeepCopy(imageReq)
 	if copyErr != nil {

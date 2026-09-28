@@ -930,6 +930,77 @@ func TestRelayOpenAIRejectsSensitiveAllowedScalarBeforeBillingAndDispatch(t *tes
 	assert.Zero(t, quotaMutations.Load(), "sensitive scalar must not reserve or refund quota")
 }
 
+func TestRelayRejectsAmbiguousRawMultipartImageFieldsBeforeConversion(t *testing.T) {
+	fixture := newSeedreamBillingOrderFixture(t)
+	quotaMutations := recordUserQuotaMutations(t, fixture.db)
+	var dispatches atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		dispatches.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(upstream.Close)
+
+	buildBody := func(t *testing.T, imageFields ...string) ([]byte, string) {
+		t.Helper()
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		require.NoError(t, writer.WriteField("model", seedreamBillingOrderModel))
+		require.NoError(t, writer.WriteField("prompt", "secret multipart prompt"))
+		require.NoError(t, writer.WriteField("n", "1"))
+		for index, field := range imageFields {
+			image, err := writer.CreateFormFile(field, fmt.Sprintf("secret-%d.png", index))
+			require.NoError(t, err)
+			_, err = image.Write([]byte("secret image bytes"))
+			require.NoError(t, err)
+		}
+		require.NoError(t, writer.Close())
+		return body.Bytes(), writer.FormDataContentType()
+	}
+
+	for _, imageFields := range [][]string{
+		{"image[bad]"},
+		{"image[01]"},
+		{"image[1]"},
+		{"image[0]", "image[0]"},
+		{"image[0]", "image[2]"},
+		{"image", "image[]"},
+		{"image", "image[0]"},
+		{"image[]", "image[0]"},
+	} {
+		name := strings.Join(imageFields, "+")
+		t.Run(name, func(t *testing.T) {
+			const initialQuota = 500_000
+			fixture.user.Quota = initialQuota
+			fixture.token.RemainQuota = initialQuota
+			fixture.resetQuota(t, initialQuota)
+			quotaMutations.Store(0)
+			dispatches.Store(0)
+			body, contentType := buildBody(t, imageFields...)
+
+			recorder := fixture.relayWithOptions(t, imageRelayOptions{
+				requestID: "raw-multipart-image-fields-" + name,
+				model:     seedreamBillingOrderModel,
+				path:      "/v1/images/edits", contentType: contentType, body: body,
+				baseURL: upstream.URL, usingGroup: "default", tokenGroup: "default",
+				passThrough: false,
+			})
+
+			assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+			assert.Contains(t, recorder.Body.String(), "image")
+			assert.Zero(t, dispatches.Load(), "invalid raw image fields must not dispatch")
+			assert.Zero(t, quotaMutations.Load(), "invalid raw image fields must not reserve or refund quota")
+
+			var user model.User
+			var token model.Token
+			require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
+			require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
+			assert.Equal(t, initialQuota, user.Quota)
+			assert.Equal(t, initialQuota, token.RemainQuota)
+		})
+	}
+
+}
+
 func TestRelaySeedreamIndexedReferencesAffectBillingAndLayerCardinality(t *testing.T) {
 	buildBody := func(t *testing.T, layered bool, imageFields ...string) ([]byte, string) {
 		t.Helper()

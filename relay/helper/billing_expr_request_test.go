@@ -396,7 +396,7 @@ func TestResolveOutboundImageBillingJSONSupportsRemainingNativeSchemas(t *testin
 				"req_key":"mapped-model",
 				"prompt":"jimeng secret",
 				"seed":-1,
-				"width":1024,
+				"width":768,
 				"height":768,
 				"use_pre_llm":true,
 				"use_sr":false,
@@ -410,7 +410,7 @@ func TestResolveOutboundImageBillingJSONSupportsRemainingNativeSchemas(t *testin
 				assert.Equal(t, "billing-origin", gjson.GetBytes(body, "model").String())
 				assert.Equal(t, int64(1), gjson.GetBytes(body, "n").Int())
 				assert.Equal(t, int64(-1), gjson.GetBytes(body, "seed").Int())
-				assert.Equal(t, "1024x768", gjson.GetBytes(body, "resolution").String())
+				assert.Equal(t, "768x768", gjson.GetBytes(body, "resolution").String())
 				assert.True(t, gjson.GetBytes(body, "logo_info.add_logo").Bool())
 				assert.InDelta(t, 0.5, gjson.GetBytes(body, "logo_info.opacity").Float(), 1e-9)
 				assert.False(t, gjson.GetBytes(body, "req_key").Exists())
@@ -447,6 +447,25 @@ func TestResolveOutboundImageBillingJSONSupportsRemainingNativeSchemas(t *testin
 			assert.False(t, gjson.GetBytes(resolved.Input.Body, "input.prompt").Exists())
 		})
 	}
+}
+
+func TestResolveOutboundImageBillingJSONUsesOnlyBoundedTypesWithoutJimengSourceRanges(t *testing.T) {
+	resolved, err := ResolveOutboundImageBillingJSON(
+		outboundImageBillingInfo(constant.APITypeJimeng, "billing-origin"),
+		[]byte(`{
+			"prompt":"jimeng secret",
+			"seed":-2,
+			"width":256,
+			"height":768,
+			"logo_info":{"position":-1,"language":-1,"opacity":2}
+		}`),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, int64(-2), gjson.GetBytes(resolved.Input.Body, "seed").Int())
+	assert.Equal(t, int64(-1), gjson.GetBytes(resolved.Input.Body, "logo_info.position").Int())
+	assert.Equal(t, int64(-1), gjson.GetBytes(resolved.Input.Body, "logo_info.language").Int())
+	assert.InDelta(t, 2, gjson.GetBytes(resolved.Input.Body, "logo_info.opacity").Float(), 1e-9)
 }
 
 func TestResolveOutboundImageBillingJSONExposesOnlyAllowedOpenAIScalars(t *testing.T) {
@@ -702,6 +721,127 @@ func TestResolveOutboundImageBillingJSONFailsClosedForUnknownOrInvalidShape(t *t
 	}
 }
 
+func TestResolveOutboundImageBillingJSONRejectsProtocolInvalidScalars(t *testing.T) {
+	tests := []struct {
+		name      string
+		apiType   int
+		payload   string
+		wantError string
+	}{
+		{
+			name: "OpenAI size", apiType: constant.APITypeOpenAI,
+			payload:   `{"prompt":"secret","n":1,"size":"not-a-size"}`,
+			wantError: "size",
+		},
+		{
+			name: "OpenAI quality", apiType: constant.APITypeOpenAI,
+			payload:   `{"prompt":"secret","n":1,"quality":"not-a-quality"}`,
+			wantError: "quality",
+		},
+		{
+			name: "OpenAI response format", apiType: constant.APITypeOpenAI,
+			payload:   `{"prompt":"secret","n":1,"response_format":"raw"}`,
+			wantError: "response_format",
+		},
+		{
+			name: "OpenAI style", apiType: constant.APITypeOpenAI,
+			payload:   `{"prompt":"secret","n":1,"style":"photographic"}`,
+			wantError: "style",
+		},
+		{
+			name: "OpenAI background", apiType: constant.APITypeOpenAI,
+			payload:   `{"prompt":"secret","n":1,"background":"blue"}`,
+			wantError: "background",
+		},
+		{
+			name: "OpenAI moderation", apiType: constant.APITypeOpenAI,
+			payload:   `{"prompt":"secret","n":1,"moderation":"strict"}`,
+			wantError: "moderation",
+		},
+		{
+			name: "OpenAI output format", apiType: constant.APITypeOpenAI,
+			payload:   `{"prompt":"secret","n":1,"output_format":"gif"}`,
+			wantError: "output_format",
+		},
+		{
+			name: "OpenAI input fidelity", apiType: constant.APITypeOpenAI,
+			payload:   `{"prompt":"secret","n":1,"input_fidelity":"medium"}`,
+			wantError: "input_fidelity",
+		},
+		{
+			name: "Gemini image size", apiType: constant.APITypeGemini,
+			payload:   `{"instances":[{"prompt":"secret"}],"parameters":{"sampleCount":1,"imageSize":"3K"}}`,
+			wantError: "parameters.imageSize",
+		},
+		{
+			name: "Gemini aspect ratio shape", apiType: constant.APITypeGemini,
+			payload:   `{"instances":[{"prompt":"secret"}],"parameters":{"sampleCount":1,"aspectRatio":"not-a-ratio"}}`,
+			wantError: "parameters.aspectRatio",
+		},
+		{
+			name: "Gemini person generation", apiType: constant.APITypeGemini,
+			payload:   `{"instances":[{"prompt":"secret"}],"parameters":{"sampleCount":1,"personGeneration":"sometimes"}}`,
+			wantError: "parameters.personGeneration",
+		},
+		{
+			name: "Replicate aspect ratio", apiType: constant.APITypeReplicate,
+			payload:   `{"input":{"prompt":"secret","num_outputs":1,"aspect_ratio":"7:5"}}`,
+			wantError: "input.aspect_ratio",
+		},
+		{
+			name: "Replicate width below converter range", apiType: constant.APITypeReplicate,
+			payload:   `{"input":{"prompt":"secret","num_outputs":1,"width":255,"height":768}}`,
+			wantError: "input.width",
+		},
+		{
+			name: "Replicate width outside converter step", apiType: constant.APITypeReplicate,
+			payload:   `{"input":{"prompt":"secret","num_outputs":1,"width":257,"height":768}}`,
+			wantError: "input.width",
+		},
+		{
+			name: "SiliconFlow image size", apiType: constant.APITypeSiliconFlow,
+			payload:   `{"prompt":"secret","batch_size":1,"image_size":"c2VjcmV0"}`,
+			wantError: "image_size",
+		},
+		{
+			name: "MiniMax aspect ratio", apiType: constant.APITypeMiniMax,
+			payload:   `{"prompt":"secret","n":1,"aspect_ratio":"7:5"}`,
+			wantError: "aspect_ratio",
+		},
+		{
+			name: "MiniMax response format", apiType: constant.APITypeMiniMax,
+			payload:   `{"prompt":"secret","n":1,"response_format":"b64_json"}`,
+			wantError: "response_format",
+		},
+		{
+			name: "Jimeng width below protocol range", apiType: constant.APITypeJimeng,
+			payload:   `{"prompt":"secret","width":255,"height":768}`,
+			wantError: "width",
+		},
+		{
+			name: "Jimeng height above protocol range", apiType: constant.APITypeJimeng,
+			payload:   `{"prompt":"secret","width":256,"height":769}`,
+			wantError: "height",
+		},
+		{
+			name: "xAI response format", apiType: constant.APITypeXai,
+			payload:   `{"prompt":"secret","n":1,"response_format":"raw"}`,
+			wantError: "response_format",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			resolved, err := ResolveOutboundImageBillingJSON(
+				outboundImageBillingInfo(testCase.apiType, "billing-origin"),
+				[]byte(testCase.payload),
+			)
+			require.ErrorContains(t, err, testCase.wantError)
+			assert.Nil(t, resolved)
+		})
+	}
+}
+
 func TestResolveOutboundImageBillingJSONRejectsSensitiveAllowedScalar(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -709,6 +849,7 @@ func TestResolveOutboundImageBillingJSONRejectsSensitiveAllowedScalar(t *testing
 	}{
 		{name: "data URI", payload: `{"prompt":"secret","n":1,"output_compression":"data:image/png;base64,c2VjcmV0"}`},
 		{name: "URL", payload: `{"prompt":"secret","n":1,"quality":"https://secret.invalid/image.png"}`},
+		{name: "short base64", payload: `{"prompt":"secret","n":1,"quality":"c2VjcmV0"}`},
 		{name: "base64", payload: `{"prompt":"secret","n":1,"quality":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"}`},
 		{name: "control character", payload: `{"prompt":"secret","n":1,"quality":"high\nsecret"}`},
 		{name: "overlong", payload: fmt.Sprintf(
@@ -726,6 +867,16 @@ func TestResolveOutboundImageBillingJSONRejectsSensitiveAllowedScalar(t *testing
 			assert.Nil(t, resolved, "rejected sensitive scalars must not produce retained billing input")
 		})
 	}
+}
+
+func TestResolveOutboundImageBillingJSONAllowsKnownShortWordThatDecodesAsBase64(t *testing.T) {
+	resolved, err := ResolveOutboundImageBillingJSON(
+		outboundImageBillingInfo(constant.APITypeReplicate, "billing-origin"),
+		[]byte(`{"input":{"prompt":"secret","num_outputs":1,"output_format":"webp"}}`),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, "webp", gjson.GetBytes(resolved.Input.Body, "input.output_format").String())
 }
 
 func TestResolveOutboundImageBillingMultipartRejectsFileContentAsScalar(t *testing.T) {
@@ -886,6 +1037,76 @@ func TestResolveOutboundImageBillingJSONAndMultipartShareScalarSemantics(t *test
 			require.NoError(t, runErr)
 			assert.Equal(t, "safe", trace.MatchedTier)
 			assert.InDelta(t, 200_000, cost, 1e-9)
+		})
+	}
+}
+
+func TestResolveOutboundImageBillingMultipartRejectsNonJSONBooleanSyntax(t *testing.T) {
+	for _, field := range []string{"stream", "watermark", "layer_decomposition", "watermark_enabled"} {
+		for _, value := range []string{"1", "t", "TRUE", "False"} {
+			t.Run(field+"="+value, func(t *testing.T) {
+				var body bytes.Buffer
+				writer := multipart.NewWriter(&body)
+				require.NoError(t, writer.WriteField("n", "1"))
+				require.NoError(t, writer.WriteField(field, value))
+				require.NoError(t, writer.Close())
+
+				resolved, err := ResolveOutboundImageBillingMultipart(
+					outboundImageBillingInfo(constant.APITypeOpenAI, "billing-origin"),
+					writer.FormDataContentType(),
+					bytes.NewReader(body.Bytes()),
+				)
+				require.ErrorContains(t, err, field)
+				assert.Nil(t, resolved)
+			})
+		}
+	}
+}
+
+func TestResolveOutboundImageBillingMultipartRejectsProtocolInvalidEnums(t *testing.T) {
+	for field, value := range map[string]string{
+		"size":            "not-a-size",
+		"quality":         "not-a-quality",
+		"response_format": "raw",
+		"style":           "photographic",
+		"background":      "blue",
+		"moderation":      "strict",
+		"output_format":   "gif",
+		"input_fidelity":  "medium",
+	} {
+		t.Run(field, func(t *testing.T) {
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			require.NoError(t, writer.WriteField("n", "1"))
+			require.NoError(t, writer.WriteField(field, value))
+			require.NoError(t, writer.Close())
+
+			resolved, err := ResolveOutboundImageBillingMultipart(
+				outboundImageBillingInfo(constant.APITypeOpenAI, "billing-origin"),
+				writer.FormDataContentType(),
+				bytes.NewReader(body.Bytes()),
+			)
+			require.ErrorContains(t, err, field)
+			assert.Nil(t, resolved)
+		})
+	}
+}
+
+func TestValidateImageMultipartFileFieldsRejectsAmbiguousValueFieldsBeforeConversion(t *testing.T) {
+	tests := []struct {
+		name   string
+		values map[string][]string
+	}{
+		{name: "malformed index", values: map[string][]string{"image[bad]": {"secret"}}},
+		{name: "duplicate index", values: map[string][]string{"image[0]": {"first", "second"}}},
+		{name: "index gap", values: map[string][]string{"image[0]": {"first"}, "image[2]": {"third"}}},
+		{name: "mixed forms", values: map[string][]string{"image": {"first"}, "image[0]": {"second"}}},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := ValidateImageMultipartFileFields(&multipart.Form{Value: testCase.values})
+			require.ErrorContains(t, err, "image")
 		})
 	}
 }

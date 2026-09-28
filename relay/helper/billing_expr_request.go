@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -57,9 +59,27 @@ const (
 )
 
 var (
-	seedreamImageSizePattern  = regexp.MustCompile(`^([0-9]+)\s*[xX*]\s*([0-9]+)$`)
-	imageBillingScalarPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:+*-]{0,127}$`)
-	indexedImageFieldPattern  = regexp.MustCompile(`^image\[(0|[1-9][0-9]*)\]$`)
+	seedreamImageSizePattern        = regexp.MustCompile(`^([0-9]+)\s*[xX*]\s*([0-9]+)$`)
+	imageBillingSizePattern         = regexp.MustCompile(`^([0-9]+)[xX*]([0-9]+)$`)
+	imageBillingAspectRatioPattern  = regexp.MustCompile(`^([0-9]+):([0-9]+)$`)
+	imageBillingScalarPattern       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:+*-]{0,127}$`)
+	imageBillingIdentifierPattern   = regexp.MustCompile(`^[a-z][a-z0-9_.+-]{0,31}$`)
+	imageBillingHostnamePattern     = regexp.MustCompile(`(?i)^(?:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.)+[a-z]{2,63}(?::[0-9]{1,5})?$`)
+	imageBillingSchemePattern       = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*:`)
+	indexedImageFieldPattern        = regexp.MustCompile(`^image\[(0|[1-9][0-9]*)\]$`)
+	imageBillingSizeValues          = []string{"auto", "1K", "1.5K", "2K", "3K", "4K"}
+	openAIImageQualityValues        = []string{"auto", "high", "medium", "low", "hd", "standard"}
+	openAIImageResponseFormatValues = []string{"url", "b64_json"}
+	openAIImageStyleValues          = []string{"vivid", "natural"}
+	openAIImageBackgroundValues     = []string{"auto", "opaque", "transparent"}
+	openAIImageModerationValues     = []string{"auto", "low"}
+	openAIImageOutputFormatValues   = []string{"png", "jpeg", "webp"}
+	openAIImageInputFidelityValues  = []string{"low", "high"}
+	geminiImageSizeValues           = []string{"1K", "2K"}
+	geminiPersonGenerationValues    = []string{"allow_adult", "dont_allow"}
+	replicateAspectRatioValues      = []string{"1:1", "16:9", "9:16", "3:2", "2:3", "4:5", "5:4", "3:4", "4:3", "custom"}
+	miniMaxAspectRatioValues        = []string{"1:1", "16:9", "4:3", "3:2", "2:3", "3:4", "9:16", "21:9"}
+	miniMaxResponseFormatValues     = []string{"url", "base64"}
 )
 
 type seedreamRequestProfile struct {
@@ -269,11 +289,13 @@ func resolveOpenAIImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageR
 		return nil, err
 	}
 	body := canonicalImageBillingBody(incoming.Model, count)
-	if err = copyImageBillingStrings(body, object, "",
+	for _, key := range []string{
 		"size", "quality", "response_format", "style", "background", "moderation",
 		"output_format", "input_fidelity",
-	); err != nil {
-		return nil, err
+	} {
+		if err = copyValidatedImageBillingString(body, object, key, key, validateOpenAIImageBillingString); err != nil {
+			return nil, err
+		}
 	}
 	if err = copyImageBillingIntegers(body, object, "", 0, 100, "output_compression"); err != nil {
 		return nil, err
@@ -312,11 +334,15 @@ func resolveOpenAIImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageR
 		}
 	}
 
-	size, err := optionalSafeImageBillingString(object, "size", "size")
+	size, err := optionalValidatedImageBillingString(
+		object, "size", "size", validateOpenAIImageBillingString,
+	)
 	if err != nil {
 		return nil, err
 	}
-	quality, err := optionalSafeImageBillingString(object, "quality", "quality")
+	quality, err := optionalValidatedImageBillingString(
+		object, "quality", "quality", validateOpenAIImageBillingString,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -378,18 +404,26 @@ func resolveGeminiImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageR
 	}
 	safeParameters := map[string]any{}
 	safeParameters["sampleCount"] = count
-	if err = copyImageBillingStrings(safeParameters, parameters, "parameters.",
-		"aspectRatio", "imageSize", "personGeneration",
-	); err != nil {
-		return nil, err
+	for key, validator := range map[string]imageBillingStringValidator{
+		"aspectRatio":      validateImageBillingAspectRatio,
+		"imageSize":        imageBillingEnumValidator(geminiImageSizeValues),
+		"personGeneration": imageBillingEnumValidator(geminiPersonGenerationValues),
+	} {
+		if err = copyValidatedImageBillingString(safeParameters, parameters, key, "parameters."+key, validator); err != nil {
+			return nil, err
+		}
 	}
 	body := canonicalImageBillingBody(incoming.Model, count)
 	body["parameters"] = safeParameters
-	aspectRatio, err := optionalSafeImageBillingString(parameters, "aspectRatio", "parameters.aspectRatio")
+	aspectRatio, err := optionalValidatedImageBillingString(
+		parameters, "aspectRatio", "parameters.aspectRatio", validateImageBillingAspectRatio,
+	)
 	if err != nil {
 		return nil, err
 	}
-	imageSize, err := optionalSafeImageBillingString(parameters, "imageSize", "parameters.imageSize")
+	imageSize, err := optionalValidatedImageBillingString(
+		parameters, "imageSize", "parameters.imageSize", imageBillingEnumValidator(geminiImageSizeValues),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -430,18 +464,36 @@ func resolveReplicateImageBilling(info *relaycommon.RelayInfo, incoming *dto.Ima
 	}
 	safeInput := map[string]any{}
 	safeInput["num_outputs"] = count
-	if err = copyImageBillingStrings(safeInput, input, "input.", "aspect_ratio", "output_format"); err != nil {
+	if err = copyValidatedImageBillingString(
+		safeInput, input, "aspect_ratio", "input.aspect_ratio",
+		imageBillingEnumValidator(replicateAspectRatioValues),
+	); err != nil {
 		return nil, err
 	}
-	if err = copyImageBillingIntegers(safeInput, input, "input.", 1, maxImageDimension, "width", "height"); err != nil {
+	if err = copyValidatedImageBillingString(
+		safeInput, input, "output_format", "input.output_format", validateFreeImageBillingIdentifier,
+	); err != nil {
 		return nil, err
+	}
+	for _, key := range []string{"width", "height"} {
+		raw, exists := input[key]
+		if !exists || isJSONNull(raw) {
+			continue
+		}
+		value, valueErr := imageBillingInteger(raw, "input."+key, 256, 1440)
+		if valueErr != nil || value%32 != 0 {
+			return nil, fmt.Errorf("input.%s must be a number represented as an integer between 256 and 1440 in increments of 32", key)
+		}
+		safeInput[key] = value
 	}
 	if err = copyImageBillingBooleans(safeInput, input, "input.", "prompt_upsampling"); err != nil {
 		return nil, err
 	}
 	body := canonicalImageBillingBody(incoming.Model, count)
 	body["input"] = safeInput
-	aspectRatio, err := optionalSafeImageBillingString(input, "aspect_ratio", "input.aspect_ratio")
+	aspectRatio, err := optionalValidatedImageBillingString(
+		input, "aspect_ratio", "input.aspect_ratio", imageBillingEnumValidator(replicateAspectRatioValues),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -478,7 +530,9 @@ func resolveSiliconFlowImageBilling(info *relaycommon.RelayInfo, incoming *dto.I
 	}
 	body := canonicalImageBillingBody(incoming.Model, count)
 	body["batch_size"] = count
-	if err = copyImageBillingStrings(body, object, "", "image_size"); err != nil {
+	if err = copyValidatedImageBillingString(
+		body, object, "image_size", "image_size", validateImageBillingSize,
+	); err != nil {
 		return nil, err
 	}
 	if err = copyImageBillingIntegers(body, object, "", 0, maxExactJSONInteger, "seed"); err != nil {
@@ -490,7 +544,9 @@ func resolveSiliconFlowImageBilling(info *relaycommon.RelayInfo, incoming *dto.I
 	if err = copyImageBillingNumbers(body, object, "", -maxImageBillingNumber, maxImageBillingNumber, "guidance_scale", "cfg"); err != nil {
 		return nil, err
 	}
-	imageSize, err := optionalSafeImageBillingString(object, "image_size", "image_size")
+	imageSize, err := optionalValidatedImageBillingString(
+		object, "image_size", "image_size", validateImageBillingSize,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -515,14 +571,23 @@ func resolveMiniMaxImageBilling(info *relaycommon.RelayInfo, incoming *dto.Image
 		return nil, err
 	}
 	body := canonicalImageBillingBody(incoming.Model, count)
-	if err = copyImageBillingStrings(body, object, "", "aspect_ratio", "response_format"); err != nil {
+	if err = copyValidatedImageBillingString(
+		body, object, "aspect_ratio", "aspect_ratio", imageBillingEnumValidator(miniMaxAspectRatioValues),
+	); err != nil {
+		return nil, err
+	}
+	if err = copyValidatedImageBillingString(
+		body, object, "response_format", "response_format", imageBillingEnumValidator(miniMaxResponseFormatValues),
+	); err != nil {
 		return nil, err
 	}
 	if err = copyImageBillingBooleans(body, object, "", "prompt_optimizer", "aigc_watermark"); err != nil {
 		return nil, err
 	}
 	body["n"] = count
-	aspectRatio, err := optionalSafeImageBillingString(object, "aspect_ratio", "aspect_ratio")
+	aspectRatio, err := optionalValidatedImageBillingString(
+		object, "aspect_ratio", "aspect_ratio", imageBillingEnumValidator(miniMaxAspectRatioValues),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -544,10 +609,10 @@ func resolveJimengImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageR
 	}
 	const count = 1
 	body := canonicalImageBillingBody(incoming.Model, count)
-	if err = copyImageBillingIntegers(body, object, "", 1, maxImageDimension, "width", "height"); err != nil {
+	if err = copyImageBillingIntegers(body, object, "", 256, 768, "width", "height"); err != nil {
 		return nil, err
 	}
-	if err = copyImageBillingIntegers(body, object, "", -1, maxExactJSONInteger, "seed"); err != nil {
+	if err = copyImageBillingIntegers(body, object, "", -maxExactJSONInteger, maxExactJSONInteger, "seed"); err != nil {
 		return nil, err
 	}
 	if err = copyImageBillingBooleans(body, object, "", "use_pre_llm", "use_sr", "return_url"); err != nil {
@@ -562,10 +627,10 @@ func resolveJimengImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageR
 		if copyErr := copyImageBillingBooleans(safeLogo, logo, "logo_info.", "add_logo"); copyErr != nil {
 			return nil, copyErr
 		}
-		if copyErr := copyImageBillingIntegers(safeLogo, logo, "logo_info.", 0, maxImageBillingInteger, "position", "language"); copyErr != nil {
+		if copyErr := copyImageBillingIntegers(safeLogo, logo, "logo_info.", -maxImageBillingInteger, maxImageBillingInteger, "position", "language"); copyErr != nil {
 			return nil, copyErr
 		}
-		if copyErr := copyImageBillingNumbers(safeLogo, logo, "logo_info.", 0, 1, "opacity"); copyErr != nil {
+		if copyErr := copyImageBillingNumbers(safeLogo, logo, "logo_info.", -maxImageBillingNumber, maxImageBillingNumber, "opacity"); copyErr != nil {
 			return nil, copyErr
 		}
 		if len(safeLogo) > 0 {
@@ -594,7 +659,10 @@ func resolveXAIImageBilling(info *relaycommon.RelayInfo, incoming *dto.ImageRequ
 		return nil, err
 	}
 	body := canonicalImageBillingBody(incoming.Model, count)
-	if err = copyImageBillingStrings(body, object, "", "response_format"); err != nil {
+	if err = copyValidatedImageBillingString(
+		body, object, "response_format", "response_format",
+		imageBillingEnumValidator(openAIImageResponseFormatValues),
+	); err != nil {
 		return nil, err
 	}
 	body["n"] = count
@@ -638,12 +706,18 @@ func optionalImageBillingString(object map[string]json.RawMessage, key, path str
 	return value, nil
 }
 
-func optionalSafeImageBillingString(object map[string]json.RawMessage, key, path string) (string, error) {
+type imageBillingStringValidator func(value, path string) (string, error)
+
+func optionalValidatedImageBillingString(
+	object map[string]json.RawMessage,
+	key, path string,
+	validator imageBillingStringValidator,
+) (string, error) {
 	value, err := optionalImageBillingString(object, key, path)
 	if err != nil || value == "" {
 		return value, err
 	}
-	return validateImageBillingString(value, path)
+	return validator(value, path)
 }
 
 func optionalImageBillingBool(object map[string]json.RawMessage, key, path string) (*bool, error) {
@@ -683,36 +757,38 @@ func imageBillingCount(object map[string]json.RawMessage, key, path string, defa
 	return int(value), nil
 }
 
-func copyImageBillingStrings(destination map[string]any, source map[string]json.RawMessage, prefix string, keys ...string) error {
-	for _, key := range keys {
-		raw, exists := source[key]
-		if !exists || isJSONNull(raw) {
-			continue
-		}
-		var value string
-		if err := common.Unmarshal(raw, &value); err != nil {
-			return fmt.Errorf("%s%s must be a string", prefix, key)
-		}
-		value, err := validateImageBillingString(value, prefix+key)
-		if err != nil {
-			return err
-		}
-		destination[key] = value
+func copyValidatedImageBillingString(
+	destination map[string]any,
+	source map[string]json.RawMessage,
+	key, path string,
+	validator imageBillingStringValidator,
+) error {
+	raw, exists := source[key]
+	if !exists || isJSONNull(raw) {
+		return nil
 	}
+	var value string
+	if err := common.Unmarshal(raw, &value); err != nil {
+		return fmt.Errorf("%s must be a string", path)
+	}
+	value, err := validator(value, path)
+	if err != nil {
+		return err
+	}
+	destination[key] = value
 	return nil
 }
 
 func validateImageBillingString(value, path string) (string, error) {
-	if value == "" {
-		return value, nil
-	}
 	lower := strings.ToLower(value)
-	if len(value) > maxImageBillingScalarBytes ||
+	if value == "" ||
+		len(value) > maxImageBillingScalarBytes ||
 		value != strings.TrimSpace(value) ||
 		!imageBillingScalarPattern.MatchString(value) ||
 		strings.Contains(lower, "://") ||
-		strings.HasPrefix(lower, "data:") ||
-		strings.HasPrefix(lower, "file:") ||
+		strings.HasPrefix(lower, "www.") ||
+		imageBillingSchemePattern.MatchString(value) ||
+		imageBillingHostnamePattern.MatchString(value) ||
 		strings.Contains(lower, ";base64,") ||
 		looksLikeEncodedImageBillingPayload(value) {
 		return "", fmt.Errorf("%s must be a bounded non-sensitive string", path)
@@ -720,16 +796,134 @@ func validateImageBillingString(value, path string) (string, error) {
 	return value, nil
 }
 
+func validateOpenAIImageBillingString(value, path string) (string, error) {
+	switch path {
+	case "size":
+		return validateImageBillingSize(value, path)
+	case "quality":
+		return imageBillingEnumValidator(openAIImageQualityValues)(value, path)
+	case "response_format":
+		return imageBillingEnumValidator(openAIImageResponseFormatValues)(value, path)
+	case "style":
+		return imageBillingEnumValidator(openAIImageStyleValues)(value, path)
+	case "background":
+		return imageBillingEnumValidator(openAIImageBackgroundValues)(value, path)
+	case "moderation":
+		return imageBillingEnumValidator(openAIImageModerationValues)(value, path)
+	case "output_format":
+		return imageBillingEnumValidator(openAIImageOutputFormatValues)(value, path)
+	case "input_fidelity":
+		return imageBillingEnumValidator(openAIImageInputFidelityValues)(value, path)
+	default:
+		return "", fmt.Errorf("unsupported image billing string %s", path)
+	}
+}
+
+func imageBillingEnumValidator(values []string) imageBillingStringValidator {
+	return func(value, path string) (string, error) {
+		value, err := validateImageBillingString(value, path)
+		if err != nil {
+			return "", err
+		}
+		if !slices.Contains(values, value) {
+			return "", fmt.Errorf("%s must be one of %s", path, strings.Join(values, ", "))
+		}
+		return value, nil
+	}
+}
+
+func validateImageBillingSize(value, path string) (string, error) {
+	value, err := validateImageBillingString(value, path)
+	if err != nil {
+		return "", err
+	}
+	if slices.Contains(imageBillingSizeValues, value) {
+		return value, nil
+	}
+	match := imageBillingSizePattern.FindStringSubmatch(value)
+	if len(match) != 3 {
+		return "", fmt.Errorf("%s must be a supported size or bounded dimensions", path)
+	}
+	width, widthErr := strconv.ParseInt(match[1], 10, 64)
+	height, heightErr := strconv.ParseInt(match[2], 10, 64)
+	if widthErr != nil || heightErr != nil ||
+		width < 1 || width > maxImageDimension ||
+		height < 1 || height > maxImageDimension {
+		return "", fmt.Errorf("%s must be a supported size or bounded dimensions", path)
+	}
+	return value, nil
+}
+
+func validateImageBillingAspectRatio(value, path string) (string, error) {
+	value, err := validateImageBillingString(value, path)
+	if err != nil {
+		return "", err
+	}
+	match := imageBillingAspectRatioPattern.FindStringSubmatch(value)
+	if len(match) != 3 {
+		return "", fmt.Errorf("%s must be a positive integer aspect ratio", path)
+	}
+	width, widthErr := strconv.ParseInt(match[1], 10, 64)
+	height, heightErr := strconv.ParseInt(match[2], 10, 64)
+	if widthErr != nil || heightErr != nil ||
+		width < 1 || width > maxImageDimension ||
+		height < 1 || height > maxImageDimension {
+		return "", fmt.Errorf("%s must be a positive integer aspect ratio", path)
+	}
+	return value, nil
+}
+
+func validateFreeImageBillingIdentifier(value, path string) (string, error) {
+	value, err := validateImageBillingString(value, path)
+	if err != nil {
+		return "", err
+	}
+	if !imageBillingIdentifierPattern.MatchString(value) {
+		return "", fmt.Errorf("%s must be a bounded lowercase identifier", path)
+	}
+	return value, nil
+}
+
 func looksLikeEncodedImageBillingPayload(value string) bool {
-	if len(value) < 24 {
+	encodings := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	}
+	for _, encoding := range encodings {
+		decoded, err := encoding.DecodeString(value)
+		if err != nil || len(decoded) == 0 {
+			continue
+		}
+		if imageBillingDecodedPayloadIsPrintable(decoded) || imageBillingDecodedPayloadHasImageMagic(decoded) {
+			return true
+		}
+	}
+	return false
+}
+
+func imageBillingDecodedPayloadIsPrintable(decoded []byte) bool {
+	if len(decoded) < 4 {
 		return false
 	}
-	raw := strings.TrimRight(value, "=")
-	if _, err := base64.RawStdEncoding.DecodeString(raw); err == nil {
-		return true
+	for _, value := range decoded {
+		if value < 0x20 || value > 0x7e {
+			return false
+		}
 	}
-	_, err := base64.RawURLEncoding.DecodeString(raw)
-	return err == nil
+	return true
+}
+
+func imageBillingDecodedPayloadHasImageMagic(decoded []byte) bool {
+	return bytes.HasPrefix(decoded, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) ||
+		bytes.HasPrefix(decoded, []byte{0xff, 0xd8, 0xff}) ||
+		bytes.HasPrefix(decoded, []byte("GIF87a")) ||
+		bytes.HasPrefix(decoded, []byte("GIF89a")) ||
+		bytes.HasPrefix(decoded, []byte("BM")) ||
+		bytes.HasPrefix(decoded, []byte("II*\x00")) ||
+		bytes.HasPrefix(decoded, []byte("MM\x00*")) ||
+		len(decoded) >= 12 && bytes.Equal(decoded[:4], []byte("RIFF")) && bytes.Equal(decoded[8:12], []byte("WEBP"))
 }
 
 func copyImageBillingIntegers(
@@ -861,6 +1055,89 @@ func isJSONNull(raw json.RawMessage) bool {
 	return strings.TrimSpace(string(raw)) == "null"
 }
 
+type imageMultipartFieldSet struct {
+	mode     string
+	indexes  map[int]struct{}
+	maxIndex int
+	count    int
+}
+
+func newImageMultipartFieldSet() imageMultipartFieldSet {
+	return imageMultipartFieldSet{
+		indexes:  map[int]struct{}{},
+		maxIndex: -1,
+	}
+}
+
+func (fields *imageMultipartFieldSet) add(name string, occurrences int) error {
+	if occurrences < 1 {
+		return nil
+	}
+	mode := name
+	if name != "image" && name != "image[]" {
+		match := indexedImageFieldPattern.FindStringSubmatch(name)
+		if len(match) != 2 {
+			return fmt.Errorf("invalid multipart image field %q", name)
+		}
+		mode = "image[index]"
+		index, err := strconv.ParseInt(match[1], 10, 32)
+		if err != nil {
+			return fmt.Errorf("invalid indexed image field %q", name)
+		}
+		if occurrences != 1 {
+			return fmt.Errorf("duplicate indexed image field %q", name)
+		}
+		if _, duplicate := fields.indexes[int(index)]; duplicate {
+			return fmt.Errorf("duplicate indexed image field %q", name)
+		}
+		fields.indexes[int(index)] = struct{}{}
+		fields.maxIndex = max(fields.maxIndex, int(index))
+	}
+	if fields.mode != "" && fields.mode != mode {
+		return fmt.Errorf("ambiguous multipart image fields %q and %q", fields.mode, name)
+	}
+	fields.mode = mode
+	fields.count += occurrences
+	return nil
+}
+
+func (fields *imageMultipartFieldSet) validate() error {
+	if fields.mode == "image[index]" && fields.maxIndex+1 != len(fields.indexes) {
+		return fmt.Errorf("indexed image fields must be unique and contiguous from image[0]")
+	}
+	return nil
+}
+
+// ValidateImageMultipartFileFields checks the original multipart part names
+// before an adaptor can collapse indexed fields into image or image[].
+func ValidateImageMultipartFileFields(form *multipart.Form) error {
+	if form == nil {
+		return nil
+	}
+	fields := newImageMultipartFieldSet()
+	for name, values := range form.Value {
+		if !isImageMultipartFieldName(name) {
+			continue
+		}
+		if err := fields.add(name, len(values)); err != nil {
+			return err
+		}
+	}
+	for name, files := range form.File {
+		if !isImageMultipartFieldName(name) {
+			continue
+		}
+		if err := fields.add(name, len(files)); err != nil {
+			return err
+		}
+	}
+	return fields.validate()
+}
+
+func isImageMultipartFieldName(name string) bool {
+	return name == "image" || name == "image[]" || strings.HasPrefix(name, "image[")
+}
+
 // ResolveOutboundImageBillingMultipart rebuilds the billing view from the
 // final multipart body without retaining prompts or file contents.
 func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentType string, body io.Reader, schemaConfirmed ...bool) (*OutboundImageBilling, error) {
@@ -884,10 +1161,7 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 	}
 
 	outbound := &dto.ImageRequest{Model: incoming.Model}
-	referenceImages := 0
-	referenceMode := ""
-	indexedReferences := map[int]struct{}{}
-	maxReferenceIndex := -1
+	references := newImageMultipartFieldSet()
 	sanitizedBody := map[string]any{}
 	seen := map[string]bool{}
 	reader := multipart.NewReader(body, params["boundary"])
@@ -901,36 +1175,14 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 		}
 		name := part.FormName()
 		if name == "image" || name == "image[]" || strings.HasPrefix(name, "image[") {
-			mode := name
-			if strings.HasPrefix(name, "image[") && name != "image[]" {
-				mode = "image[index]"
-				match := indexedImageFieldPattern.FindStringSubmatch(name)
-				if len(match) != 2 {
-					_ = part.Close()
-					return nil, fmt.Errorf("invalid indexed image field %q", name)
-				}
-				index, parseErr := strconv.ParseInt(match[1], 10, 32)
-				if parseErr != nil {
-					_ = part.Close()
-					return nil, fmt.Errorf("invalid indexed image field %q", name)
-				}
-				if _, duplicate := indexedReferences[int(index)]; duplicate {
-					_ = part.Close()
-					return nil, fmt.Errorf("duplicate indexed image field %q", name)
-				}
-				indexedReferences[int(index)] = struct{}{}
-				maxReferenceIndex = max(maxReferenceIndex, int(index))
-			}
-			if referenceMode != "" && referenceMode != mode {
+			if err = references.add(name, 1); err != nil {
 				_ = part.Close()
-				return nil, fmt.Errorf("ambiguous multipart image fields %q and %q", referenceMode, name)
+				return nil, err
 			}
 			if part.FileName() == "" {
 				_ = part.Close()
 				return nil, fmt.Errorf("%s must be a file part", name)
 			}
-			referenceMode = mode
-			referenceImages++
 			_, err = io.Copy(io.Discard, part)
 			_ = part.Close()
 			if err != nil {
@@ -979,7 +1231,7 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 				}
 				outbound.N = common.GetPointer(uint(parsed))
 			case "size":
-				parsed, parseErr := validateImageBillingString(value, "size")
+				parsed, parseErr := validateOpenAIImageBillingString(value, "size")
 				if parseErr != nil {
 					return nil, parseErr
 				}
@@ -987,14 +1239,14 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 				sanitizedBody["size"] = parsed
 				sanitizedBody["resolution"] = parsed
 			case "quality":
-				parsed, parseErr := validateImageBillingString(value, "quality")
+				parsed, parseErr := validateOpenAIImageBillingString(value, "quality")
 				if parseErr != nil {
 					return nil, parseErr
 				}
 				outbound.Quality = parsed
 				sanitizedBody["quality"] = parsed
 			case "response_format", "style", "background", "moderation", "output_format", "input_fidelity":
-				parsed, parseErr := validateImageBillingString(value, name)
+				parsed, parseErr := validateOpenAIImageBillingString(value, name)
 				if parseErr != nil {
 					return nil, parseErr
 				}
@@ -1012,15 +1264,15 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 				}
 				sanitizedBody[name] = parsed
 			case "stream", "watermark", "watermark_enabled":
-				parsed, parseErr := strconv.ParseBool(strings.TrimSpace(value))
+				parsed, parseErr := parseMultipartImageBillingBool(value, name)
 				if parseErr != nil {
-					return nil, fmt.Errorf("%s must be a boolean", name)
+					return nil, parseErr
 				}
 				sanitizedBody[name] = parsed
 			case "layer_decomposition":
-				parsed, parseErr := strconv.ParseBool(strings.TrimSpace(value))
+				parsed, parseErr := parseMultipartImageBillingBool(value, name)
 				if parseErr != nil {
-					return nil, fmt.Errorf("invalid layer_decomposition: %w", parseErr)
+					return nil, parseErr
 				}
 				outbound.LayerDecomposition = common.GetPointer(parsed)
 				sanitizedBody["layer_decomposition"] = parsed
@@ -1052,12 +1304,23 @@ func ResolveOutboundImageBillingMultipart(info *relaycommon.RelayInfo, contentTy
 			}
 		}
 	}
-	if referenceMode == "image[index]" && maxReferenceIndex+1 != len(indexedReferences) {
-		return nil, fmt.Errorf("indexed image fields must be unique and contiguous from image[0]")
+	if err = references.validate(); err != nil {
+		return nil, err
 	}
 	promptTexts := []string{outbound.Prompt}
 	outbound.Prompt = ""
-	return resolveOutboundImageBilling(info, outbound, referenceImages, sanitizedBody, promptTexts)
+	return resolveOutboundImageBilling(info, outbound, references.count, sanitizedBody, promptTexts)
+}
+
+func parseMultipartImageBillingBool(value, path string) (bool, error) {
+	switch value {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be true or false", path)
+	}
 }
 
 func resolveOutboundImageBilling(
