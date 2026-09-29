@@ -330,8 +330,7 @@ func enqueueStaleManagedRouteProbes(current *model.UpstreamManagedRoute, now int
 	if current == nil || freshnessSeconds <= 0 {
 		return
 	}
-	var routes []model.UpstreamManagedRoute
-	query := model.DB.Where(
+	query := model.DB.Model(&model.UpstreamManagedRoute{}).Where(
 		"platform = ? AND protocol = ? AND detached = ? AND channel_id <> ? AND state IN ? AND last_success_at < ?",
 		current.Platform,
 		current.Protocol,
@@ -339,8 +338,18 @@ func enqueueStaleManagedRouteProbes(current *model.UpstreamManagedRoute, now int
 		current.ChannelID,
 		[]string{model.UpstreamRouteStateActive, model.UpstreamRouteStateQuarantined},
 		now-int64(freshnessSeconds),
-	).Order("rank asc")
+	)
 	limit := operation_setting.GetUpstreamOrchestrationSetting().CandidateLimit
+	if limit == 0 {
+		if err := query.Where("next_probe_at <= ?", now).
+			Updates(map[string]any{"next_probe_at": now, "updated_at": now}).Error; err != nil {
+			common.SysLog("schedule stale managed route probes failed: " + err.Error())
+		}
+		return
+	}
+
+	var routes []model.UpstreamManagedRoute
+	query = query.Order("rank asc")
 	if limit > 0 {
 		query = query.Limit(limit)
 	}

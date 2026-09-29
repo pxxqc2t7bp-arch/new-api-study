@@ -1034,6 +1034,14 @@ func TestEnqueueStaleManagedRouteProbesUnlimitedSchedulesEveryRoute(t *testing.T
 		})
 	}
 	require.NoError(t, model.DB.Create(&routes).Error)
+	updateCount := 0
+	const callbackName = "test:count-unlimited-managed-route-probe-updates"
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callbackName, func(*gorm.DB) {
+		updateCount++
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Callback().Update().Remove(callbackName))
+	})
 	current := &model.UpstreamManagedRoute{
 		SourceID:        100,
 		ExternalGroupID: "current",
@@ -1045,6 +1053,7 @@ func TestEnqueueStaleManagedRouteProbesUnlimitedSchedulesEveryRoute(t *testing.T
 
 	enqueueStaleManagedRouteProbes(current, now, 60)
 
+	assert.Equal(t, 1, updateCount)
 	var stored []model.UpstreamManagedRoute
 	require.NoError(t, model.DB.Order("rank asc").Find(&stored).Error)
 	require.Len(t, stored, 6)
