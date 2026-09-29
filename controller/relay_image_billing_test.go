@@ -24,6 +24,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1404,6 +1405,97 @@ func TestRelayImagesRefreshesTieredGroupBeforeEachDispatch(t *testing.T) {
 	}
 }
 
+func TestRelayImagesRefundsAllWalletReservesAfterHigherPricedRetryFails(t *testing.T) {
+	const firstGroup = "image-failing-low"
+	const retryGroup = "image-failing-high"
+	configureImageBillingGroups(
+		t,
+		`{"default":1,"`+firstGroup+`":0.1,"`+retryGroup+`":0.2}`,
+		`{"default":"Default","`+firstGroup+`":"Low","`+retryGroup+`":"High"}`,
+	)
+	fixture := newSeedreamBillingOrderFixture(t)
+	previousRetries := common.RetryTimes
+	common.RetryTimes = 1
+	t.Cleanup(func() { common.RetryTimes = previousRetries })
+
+	const initialQuota = 500_000
+	fixture.user.Quota = initialQuota
+	fixture.token.RemainQuota = initialQuota
+	fixture.resetQuota(t, initialQuota)
+
+	type dispatchSnapshot struct {
+		userQuota  int
+		tokenQuota int
+		err        error
+	}
+	firstDispatch := make(chan dispatchSnapshot, 1)
+	firstUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var user model.User
+		var token model.Token
+		userErr := fixture.db.First(&user, fixture.user.Id).Error
+		tokenErr := fixture.db.First(&token, fixture.token.Id).Error
+		firstDispatch <- dispatchSnapshot{
+			userQuota: user.Quota, tokenQuota: token.RemainQuota,
+			err: firstError(userErr, tokenErr),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"message":"first failure","type":"server_error"}}`)
+	}))
+	t.Cleanup(firstUpstream.Close)
+
+	retryDispatch := make(chan dispatchSnapshot, 1)
+	retryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var user model.User
+		var token model.Token
+		userErr := fixture.db.First(&user, fixture.user.Id).Error
+		tokenErr := fixture.db.First(&token, fixture.token.Id).Error
+		retryDispatch <- dispatchSnapshot{
+			userQuota: user.Quota, tokenQuota: token.RemainQuota,
+			err: firstError(userErr, tokenErr),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"message":"retry failure","type":"server_error"}}`)
+	}))
+	t.Cleanup(retryUpstream.Close)
+	fixture.createRetryChannel(t, retryGroup, gptImageBillingOrderModel, retryUpstream.URL)
+
+	recorder := fixture.relayWithOptions(t, imageRelayOptions{
+		requestID:   "image-group-retry-all-fail",
+		model:       gptImageBillingOrderModel,
+		path:        "/v1/images/generations",
+		contentType: "application/json",
+		body:        []byte(`{"model":"` + gptImageBillingOrderModel + `","prompt":"billing fixture","n":1}`),
+		baseURL:     firstUpstream.URL,
+		usingGroup:  firstGroup,
+		tokenGroup:  "auto",
+		autoGroups:  []string{firstGroup, retryGroup},
+		crossGroup:  true,
+	})
+
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code, recorder.Body.String())
+	require.Len(t, firstDispatch, 1)
+	require.Len(t, retryDispatch, 1)
+	first := <-firstDispatch
+	retry := <-retryDispatch
+	require.NoError(t, first.err)
+	require.NoError(t, retry.err)
+	assert.Equal(t, 495_000, first.userQuota)
+	assert.Equal(t, 495_000, first.tokenQuota)
+	assert.Equal(t, 490_000, retry.userQuota)
+	assert.Equal(t, 490_000, retry.tokenQuota)
+	require.Eventually(t, func() bool {
+		var user model.User
+		var token model.Token
+		if fixture.db.First(&user, fixture.user.Id).Error != nil ||
+			fixture.db.First(&token, fixture.token.Id).Error != nil {
+			return false
+		}
+		return user.Quota == initialQuota && token.RemainQuota == initialQuota
+	}, 3*time.Second, 10*time.Millisecond)
+}
+
 func TestRelayImagesRejectsFinalSensitivePromptBeforeBillingAndDispatch(t *testing.T) {
 	previousCheckSensitive := setting.CheckSensitiveEnabled
 	previousCheckPrompt := setting.CheckSensitiveOnPromptEnabled
@@ -1972,6 +2064,89 @@ func TestRelayReplicateEditValidatesAndReservesBeforeUpload(t *testing.T) {
 	})
 }
 
+func TestRelayReplicateEditRequiresExactlyOneSourceImageBeforeBilling(t *testing.T) {
+	buildBody := func(t *testing.T, fileFields ...string) ([]byte, string) {
+		t.Helper()
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		require.NoError(t, writer.WriteField("model", gptImageBillingOrderModel))
+		require.NoError(t, writer.WriteField("prompt", "ordinary edit prompt"))
+		require.NoError(t, writer.WriteField("n", "1"))
+		for index, field := range fileFields {
+			file, err := writer.CreateFormFile(field, fmt.Sprintf("fixture-%d.png", index))
+			require.NoError(t, err)
+			_, err = file.Write([]byte("fixture image"))
+			require.NoError(t, err)
+		}
+		require.NoError(t, writer.Close())
+		return body.Bytes(), writer.FormDataContentType()
+	}
+
+	for _, testCase := range []struct {
+		name       string
+		fileFields []string
+	}{
+		{name: "mask only", fileFields: []string{"mask"}},
+		{name: "unknown field", fileFields: []string{"reference_image"}},
+		{name: "multiple candidates", fileFields: []string{"image", "image_prompt"}},
+		{name: "multiple files in one candidate", fileFields: []string{"image_prompt", "image_prompt"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newSeedreamBillingOrderFixture(t)
+			const initialQuota = 500_000
+			fixture.user.Quota = initialQuota
+			fixture.token.RemainQuota = initialQuota
+			fixture.resetQuota(t, initialQuota)
+			quotaMutations := recordUserQuotaMutations(t, fixture.db)
+			quotaMutations.Store(0)
+
+			var uploads atomic.Int32
+			var predictions atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				switch {
+				case request.URL.Path == "/v1/files":
+					uploads.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"urls":{"get":"https://files.invalid/input.png"}}`)
+				case strings.HasSuffix(request.URL.Path, "/predictions"):
+					predictions.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"status":"succeeded","output":["https://output.invalid/image.png"]}`)
+				default:
+					http.NotFound(w, request)
+				}
+			}))
+			t.Cleanup(upstream.Close)
+
+			body, contentType := buildBody(t, testCase.fileFields...)
+			recorder := fixture.relayWithOptions(t, imageRelayOptions{
+				requestID:   "replicate-edit-source-" + strings.ReplaceAll(testCase.name, " ", "-"),
+				model:       gptImageBillingOrderModel,
+				path:        "/v1/images/edits",
+				contentType: contentType,
+				body:        body,
+				baseURL:     upstream.URL,
+				usingGroup:  "default",
+				tokenGroup:  "default",
+				channelType: constant.ChannelTypeReplicate,
+			})
+
+			assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+			assert.Contains(t, recorder.Body.String(), "invalid_request")
+			assert.Zero(t, quotaMutations.Load(), "invalid source image must not reserve or refund quota")
+			assert.Zero(t, uploads.Load(), "invalid source image must not upload")
+			assert.Zero(t, predictions.Load(), "invalid source image must not predict")
+
+			var user model.User
+			var token model.Token
+			require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
+			require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
+			assert.Equal(t, initialQuota, user.Quota)
+			assert.Equal(t, initialQuota, token.RemainQuota)
+		})
+	}
+}
+
 func TestRelayReplicateEditUploadUnknownDoesNotRetryOrRefund(t *testing.T) {
 	const firstGroup = "replicate-edit-unknown"
 	const retryGroup = "replicate-edit-retry"
@@ -2060,6 +2235,108 @@ func TestRelayReplicateEditUploadUnknownDoesNotRetryOrRefund(t *testing.T) {
 	require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
 	assert.Equal(t, initialQuota-expectedQuota, user.Quota)
 	assert.Equal(t, initialQuota-expectedQuota, token.RemainQuota)
+}
+
+func TestRelayReplicateEditUploadRedirectDoesNotReplayOrRefund(t *testing.T) {
+	fetchSetting := system_setting.GetFetchSetting()
+	previousFetchSetting := *fetchSetting
+	fetchSetting.EnableSSRFProtection = false
+	t.Cleanup(func() { *fetchSetting = previousFetchSetting })
+
+	for _, statusCode := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(fmt.Sprintf("status_%d", statusCode), func(t *testing.T) {
+			firstGroup := fmt.Sprintf("replicate-upload-redirect-%d", statusCode)
+			retryGroup := fmt.Sprintf("replicate-upload-redirect-retry-%d", statusCode)
+			configureImageBillingGroups(
+				t,
+				`{"default":1,"`+firstGroup+`":1,"`+retryGroup+`":1}`,
+				`{"default":"Default","`+firstGroup+`":"Replicate","`+retryGroup+`":"Retry"}`,
+			)
+			fixture := newSeedreamBillingOrderFixture(t)
+			previousRetries := common.RetryTimes
+			common.RetryTimes = 1
+			t.Cleanup(func() { common.RetryTimes = previousRetries })
+
+			const initialQuota = 500_000
+			const expectedQuota = 50_000
+			quotaMutations := recordUserQuotaMutations(t, fixture.db)
+			quotaMutations.Store(0)
+
+			var redirectedUploads atomic.Int32
+			redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				redirectedUploads.Add(1)
+				assert.Equal(t, http.MethodPost, request.Method)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"urls":{"get":"https://files.invalid/redirected.png"}}`)
+			}))
+			t.Cleanup(redirectTarget.Close)
+
+			var uploads atomic.Int32
+			var predictions atomic.Int32
+			firstUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				switch {
+				case request.URL.Path == "/v1/files":
+					uploads.Add(1)
+					w.Header().Set("Location", redirectTarget.URL+"/redirected")
+					w.WriteHeader(statusCode)
+				case strings.HasSuffix(request.URL.Path, "/predictions"):
+					predictions.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"status":"succeeded","output":["https://output.invalid/image.png"]}`)
+				default:
+					http.NotFound(w, request)
+				}
+			}))
+			t.Cleanup(firstUpstream.Close)
+
+			var retryRequests atomic.Int32
+			retryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				retryRequests.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://output.invalid/retry.png"}]}`)
+			}))
+			t.Cleanup(retryUpstream.Close)
+			fixture.createRetryChannel(t, retryGroup, gptImageBillingOrderModel, retryUpstream.URL)
+
+			body, contentType := imageBillingMultipartBody(t, gptImageBillingOrderModel, "1")
+			recorder := fixture.relayWithOptions(t, imageRelayOptions{
+				requestID:   fmt.Sprintf("replicate-upload-redirect-%d", statusCode),
+				model:       gptImageBillingOrderModel,
+				path:        "/v1/images/edits",
+				contentType: contentType,
+				body:        body,
+				baseURL:     firstUpstream.URL,
+				usingGroup:  firstGroup,
+				tokenGroup:  "auto",
+				autoGroups:  []string{firstGroup, retryGroup},
+				crossGroup:  true,
+				channelType: constant.ChannelTypeReplicate,
+			})
+
+			assert.Equal(t, http.StatusBadGateway, recorder.Code, recorder.Body.String())
+			assert.Equal(t, int32(1), uploads.Load())
+			assert.Zero(t, redirectedUploads.Load(), "upload POST must not be replayed at the redirect target")
+			assert.Zero(t, predictions.Load())
+			assert.Zero(t, retryRequests.Load(), "redirected upload must not use another channel")
+			require.Never(t, func() bool {
+				var user model.User
+				var token model.Token
+				if fixture.db.First(&user, fixture.user.Id).Error != nil ||
+					fixture.db.First(&token, fixture.token.Id).Error != nil {
+					return false
+				}
+				return user.Quota == initialQuota || token.RemainQuota == initialQuota
+			}, 300*time.Millisecond, 10*time.Millisecond)
+			assert.Equal(t, int32(1), quotaMutations.Load(), "redirected upload must retain the reservation")
+
+			var user model.User
+			var token model.Token
+			require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
+			require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
+			assert.Equal(t, initialQuota-expectedQuota, user.Quota)
+			assert.Equal(t, initialQuota-expectedQuota, token.RemainQuota)
+		})
+	}
 }
 
 func TestRelayReplicateEditPredictionUnknownDoesNotUploadAgainOrRefund(t *testing.T) {

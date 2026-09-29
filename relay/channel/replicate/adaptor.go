@@ -153,11 +153,16 @@ func (a *Adaptor) PrepareImageRequest(c *gin.Context, info *relaycommon.RelayInf
 
 	if info.RelayMode == relayconstant.RelayModeImagesEdits {
 		fileHeader, err := imageFileFromForm(c, "image", "image[]", "image_prompt")
-		if err != nil {
-			return nil, err
+		if err == nil && fileHeader == nil {
+			err = errors.New("replicate adaptor: exactly one source image file is required for edits")
 		}
-		if fileHeader == nil {
-			return nil, errors.New("replicate adaptor: image file is required for edits")
+		if err != nil {
+			return nil, types.NewErrorWithStatusCode(
+				err,
+				types.ErrorCodeInvalidRequest,
+				http.StatusBadRequest,
+				types.ErrOptionWithSkipRetry(),
+			)
 		}
 		file, err := fileHeader.Open()
 		if err != nil {
@@ -252,16 +257,16 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	if resp == nil {
 		return nil, types.NewError(errors.New("replicate adaptor: empty response"), types.ErrorCodeBadResponse)
 	}
+	defer resp.Body.Close()
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}
-	_ = resp.Body.Close()
 
 	var prediction PredictionResponse
-	if err := common.Unmarshal(responseBody, &prediction); err != nil {
-		return nil, types.NewError(fmt.Errorf("replicate adaptor: failed to decode response: %w", err), types.ErrorCodeBadResponseBody)
+	if decodeErr := common.Unmarshal(responseBody, &prediction); decodeErr != nil {
+		return nil, types.NewError(fmt.Errorf("replicate adaptor: failed to decode response: %w", decodeErr), types.ErrorCodeBadResponseBody)
 	}
 
 	if prediction.Error != nil {
@@ -482,29 +487,30 @@ func imageFileFromForm(c *gin.Context, fieldCandidates ...string) (*multipart.Fi
 		return nil, nil
 	}
 
-	if len(fieldCandidates) == 0 {
+	explicitCandidates := len(fieldCandidates) > 0
+	if !explicitCandidates {
 		fieldCandidates = []string{"image", "image[]", "image_prompt"}
 	}
 
-	var fileHeader *multipart.FileHeader
+	var matchingFiles []*multipart.FileHeader
 	for _, key := range fieldCandidates {
-		if files := mf.File[key]; len(files) > 0 {
-			fileHeader = files[0]
-			break
-		}
+		matchingFiles = append(matchingFiles, mf.File[key]...)
 	}
-	if fileHeader == nil {
-		for _, files := range mf.File {
-			if len(files) > 0 {
-				fileHeader = files[0]
-				break
-			}
-		}
+	if len(matchingFiles) > 1 {
+		return nil, errors.New("replicate adaptor: exactly one source image file is required for edits")
 	}
-	if fileHeader == nil {
+	if len(matchingFiles) == 1 {
+		return matchingFiles[0], nil
+	}
+	if explicitCandidates {
 		return nil, nil
 	}
-	return fileHeader, nil
+	for _, files := range mf.File {
+		if len(files) > 0 {
+			return files[0], nil
+		}
+	}
+	return nil, nil
 }
 
 func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandidates ...string) (string, bool, error) {
@@ -537,13 +543,13 @@ func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandid
 		writer.Close()
 		return "", false, fmt.Errorf("replicate adaptor: create upload form failed: %w", err)
 	}
-	if _, err := io.Copy(part, file); err != nil {
+	if _, copyErr := io.Copy(part, file); copyErr != nil {
 		writer.Close()
-		return "", false, fmt.Errorf("replicate adaptor: copy image content failed: %w", err)
+		return "", false, fmt.Errorf("replicate adaptor: copy image content failed: %w", copyErr)
 	}
 	formContentType := writer.FormDataContentType()
-	if err := writer.Close(); err != nil {
-		return "", false, fmt.Errorf("replicate adaptor: close upload form failed: %w", err)
+	if closeErr := writer.Close(); closeErr != nil {
+		return "", false, fmt.Errorf("replicate adaptor: close upload form failed: %w", closeErr)
 	}
 
 	baseURL := info.ChannelBaseUrl
@@ -559,7 +565,11 @@ func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandid
 	req.Header.Set("Content-Type", formContentType)
 	req.Header.Set("Authorization", "Bearer "+info.ApiKey)
 
-	resp, err := service.GetHttpClient().Do(req)
+	uploadClient := *service.GetHttpClient()
+	uploadClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := uploadClient.Do(req)
 	if err != nil {
 		return "", true, fmt.Errorf("replicate adaptor: upload image failed: %w", err)
 	}
