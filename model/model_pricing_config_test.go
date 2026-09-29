@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -649,6 +650,227 @@ export function parseTaskResult() { return {}; }
 	}).Error)
 	rebuildTaskAliasView()
 	return fixture
+}
+
+func seedSharedAliasCandidatePricing(t *testing.T, fixture sharedAliasPricingFixture, aliasMain, targetMain string, targetVariants map[string]string) {
+	t.Helper()
+	pluginExpressions := make(map[string]string, len(targetVariants))
+	for plugin, expression := range targetVariants {
+		pluginExpressions[billing_setting.PluginBillingExprKey(plugin, fixture.target)] = expression
+	}
+	modes := map[string]string{fixture.target: billing_setting.BillingModeTieredExpr}
+	expressions := map[string]string{fixture.target: targetMain}
+	if aliasMain != "" {
+		modes[fixture.alias] = billing_setting.BillingModeTieredExpr
+		expressions[fixture.alias] = aliasMain
+	}
+	for key, entries := range map[string]map[string]string{
+		"billing_setting.billing_mode":          modes,
+		"billing_setting.billing_expr":          expressions,
+		billing_setting.PluginBillingExprOption: pluginExpressions,
+	} {
+		raw, err := common.Marshal(entries)
+		require.NoError(t, err)
+		require.NoError(t, fixture.database.Create(&Option{Key: key, Value: string(raw)}).Error)
+	}
+}
+
+func sharedAliasCandidateEntries(t *testing.T, fixture sharedAliasPricingFixture) map[string]ModelPricingEntry {
+	t.Helper()
+	snapshot, err := GetModelPricingSnapshot([]string{fixture.alias, fixture.target})
+	require.NoError(t, err)
+	require.Len(t, snapshot.Entries, 2)
+	entries := make(map[string]ModelPricingEntry, len(snapshot.Entries))
+	for _, entry := range snapshot.Entries {
+		entries[entry.ModelName] = entry
+	}
+	return entries
+}
+
+func requireSharedAliasCandidateRejectionIsAtomic(t *testing.T, fixture sharedAliasPricingFixture, changes []ModelPricingChange) error {
+	t.Helper()
+	baselineEvidence := modelPricingCASEvidence("existing-candidate-evidence", "a")
+	require.NoError(t, fixture.database.Create(&baselineEvidence).Error)
+	var beforeOptions []Option
+	require.NoError(t, fixture.database.Order("key").Find(&beforeOptions).Error)
+
+	err := UpdateModelPricingWithEvidence(changes, []UpstreamPriceEvidence{
+		modelPricingCASEvidence("rejected-candidate-evidence", "b"),
+	})
+	require.Error(t, err)
+
+	var afterOptions []Option
+	require.NoError(t, fixture.database.Order("key").Find(&afterOptions).Error)
+	assert.Equal(t, beforeOptions, afterOptions)
+	var revision Option
+	require.NoError(t, fixture.database.Where("key = ?", modelPricingRevisionOptionKey).First(&revision).Error)
+	assert.Equal(t, "7", revision.Value)
+	var evidence []UpstreamPriceEvidence
+	require.NoError(t, fixture.database.Order("id").Find(&evidence).Error)
+	require.Len(t, evidence, 1)
+	assert.Equal(t, baselineEvidence.EvidenceHash, evidence[0].EvidenceHash)
+	return err
+}
+
+func TestUpdateModelPricingValidatesFinalCandidateForDependentAliases(t *testing.T) {
+	const (
+		secondsExpr = `tier("seconds", u("seconds") * 1)`
+		creditsExpr = `tier("credits", u("credits") * 1)`
+	)
+
+	t.Run("rejects target replacement with unchanged alias draft", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "cand-reject")
+		seedSharedAliasCandidatePricing(t, fixture, secondsExpr, secondsExpr, map[string]string{
+			fixture.betaPlugin: creditsExpr,
+		})
+		require.NoError(t, fixture.database.Create(&Option{Key: modelPricingRevisionOptionKey, Value: "7"}).Error)
+		initial := sharedAliasCandidateEntries(t, fixture)
+
+		err := requireSharedAliasCandidateRejectionIsAtomic(t, fixture, []ModelPricingChange{
+			{
+				ModelName:       fixture.target,
+				ExpectedVersion: initial[fixture.target].Version,
+				Pricing: PricingValues{
+					"billing_setting.billing_mode":          billing_setting.BillingModeTieredExpr,
+					"billing_setting.billing_expr":          creditsExpr,
+					billing_setting.PluginBillingExprOption: map[string]any{fixture.alphaPlugin: secondsExpr},
+				},
+			},
+			{
+				ModelName:       fixture.alias,
+				ExpectedVersion: initial[fixture.alias].Version,
+				Pricing:         maps.Clone(initial[fixture.alias].Configured),
+			},
+		})
+		assert.ErrorContains(t, err, "model "+fixture.alias+": plugin "+fixture.betaPlugin)
+		assert.ErrorContains(t, err, `usage key "seconds" is not declared`)
+	})
+
+	t.Run("accepts inverse batch that adds required target override", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "cand-inverse")
+		seedSharedAliasCandidatePricing(t, fixture, secondsExpr, creditsExpr, map[string]string{
+			fixture.alphaPlugin: secondsExpr,
+		})
+		initial := sharedAliasCandidateEntries(t, fixture)
+
+		require.NoError(t, UpdateModelPricing([]ModelPricingChange{
+			{
+				ModelName:       fixture.target,
+				ExpectedVersion: initial[fixture.target].Version,
+				Pricing: PricingValues{
+					"billing_setting.billing_mode":          billing_setting.BillingModeTieredExpr,
+					"billing_setting.billing_expr":          secondsExpr,
+					billing_setting.PluginBillingExprOption: map[string]any{fixture.betaPlugin: creditsExpr},
+				},
+			},
+			{
+				ModelName:       fixture.alias,
+				ExpectedVersion: initial[fixture.alias].Version,
+				Pricing:         maps.Clone(initial[fixture.alias].Configured),
+			},
+		}))
+
+		saved := sharedAliasCandidateEntries(t, fixture)
+		require.Len(t, saved[fixture.alias].PluginVariants, 2)
+		for _, variant := range saved[fixture.alias].PluginVariants {
+			assert.True(t, variant.Compatible)
+		}
+	})
+
+	t.Run("accepts target-only change when alias inherits target state", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "cand-inherit")
+		seedSharedAliasCandidatePricing(t, fixture, "", secondsExpr, map[string]string{
+			fixture.betaPlugin: creditsExpr,
+		})
+		initial := sharedAliasCandidateEntries(t, fixture)
+		assert.Empty(t, initial[fixture.alias].Configured)
+
+		require.NoError(t, UpdateModelPricing([]ModelPricingChange{{
+			ModelName:       fixture.target,
+			ExpectedVersion: initial[fixture.target].Version,
+			Pricing: PricingValues{
+				"billing_setting.billing_mode":          billing_setting.BillingModeTieredExpr,
+				"billing_setting.billing_expr":          creditsExpr,
+				billing_setting.PluginBillingExprOption: map[string]any{fixture.alphaPlugin: secondsExpr},
+			},
+		}}))
+
+		saved := sharedAliasCandidateEntries(t, fixture)
+		assert.Empty(t, saved[fixture.alias].Configured)
+		require.Len(t, saved[fixture.alias].PluginVariants, 2)
+		for _, variant := range saved[fixture.alias].PluginVariants {
+			assert.True(t, variant.Compatible)
+		}
+	})
+
+	t.Run("rejects target-only change that breaks active alias", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "cand-target")
+		seedSharedAliasCandidatePricing(t, fixture, secondsExpr, secondsExpr, map[string]string{
+			fixture.betaPlugin: creditsExpr,
+		})
+		require.NoError(t, fixture.database.Create(&Option{Key: modelPricingRevisionOptionKey, Value: "7"}).Error)
+		initial := sharedAliasCandidateEntries(t, fixture)
+
+		err := requireSharedAliasCandidateRejectionIsAtomic(t, fixture, []ModelPricingChange{{
+			ModelName:       fixture.target,
+			ExpectedVersion: initial[fixture.target].Version,
+			Pricing: PricingValues{
+				"billing_setting.billing_mode":          billing_setting.BillingModeTieredExpr,
+				"billing_setting.billing_expr":          creditsExpr,
+				billing_setting.PluginBillingExprOption: map[string]any{fixture.alphaPlugin: secondsExpr},
+			},
+		}})
+		assert.ErrorContains(t, err, "model "+fixture.alias+": plugin "+fixture.betaPlugin)
+		assert.ErrorContains(t, err, `usage key "seconds" is not declared`)
+	})
+
+	t.Run("valid batch is order independent", func(t *testing.T) {
+		run := func(t *testing.T, reverse bool) map[string]string {
+			t.Helper()
+			fixture := setupSharedAliasPricing(t, "cand-order")
+			seedSharedAliasCandidatePricing(t, fixture, secondsExpr, creditsExpr, map[string]string{
+				fixture.alphaPlugin: secondsExpr,
+			})
+			initial := sharedAliasCandidateEntries(t, fixture)
+			changes := []ModelPricingChange{
+				{
+					ModelName:       fixture.target,
+					ExpectedVersion: initial[fixture.target].Version,
+					Pricing: PricingValues{
+						"billing_setting.billing_mode":          billing_setting.BillingModeTieredExpr,
+						"billing_setting.billing_expr":          secondsExpr,
+						billing_setting.PluginBillingExprOption: map[string]any{fixture.betaPlugin: creditsExpr},
+					},
+				},
+				{
+					ModelName:       fixture.alias,
+					ExpectedVersion: initial[fixture.alias].Version,
+					Pricing:         maps.Clone(initial[fixture.alias].Configured),
+				},
+			}
+			if reverse {
+				slices.Reverse(changes)
+			}
+			require.NoError(t, UpdateModelPricing(changes))
+
+			var rows []Option
+			require.NoError(t, fixture.database.Order("key").Find(&rows).Error)
+			stored := make(map[string]string, len(rows))
+			for _, row := range rows {
+				stored[row.Key] = row.Value
+			}
+			return stored
+		}
+
+		var targetFirst, aliasFirst map[string]string
+		t.Run("target then alias", func(t *testing.T) {
+			targetFirst = run(t, false)
+		})
+		t.Run("alias then target", func(t *testing.T) {
+			aliasFirst = run(t, true)
+		})
+		assert.Equal(t, targetFirst, aliasFirst)
+	})
 }
 
 func TestAliasPricingUsesEveryProviderForCanonicalTarget(t *testing.T) {

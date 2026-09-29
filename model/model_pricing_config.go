@@ -252,6 +252,14 @@ func replaceModelPricing(values map[string]map[string]any, name string, draft Pr
 	}
 }
 
+func cloneModelPricingMaps(values map[string]map[string]any) map[string]map[string]any {
+	cloned := make(map[string]map[string]any, len(values))
+	for key, entries := range values {
+		cloned[key] = maps.Clone(entries)
+	}
+	return cloned
+}
+
 func effectiveModelPricing(values map[string]map[string]any, name string) PricingValues {
 	result := modelPricingValues(values, name)
 	// Legacy wildcard aliases are resolved by the same normalization as relay.
@@ -657,6 +665,44 @@ func validateMainModelPricingExpression(name, expression string, variants map[st
 	return nil
 }
 
+func validateEffectiveTaskAliasPricing(name string, pricingMaps map[string]map[string]any, aliases *taskAliasView) error {
+	generation := jsplugin.DefaultRegistry.Generation()
+	plugins, schemaModel := activeTaskPluginVariants(generation, aliases, name)
+	configured := modelPricingValues(pricingMaps, name)
+	effective := effectiveModelPricing(pricingMaps, name)
+	for _, plugin := range plugins {
+		expression := effectiveTaskPluginPricingExpression(
+			pricingMaps, configured, effective, plugin.Meta.Key, name, schemaModel,
+		)
+		if strings.TrimSpace(expression) == "" {
+			return fmt.Errorf("model %s: plugin %s: billing expression is required", name, plugin.Meta.Key)
+		}
+		schema, _ := plugin.Meta.UsageForModel(schemaModel)
+		if err := billing_setting.SmokeTestTaskExpr(expression, schema); err != nil {
+			return fmt.Errorf("model %s: plugin %s: %w", name, plugin.Meta.Key, err)
+		}
+	}
+	return nil
+}
+
+func validateCandidateTaskAliases(changedModels map[string]bool, pricingMaps map[string]map[string]any, aliases *taskAliasView) error {
+	if aliases == nil {
+		return nil
+	}
+	aliasNames := make(map[string]bool)
+	for _, target := range aliases.byFold {
+		if changedModels[target.Alias] || target.Declared != "" && changedModels[target.Declared] {
+			aliasNames[target.Alias] = true
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(aliasNames)) {
+		if err := validateEffectiveTaskAliasPricing(name, pricingMaps, aliases); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func smokeTestModelRequestExpr(expression string) error {
 	used := billingexpr.UsedVars(expression)
 	if !used["images_up_to_1_5k"] && !used["images_above_1_5k"] && !used["input_images"] {
@@ -728,6 +774,7 @@ func updateModelPricingDatabaseCore(db *gorm.DB, changes []ModelPricingChange, a
 	return mutateModelPricingOptionsDatabaseWithAliasCache(db, cachedAliases, requireCoherentAliases, func(tx *gorm.DB, values map[string]map[string]any, aliases *taskAliasView) error {
 		defaults := defaultPricingMaps()
 		prepared := make([]PricingValues, len(changes))
+		previous := make([]PricingValues, len(changes))
 		type legacyStorageKey struct {
 			option, model string
 		}
@@ -739,16 +786,13 @@ func updateModelPricingDatabaseCore(db *gorm.DB, changes []ModelPricingChange, a
 		legacyIntents := make(map[legacyStorageKey]legacyStorageIntent)
 		legacyOrder := make([]legacyStorageKey, 0)
 		for index, change := range changes {
-			previous := modelPricingValues(values, change.ModelName)
-			if ModelPricingVersion(previous) != change.ExpectedVersion {
+			previous[index] = modelPricingValues(values, change.ModelName)
+			if ModelPricingVersion(previous[index]) != change.ExpectedVersion {
 				return fmt.Errorf("%w: %s", ErrModelPricingConflict, change.ModelName)
 			}
 			pricing := change.Pricing
 			if change.Reset {
 				pricing = modelPricingValues(defaults, change.ModelName)
-			}
-			if err := validateModelPricing(change.ModelName, pricing, previous, change.PluginValidationModels, values, aliases); err != nil {
-				return err
 			}
 			prepared[index] = pricing
 			for _, key := range legacyWildcardPricingOptionKeys {
@@ -768,12 +812,13 @@ func updateModelPricingDatabaseCore(db *gorm.DB, changes []ModelPricingChange, a
 				}
 			}
 		}
+		candidate := cloneModelPricingMaps(values)
 		for index, change := range changes {
 			for _, key := range modelPricingOptionKeys {
 				if slices.Contains(legacyWildcardPricingOptionKeys, key) {
 					continue
 				}
-				replaceModelPricingKey(values, key, change.ModelName, prepared[index])
+				replaceModelPricingKey(candidate, key, change.ModelName, prepared[index])
 			}
 		}
 		for _, storageKey := range legacyOrder {
@@ -782,8 +827,19 @@ func updateModelPricingDatabaseCore(db *gorm.DB, changes []ModelPricingChange, a
 			if intent.present {
 				draft[storageKey.option] = intent.value
 			}
-			replaceModelPricingKey(values, storageKey.option, storageKey.model, draft)
+			replaceModelPricingKey(candidate, storageKey.option, storageKey.model, draft)
 		}
+		changedModels := make(map[string]bool, len(changes))
+		for index, change := range changes {
+			if err := validateModelPricing(change.ModelName, prepared[index], previous[index], change.PluginValidationModels, candidate, aliases); err != nil {
+				return err
+			}
+			changedModels[change.ModelName] = true
+		}
+		if err := validateCandidateTaskAliases(changedModels, candidate, aliases); err != nil {
+			return err
+		}
+		maps.Copy(values, candidate)
 		if afterPricing != nil {
 			return afterPricing(tx)
 		}
