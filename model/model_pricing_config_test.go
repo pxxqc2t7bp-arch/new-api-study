@@ -185,6 +185,43 @@ export function parseTaskResult() { return {}; }
 	}
 }
 
+func TestValidateModelPricingRejectsUnusableUnchangedMainExpressionAfterProviderChanges(t *testing.T) {
+	const (
+		modelName  = "main-expression-provider-change"
+		expression = `tier("main", u("seconds") * 1)`
+	)
+	previous := PricingValues{
+		"billing_setting.billing_mode": billing_setting.BillingModeTieredExpr,
+		"billing_setting.billing_expr": expression,
+	}
+
+	t.Run("all providers disappear", func(t *testing.T) {
+		err := validateModelPricing(modelName, previous, previous, nil)
+		require.ErrorContains(t, err, "no task plugin usage schema")
+	})
+
+	t.Run("provider returns with incompatible schema", func(t *testing.T) {
+		const pluginKey = "main-return-provider"
+		source := fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: "1.0.0", author: {name: "Test"},
+  models: [%q], fetchMode: "per_task",
+  usageSchema: {credits: {type: "number", unit: "credit"}}
+};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+`, pluginKey, pluginKey, modelName)
+		_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+		require.NoError(t, err)
+		t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
+
+		err = validateModelPricing(modelName, previous, previous, nil)
+		require.ErrorContains(t, err, `usage key "seconds" is not declared`)
+	})
+}
+
 func TestLegacyWildcardAliasUsesCanonicalConfiguredStateAndRuntimePublication(t *testing.T) {
 	database, _ := openModelPricingInstanceDatabases(t)
 	previousDB := DB

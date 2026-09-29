@@ -194,16 +194,35 @@ func modelPricingValues(values map[string]map[string]any, name string) PricingVa
 	return result
 }
 
+func removeModelPricing(values map[string]map[string]any, name string) {
+	for key, entries := range values {
+		if key == billing_setting.PluginBillingExprOption {
+			for variant := range entries {
+				if _, model, ok := billing_setting.SplitPluginBillingExprKey(variant); ok && model == name {
+					delete(entries, variant)
+				}
+			}
+			continue
+		}
+		if !slices.Contains(legacyWildcardPricingOptionKeys, key) {
+			delete(entries, name)
+			continue
+		}
+		storageName := modelPricingStorageName(key, name)
+		for existingName := range entries {
+			if modelPricingStorageName(key, existingName) == storageName {
+				delete(entries, existingName)
+			}
+		}
+	}
+}
+
 // replaceModelPricing writes one complete model draft into the option maps.
 // Plugin expressions are grouped in the draft and flattened only in storage.
 func replaceModelPricing(values map[string]map[string]any, name string, draft PricingValues) {
+	removeModelPricing(values, name)
 	for _, key := range modelPricingOptionKeys {
 		if key == billing_setting.PluginBillingExprOption {
-			for variant := range values[key] {
-				if _, model, ok := billing_setting.SplitPluginBillingExprKey(variant); ok && model == name {
-					delete(values[key], variant)
-				}
-			}
 			variants, _ := draft[key].(map[string]any)
 			for plugin, expr := range variants {
 				values[key][billing_setting.PluginBillingExprKey(plugin, name)] = expr
@@ -211,11 +230,6 @@ func replaceModelPricing(values map[string]map[string]any, name string, draft Pr
 			continue
 		}
 		storageName := modelPricingStorageName(key, name)
-		for existingName := range values[key] {
-			if modelPricingStorageName(key, existingName) == storageName {
-				delete(values[key], existingName)
-			}
-		}
 		if value, exists := draft[key]; exists {
 			values[key][storageName] = value
 		}
@@ -482,7 +496,7 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 			if !ok || strings.TrimSpace(expression) == "" {
 				return errors.New("billing expression is required")
 			}
-			if err := validateMainModelPricingExpression(name, expression, previous, variants); err != nil {
+			if err := validateMainModelPricingExpression(name, expression, variants); err != nil {
 				return err
 			}
 			continue
@@ -498,7 +512,7 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 			if !builtin {
 				return errors.New("billing expression is required")
 			}
-			if err := validateMainModelPricingExpression(name, expression, previous, variants); err != nil {
+			if err := validateMainModelPricingExpression(name, expression, variants); err != nil {
 				return err
 			}
 		}
@@ -506,7 +520,7 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 	return nil
 }
 
-func validateMainModelPricingExpression(name, expression string, previous PricingValues, variants map[string]any) error {
+func validateMainModelPricingExpression(name, expression string, variants map[string]any) error {
 	if _, err := billingexpr.CompileFromCache(expression); err != nil {
 		return fmt.Errorf("model %s: %w", name, err)
 	}
@@ -546,12 +560,6 @@ func validateMainModelPricingExpression(name, expression string, previous Pricin
 			}
 			return nil
 		}
-	}
-	// With no remaining plugin, an unchanged stored usage expression has no
-	// schema to test. Preserve it so removing stale overrides or saving other
-	// model prices does not become impossible.
-	if previous["billing_setting.billing_expr"] == expression && len(billingexpr.UsedUsageKeys(expression)) > 0 {
-		return nil
 	}
 	if requestErr != nil {
 		return fmt.Errorf("model %s: %w", name, requestErr)
@@ -650,6 +658,7 @@ func UpdateModelPricingOptions(updates map[string]string) error {
 	return mutateModelPricingOptions(func(_ *gorm.DB, values map[string]map[string]any) error {
 		previous := maps.Clone(values)
 		names := make(map[string]bool)
+		updatedKeys := make(map[string]bool)
 		for key, raw := range updates {
 			if !IsModelPricingOption(key) {
 				return fmt.Errorf("unsupported pricing field: %s", key)
@@ -678,14 +687,83 @@ func UpdateModelPricingOptions(updates map[string]string) error {
 				}
 			}
 			values[key] = entries
+			updatedKeys[key] = true
 		}
 		for name := range names {
-			if err := validateModelPricing(name, modelPricingValues(values, name), modelPricingValues(previous, name), nil); err != nil {
+			before := modelPricingValues(previous, name)
+			after := modelPricingValues(values, name)
+			if reflect.DeepEqual(before, after) {
+				continue
+			}
+			changed := legacyModelPricingValidationDraft(name, after, before, updatedKeys)
+			if err := validateModelPricing(name, changed, before, nil); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+}
+
+func legacyModelPricingValidationDraft(name string, after, before PricingValues, updatedKeys map[string]bool) PricingValues {
+	changed := make(PricingValues)
+	fieldChanged := func(key string) bool {
+		afterValue, afterExists := after[key]
+		beforeValue, beforeExists := before[key]
+		return afterExists != beforeExists || !reflect.DeepEqual(afterValue, beforeValue)
+	}
+	for key := range updatedKeys {
+		if !fieldChanged(key) {
+			continue
+		}
+		if value, exists := after[key]; exists {
+			changed[key] = value
+		} else if key == billing_setting.PluginBillingExprOption {
+			changed[key] = map[string]any{}
+		}
+	}
+
+	mainChanged := fieldChanged("billing_setting.billing_expr")
+	modeChanged := fieldChanged("billing_setting.billing_mode")
+	variantsChanged := fieldChanged(billing_setting.PluginBillingExprOption)
+	validateMain := mainChanged ||
+		(modeChanged && after["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr) ||
+		(variantsChanged && !onlyStalePluginOverridesRemoved(name, after, before))
+	if !validateMain {
+		return changed
+	}
+	for _, key := range []string{"billing_setting.billing_mode", "billing_setting.billing_expr", billing_setting.PluginBillingExprOption} {
+		if value, exists := after[key]; exists {
+			changed[key] = value
+		}
+	}
+	return changed
+}
+
+func onlyStalePluginOverridesRemoved(name string, after, before PricingValues) bool {
+	afterVariants, _ := after[billing_setting.PluginBillingExprOption].(map[string]any)
+	beforeVariants, _ := before[billing_setting.PluginBillingExprOption].(map[string]any)
+	removed := false
+	generation := jsplugin.DefaultRegistry.Generation()
+	for key, previousExpression := range beforeVariants {
+		currentExpression, stillExists := afterVariants[key]
+		if stillExists && reflect.DeepEqual(currentExpression, previousExpression) {
+			continue
+		}
+		if stillExists {
+			return false
+		}
+		plugin, exists := generation.Get(key)
+		if exists && slices.Contains(plugin.Meta.Models, name) {
+			return false
+		}
+		removed = true
+	}
+	for key := range afterVariants {
+		if _, existed := beforeVariants[key]; !existed {
+			return false
+		}
+	}
+	return removed
 }
 
 func mutateModelPricingOptions(mutate func(*gorm.DB, map[string]map[string]any) error) error {

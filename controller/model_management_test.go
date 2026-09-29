@@ -1496,6 +1496,122 @@ func TestModelDeletionDatabaseMatrix(t *testing.T) {
 					assert.Zero(t, count)
 				})
 			}
+			t.Run("pricing_removal_clears_canonical_aliases_and_runtime", func(t *testing.T) {
+				const (
+					name       = "gpt-4-gizmo-delete-alias"
+					canonical  = "gpt-4-gizmo-*"
+					keep       = "gpt-4-gizmo-delete-keep"
+					pluginKey  = "delete-pricing-probe"
+					expression = `tier("base", p * 2 + c * 4)`
+				)
+				metadata := model.Model{ModelName: name, NameRule: model.NameRuleExact, Status: 1}
+				require.NoError(t, metadata.Insert())
+				baseline, err := model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{{
+					ModelName:       name,
+					ExpectedVersion: baseline.Entries[0].Version,
+					Pricing: model.PricingValues{
+						"ModelPrice":                   0.25,
+						"ModelRatio":                   21.0,
+						"CompletionRatio":              4.0,
+						"CacheRatio":                   0.2,
+						"CreateCacheRatio":             1.5,
+						"ImageRatio":                   3.0,
+						"AudioRatio":                   5.0,
+						"AudioCompletionRatio":         6.0,
+						"billing_setting.billing_mode": "tiered_expr",
+						"billing_setting.billing_expr": expression,
+					},
+				}}))
+
+				legacyKeys := []string{"ModelPrice", "ModelRatio", "CompletionRatio", "AudioRatio", "AudioCompletionRatio"}
+				legacyKeySet := make(map[string]bool, len(legacyKeys))
+				for _, key := range legacyKeys {
+					legacyKeySet[key] = true
+				}
+				exactKeys := []string{"CacheRatio", "CreateCacheRatio", "ImageRatio", "billing_setting.billing_mode", "billing_setting.billing_expr"}
+				allKeys := append([]string{}, legacyKeys...)
+				allKeys = append(allKeys, exactKeys...)
+				allKeys = append(allKeys, billing_setting.PluginBillingExprOption)
+				seededOptions := make(map[string]string)
+				for _, key := range allKeys {
+					var option model.Option
+					require.NoError(t, db.Where("key = ?", key).First(&option).Error)
+					var entries map[string]any
+					require.NoError(t, common.UnmarshalJsonStr(option.Value, &entries))
+					switch {
+					case key == billing_setting.PluginBillingExprOption:
+						entries[billing_setting.PluginBillingExprKey(pluginKey, name)] = `tier("target", u("seconds") * 1)`
+						entries[billing_setting.PluginBillingExprKey(pluginKey, keep)] = `tier("keep", u("seconds") * 2)`
+					case key == "CacheRatio":
+						entries[canonical] = 0.9
+					case legacyKeySet[key]:
+						entries[name] = entries[canonical]
+					}
+					raw, err := common.Marshal(entries)
+					require.NoError(t, err)
+					require.NoError(t, db.Model(&model.Option{}).Where("key = ?", key).Update("value", string(raw)).Error)
+					seededOptions[key] = string(raw)
+				}
+				require.NoError(t, config.GlobalConfig.LoadFromDB(seededOptions))
+				assert.Contains(t, ratio_setting.GetModelRatioCopy(), canonical)
+				_, hasPlugin := billing_setting.GetPluginBillingExpr(pluginKey, name)
+				assert.True(t, hasPlugin)
+
+				before, err := model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				require.NotEqual(t, before.EmptyVersion, before.Entries[0].Version)
+				result, err := model.DeleteModelMetadata([]int{metadata.Id}, false, true)
+				require.NoError(t, err)
+				assert.Equal(t, model.ModelDeleteResult{DeletedCount: 1}, result)
+
+				after, err := model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				assert.Empty(t, after.Entries[0].Configured)
+				assert.Equal(t, after.EmptyVersion, after.Entries[0].Version)
+				assert.NotEqual(t, before.Entries[0].Version, after.Entries[0].Version)
+
+				for _, key := range allKeys {
+					var option model.Option
+					require.NoError(t, db.Where("key = ?", key).First(&option).Error)
+					var entries map[string]any
+					require.NoError(t, common.UnmarshalJsonStr(option.Value, &entries))
+					assert.NotContains(t, entries, name, key)
+					if legacyKeySet[key] {
+						assert.NotContains(t, entries, canonical, key)
+					}
+					if key == "CacheRatio" {
+						assert.Equal(t, 0.9, entries[canonical], "non-legacy keys remove only the literal model")
+					}
+					if key == billing_setting.PluginBillingExprOption {
+						assert.NotContains(t, entries, billing_setting.PluginBillingExprKey(pluginKey, name))
+						assert.Contains(t, entries, billing_setting.PluginBillingExprKey(pluginKey, keep))
+					}
+				}
+				for key, entries := range map[string]map[string]float64{
+					"ModelPrice":           ratio_setting.GetModelPriceCopy(),
+					"ModelRatio":           ratio_setting.GetModelRatioCopy(),
+					"CompletionRatio":      ratio_setting.GetCompletionRatioCopy(),
+					"AudioRatio":           ratio_setting.GetAudioRatioCopy(),
+					"AudioCompletionRatio": ratio_setting.GetAudioCompletionRatioCopy(),
+					"CacheRatio":           ratio_setting.GetCacheRatioCopy(),
+					"CreateCacheRatio":     ratio_setting.GetCreateCacheRatioCopy(),
+					"ImageRatio":           ratio_setting.GetImageRatioCopy(),
+				} {
+					assert.NotContains(t, entries, name, key)
+					if legacyKeySet[key] {
+						assert.NotContains(t, entries, canonical, key)
+					}
+				}
+				assert.Equal(t, billing_setting.BillingModeRatio, billing_setting.GetBillingMode(name))
+				_, hasExpression := billing_setting.GetBillingExpr(name)
+				assert.False(t, hasExpression)
+				_, hasPlugin = billing_setting.GetPluginBillingExpr(pluginKey, name)
+				assert.False(t, hasPlugin)
+				_, keepPlugin := billing_setting.GetPluginBillingExpr(pluginKey, keep)
+				assert.True(t, keepPlugin)
+			})
 			for _, ids := range [][]int{nil, {0}, {-1}, make([]int, 1001)} {
 				_, err := model.DeleteModelMetadata(ids, true, false)
 				assert.Error(t, err)
@@ -1605,7 +1721,7 @@ func TestSharedModelPluginPricingDatabaseMatrix(t *testing.T) {
 			final, err := model.GetModelPricingSnapshot([]string{name})
 			require.NoError(t, err)
 			assert.Equal(t, variant, final.Entries[0].PluginVariants[1].Effective)
-			// A provider may disappear without making every legacy price save fail.
+			// One provider may disappear while the main remains valid for another.
 			require.NoError(t, jsplugin.DefaultRegistry.Unregister("matrix-beta"))
 			stale, err := model.GetModelPricingSnapshot([]string{name})
 			require.NoError(t, err)
@@ -1617,6 +1733,8 @@ func TestSharedModelPluginPricingDatabaseMatrix(t *testing.T) {
 			require.NoError(t, err)
 			ratioJSON, err := common.Marshal(map[string]float64{name: 2})
 			require.NoError(t, err)
+			// Legacy whole-map updates validate only changed fields, so a
+			// non-main ratio update and an unchanged expression map still work.
 			response = modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: "ModelRatio", Value: string(ratioJSON)}, nil)
 			assert.Contains(t, response.Body.String(), `"success":true`)
 			response = modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: "billing_setting.billing_expr", Value: string(baseJSON)}, nil)
@@ -1624,7 +1742,6 @@ func TestSharedModelPluginPricingDatabaseMatrix(t *testing.T) {
 			final, err = model.GetModelPricingSnapshot([]string{name})
 			require.NoError(t, err)
 			assert.Equal(t, variant, final.Entries[0].PluginVariants[1].Configured)
-			// The versioned save also preserves an unchanged stale expression.
 			change = model.ModelPricingChange{ModelName: name, ExpectedVersion: final.Entries[0].Version, Pricing: final.Entries[0].Configured}
 			require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{change}))
 			change.Pricing[billing_setting.PluginBillingExprOption] = map[string]any{"matrix-beta": "1"}
@@ -1651,7 +1768,18 @@ export function parseTaskResult(){return {};}
 			require.Len(t, stale.Entries[0].PluginVariants, 1)
 			assert.True(t, stale.Entries[0].PluginVariants[0].Stale)
 			assert.Equal(t, "Beta updated", stale.Entries[0].PluginVariants[0].PluginName)
+			// With every provider gone, a versioned full-draft save must reject
+			// the unchanged usage-based main expression.
+			change = model.ModelPricingChange{ModelName: name, ExpectedVersion: stale.Entries[0].Version, Pricing: stale.Entries[0].Configured}
+			require.ErrorContains(t, model.UpdateModelPricing([]model.ModelPricingChange{change}), "no task plugin usage schema")
+			// An unrelated model can still be added without revalidating this
+			// unchanged stale model from the same whole-map option.
+			ratioJSON, err = common.Marshal(map[string]float64{name: 2, "unrelated-ratio-model": 3})
+			require.NoError(t, err)
 			require.NoError(t, model.UpdateModelPricingOptions(map[string]string{"ModelRatio": string(ratioJSON)}))
+			unrelatedPricing, err := model.GetModelPricingSnapshot([]string{"unrelated-ratio-model"})
+			require.NoError(t, err)
+			assert.Equal(t, 3.0, unrelatedPricing.Entries[0].Configured["ModelRatio"])
 			// Removing just the stale override succeeds and leaves other prices.
 			response = modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: billing_setting.PluginBillingExprOption, Value: `{}`}, nil)
 			assert.Contains(t, response.Body.String(), `"success":true`)
