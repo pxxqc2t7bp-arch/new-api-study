@@ -473,7 +473,7 @@ func TestValidateModelPricingRejectsUnusableUnchangedMainExpressionAfterProvider
 	}
 
 	t.Run("all providers disappear", func(t *testing.T) {
-		err := validateModelPricing(modelName, previous, previous, nil, newTaskAliasView(jsplugin.DefaultRegistry.Generation()))
+		err := validateModelPricing(modelName, previous, previous, nil, nil, newTaskAliasView(jsplugin.DefaultRegistry.Generation()))
 		require.ErrorContains(t, err, "no task plugin usage schema")
 	})
 
@@ -494,7 +494,7 @@ export function parseTaskResult() { return {}; }
 		require.NoError(t, err)
 		t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
 
-		err = validateModelPricing(modelName, previous, previous, nil, newTaskAliasView(jsplugin.DefaultRegistry.Generation()))
+		err = validateModelPricing(modelName, previous, previous, nil, nil, newTaskAliasView(jsplugin.DefaultRegistry.Generation()))
 		require.ErrorContains(t, err, `usage key "seconds" is not declared`)
 	})
 }
@@ -725,6 +725,91 @@ func TestAliasPricingUsesEveryProviderForCanonicalTarget(t *testing.T) {
 			"billing_setting.billing_expr": mainExpr,
 		})
 		require.ErrorContains(t, err, "plugin "+fixture.betaPlugin)
+	})
+
+	t.Run("canonical target overrides cover preview providers", func(t *testing.T) {
+		for _, test := range []struct {
+			name, mainExpression string
+			targetOverrides      func(sharedAliasPricingFixture) map[string]string
+		}{
+			{
+				name:           "task main",
+				mainExpression: mainExpr,
+				targetOverrides: func(fixture sharedAliasPricingFixture) map[string]string {
+					return map[string]string{
+						billing_setting.PluginBillingExprKey(fixture.betaPlugin, fixture.target): betaExpr,
+					}
+				},
+			},
+			{
+				name:           "request main",
+				mainExpression: `tier("request", fixed(0.01))`,
+				targetOverrides: func(fixture sharedAliasPricingFixture) map[string]string {
+					return map[string]string{
+						billing_setting.PluginBillingExprKey(fixture.alphaPlugin, fixture.target): mainExpr,
+						billing_setting.PluginBillingExprKey(fixture.betaPlugin, fixture.target):  betaExpr,
+					}
+				},
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				fixture := setupSharedAliasPricing(t, "preview-"+strings.ReplaceAll(test.name, " ", "-"))
+				raw, err := common.Marshal(test.targetOverrides(fixture))
+				require.NoError(t, err)
+				require.NoError(t, fixture.database.Create(&Option{
+					Key: billing_setting.PluginBillingExprOption, Value: string(raw),
+				}).Error)
+
+				preview, err := PreviewModelPricing(fixture.alias, PricingValues{
+					"billing_setting.billing_mode": billing_setting.BillingModeTieredExpr,
+					"billing_setting.billing_expr": test.mainExpression,
+				})
+				require.NoError(t, err)
+				assert.Equal(t, test.mainExpression, preview["billing_setting.billing_expr"])
+			})
+		}
+	})
+
+	t.Run("canonical target override permits versioned alias update", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "update")
+		raw, err := common.Marshal(map[string]string{
+			billing_setting.PluginBillingExprKey(fixture.betaPlugin, fixture.target): betaExpr,
+		})
+		require.NoError(t, err)
+		require.NoError(t, fixture.database.Create(&Option{
+			Key: billing_setting.PluginBillingExprOption, Value: string(raw),
+		}).Error)
+		initial, err := GetModelPricingSnapshot([]string{fixture.alias})
+		require.NoError(t, err)
+		require.Len(t, initial.Entries, 1)
+
+		require.NoError(t, UpdateModelPricing([]ModelPricingChange{{
+			ModelName:       fixture.alias,
+			ExpectedVersion: initial.Entries[0].Version,
+			Pricing: PricingValues{
+				"billing_setting.billing_mode": billing_setting.BillingModeTieredExpr,
+				"billing_setting.billing_expr": mainExpr,
+			},
+		}}))
+	})
+
+	t.Run("invalid canonical target override is rejected", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "invalid-target")
+		raw, err := common.Marshal(map[string]string{
+			billing_setting.PluginBillingExprKey(fixture.alphaPlugin, fixture.target): mainExpr,
+			billing_setting.PluginBillingExprKey(fixture.betaPlugin, fixture.target):  mainExpr,
+		})
+		require.NoError(t, err)
+		require.NoError(t, fixture.database.Create(&Option{
+			Key: billing_setting.PluginBillingExprOption, Value: string(raw),
+		}).Error)
+
+		_, err = PreviewModelPricing(fixture.alias, PricingValues{
+			"billing_setting.billing_mode": billing_setting.BillingModeTieredExpr,
+			"billing_setting.billing_expr": `tier("request", fixed(0.01))`,
+		})
+		require.ErrorContains(t, err, "plugin "+fixture.betaPlugin)
+		require.ErrorContains(t, err, `usage key "seconds" is not declared`)
 	})
 
 	t.Run("different canonical targets remain ambiguous", func(t *testing.T) {

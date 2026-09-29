@@ -335,11 +335,13 @@ func TestRelayTaskSubmitCanonicalizesMappedBillingIdentityOnly(t *testing.T) {
 		pluginKey    = "r4-case-provider"
 		mainExpr     = `tier("main", u("seconds") * 2)`
 		providerExpr = `tier("provider", u("seconds") * 3)`
+		incompatible = `true ? tier("selected", u("seconds") * 2) : tier("missing", u("credits"))`
 	)
 	for _, test := range []struct {
-		name     string
-		variants map[string]string
-		wantExpr string
+		name           string
+		variants       map[string]string
+		wantExpr       string
+		wantPriceError bool
 	}{
 		{
 			name: "canonical provider override",
@@ -352,6 +354,14 @@ func TestRelayTaskSubmitCanonicalizesMappedBillingIdentityOnly(t *testing.T) {
 			name:     "canonical main fallback",
 			variants: map[string]string{},
 			wantExpr: mainExpr,
+		},
+		{
+			name: "canonical shared schema rejects incompatible override",
+			variants: map[string]string{
+				billing_setting.PluginBillingExprKey(pluginKey, canonical): incompatible,
+			},
+			wantExpr:       incompatible,
+			wantPriceError: true,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -376,6 +386,21 @@ export function extractUsage() { return {seconds:2}; }
 			plugin, err := pluginruntime.DefaultRegistry.Register(source, pluginruntime.Options{})
 			require.NoError(t, err)
 			t.Cleanup(func() { pluginruntime.DefaultRegistry.Unregister(pluginKey) })
+			const secondaryPluginKey = "r4-case-secondary"
+			secondarySource := fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: "1.0.0", author: {name: "Test"},
+  models: [%q], fetchMode: "per_task",
+  usageSchema: {credits: {type: "number", unit: "credit"}}
+};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+`, secondaryPluginKey, secondaryPluginKey, canonical)
+			_, err = pluginruntime.DefaultRegistry.Register(secondarySource, pluginruntime.Options{})
+			require.NoError(t, err)
+			t.Cleanup(func() { pluginruntime.DefaultRegistry.Unregister(secondaryPluginKey) })
 
 			mapping := fmt.Sprintf(`{%q:%q}`, alias, rawMapped)
 			require.NoError(t, database.Create(&model.Channel{
@@ -405,11 +430,17 @@ export function extractUsage() { return {seconds:2}; }
 			snapshot, err := model.GetModelPricingSnapshot([]string{alias})
 			require.NoError(t, err)
 			require.Len(t, snapshot.Entries, 1)
-			require.Len(t, snapshot.Entries[0].PluginVariants, 1)
-			variant := snapshot.Entries[0].PluginVariants[0]
+			require.Len(t, snapshot.Entries[0].PluginVariants, 2)
+			var variant model.ModelPricingPluginVariant
+			for _, candidate := range snapshot.Entries[0].PluginVariants {
+				if candidate.PluginKey == pluginKey {
+					variant = candidate
+				}
+			}
 			assert.Equal(t, pluginKey, variant.PluginKey)
 			assert.Empty(t, variant.Configured)
 			assert.Equal(t, test.wantExpr, variant.Effective)
+			assert.Equal(t, !test.wantPriceError, variant.Compatible)
 
 			type capturedRequest struct {
 				body map[string]any
@@ -438,6 +469,19 @@ export function extractUsage() { return {seconds:2}; }
 			info.Billing = &imageReservation{limit: 1 << 30}
 
 			result, taskErr := RelayTaskSubmit(c, info)
+			if test.wantPriceError {
+				require.NotNil(t, taskErr)
+				assert.Equal(t, "model_price_error", taskErr.Code)
+				assert.Nil(t, result)
+				assert.Nil(t, info.TieredBillingSnapshot)
+				assert.Equal(t, rawMapped, info.UpstreamModelName)
+				select {
+				case <-requestBody:
+					assert.Fail(t, "incompatible pricing must be rejected before outbound")
+				default:
+				}
+				return
+			}
 			require.Nil(t, taskErr, "submission error: %+v", taskErr)
 			require.NotNil(t, result)
 			require.NotNil(t, info.TieredBillingSnapshot)

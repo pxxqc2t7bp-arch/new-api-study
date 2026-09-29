@@ -318,7 +318,7 @@ func PreviewModelPricing(name string, draft PricingValues) (PricingValues, error
 	if err != nil {
 		return nil, fmt.Errorf("read task model aliases: %w", err)
 	}
-	if err := validateModelPricing(name, draft, modelPricingValues(values, name), nil, aliasView); err != nil {
+	if err := validateModelPricing(name, draft, modelPricingValues(values, name), nil, values, aliasView); err != nil {
 		return nil, err
 	}
 	replaceModelPricing(values, name, draft)
@@ -516,18 +516,22 @@ func ValidateModelPricing(name string, values PricingValues) error {
 	}
 	generation := jsplugin.DefaultRegistry.Generation()
 	if DB == nil {
-		return validateModelPricing(name, values, previous, nil, loadFreshTaskAliasView(generation))
+		return validateModelPricing(name, values, previous, nil, nil, loadFreshTaskAliasView(generation))
+	}
+	pricingMaps, _, _, err := readModelPricingMaps(DB)
+	if err != nil {
+		return err
 	}
 	aliasView, err := buildTaskAliasView(DB, generation)
 	if err != nil {
 		return fmt.Errorf("read task model aliases: %w", err)
 	}
-	return validateModelPricing(name, values, previous, nil, aliasView)
+	return validateModelPricing(name, values, previous, nil, pricingMaps, aliasView)
 }
 
 // Writes pass the locked database snapshot here, so allowing an unchanged stale
 // override cannot bypass validation through an out-of-date process-local cache.
-func validateModelPricing(name string, values, previous PricingValues, pluginValidationModels map[string]string, aliases *taskAliasView) error {
+func validateModelPricing(name string, values, previous PricingValues, pluginValidationModels map[string]string, pricingMaps map[string]map[string]any, aliases *taskAliasView) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("model name is required")
 	}
@@ -589,7 +593,7 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 			if !ok || strings.TrimSpace(expression) == "" {
 				return errors.New("billing expression is required")
 			}
-			if err := validateMainModelPricingExpression(name, expression, variants, aliases); err != nil {
+			if err := validateMainModelPricingExpression(name, expression, variants, pricingMaps, aliases); err != nil {
 				return err
 			}
 			continue
@@ -605,7 +609,7 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 			if !builtin {
 				return errors.New("billing expression is required")
 			}
-			if err := validateMainModelPricingExpression(name, expression, variants, aliases); err != nil {
+			if err := validateMainModelPricingExpression(name, expression, variants, pricingMaps, aliases); err != nil {
 				return err
 			}
 		}
@@ -613,7 +617,7 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 	return nil
 }
 
-func validateMainModelPricingExpression(name, expression string, variants map[string]any, aliases *taskAliasView) error {
+func validateMainModelPricingExpression(name, expression string, variants map[string]any, pricingMaps map[string]map[string]any, aliases *taskAliasView) error {
 	if _, err := billingexpr.CompileFromCache(expression); err != nil {
 		return fmt.Errorf("model %s: %w", name, err)
 	}
@@ -622,19 +626,24 @@ func validateMainModelPricingExpression(name, expression string, variants map[st
 	if plugins, schemaModel := activeTaskPluginVariants(generation, aliases, name); len(plugins) > 0 {
 		compatible := requestErr == nil
 		var compatibilityErr error
+		configured := PricingValues{billing_setting.PluginBillingExprOption: variants}
+		effective := PricingValues{
+			"billing_setting.billing_mode": billing_setting.BillingModeTieredExpr,
+			"billing_setting.billing_expr": expression,
+		}
 		for _, plugin := range plugins {
 			schema, _ := plugin.Meta.UsageForModel(schemaModel)
-			err := billing_setting.SmokeTestTaskExpr(expression, schema)
-			if err == nil {
+			mainErr := billing_setting.SmokeTestTaskExpr(expression, schema)
+			if mainErr == nil {
 				compatible = true
-				continue
+			} else if compatibilityErr == nil {
+				compatibilityErr = fmt.Errorf("model %s: plugin %s: %w", name, plugin.Meta.Key, mainErr)
 			}
-			wrapped := fmt.Errorf("model %s: plugin %s: %w", name, plugin.Meta.Key, err)
-			if compatibilityErr == nil {
-				compatibilityErr = wrapped
-			}
-			if _, overridden := variants[plugin.Meta.Key]; !overridden {
-				return wrapped
+			selected := effectiveTaskPluginPricingExpression(
+				pricingMaps, configured, effective, plugin.Meta.Key, name, schemaModel,
+			)
+			if err := billing_setting.SmokeTestTaskExpr(selected, schema); err != nil {
+				return fmt.Errorf("model %s: plugin %s: %w", name, plugin.Meta.Key, err)
 			}
 		}
 		if !compatible {
@@ -738,7 +747,7 @@ func updateModelPricingDatabaseCore(db *gorm.DB, changes []ModelPricingChange, a
 			if change.Reset {
 				pricing = modelPricingValues(defaults, change.ModelName)
 			}
-			if err := validateModelPricing(change.ModelName, pricing, previous, change.PluginValidationModels, aliases); err != nil {
+			if err := validateModelPricing(change.ModelName, pricing, previous, change.PluginValidationModels, values, aliases); err != nil {
 				return err
 			}
 			prepared[index] = pricing
@@ -826,7 +835,7 @@ func UpdateModelPricingOptions(updates map[string]string) error {
 				continue
 			}
 			changed := legacyModelPricingValidationDraft(name, after, before, updatedKeys, aliases)
-			if err := validateModelPricing(name, changed, before, nil, aliases); err != nil {
+			if err := validateModelPricing(name, changed, before, nil, values, aliases); err != nil {
 				return err
 			}
 		}
