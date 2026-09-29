@@ -24,6 +24,57 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestModelPriceHelperTieredUsesAlreadyResolvedExpression(t *testing.T) {
+	const (
+		modelName  = "resolved-tiered-expression"
+		expression = `tier("resolved", p * 2)`
+	)
+
+	previous := config.GlobalConfig.ExportAllConfigs()
+	previousMultiplier := operation_setting.GetQuotaSetting().PreConsumeMultiplier
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previous))
+		operation_setting.GetQuotaSetting().PreConsumeMultiplier = previousMultiplier
+	})
+	operation_setting.GetQuotaSetting().PreConsumeMultiplier = 1
+	require.NoError(t, billing_setting.UpdateBillingSettingOptions(map[string]string{
+		billing_setting.BillingModeOption:       `{"resolved-tiered-expression":"tiered_expr"}`,
+		billing_setting.BillingExprOption:       `{"resolved-tiered-expression":"tier(\"resolved\", p * 2)"}`,
+		billing_setting.PluginBillingExprOption: `{}`,
+	}))
+	decision := billing_setting.ResolveModelBillingDecision(modelName)
+	require.Equal(t, billing_setting.BillingModeTieredExpr, decision.Mode)
+	require.True(t, decision.ExpressionExists)
+
+	require.NoError(t, billing_setting.UpdateBillingSettingOptions(map[string]string{
+		billing_setting.BillingModeOption:       `{"resolved-tiered-expression":"ratio"}`,
+		billing_setting.BillingExprOption:       `{}`,
+		billing_setting.PluginBillingExprOption: `{}`,
+	}))
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	info := &relaycommon.RelayInfo{
+		OriginModelName:     modelName,
+		BillingRequestInput: &billingexpr.RequestInput{},
+	}
+	priceData, err := modelPriceHelperTiered(
+		ctx,
+		info,
+		modelName,
+		decision.Expression,
+		decision.ExpressionExists,
+		1000,
+		hosttypes.GroupRatioInfo{GroupRatio: 1},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1000, priceData.QuotaToPreConsume)
+	require.NotNil(t, info.TieredBillingSnapshot)
+	assert.Equal(t, expression, info.TieredBillingSnapshot.ExprString)
+	assert.Equal(t, "resolved", info.TieredBillingSnapshot.EstimatedTier)
+}
+
 func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

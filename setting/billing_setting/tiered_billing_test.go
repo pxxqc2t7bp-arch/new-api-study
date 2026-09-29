@@ -8,9 +8,174 @@ import (
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestResolveModelBillingDecisionKeepsPublishedBundleCoherent(t *testing.T) {
+	const (
+		modelName   = "atomic-model-decision"
+		requestExpr = `tier("request", p * 2)`
+	)
+
+	previous := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previous))
+	})
+
+	transitions := []struct {
+		name       string
+		mode       string
+		expression string
+		exists     bool
+	}{
+		{name: "ratio before publication", mode: BillingModeRatio},
+		{name: "tiered publication", mode: BillingModeTieredExpr, expression: requestExpr, exists: true},
+		{name: "ratio after publication", mode: BillingModeRatio},
+	}
+	for _, transition := range transitions {
+		t.Run(transition.name, func(t *testing.T) {
+			modes := fmt.Sprintf(`{%q:%q}`, modelName, transition.mode)
+			expressions := `{}`
+			if transition.exists {
+				expressions = fmt.Sprintf(`{%q:%q}`, modelName, transition.expression)
+			}
+			require.NoError(t, UpdateBillingSettingOptions(map[string]string{
+				BillingModeOption:       modes,
+				BillingExprOption:       expressions,
+				PluginBillingExprOption: `{}`,
+			}))
+
+			decision := ResolveModelBillingDecision(modelName)
+
+			assert.Equal(t, transition.mode, decision.Mode)
+			assert.Equal(t, transition.expression, decision.Expression)
+			assert.Equal(t, transition.exists, decision.ExpressionExists)
+		})
+	}
+}
+
+func TestResolveTaskBillingDecisionKeepsModeAndSelectedExpressionCoherent(t *testing.T) {
+	const (
+		pluginKey          = "atomic-provider"
+		modelName          = "atomic-task-alias"
+		mappedModel        = "atomic-task-target"
+		mainExpr           = `tier("main", u("image_count") * 0.01)`
+		mappedExpr         = `tier("mapped", u("image_count") * 0.02)`
+		providerExpr       = `tier("provider", u("image_count") * 0.03)`
+		mappedProviderExpr = `tier("mapped-provider", u("image_count") * 0.04)`
+	)
+
+	previous := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previous))
+	})
+
+	transitions := []struct {
+		name              string
+		modes             string
+		expressions       string
+		pluginExpressions string
+		expected          BillingDecision
+	}{
+		{
+			name:              "ratio before publication",
+			modes:             fmt.Sprintf(`{%q:%q}`, modelName, BillingModeRatio),
+			expressions:       `{}`,
+			pluginExpressions: `{}`,
+			expected:          BillingDecision{Mode: BillingModeRatio},
+		},
+		{
+			name:              "model tiered publication",
+			modes:             fmt.Sprintf(`{%q:%q}`, modelName, BillingModeTieredExpr),
+			expressions:       fmt.Sprintf(`{%q:%q}`, modelName, mainExpr),
+			pluginExpressions: `{}`,
+			expected:          BillingDecision{Mode: BillingModeTieredExpr, Expression: mainExpr, ExpressionExists: true},
+		},
+		{
+			name:        "provider override ignores ratio mode",
+			modes:       fmt.Sprintf(`{%q:%q}`, modelName, BillingModeRatio),
+			expressions: `{}`,
+			pluginExpressions: fmt.Sprintf(`{%q:%q}`,
+				PluginBillingExprKey(pluginKey, modelName), providerExpr),
+			expected: BillingDecision{Mode: BillingModeTieredExpr, Expression: providerExpr, ExpressionExists: true},
+		},
+		{
+			name:  "alias provider override precedes mapped override",
+			modes: fmt.Sprintf(`{%q:%q,%q:%q}`, modelName, BillingModeTieredExpr, mappedModel, BillingModeTieredExpr),
+			expressions: fmt.Sprintf(`{%q:%q,%q:%q}`,
+				modelName, mainExpr, mappedModel, mappedExpr),
+			pluginExpressions: fmt.Sprintf(`{%q:%q,%q:%q}`,
+				PluginBillingExprKey(pluginKey, modelName), providerExpr,
+				PluginBillingExprKey(pluginKey, mappedModel), mappedProviderExpr),
+			expected: BillingDecision{Mode: BillingModeTieredExpr, Expression: providerExpr, ExpressionExists: true},
+		},
+		{
+			name:  "mapped provider override precedes alias main expression",
+			modes: fmt.Sprintf(`{%q:%q,%q:%q}`, modelName, BillingModeTieredExpr, mappedModel, BillingModeTieredExpr),
+			expressions: fmt.Sprintf(`{%q:%q,%q:%q}`,
+				modelName, mainExpr, mappedModel, mappedExpr),
+			pluginExpressions: fmt.Sprintf(`{%q:%q}`,
+				PluginBillingExprKey(pluginKey, mappedModel), mappedProviderExpr),
+			expected: BillingDecision{Mode: BillingModeTieredExpr, Expression: mappedProviderExpr, ExpressionExists: true},
+		},
+		{
+			name:  "alias main expression precedes mapped main expression",
+			modes: fmt.Sprintf(`{%q:%q,%q:%q}`, modelName, BillingModeTieredExpr, mappedModel, BillingModeTieredExpr),
+			expressions: fmt.Sprintf(`{%q:%q,%q:%q}`,
+				modelName, mainExpr, mappedModel, mappedExpr),
+			pluginExpressions: `{}`,
+			expected:          BillingDecision{Mode: BillingModeTieredExpr, Expression: mainExpr, ExpressionExists: true},
+		},
+		{
+			name:              "tiered alias with missing expression fails closed",
+			modes:             fmt.Sprintf(`{%q:%q,%q:%q}`, modelName, BillingModeTieredExpr, mappedModel, BillingModeTieredExpr),
+			expressions:       fmt.Sprintf(`{%q:%q}`, mappedModel, mappedExpr),
+			pluginExpressions: `{}`,
+			expected:          BillingDecision{Mode: BillingModeTieredExpr},
+		},
+		{
+			name:              "mapped provider override forces tiered mode",
+			modes:             fmt.Sprintf(`{%q:%q,%q:%q}`, modelName, BillingModeRatio, mappedModel, BillingModeRatio),
+			expressions:       `{}`,
+			pluginExpressions: fmt.Sprintf(`{%q:%q}`, PluginBillingExprKey(pluginKey, mappedModel), mappedProviderExpr),
+			expected:          BillingDecision{Mode: BillingModeTieredExpr, Expression: mappedProviderExpr, ExpressionExists: true},
+		},
+		{
+			name:              "mapped target fallback",
+			modes:             fmt.Sprintf(`{%q:%q,%q:%q}`, modelName, BillingModeRatio, mappedModel, BillingModeTieredExpr),
+			expressions:       fmt.Sprintf(`{%q:%q}`, mappedModel, mappedExpr),
+			pluginExpressions: `{}`,
+			expected:          BillingDecision{Mode: BillingModeTieredExpr, Expression: mappedExpr, ExpressionExists: true},
+		},
+		{
+			name:              "tiered mapped target with missing expression fails closed",
+			modes:             fmt.Sprintf(`{%q:%q,%q:%q}`, modelName, BillingModeRatio, mappedModel, BillingModeTieredExpr),
+			expressions:       `{}`,
+			pluginExpressions: `{}`,
+			expected:          BillingDecision{Mode: BillingModeTieredExpr},
+		},
+		{
+			name:              "ratio after publication",
+			modes:             fmt.Sprintf(`{%q:%q,%q:%q}`, modelName, BillingModeRatio, mappedModel, BillingModeRatio),
+			expressions:       `{}`,
+			pluginExpressions: `{}`,
+			expected:          BillingDecision{Mode: BillingModeRatio},
+		},
+	}
+	for _, transition := range transitions {
+		t.Run(transition.name, func(t *testing.T) {
+			require.NoError(t, UpdateBillingSettingOptions(map[string]string{
+				BillingModeOption:       transition.modes,
+				BillingExprOption:       transition.expressions,
+				PluginBillingExprOption: transition.pluginExpressions,
+			}))
+
+			assert.Equal(t, transition.expected, ResolveTaskBillingDecision(pluginKey, modelName, mappedModel))
+		})
+	}
+}
 
 func TestSmokeTestTaskExprValidatesDeclaredUsageVectors(t *testing.T) {
 	videoSchema := map[string]jsplugin.UsageFieldSchema{

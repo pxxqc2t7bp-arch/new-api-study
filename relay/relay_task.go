@@ -274,14 +274,14 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			billingMappedModel = canonical
 		}
 	}
-	exprStr, exists := billing_setting.ResolveTaskBillingExpr(pluginKey, modelName, billingMappedModel)
-	useTiered := exists || billing_setting.GetBillingMode(modelName) == billing_setting.BillingModeTieredExpr
-	if useTiered {
+	billingDecision := billing_setting.ResolveTaskBillingDecision(pluginKey, modelName, billingMappedModel)
+	exprStr := billingDecision.Expression
+	if billingDecision.Mode == billing_setting.BillingModeTieredExpr {
 		provider, supported := adaptor.(channel.TaskUsageFactsProvider)
 		if billingexpr.UsesFixedPricing(exprStr) {
 			return nil, service.TaskErrorWrapper(fmt.Errorf("fixed pricing is not supported for task usage expressions"), "model_price_error", http.StatusBadRequest)
 		}
-		if !exists || !supported {
+		if !billingDecision.ExpressionExists || !supported {
 			return nil, service.TaskErrorWrapper(fmt.Errorf("task model %s has no usage expression or meter", modelName), "model_price_error", http.StatusBadRequest)
 		}
 		sharedModel := pinnedPlugin.Generation.SharedModel(modelName) || pinnedPlugin.Generation.SharedModel(billingMappedModel)

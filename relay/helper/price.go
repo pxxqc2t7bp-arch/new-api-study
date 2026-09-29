@@ -80,8 +80,17 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 	groupRatioInfo := HandleGroupRatio(c, info)
 
 	// Check if this model uses tiered_expr billing
-	if billing_setting.GetBillingMode(billingModelName) == billing_setting.BillingModeTieredExpr {
-		return modelPriceHelperTiered(c, info, billingModelName, promptTokens, groupRatioInfo)
+	billingDecision := billing_setting.ResolveModelBillingDecision(billingModelName)
+	if billingDecision.Mode == billing_setting.BillingModeTieredExpr {
+		return modelPriceHelperTiered(
+			c,
+			info,
+			billingModelName,
+			billingDecision.Expression,
+			billingDecision.ExpressionExists,
+			promptTokens,
+			groupRatioInfo,
+		)
 	}
 
 	var preConsumedQuota int
@@ -288,11 +297,11 @@ func HasModelBillingConfig(modelName string) bool {
 	if _, ok, _ := ratio_setting.GetModelRatio(modelName); ok {
 		return true
 	}
-	if billing_setting.GetBillingMode(modelName) != billing_setting.BillingModeTieredExpr {
+	billingDecision := billing_setting.ResolveModelBillingDecision(modelName)
+	if billingDecision.Mode != billing_setting.BillingModeTieredExpr {
 		return false
 	}
-	expr, ok := billing_setting.GetBillingExpr(modelName)
-	return ok && strings.TrimSpace(expr) != ""
+	return billingDecision.ExpressionExists && strings.TrimSpace(billingDecision.Expression) != ""
 }
 
 // ApplySmartRouterActualModelPricing swaps the conservative pre-consume price
@@ -386,9 +395,16 @@ func resolveBillingModelName(origin string) string {
 	return matched
 }
 
-func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billingModelName string, promptTokens int, groupRatioInfo hosttypes.GroupRatioInfo) (hosttypes.PriceData, error) {
-	exprStr, ok := billing_setting.GetBillingExpr(billingModelName)
-	if !ok {
+func modelPriceHelperTiered(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	billingModelName string,
+	exprStr string,
+	expressionExists bool,
+	promptTokens int,
+	groupRatioInfo hosttypes.GroupRatioInfo,
+) (hosttypes.PriceData, error) {
+	if !expressionExists {
 		return hosttypes.PriceData{}, fmt.Errorf("model %s is configured as tiered_expr but has no billing expression", billingModelName)
 	}
 	exprHash := billingexpr.ExprHashString(exprStr)

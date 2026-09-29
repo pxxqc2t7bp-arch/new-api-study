@@ -75,18 +75,93 @@ func TestPublishModelPricingOptionsPublishesBillingBundleAtomically(t *testing.T
 	case <-time.After(5 * time.Second):
 		require.FailNow(t, "timed out waiting for plugin expression publication")
 	}
-	mode := billing_setting.GetBillingMode(modelName)
-	expression, selected := billing_setting.ResolveTaskBillingExpr(pluginKey, modelName, modelName)
+	decision := billing_setting.ResolveTaskBillingDecision(pluginKey, modelName, modelName)
 	close(release)
 	require.NoError(t, <-published)
 
-	assert.False(t,
-		mode == billing_setting.BillingModeTieredExpr && selected && expression == requestExpr,
-		"runtime observed the request-only main expression before the task-provider override",
+	assert.Equal(t, billing_setting.BillingDecision{Mode: billing_setting.BillingModeRatio}, decision)
+	finalDecision := billing_setting.ResolveTaskBillingDecision(pluginKey, modelName, modelName)
+	assert.Equal(t, billing_setting.BillingDecision{
+		Mode: billing_setting.BillingModeTieredExpr, Expression: taskExpr, ExpressionExists: true,
+	}, finalDecision)
+}
+
+func TestResolvePricingBillingDecisionUsesOneAliasFallbackDecision(t *testing.T) {
+	const (
+		alias      = "aggregate-seedream-alias"
+		mapped     = "aggregate-seedream-target"
+		aliasExpr  = `tier("alias", u("image_count") * 0.01)`
+		mappedExpr = `tier("mapped", u("image_count") * 0.02)`
 	)
-	finalExpression, finalSelected := billing_setting.ResolveTaskBillingExpr(pluginKey, modelName, modelName)
-	require.True(t, finalSelected)
-	assert.Equal(t, taskExpr, finalExpression)
+
+	previousConfig := config.GlobalConfig.ExportAllConfigs()
+	previousAliases := taskAliasViewPtr.Load()
+	generation := jsplugin.DefaultRegistry.Generation()
+	aliases := newTaskAliasView(generation)
+	aliases.byFold[jsplugin.ASCIIFold(alias)] = TaskAliasTarget{
+		Alias: alias, Declared: mapped, PluginKey: "doubao",
+	}
+	taskAliasViewPtr.Store(aliases)
+	t.Cleanup(func() {
+		taskAliasViewPtr.Store(previousAliases)
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previousConfig))
+	})
+
+	for _, test := range []struct {
+		name        string
+		modes       string
+		expressions string
+		expected    billing_setting.BillingDecision
+	}{
+		{
+			name: "alias expression precedes mapped expression",
+			modes: fmt.Sprintf(`{%q:%q,%q:%q}`,
+				alias, billing_setting.BillingModeTieredExpr,
+				mapped, billing_setting.BillingModeTieredExpr),
+			expressions: fmt.Sprintf(`{%q:%q,%q:%q}`, alias, aliasExpr, mapped, mappedExpr),
+			expected: billing_setting.BillingDecision{
+				Mode: billing_setting.BillingModeTieredExpr, Expression: aliasExpr, ExpressionExists: true,
+			},
+		},
+		{
+			name: "mapped expression is the alias fallback",
+			modes: fmt.Sprintf(`{%q:%q,%q:%q}`,
+				alias, billing_setting.BillingModeRatio,
+				mapped, billing_setting.BillingModeTieredExpr),
+			expressions: fmt.Sprintf(`{%q:%q}`, mapped, mappedExpr),
+			expected: billing_setting.BillingDecision{
+				Mode: billing_setting.BillingModeTieredExpr, Expression: mappedExpr, ExpressionExists: true,
+			},
+		},
+		{
+			name: "missing alias expression fails closed before mapped fallback",
+			modes: fmt.Sprintf(`{%q:%q,%q:%q}`,
+				alias, billing_setting.BillingModeTieredExpr,
+				mapped, billing_setting.BillingModeTieredExpr),
+			expressions: fmt.Sprintf(`{%q:%q}`, mapped, mappedExpr),
+			expected: billing_setting.BillingDecision{
+				Mode: billing_setting.BillingModeTieredExpr,
+			},
+		},
+		{
+			name: "ratio remains the final fallback",
+			modes: fmt.Sprintf(`{%q:%q,%q:%q}`,
+				alias, billing_setting.BillingModeRatio,
+				mapped, billing_setting.BillingModeRatio),
+			expressions: `{}`,
+			expected:    billing_setting.BillingDecision{Mode: billing_setting.BillingModeRatio},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require.NoError(t, billing_setting.UpdateBillingSettingOptions(map[string]string{
+				billing_setting.BillingModeOption:       test.modes,
+				billing_setting.BillingExprOption:       test.expressions,
+				billing_setting.PluginBillingExprOption: `{}`,
+			}))
+
+			assert.Equal(t, test.expected, resolvePricingBillingDecision(generation, alias))
+		})
+	}
 }
 
 func openModelPricingInstanceDatabases(t *testing.T) (*gorm.DB, *gorm.DB) {

@@ -43,6 +43,12 @@ var billingSetting = BillingSetting{
 	PluginBillingExpr: make(map[string]string),
 }
 
+type BillingDecision struct {
+	Mode             string
+	Expression       string
+	ExpressionExists bool
+}
+
 func init() {
 	config.GlobalConfig.Register("billing_setting", &billingSetting)
 }
@@ -80,21 +86,27 @@ func getBillingExpr(setting *BillingSetting, model string) (string, bool) {
 	return "", false
 }
 
-func GetBillingMode(model string) string {
-	mode := BillingModeRatio
+func resolveModelBillingDecision(setting *BillingSetting, model string) BillingDecision {
+	mode := getBillingMode(setting, model)
+	expression, exists := getBillingExpr(setting, model)
+	return BillingDecision{Mode: mode, Expression: expression, ExpressionExists: exists}
+}
+
+func ResolveModelBillingDecision(model string) BillingDecision {
+	decision := BillingDecision{Mode: BillingModeRatio}
 	config.GlobalConfig.Read("billing_setting", func(value any) {
-		mode = getBillingMode(value.(*BillingSetting), model)
+		decision = resolveModelBillingDecision(value.(*BillingSetting), model)
 	})
-	return mode
+	return decision
+}
+
+func GetBillingMode(model string) string {
+	return ResolveModelBillingDecision(model).Mode
 }
 
 func GetBillingExpr(model string) (string, bool) {
-	var expression string
-	var ok bool
-	config.GlobalConfig.Read("billing_setting", func(value any) {
-		expression, ok = getBillingExpr(value.(*BillingSetting), model)
-	})
-	return expression, ok
+	decision := ResolveModelBillingDecision(model)
+	return decision.Expression, decision.ExpressionExists
 }
 
 func GetBuiltinBillingExpr(model string) (string, bool) {
@@ -131,37 +143,46 @@ func GetPluginBillingExpr(pluginKey, model string) (string, bool) {
 	return expression, ok
 }
 
-// ResolveTaskBillingExpr selects the executing plugin's override before the
-// model expression, retaining the model alias fallback and explicit modes.
-func ResolveTaskBillingExpr(pluginKey, model, mappedModel string) (string, bool) {
-	var expression string
-	var selected bool
+func resolveTaskBillingDecision(setting *BillingSetting, pluginKey, model, mappedModel string) BillingDecision {
+	if pluginKey != "" {
+		if expression, ok := setting.PluginBillingExpr[PluginBillingExprKey(pluginKey, model)]; ok {
+			return BillingDecision{Mode: BillingModeTieredExpr, Expression: expression, ExpressionExists: true}
+		}
+		if mappedModel != "" && mappedModel != model {
+			if expression, ok := setting.PluginBillingExpr[PluginBillingExprKey(pluginKey, mappedModel)]; ok {
+				return BillingDecision{Mode: BillingModeTieredExpr, Expression: expression, ExpressionExists: true}
+			}
+		}
+	}
+	decision := resolveModelBillingDecision(setting, model)
+	if decision.Mode == BillingModeTieredExpr {
+		return decision
+	}
+	if mappedModel != "" && mappedModel != model {
+		mappedDecision := resolveModelBillingDecision(setting, mappedModel)
+		if mappedDecision.Mode == BillingModeTieredExpr {
+			mappedDecision.ExpressionExists = mappedDecision.ExpressionExists &&
+				strings.TrimSpace(mappedDecision.Expression) != ""
+			return mappedDecision
+		}
+	}
+	return BillingDecision{Mode: BillingModeRatio}
+}
+
+// ResolveTaskBillingDecision selects the executing plugin's override before
+// model and mapped-model expressions under one configuration read lock.
+func ResolveTaskBillingDecision(pluginKey, model, mappedModel string) BillingDecision {
+	decision := BillingDecision{Mode: BillingModeRatio}
 	config.GlobalConfig.Read("billing_setting", func(value any) {
-		setting := value.(*BillingSetting)
-		if pluginKey != "" {
-			if expr, ok := setting.PluginBillingExpr[PluginBillingExprKey(pluginKey, model)]; ok {
-				expression, selected = expr, true
-				return
-			}
-			if mappedModel != "" && mappedModel != model {
-				if expr, ok := setting.PluginBillingExpr[PluginBillingExprKey(pluginKey, mappedModel)]; ok {
-					expression, selected = expr, true
-					return
-				}
-			}
-		}
-		if getBillingMode(setting, model) == BillingModeTieredExpr {
-			expression, selected = getBillingExpr(setting, model)
-			return
-		}
-		if mappedModel != "" && mappedModel != model && getBillingMode(setting, mappedModel) == BillingModeTieredExpr {
-			expression, selected = getBillingExpr(setting, mappedModel)
-			if strings.TrimSpace(expression) == "" {
-				selected = false
-			}
-		}
+		decision = resolveTaskBillingDecision(value.(*BillingSetting), pluginKey, model, mappedModel)
 	})
-	return expression, selected
+	return decision
+}
+
+// ResolveTaskBillingExpr preserves the expression-only API for existing callers.
+func ResolveTaskBillingExpr(pluginKey, model, mappedModel string) (string, bool) {
+	decision := ResolveTaskBillingDecision(pluginKey, model, mappedModel)
+	return decision.Expression, decision.ExpressionExists
 }
 
 // TaskExprCompatible checks the schema contract even for usage references in
