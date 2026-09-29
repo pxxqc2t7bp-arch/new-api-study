@@ -229,6 +229,21 @@ func getBillingExprCopy(setting *BillingSetting) map[string]string {
 	return expressions
 }
 
+// GetBillingOptionSnapshot returns the complete API-facing billing bundle
+// from one configuration generation.
+func GetBillingOptionSnapshot() BillingSetting {
+	var snapshot BillingSetting
+	config.GlobalConfig.Read("billing_setting", func(value any) {
+		setting := value.(*BillingSetting)
+		snapshot = BillingSetting{
+			BillingMode:       getBillingModeCopy(setting),
+			BillingExpr:       getBillingExprCopy(setting),
+			PluginBillingExpr: maps.Clone(setting.PluginBillingExpr),
+		}
+	})
+	return snapshot
+}
+
 func GetBillingModeCopy() map[string]string {
 	var modes map[string]string
 	config.GlobalConfig.Read("billing_setting", func(value any) {

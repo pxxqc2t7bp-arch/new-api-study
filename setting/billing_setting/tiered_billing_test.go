@@ -56,6 +56,43 @@ func TestResolveModelBillingDecisionKeepsPublishedBundleCoherent(t *testing.T) {
 	}
 }
 
+func TestGetBillingOptionSnapshotReturnsEffectiveIndependentCopies(t *testing.T) {
+	const (
+		modelName    = "option-snapshot-model"
+		pluginKey    = "option-snapshot-provider"
+		mainExpr     = `tier("main", p * 2 + c * 8)`
+		providerExpr = `tier("provider", u("image_count") * 0.03)`
+	)
+
+	previous := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previous))
+	})
+	require.NoError(t, UpdateBillingSettingOptions(map[string]string{
+		BillingModeOption:       fmt.Sprintf(`{%q:%q}`, modelName, BillingModeTieredExpr),
+		BillingExprOption:       fmt.Sprintf(`{%q:%q}`, modelName, mainExpr),
+		PluginBillingExprOption: fmt.Sprintf(`{%q:%q}`, PluginBillingExprKey(pluginKey, modelName), providerExpr),
+	}))
+
+	expectedModes := GetBillingModeCopy()
+	expectedExpressions := GetBillingExprCopy()
+	expectedProviderExpressions := GetPluginBillingExprCopy()
+	snapshot := GetBillingOptionSnapshot()
+
+	assert.Equal(t, expectedModes, snapshot.BillingMode)
+	assert.Equal(t, expectedExpressions, snapshot.BillingExpr)
+	assert.Equal(t, expectedProviderExpressions, snapshot.PluginBillingExpr)
+
+	snapshot.BillingMode[modelName] = BillingModeRatio
+	snapshot.BillingExpr[modelName] = "mutated"
+	snapshot.PluginBillingExpr[PluginBillingExprKey(pluginKey, modelName)] = "mutated"
+
+	fresh := GetBillingOptionSnapshot()
+	assert.Equal(t, BillingModeTieredExpr, fresh.BillingMode[modelName])
+	assert.Equal(t, mainExpr, fresh.BillingExpr[modelName])
+	assert.Equal(t, providerExpr, fresh.PluginBillingExpr[PluginBillingExprKey(pluginKey, modelName)])
+}
+
 func TestResolveTaskBillingDecisionKeepsModeAndSelectedExpressionCoherent(t *testing.T) {
 	const (
 		pluginKey          = "atomic-provider"

@@ -110,6 +110,68 @@ func modelManagementRequest(t *testing.T, handler gin.HandlerFunc, method, path 
 	return recorder
 }
 
+func TestGetOptionsReturnsCoherentBillingOptionSnapshot(t *testing.T) {
+	const (
+		modelName    = "controller-option-snapshot"
+		pluginKey    = "controller-option-provider"
+		mainExpr     = `tier("main", p * 2 + c * 8)`
+		providerExpr = `tier("provider", u("image_count") * 0.03)`
+	)
+
+	previousConfig := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previousConfig))
+	})
+	require.NoError(t, billing_setting.UpdateBillingSettingOptions(map[string]string{
+		billing_setting.BillingModeOption:       fmt.Sprintf(`{%q:%q}`, modelName, billing_setting.BillingModeTieredExpr),
+		billing_setting.BillingExprOption:       fmt.Sprintf(`{%q:%q}`, modelName, mainExpr),
+		billing_setting.PluginBillingExprOption: fmt.Sprintf(`{%q:%q}`, billing_setting.PluginBillingExprKey(pluginKey, modelName), providerExpr),
+	}))
+	expected := billing_setting.GetBillingOptionSnapshot()
+
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
+	common.OptionMap = map[string]string{
+		"public-option":                         "kept",
+		"model_pricing.revision":                "41",
+		billing_setting.BillingModeOption:       `{"stale-model":"ratio"}`,
+		billing_setting.BillingExprOption:       `{"stale-model":"stale-main"}`,
+		billing_setting.PluginBillingExprOption: `{"stale-provider::stale-model":"stale-provider"}`,
+	}
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+	})
+
+	var response struct {
+		Success bool            `json:"success"`
+		Data    []*model.Option `json:"data"`
+	}
+	recorder := modelManagementRequest(t, GetOptions, http.MethodGet, "/api/option/", nil, &response)
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.True(t, response.Success, recorder.Body.String())
+
+	values := make(map[string][]string)
+	for _, option := range response.Data {
+		values[option.Key] = append(values[option.Key], option.Value)
+	}
+	assert.Equal(t, []string{"kept"}, values["public-option"])
+	assert.NotContains(t, values, "model_pricing.revision")
+
+	for key, expectedMap := range map[string]map[string]string{
+		billing_setting.BillingModeOption:       expected.BillingMode,
+		billing_setting.BillingExprOption:       expected.BillingExpr,
+		billing_setting.PluginBillingExprOption: expected.PluginBillingExpr,
+	} {
+		require.Len(t, values[key], 1, "%s must be projected exactly once", key)
+		var actual map[string]string
+		require.NoError(t, common.UnmarshalJsonStr(values[key][0], &actual))
+		assert.Equal(t, expectedMap, actual)
+	}
+}
+
 func TestUpdateOptionBillingExpressionReadsAreBounded(t *testing.T) {
 	db := modelManagementDB(t, "sqlite", "")
 	require.NoError(t, db.AutoMigrate(&model.UpstreamPriceEvidence{}))
