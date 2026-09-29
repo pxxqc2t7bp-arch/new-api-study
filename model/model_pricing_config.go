@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"reflect"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -62,13 +64,22 @@ type ModelPricingSnapshot struct {
 
 var ErrModelPricingConflict = errors.New("model pricing changed; reload before saving")
 
-// Lock order is stable across instances. Creating missing option rows inside
-// the transaction also serializes the first write to an unconfigured database.
 var modelPricingOptionKeys = []string{
 	"AudioCompletionRatio", "AudioRatio", "CacheRatio", "CompletionRatio",
 	"CreateCacheRatio", "ImageRatio", "ModelPrice", "ModelRatio",
 	"billing_setting.billing_expr", "billing_setting.billing_mode", billing_setting.PluginBillingExprOption,
 }
+
+var legacyWildcardPricingOptionKeys = []string{
+	"ModelPrice", "ModelRatio", "CompletionRatio", "AudioRatio", "AudioCompletionRatio",
+}
+
+const (
+	modelPricingRevisionOptionKey = "model_pricing.revision"
+	modelPricingCASMaxAttempts    = 8
+)
+
+var errModelPricingCASMiss = errors.New("model pricing revision changed")
 
 var modelPricingMutationMu sync.Mutex
 
@@ -110,6 +121,10 @@ func readModelPricingMaps(db *gorm.DB) (map[string]map[string]any, map[string]bo
 		if entries == nil {
 			return nil, nil, nil, fmt.Errorf("%s must be a JSON object", row.Key)
 		}
+		entries, err := normalizeLegacyPricingEntries(row.Key, entries)
+		if err != nil {
+			return nil, nil, nil, err
+		}
 		values[row.Key] = entries
 		existing[row.Key] = true
 		counts[row.Key]++
@@ -121,6 +136,40 @@ func readModelPricingMaps(db *gorm.DB) (map[string]map[string]any, map[string]bo
 		}
 	}
 	return values, existing, duplicated, nil
+}
+
+func modelPricingStorageName(key, name string) string {
+	if slices.Contains(legacyWildcardPricingOptionKeys, key) {
+		return ratio_setting.FormatMatchingModelName(name)
+	}
+	return name
+}
+
+func normalizeLegacyPricingEntries(key string, entries map[string]any) (map[string]any, error) {
+	if !slices.Contains(legacyWildcardPricingOptionKeys, key) {
+		return entries, nil
+	}
+	normalized := make(map[string]any, len(entries))
+	sources := make(map[string]string, len(entries))
+	for name, value := range entries {
+		canonical := modelPricingStorageName(key, name)
+		existing, exists := normalized[canonical]
+		if !exists {
+			normalized[canonical] = value
+			sources[canonical] = name
+			continue
+		}
+		if name == canonical {
+			normalized[canonical] = value
+			sources[canonical] = name
+			continue
+		}
+		if sources[canonical] == canonical || reflect.DeepEqual(existing, value) {
+			continue
+		}
+		return nil, fmt.Errorf("%s contains conflicting aliases for %s", key, canonical)
+	}
+	return normalized, nil
 }
 
 func modelPricingValues(values map[string]map[string]any, name string) PricingValues {
@@ -138,7 +187,7 @@ func modelPricingValues(values map[string]map[string]any, name string) PricingVa
 			}
 			continue
 		}
-		if value, exists := values[key][name]; exists {
+		if value, exists := values[key][modelPricingStorageName(key, name)]; exists {
 			result[key] = value
 		}
 	}
@@ -161,9 +210,14 @@ func replaceModelPricing(values map[string]map[string]any, name string, draft Pr
 			}
 			continue
 		}
-		delete(values[key], name)
+		storageName := modelPricingStorageName(key, name)
+		for existingName := range values[key] {
+			if modelPricingStorageName(key, existingName) == storageName {
+				delete(values[key], existingName)
+			}
+		}
 		if value, exists := draft[key]; exists {
-			values[key][name] = value
+			values[key][storageName] = value
 		}
 	}
 }
@@ -172,7 +226,7 @@ func effectiveModelPricing(values map[string]map[string]any, name string) Pricin
 	result := modelPricingValues(values, name)
 	// Legacy wildcard aliases are resolved by the same normalization as relay.
 	alias := ratio_setting.FormatMatchingModelName(name)
-	for _, key := range []string{"ModelPrice", "ModelRatio", "CompletionRatio", "AudioRatio", "AudioCompletionRatio"} {
+	for _, key := range legacyWildcardPricingOptionKeys {
 		delete(result, key)
 		if value, exists := values[key][alias]; exists {
 			result[key] = value
@@ -428,39 +482,8 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 			if !ok || strings.TrimSpace(expression) == "" {
 				return errors.New("billing expression is required")
 			}
-			// Even a model expression currently shadowed by every provider must
-			// compile; only its schema-specific smoke tests can be skipped.
-			if _, err := billingexpr.CompileFromCache(expression); err != nil {
-				return fmt.Errorf("model %s: %w", name, err)
-			}
-			var err error
-			if plugins := generation.PluginsByModel(name); len(plugins) > 0 {
-				for _, plugin := range plugins {
-					if _, overridden := variants[plugin.Meta.Key]; overridden {
-						continue
-					}
-					schema, _ := plugin.Meta.UsageForModel(name)
-					if err = billing_setting.SmokeTestTaskExpr(expression, schema); err != nil {
-						return fmt.Errorf("model %s: plugin %s: %w", name, plugin.Meta.Key, err)
-					}
-				}
-			} else if target, resolved := ResolveTaskModelAlias(generation, name); resolved {
-				if _, overridden := variants[target.PluginKey]; overridden {
-					err = smokeTestModelRequestExpr(expression)
-				} else if plugin, ok := generation.Get(target.PluginKey); ok {
-					schema, _ := plugin.Meta.UsageForModel(target.Declared)
-					err = billing_setting.SmokeTestTaskExpr(expression, schema)
-				} else {
-					err = smokeTestModelRequestExpr(expression)
-				}
-			} else if previous[key] != expression || len(billingexpr.UsedUsageKeys(expression)) == 0 {
-				err = smokeTestModelRequestExpr(expression)
-			}
-			// With no remaining plugin, an unchanged stored usage expression has
-			// no schema to test. Preserve it so removing stale overrides or saving
-			// other model prices does not become impossible.
-			if err != nil {
-				return fmt.Errorf("model %s: %w", name, err)
+			if err := validateMainModelPricingExpression(name, expression, previous, variants); err != nil {
+				return err
 			}
 			continue
 		}
@@ -471,10 +494,67 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 	}
 	if values["billing_setting.billing_mode"] == "tiered_expr" {
 		if _, exists := values["billing_setting.billing_expr"]; !exists {
-			if _, builtin := billing_setting.GetBuiltinBillingExpr(name); !builtin {
+			expression, builtin := billing_setting.GetBuiltinBillingExpr(name)
+			if !builtin {
 				return errors.New("billing expression is required")
 			}
+			if err := validateMainModelPricingExpression(name, expression, previous, variants); err != nil {
+				return err
+			}
 		}
+	}
+	return nil
+}
+
+func validateMainModelPricingExpression(name, expression string, previous PricingValues, variants map[string]any) error {
+	if _, err := billingexpr.CompileFromCache(expression); err != nil {
+		return fmt.Errorf("model %s: %w", name, err)
+	}
+	requestErr := smokeTestModelRequestExpr(expression)
+	generation := jsplugin.DefaultRegistry.Generation()
+	if plugins := generation.PluginsByModel(name); len(plugins) > 0 {
+		compatible := requestErr == nil
+		var compatibilityErr error
+		for _, plugin := range plugins {
+			schema, _ := plugin.Meta.UsageForModel(name)
+			err := billing_setting.SmokeTestTaskExpr(expression, schema)
+			if err == nil {
+				compatible = true
+				continue
+			}
+			wrapped := fmt.Errorf("model %s: plugin %s: %w", name, plugin.Meta.Key, err)
+			if compatibilityErr == nil {
+				compatibilityErr = wrapped
+			}
+			if _, overridden := variants[plugin.Meta.Key]; !overridden {
+				return wrapped
+			}
+		}
+		if !compatible {
+			return compatibilityErr
+		}
+		return nil
+	}
+	if target, resolved := ResolveTaskModelAlias(generation, name); resolved {
+		if plugin, ok := generation.Get(target.PluginKey); ok {
+			schema, _ := plugin.Meta.UsageForModel(target.Declared)
+			if err := billing_setting.SmokeTestTaskExpr(expression, schema); err != nil {
+				if _, overridden := variants[target.PluginKey]; overridden && requestErr == nil {
+					return nil
+				}
+				return fmt.Errorf("model %s: plugin %s: %w", name, target.PluginKey, err)
+			}
+			return nil
+		}
+	}
+	// With no remaining plugin, an unchanged stored usage expression has no
+	// schema to test. Preserve it so removing stale overrides or saving other
+	// model prices does not become impossible.
+	if previous["billing_setting.billing_expr"] == expression && len(billingexpr.UsedUsageKeys(expression)) > 0 {
+		return nil
+	}
+	if requestErr != nil {
+		return fmt.Errorf("model %s: %w", name, requestErr)
 	}
 	return nil
 }
@@ -518,20 +598,30 @@ func UpdateModelPricingWithEvidence(changes []ModelPricingChange, evidence []Ups
 }
 
 func updateModelPricing(changes []ModelPricingChange, afterPricing func(*gorm.DB) error) error {
+	modelPricingMutationMu.Lock()
+	defer modelPricingMutationMu.Unlock()
+	committed, err := updateModelPricingDatabase(DB, changes, afterPricing)
+	if err != nil {
+		return err
+	}
+	return publishModelPricingOptions(committed)
+}
+
+func updateModelPricingDatabase(db *gorm.DB, changes []ModelPricingChange, afterPricing func(*gorm.DB) error) (map[string]map[string]any, error) {
 	if len(changes) == 0 {
-		return errors.New("select model pricing changes before saving")
+		return nil, errors.New("select model pricing changes before saving")
 	}
 	seen := make(map[string]bool)
 	for _, change := range changes {
 		if seen[change.ModelName] {
-			return errors.New("duplicate model pricing change")
+			return nil, errors.New("duplicate model pricing change")
 		}
 		seen[change.ModelName] = true
 		if change.ExpectedVersion == "" {
-			return ErrModelPricingConflict
+			return nil, ErrModelPricingConflict
 		}
 	}
-	return mutateModelPricingOptions(func(tx *gorm.DB, values map[string]map[string]any) error {
+	return mutateModelPricingOptionsDatabase(db, func(tx *gorm.DB, values map[string]map[string]any) error {
 		defaults := defaultPricingMaps()
 		for _, change := range changes {
 			previous := modelPricingValues(values, change.ModelName)
@@ -571,6 +661,10 @@ func UpdateModelPricingOptions(updates map[string]string) error {
 			if entries == nil {
 				return fmt.Errorf("%s must be a JSON object", key)
 			}
+			entries, err := normalizeLegacyPricingEntries(key, entries)
+			if err != nil {
+				return err
+			}
 			for _, entriesForKey := range []map[string]any{values[key], entries} {
 				for name := range entriesForKey {
 					if key == billing_setting.PluginBillingExprOption {
@@ -597,50 +691,87 @@ func UpdateModelPricingOptions(updates map[string]string) error {
 func mutateModelPricingOptions(mutate func(*gorm.DB, map[string]map[string]any) error) error {
 	modelPricingMutationMu.Lock()
 	defer modelPricingMutationMu.Unlock()
-	var committed map[string]map[string]any
-	err := DB.Transaction(func(tx *gorm.DB) error {
-		values, existing, duplicated, err := readModelPricingMaps(lockForUpdate(tx))
-		if err != nil {
-			return err
-		}
-		if len(duplicated) > 0 {
-			common.SysError("options table has duplicate pricing keys [" + strings.Join(duplicated, ", ") + "]; the table is missing a primary key")
-		}
-		defaults := defaultPricingMaps()
-		for _, key := range modelPricingOptionKeys {
-			if existing[key] {
-				continue
-			}
-			encoded, err := common.Marshal(defaults[key])
-			if err != nil {
-				return err
-			}
-			row := Option{Key: key, Value: string(encoded)}
-			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
-				return err
-			}
-		}
-		if err := mutate(tx, values); err != nil {
-			return err
-		}
-		for _, key := range modelPricingOptionKeys {
-			encoded, err := common.Marshal(values[key])
-			if err != nil {
-				return err
-			}
-			if err := tx.Model(&Option{}).Where(clause.Eq{
-				Column: clause.Column{Name: "key"},
-				Value:  key,
-			}).Update("value", string(encoded)).Error; err != nil {
-				return err
-			}
-		}
-		committed = values
-		return nil
-	})
+	committed, err := mutateModelPricingOptionsDatabase(DB, mutate)
 	if err != nil {
 		return err
 	}
+	return publishModelPricingOptions(committed)
+}
+
+func mutateModelPricingOptionsDatabase(db *gorm.DB, mutate func(*gorm.DB, map[string]map[string]any) error) (map[string]map[string]any, error) {
+	revision := Option{Key: modelPricingRevisionOptionKey, Value: "0"}
+	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&revision).Error; err != nil {
+		return nil, err
+	}
+	for range modelPricingCASMaxAttempts {
+		var anchor Option
+		if err := db.Select("value").Where("key = ?", modelPricingRevisionOptionKey).First(&anchor).Error; err != nil {
+			return nil, err
+		}
+		current, err := strconv.ParseUint(anchor.Value, 10, 64)
+		if err != nil || current == math.MaxUint64 {
+			return nil, fmt.Errorf("invalid model pricing revision %q", anchor.Value)
+		}
+		next := strconv.FormatUint(current+1, 10)
+		var committed map[string]map[string]any
+		err = db.Transaction(func(tx *gorm.DB) error {
+			claim := tx.Model(&Option{}).
+				Where("key = ? AND value = ?", modelPricingRevisionOptionKey, anchor.Value).
+				Update("value", next)
+			if claim.Error != nil {
+				return claim.Error
+			}
+			if claim.RowsAffected != 1 {
+				return errModelPricingCASMiss
+			}
+			values, existing, duplicated, err := readModelPricingMaps(tx)
+			if err != nil {
+				return err
+			}
+			if len(duplicated) > 0 {
+				common.SysError("options table has duplicate pricing keys [" + strings.Join(duplicated, ", ") + "]; the table is missing a primary key")
+			}
+			if err := mutate(tx, values); err != nil {
+				return err
+			}
+			defaults := defaultPricingMaps()
+			for _, key := range modelPricingOptionKeys {
+				if existing[key] {
+					continue
+				}
+				encoded, err := common.Marshal(defaults[key])
+				if err != nil {
+					return err
+				}
+				row := Option{Key: key, Value: string(encoded)}
+				if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
+					return err
+				}
+			}
+			for _, key := range modelPricingOptionKeys {
+				encoded, err := common.Marshal(values[key])
+				if err != nil {
+					return err
+				}
+				if err := tx.Model(&Option{}).Where(clause.Eq{
+					Column: clause.Column{Name: "key"},
+					Value:  key,
+				}).Update("value", string(encoded)).Error; err != nil {
+					return err
+				}
+			}
+			committed = values
+			return nil
+		})
+		if errors.Is(err, errModelPricingCASMiss) {
+			continue
+		}
+		return committed, err
+	}
+	return nil, fmt.Errorf("%w: concurrent database updates", ErrModelPricingConflict)
+}
+
+func publishModelPricingOptions(committed map[string]map[string]any) error {
 	for _, key := range modelPricingOptionKeys {
 		encoded, _ := common.Marshal(committed[key])
 		if err := updateOptionMap(key, string(encoded)); err != nil {
