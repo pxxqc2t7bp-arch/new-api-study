@@ -223,6 +223,7 @@ func TestUpdateBillingSettingOptionsPublishesOnlyCompleteGenerations(t *testing.
 		}
 	}
 	require.NoError(t, UpdateBillingSettingOptions(optionsFor(oldGeneration)))
+	require.Equal(t, oldGeneration, observe(), "published initial generation")
 
 	const readerCount = 8
 	start := make(chan struct{})
@@ -278,6 +279,9 @@ func TestUpdateBillingSettingOptionsPublishesOnlyCompleteGenerations(t *testing.
 			next = oldGeneration
 		}
 		if updateErr = UpdateBillingSettingOptions(optionsFor(next)); updateErr != nil {
+			break
+		}
+		if !assert.Equal(t, next, observe(), "published generation after update %d", index) {
 			break
 		}
 		runtime.Gosched()
