@@ -267,19 +267,25 @@ func TestUpdateModelPricingOptionsRejectsRemovingActiveAliasVariant(t *testing.T
 export const meta = {
   apiVersion: 1, key: %q, name: %q, version: "1.0.0", author: {name: "Test"},
   models: [%q], fetchMode: "per_task",
-  usageSchema: {seconds: {type: "number", unit: "second"}}
+  usageSchema: {credits: {type: "number", unit: "credit"}},
+  usageExamples: [{label: "default credit", facts: {credits: 1}}],
+  usageProfiles: [{
+    models: [%q],
+    schema: {seconds: {type: "number", unit: "second"}},
+    examples: [{label: "canonical second", facts: {seconds: 1}}]
+  }]
 };
 export function buildSubmitRequest() { return {}; }
 export function parseSubmitResponse() { return {}; }
 export function buildQueryRequest() { return {}; }
 export function parseTaskResult() { return {}; }
-`, pluginKey, pluginKey, canonical)
+`, pluginKey, pluginKey, canonical, canonical)
 	_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
 	require.NoError(t, err)
 	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
 	plugin, exists := jsplugin.DefaultRegistry.Generation().Get(pluginKey)
 	require.True(t, exists)
-	schema, _ := plugin.Meta.UsageForModel(canonical)
+	schema, examples := plugin.Meta.UsageForModel(canonical)
 	require.NoError(t, billing_setting.SmokeTestExpr(mainExpr))
 	require.ErrorContains(t, billing_setting.SmokeTestTaskExpr(mainExpr, schema), "fixed pricing is not supported")
 	require.NoError(t, billing_setting.SmokeTestTaskExpr(variantExpr, schema))
@@ -313,9 +319,24 @@ export function parseTaskResult() { return {}; }
 	active, err := GetModelPricingSnapshot([]string{alias})
 	require.NoError(t, err)
 	require.Equal(t, map[string]any{pluginKey: variantExpr}, active.Entries[0].Configured[billing_setting.PluginBillingExprOption])
+	require.Len(t, active.Entries[0].PluginVariants, 1)
+	activeVariant := active.Entries[0].PluginVariants[0]
+	assert.False(t, activeVariant.Stale)
+	assert.Equal(t, schema, activeVariant.UsageSchema)
+	assert.Equal(t, examples, activeVariant.UsageExamples)
+	assert.Equal(t, variantExpr, activeVariant.Configured)
+	assert.Equal(t, variantExpr, activeVariant.Effective)
+	assert.True(t, activeVariant.Compatible)
 
 	require.NoError(t, database.Model(&Channel{}).Where("id = ?", channel.Id).Update("status", common.ChannelStatusManuallyDisabled).Error)
 	rebuildTaskAliasView()
+	stale, err := GetModelPricingSnapshot([]string{alias})
+	require.NoError(t, err)
+	require.Len(t, stale.Entries[0].PluginVariants, 1)
+	staleVariant := stale.Entries[0].PluginVariants[0]
+	assert.True(t, staleVariant.Stale)
+	assert.Equal(t, variantExpr, staleVariant.Configured)
+
 	require.NoError(t, UpdateModelPricingOptions(map[string]string{billing_setting.PluginBillingExprOption: `{}`}))
 	staleRemoved, err := GetModelPricingSnapshot([]string{alias})
 	require.NoError(t, err)

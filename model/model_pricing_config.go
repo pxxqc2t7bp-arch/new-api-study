@@ -319,6 +319,22 @@ func GetEffectiveModelPricingTx(tx *gorm.DB, names []string) (map[string]Pricing
 	return result, nil
 }
 
+func resolveActivePluginVariant(generation *jsplugin.RoutingGeneration, pluginKey, name string) (*jsplugin.LoadedPlugin, string, bool) {
+	plugin, exists := generation.Get(pluginKey)
+	if !exists {
+		return nil, "", false
+	}
+	if slices.Contains(plugin.Meta.Models, name) {
+		return plugin, name, true
+	}
+	target, resolved := ResolveTaskModelAlias(generation, name)
+	if !resolved || target.PluginKey != pluginKey || target.Declared == "" ||
+		!slices.Contains(plugin.Meta.Models, target.Declared) {
+		return plugin, "", false
+	}
+	return plugin, target.Declared, true
+}
+
 func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 	values, _, _, err := readModelPricingMaps(DB)
 	if err != nil {
@@ -374,19 +390,19 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 			for _, key := range slices.Sorted(maps.Keys(keys)) {
 				configuredValue, overridden := configuredVariants[key]
 				configuredExpr, _ := configuredValue.(string)
-				plugin, exists := generation.Get(key)
-				if !exists || !slices.Contains(plugin.Meta.Models, name) {
+				plugin, schemaModel, active := resolveActivePluginVariant(generation, key, name)
+				if !active {
 					variant := ModelPricingPluginVariant{
 						PluginKey: key, PluginName: key, Configured: configuredExpr,
 						UsageSchema: map[string]jsplugin.UsageFieldSchema{}, Stale: true,
 					}
-					if exists {
+					if plugin != nil {
 						variant.PluginName, variant.Icon = plugin.Meta.Name, plugin.Meta.Icon
 					}
 					entry.PluginVariants = append(entry.PluginVariants, variant)
 					continue
 				}
-				schema, examples := plugin.Meta.UsageForModel(name)
+				schema, examples := plugin.Meta.UsageForModel(schemaModel)
 				if schema == nil {
 					schema = map[string]jsplugin.UsageFieldSchema{}
 				}
@@ -752,16 +768,8 @@ func onlyStalePluginOverridesRemoved(name string, after, before PricingValues) b
 		if stillExists {
 			return false
 		}
-		plugin, exists := generation.Get(key)
-		if exists {
-			if slices.Contains(plugin.Meta.Models, name) {
-				return false
-			}
-			if target, resolved := ResolveTaskModelAlias(generation, name); resolved &&
-				target.PluginKey == key && target.Declared != "" &&
-				slices.Contains(plugin.Meta.Models, target.Declared) {
-				return false
-			}
+		if _, _, active := resolveActivePluginVariant(generation, key, name); active {
+			return false
 		}
 		removed = true
 	}
