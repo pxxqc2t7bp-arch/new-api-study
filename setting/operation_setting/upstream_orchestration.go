@@ -69,7 +69,7 @@ func GetUpstreamOrchestrationSetting() *UpstreamOrchestrationSetting {
 }
 
 func normalizeUpstreamOrchestrationSetting(setting *UpstreamOrchestrationSetting) {
-	if setting.CandidateLimit < 1 || setting.CandidateLimit > 5 {
+	if setting.CandidateLimit < 0 {
 		setting.CandidateLimit = 5
 	}
 	if setting.RequestAttemptLimit < 1 || setting.RequestAttemptLimit > 5 {
