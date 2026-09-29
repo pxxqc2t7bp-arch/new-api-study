@@ -372,12 +372,15 @@ func buildUpstreamRouteCandidates(
 }
 
 func selectUpstreamCandidateGroups(candidates []upstreamRouteCandidate, limit int) []upstreamRouteCandidate {
-	if limit <= 0 {
-		return nil
-	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return lessUpstreamCandidate(candidates[i], candidates[j])
 	})
+	if limit == 0 {
+		return candidates
+	}
+	if limit < 0 {
+		return nil
+	}
 	selected := make(map[string]upstreamRouteCandidate)
 	selectedModels := make(map[string]map[string]struct{})
 	modelCandidates := make(map[string][]upstreamRouteCandidate)

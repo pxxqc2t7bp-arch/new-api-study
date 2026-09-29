@@ -579,6 +579,22 @@ func TestSelectUpstreamCandidateGroupsCapsAtFiveWithSourceDiversity(t *testing.T
 	assert.Len(t, sourceIDs, 5)
 }
 
+func TestSelectUpstreamCandidateGroupsUnlimitedReturnsAllSortedCandidates(t *testing.T) {
+	candidates := []upstreamRouteCandidate{
+		{source: model.UpstreamSource{ID: 1, Key: "expensive"}, group: model.UpstreamGroup{SourceID: 1, ExternalID: "expensive", Platform: "openai", EffectiveMultiplier: 0.3}, models: []string{"gpt-test"}},
+		{source: model.UpstreamSource{ID: 2, Key: "cheap"}, group: model.UpstreamGroup{SourceID: 2, ExternalID: "cheap", Platform: "openai", EffectiveMultiplier: 0.1}, models: []string{"gpt-test"}},
+		{source: model.UpstreamSource{ID: 3, Key: "middle"}, group: model.UpstreamGroup{SourceID: 3, ExternalID: "middle", Platform: "openai", EffectiveMultiplier: 0.2}, models: []string{"gpt-test"}},
+	}
+
+	selected := selectUpstreamCandidateGroups(candidates, 0)
+
+	require.Len(t, selected, 3)
+	for index, externalID := range []string{"cheap", "middle", "expensive"} {
+		require.Equal(t, externalID, selected[index].group.ExternalID)
+		require.Equal(t, []string{"gpt-test"}, selected[index].models)
+	}
+}
+
 func TestSelectUpstreamCandidateGroupsPrunesSharedModelsFromExtraGroups(t *testing.T) {
 	candidates := []upstreamRouteCandidate{
 		{source: model.UpstreamSource{ID: 1, Key: "a"}, group: model.UpstreamGroup{SourceID: 1, ExternalID: "a", Platform: "openai", EffectiveMultiplier: 0.01}, models: []string{"gpt-shared"}},
@@ -990,6 +1006,50 @@ func TestManagedRouteRecoveryBackoff(t *testing.T) {
 		}
 		assert.GreaterOrEqual(t, stored.NextProbeAt, before+expectedDelay)
 		assert.LessOrEqual(t, stored.NextProbeAt, common.GetTimestamp()+expectedDelay)
+	}
+}
+
+func TestEnqueueStaleManagedRouteProbesUnlimitedSchedulesEveryRoute(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	original := *setting
+	setting.CandidateLimit = 0
+	t.Cleanup(func() {
+		*setting = original
+	})
+
+	now := time.Unix(1_788_320_000, 0).Unix()
+	groupIDs := []string{"group-1", "group-2", "group-3", "group-4", "group-5", "group-6"}
+	routes := make([]model.UpstreamManagedRoute, 0, len(groupIDs))
+	for index, groupID := range groupIDs {
+		routes = append(routes, model.UpstreamManagedRoute{
+			SourceID:        int64(index + 1),
+			ExternalGroupID: groupID,
+			Platform:        "openai",
+			Protocol:        model.UpstreamProtocolOpenAI,
+			ChannelID:       1000 + index,
+			State:           model.UpstreamRouteStateActive,
+			Rank:            index + 1,
+			LastSuccessAt:   now - 120,
+		})
+	}
+	require.NoError(t, model.DB.Create(&routes).Error)
+	current := &model.UpstreamManagedRoute{
+		SourceID:        100,
+		ExternalGroupID: "current",
+		Platform:        "openai",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       2000,
+		State:           model.UpstreamRouteStateActive,
+	}
+
+	enqueueStaleManagedRouteProbes(current, now, 60)
+
+	var stored []model.UpstreamManagedRoute
+	require.NoError(t, model.DB.Order("rank asc").Find(&stored).Error)
+	require.Len(t, stored, 6)
+	for _, route := range stored {
+		require.Equal(t, now, route.NextProbeAt)
 	}
 }
 

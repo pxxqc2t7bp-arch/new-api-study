@@ -331,7 +331,7 @@ func enqueueStaleManagedRouteProbes(current *model.UpstreamManagedRoute, now int
 		return
 	}
 	var routes []model.UpstreamManagedRoute
-	if err := model.DB.Where(
+	query := model.DB.Where(
 		"platform = ? AND protocol = ? AND detached = ? AND channel_id <> ? AND state IN ? AND last_success_at < ?",
 		current.Platform,
 		current.Protocol,
@@ -339,7 +339,12 @@ func enqueueStaleManagedRouteProbes(current *model.UpstreamManagedRoute, now int
 		current.ChannelID,
 		[]string{model.UpstreamRouteStateActive, model.UpstreamRouteStateQuarantined},
 		now-int64(freshnessSeconds),
-	).Order("rank asc").Limit(operation_setting.GetUpstreamOrchestrationSetting().CandidateLimit).Find(&routes).Error; err != nil {
+	).Order("rank asc")
+	limit := operation_setting.GetUpstreamOrchestrationSetting().CandidateLimit
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	if err := query.Find(&routes).Error; err != nil {
 		common.SysLog("load stale managed routes failed: " + err.Error())
 		return
 	}
