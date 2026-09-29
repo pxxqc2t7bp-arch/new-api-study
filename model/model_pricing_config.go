@@ -1093,11 +1093,28 @@ func mutateModelPricingOptionsDatabaseCore(db *gorm.DB, mutate func(*gorm.DB, ma
 }
 
 func publishModelPricingOptions(committed map[string]map[string]any) error {
+	encoded := make(map[string]string, len(modelPricingOptionKeys))
 	for _, key := range modelPricingOptionKeys {
-		encoded, _ := common.Marshal(committed[key])
-		if err := updateOptionMap(key, string(encoded)); err != nil {
+		value, err := common.Marshal(committed[key])
+		if err != nil {
 			return err
 		}
+		encoded[key] = string(value)
+	}
+	for _, key := range modelPricingOptionKeys {
+		if billing_setting.IsBillingSettingOption(key) {
+			continue
+		}
+		if err := updateOptionMap(key, encoded[key]); err != nil {
+			return err
+		}
+	}
+	if err := updateBillingSettingOptionMap(map[string]string{
+		billing_setting.BillingModeOption:       encoded[billing_setting.BillingModeOption],
+		billing_setting.BillingExprOption:       encoded[billing_setting.BillingExprOption],
+		billing_setting.PluginBillingExprOption: encoded[billing_setting.PluginBillingExprOption],
+	}); err != nil {
+		return err
 	}
 	RefreshPricing()
 	ratio_setting.InvalidateExposedDataCache()

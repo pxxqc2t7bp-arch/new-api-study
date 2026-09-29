@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/performance_setting"
@@ -229,6 +230,7 @@ func loadOptionsFromDatabase() {
 		return
 	}
 	passkeyOptions := make(map[string]string)
+	billingOptions := make(map[string]string)
 	for _, option := range options {
 		if IsPasskeyDomainOption(option.Key) {
 			passkeyOptions[option.Key] = option.Value
@@ -237,10 +239,17 @@ func loadOptionsFromDatabase() {
 		if strings.HasPrefix(option.Key, upstreamOrchestrationOptionPrefix) {
 			continue
 		}
+		if billing_setting.IsBillingSettingOption(option.Key) {
+			billingOptions[option.Key] = option.Value
+			continue
+		}
 		err := updateOptionMap(option.Key, option.Value)
 		if err != nil {
 			common.SysLog("failed to update option map: " + err.Error())
 		}
+	}
+	if err := updateBillingSettingOptionMap(billingOptions); err != nil {
+		common.SysLog("failed to update billing option maps: " + err.Error())
 	}
 	applyPasskeyDomainOptions(passkeyOptions)
 	if err := reloadUpstreamOrchestrationPolicy(); err != nil {
@@ -566,10 +575,18 @@ func UpdateOptionsBulk(values map[string]string) error {
 	if err != nil {
 		return err
 	}
-	for k, v := range values {
-		if err := updateOptionMap(k, v); err != nil {
+	billingOptions := make(map[string]string)
+	for _, key := range slices.Sorted(maps.Keys(values)) {
+		if billing_setting.IsBillingSettingOption(key) {
+			billingOptions[key] = values[key]
+			continue
+		}
+		if err := updateOptionMap(key, values[key]); err != nil {
 			return err
 		}
+	}
+	if err := updateBillingSettingOptionMap(billingOptions); err != nil {
+		return err
 	}
 	if policySnapshot != nil {
 		requestPolicySnapshot.Store(policySnapshot)
@@ -578,6 +595,9 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
+	if billing_setting.IsBillingSettingOption(key) {
+		return updateBillingSettingOptionMap(map[string]string{key: value})
+	}
 	if key == retiredThemeOptionKey {
 		common.OptionMapRWMutex.Lock()
 		delete(common.OptionMap, key)
@@ -925,6 +945,27 @@ func updateOptionMap(key string, value string) (err error) {
 		// No additional in-memory variable to update.
 	}
 	return err
+}
+
+func updateBillingSettingOptionMap(values map[string]string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	common.OptionMapRWMutex.Lock()
+	err := billing_setting.UpdateBillingSettingOptions(values)
+	if err == nil {
+		if common.OptionMap == nil {
+			common.OptionMap = make(map[string]string)
+		}
+		maps.Copy(common.OptionMap, values)
+	}
+	common.OptionMapRWMutex.Unlock()
+	if err != nil {
+		return err
+	}
+	InvalidatePricingCache()
+	ratio_setting.InvalidateExposedDataCache()
+	return nil
 }
 
 // handleConfigUpdate 处理分层配置更新，返回是否已处理

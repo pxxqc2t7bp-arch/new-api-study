@@ -30,6 +30,65 @@ func modelPricingSQLiteDSN(path string) string {
 	return "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate"
 }
 
+type blockingBillingExpression struct {
+	value   string
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (expression blockingBillingExpression) MarshalJSON() ([]byte, error) {
+	close(expression.started)
+	<-expression.release
+	return []byte(strconv.Quote(expression.value)), nil
+}
+
+func TestPublishModelPricingOptionsPublishesBillingBundleAtomically(t *testing.T) {
+	const (
+		modelName   = "aggregate-seedream-publication"
+		pluginKey   = "doubao"
+		requestExpr = `tier("request", fixed(0.01)) * image_count`
+		taskExpr    = `tier("task", u("image_count") * 0.01)`
+	)
+
+	useModelPricingOptionDatabase(t)
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode":          fmt.Sprintf(`{%q:%q}`, modelName, billing_setting.BillingModeRatio),
+		"billing_setting.billing_expr":          `{}`,
+		billing_setting.PluginBillingExprOption: `{}`,
+	}))
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	committed := defaultPricingMaps()
+	committed["billing_setting.billing_mode"][modelName] = billing_setting.BillingModeTieredExpr
+	committed["billing_setting.billing_expr"][modelName] = requestExpr
+	committed[billing_setting.PluginBillingExprOption][billing_setting.PluginBillingExprKey(pluginKey, modelName)] =
+		blockingBillingExpression{value: taskExpr, started: started, release: release}
+
+	published := make(chan error, 1)
+	go func() {
+		published <- publishModelPricingOptions(committed)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "timed out waiting for plugin expression publication")
+	}
+	mode := billing_setting.GetBillingMode(modelName)
+	expression, selected := billing_setting.ResolveTaskBillingExpr(pluginKey, modelName, modelName)
+	close(release)
+	require.NoError(t, <-published)
+
+	assert.False(t,
+		mode == billing_setting.BillingModeTieredExpr && selected && expression == requestExpr,
+		"runtime observed the request-only main expression before the task-provider override",
+	)
+	finalExpression, finalSelected := billing_setting.ResolveTaskBillingExpr(pluginKey, modelName, modelName)
+	require.True(t, finalSelected)
+	assert.Equal(t, taskExpr, finalExpression)
+}
+
 func openModelPricingInstanceDatabases(t *testing.T) (*gorm.DB, *gorm.DB) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "model-pricing.sqlite")

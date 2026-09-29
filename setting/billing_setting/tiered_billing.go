@@ -22,6 +22,8 @@ const (
 	BillingModeTieredExpr   = "tiered_expr"
 	BillingModeField        = "billing_mode"
 	BillingExprField        = "billing_expr"
+	BillingModeOption       = "billing_setting." + BillingModeField
+	BillingExprOption       = "billing_setting." + BillingExprField
 	PluginBillingExprOption = "billing_setting.plugin_billing_expr"
 	maxTaskExprSmokeTests   = 64
 )
@@ -49,8 +51,8 @@ func init() {
 // Read accessors (hot path, must be fast)
 // ---------------------------------------------------------------------------
 
-func GetBillingMode(model string) string {
-	if mode, ok := billingSetting.BillingMode[model]; ok {
+func getBillingMode(setting *BillingSetting, model string) string {
+	if mode, ok := setting.BillingMode[model]; ok {
 		return mode
 	}
 	if _, ok := builtinBillingExpr[model]; ok {
@@ -67,15 +69,32 @@ func GetBillingMode(model string) string {
 	return BillingModeRatio
 }
 
-func GetBillingExpr(model string) (string, bool) {
-	if expr, ok := billingSetting.BillingExpr[model]; ok {
+func getBillingExpr(setting *BillingSetting, model string) (string, bool) {
+	if expr, ok := setting.BillingExpr[model]; ok {
 		return expr, true
 	}
-	if GetBillingMode(model) == BillingModeTieredExpr {
+	if getBillingMode(setting, model) == BillingModeTieredExpr {
 		expr, ok := builtinBillingExpr[model]
 		return expr, ok
 	}
 	return "", false
+}
+
+func GetBillingMode(model string) string {
+	mode := BillingModeRatio
+	config.GlobalConfig.Read("billing_setting", func(value any) {
+		mode = getBillingMode(value.(*BillingSetting), model)
+	})
+	return mode
+}
+
+func GetBillingExpr(model string) (string, bool) {
+	var expression string
+	var ok bool
+	config.GlobalConfig.Read("billing_setting", func(value any) {
+		expression, ok = getBillingExpr(value.(*BillingSetting), model)
+	})
+	return expression, ok
 }
 
 func GetBuiltinBillingExpr(model string) (string, bool) {
@@ -96,35 +115,53 @@ func SplitPluginBillingExprKey(key string) (plugin, model string, ok bool) {
 }
 
 func GetPluginBillingExprCopy() map[string]string {
-	return maps.Clone(billingSetting.PluginBillingExpr)
+	var expressions map[string]string
+	config.GlobalConfig.Read("billing_setting", func(value any) {
+		expressions = maps.Clone(value.(*BillingSetting).PluginBillingExpr)
+	})
+	return expressions
 }
 
 func GetPluginBillingExpr(pluginKey, model string) (string, bool) {
-	expression, ok := billingSetting.PluginBillingExpr[PluginBillingExprKey(pluginKey, model)]
+	var expression string
+	var ok bool
+	config.GlobalConfig.Read("billing_setting", func(value any) {
+		expression, ok = value.(*BillingSetting).PluginBillingExpr[PluginBillingExprKey(pluginKey, model)]
+	})
 	return expression, ok
 }
 
 // ResolveTaskBillingExpr selects the executing plugin's override before the
 // model expression, retaining the model alias fallback and explicit modes.
 func ResolveTaskBillingExpr(pluginKey, model, mappedModel string) (string, bool) {
-	if pluginKey != "" {
-		if expr, ok := GetPluginBillingExpr(pluginKey, model); ok {
-			return expr, true
-		}
-		if mappedModel != "" && mappedModel != model {
-			if expr, ok := GetPluginBillingExpr(pluginKey, mappedModel); ok {
-				return expr, true
+	var expression string
+	var selected bool
+	config.GlobalConfig.Read("billing_setting", func(value any) {
+		setting := value.(*BillingSetting)
+		if pluginKey != "" {
+			if expr, ok := setting.PluginBillingExpr[PluginBillingExprKey(pluginKey, model)]; ok {
+				expression, selected = expr, true
+				return
+			}
+			if mappedModel != "" && mappedModel != model {
+				if expr, ok := setting.PluginBillingExpr[PluginBillingExprKey(pluginKey, mappedModel)]; ok {
+					expression, selected = expr, true
+					return
+				}
 			}
 		}
-	}
-	if GetBillingMode(model) == BillingModeTieredExpr {
-		return GetBillingExpr(model)
-	}
-	if mappedModel != "" && mappedModel != model && GetBillingMode(mappedModel) == BillingModeTieredExpr {
-		expression, ok := GetBillingExpr(mappedModel)
-		return expression, ok && strings.TrimSpace(expression) != ""
-	}
-	return "", false
+		if getBillingMode(setting, model) == BillingModeTieredExpr {
+			expression, selected = getBillingExpr(setting, model)
+			return
+		}
+		if mappedModel != "" && mappedModel != model && getBillingMode(setting, mappedModel) == BillingModeTieredExpr {
+			expression, selected = getBillingExpr(setting, mappedModel)
+			if strings.TrimSpace(expression) == "" {
+				selected = false
+			}
+		}
+	})
+	return expression, selected
 }
 
 // TaskExprCompatible checks the schema contract even for usage references in
@@ -148,38 +185,97 @@ func GetBuiltinBillingExprCopy() map[string]string {
 	return lo.Assign(builtinBillingExpr)
 }
 
-func GetBillingModeCopy() map[string]string {
-	modes := lo.Assign(billingSetting.BillingMode)
+func getBillingModeCopy(setting *BillingSetting) map[string]string {
+	modes := lo.Assign(setting.BillingMode)
 	for model := range builtinBillingExpr {
-		if _, configured := modes[model]; !configured && GetBillingMode(model) == BillingModeTieredExpr {
+		if _, configured := modes[model]; !configured && getBillingMode(setting, model) == BillingModeTieredExpr {
 			modes[model] = BillingModeTieredExpr
 		}
 	}
 	return modes
 }
 
-func GetBillingExprCopy() map[string]string {
-	expressions := lo.Assign(billingSetting.BillingExpr)
+func getBillingExprCopy(setting *BillingSetting) map[string]string {
+	expressions := lo.Assign(setting.BillingExpr)
 	for model := range builtinBillingExpr {
 		if _, configured := expressions[model]; configured {
 			continue
 		}
-		if expression, ok := GetBillingExpr(model); ok {
+		if expression, ok := getBillingExpr(setting, model); ok {
 			expressions[model] = expression
 		}
 	}
 	return expressions
 }
 
+func GetBillingModeCopy() map[string]string {
+	var modes map[string]string
+	config.GlobalConfig.Read("billing_setting", func(value any) {
+		modes = getBillingModeCopy(value.(*BillingSetting))
+	})
+	return modes
+}
+
+func GetBillingExprCopy() map[string]string {
+	var expressions map[string]string
+	config.GlobalConfig.Read("billing_setting", func(value any) {
+		expressions = getBillingExprCopy(value.(*BillingSetting))
+	})
+	return expressions
+}
+
 func GetPricingSyncData(base map[string]any) map[string]any {
 	extra := make(map[string]any, 2)
-	if modes := GetBillingModeCopy(); len(modes) > 0 {
-		extra[BillingModeField] = modes
-	}
-	if exprs := GetBillingExprCopy(); len(exprs) > 0 {
-		extra[BillingExprField] = exprs
-	}
+	config.GlobalConfig.Read("billing_setting", func(value any) {
+		setting := value.(*BillingSetting)
+		modes := getBillingModeCopy(setting)
+		expressions := getBillingExprCopy(setting)
+		if len(modes) > 0 {
+			extra[BillingModeField] = modes
+		}
+		if len(expressions) > 0 {
+			extra[BillingExprField] = expressions
+		}
+	})
 	return lo.Assign(base, extra)
+}
+
+func IsBillingSettingOption(key string) bool {
+	switch key {
+	case BillingModeOption, BillingExprOption, PluginBillingExprOption:
+		return true
+	default:
+		return false
+	}
+}
+
+// UpdateBillingSettingOptions publishes all supplied billing maps under the
+// ConfigManager write lock used by runtime readers.
+func UpdateBillingSettingOptions(options map[string]string) error {
+	values := make(map[string]string, len(options))
+	for key, value := range options {
+		switch key {
+		case BillingModeOption:
+			values[BillingModeField] = value
+		case BillingExprOption:
+			values[BillingExprField] = value
+		case PluginBillingExprOption:
+			values["plugin_billing_expr"] = value
+		default:
+			return fmt.Errorf("unsupported billing setting option: %s", key)
+		}
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	updated, err := config.GlobalConfig.UpdateFromMap("billing_setting", values)
+	if err != nil {
+		return err
+	}
+	if !updated {
+		return fmt.Errorf("billing setting is not registered")
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
