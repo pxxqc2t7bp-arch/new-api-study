@@ -28,6 +28,7 @@ import (
 )
 
 func TestUpdateOptionRejectsInvalidTaskBillingExpressions(t *testing.T) {
+	database := modelManagementDB(t, "sqlite", "")
 	const pluginKey = "billing-save-probe"
 	const modelName = "billing-save-model"
 	source := `
@@ -81,11 +82,15 @@ export function parseTaskResult() { return {}; }
 			assert.Contains(t, recorder.Body.String(), `"success":false`)
 			assert.Contains(t, recorder.Body.String(), modelName)
 			assert.Contains(t, recorder.Body.String(), testCase.errorText)
+			var count int64
+			require.NoError(t, database.Model(&model.Option{}).Where("key = ?", "billing_setting.billing_expr").Count(&count).Error)
+			assert.Zero(t, count, "invalid expressions must not be persisted")
 		})
 	}
 }
 
 func TestUpdateOptionRejectsUsageExpressionWithoutTaskPlugin(t *testing.T) {
+	database := modelManagementDB(t, "sqlite", "")
 	const modelName = "billing-save-model-without-plugin"
 	expressions, err := common.Marshal(map[string]string{
 		modelName: `u("mode") == "std" ? 1 : 2`,
@@ -111,6 +116,9 @@ func TestUpdateOptionRejectsUsageExpressionWithoutTaskPlugin(t *testing.T) {
 	assert.Contains(t, recorder.Body.String(), modelName)
 	assert.Contains(t, recorder.Body.String(), "mode")
 	assert.Contains(t, recorder.Body.String(), "no task plugin usage schema")
+	var count int64
+	require.NoError(t, database.Model(&model.Option{}).Where("key = ?", "billing_setting.billing_expr").Count(&count).Error)
+	assert.Zero(t, count, "invalid expressions must not be persisted")
 }
 
 func TestUpdateOptionAliasBillingExprUsesPluginSchema(t *testing.T) {
