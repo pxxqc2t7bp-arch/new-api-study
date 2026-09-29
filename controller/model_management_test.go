@@ -1850,7 +1850,43 @@ export function parseTaskResult() { return {}; }
 					UpdatedModels []string `json:"updated_models"`
 				} `json:"data"`
 			}
+			mixedCaseAlias := strings.ToUpper(alias)
+			target, resolved := model.ResolveTaskModelAlias(jsplugin.DefaultRegistry.Generation(), mixedCaseAlias)
+			require.True(t, resolved, "task routing retains ASCII-folded alias resolution")
+			assert.Equal(t, alias, target.Alias)
+			modelManagementRequest(t, PreviewModelPricing, http.MethodPost, "/api/option/model_pricing/preview", map[string]any{
+				"model_name": mixedCaseAlias,
+				"pricing":    pricing,
+			}, &response)
+			assert.False(t, response.Success)
+			assert.Contains(t, response.Message, "must use canonical alias spelling "+strconv.Quote(alias))
+
+			response = struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+				Data    struct {
+					UpdatedModels []string `json:"updated_models"`
+				} `json:"data"`
+			}{}
 			recorder := modelManagementRequest(t, UpdateModelPricingConfig, http.MethodPatch, "/api/option/model_pricing", map[string]any{
+				"changes": []any{map[string]any{
+					"model_name":       mixedCaseAlias,
+					"expected_version": initial.Entries[0].Version,
+					"pricing":          pricing,
+				}},
+			}, &response)
+			assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+			assert.False(t, response.Success)
+			assert.Contains(t, response.Message, "must use canonical alias spelling "+strconv.Quote(alias))
+
+			response = struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+				Data    struct {
+					UpdatedModels []string `json:"updated_models"`
+				} `json:"data"`
+			}{}
+			recorder = modelManagementRequest(t, UpdateModelPricingConfig, http.MethodPatch, "/api/option/model_pricing", map[string]any{
 				"changes": []any{map[string]any{
 					"model_name":       alias,
 					"expected_version": initial.Entries[0].Version,

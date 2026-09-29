@@ -107,7 +107,7 @@ func defaultPricingMaps() map[string]map[string]any {
 
 func readModelPricingMaps(db *gorm.DB) (map[string]map[string]any, map[string]bool, []string, error) {
 	var rows []Option
-	if err := db.Where(map[string]any{"key": modelPricingOptionKeys}).Find(&rows).Error; err != nil {
+	if err := db.Where(map[string]any{"key": modelPricingOptionKeys}).Order("key").Find(&rows).Error; err != nil {
 		return nil, nil, nil, err
 	}
 	values := defaultPricingMaps()
@@ -150,21 +150,26 @@ func normalizeLegacyPricingEntries(key string, entries map[string]any) (map[stri
 		return entries, nil
 	}
 	normalized := make(map[string]any, len(entries))
-	sources := make(map[string]string, len(entries))
 	for name, value := range entries {
 		canonical := modelPricingStorageName(key, name)
+		if name == canonical {
+			normalized[canonical] = value
+		}
+	}
+	for name, value := range entries {
+		canonical := modelPricingStorageName(key, name)
+		if name == canonical {
+			continue
+		}
+		if _, exists := entries[canonical]; exists {
+			continue
+		}
 		existing, exists := normalized[canonical]
 		if !exists {
 			normalized[canonical] = value
-			sources[canonical] = name
 			continue
 		}
-		if name == canonical {
-			normalized[canonical] = value
-			sources[canonical] = name
-			continue
-		}
-		if sources[canonical] == canonical || reflect.DeepEqual(existing, value) {
+		if reflect.DeepEqual(existing, value) {
 			continue
 		}
 		return nil, fmt.Errorf("%s contains conflicting aliases for %s", key, canonical)
@@ -370,22 +375,26 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 			ModelPricingDescription: ModelPricingDescription{Effective: effectiveModelPricing(values, name)}}
 		entry.CacheWriteMode = ResolveCacheWriteMode(name, configured)
 		entry.BillingDetails = ResolveLegacyBillingDetails(name, entry.Effective, configured)
+		aliasTarget, aliasResolved := ResolveTaskModelAlias(generation, name)
 		if plugin, ok := generation.GetByModel(name); ok {
 			entry.UsageSchema, _ = plugin.Meta.UsageForModel(name)
-		} else if target, ok := ResolveTaskModelAlias(generation, name); ok {
-			if plugin, ok := generation.Get(target.PluginKey); ok {
-				entry.UsageSchema, _ = plugin.Meta.UsageForModel(target.Declared)
+		} else if aliasResolved {
+			if plugin, ok := generation.Get(aliasTarget.PluginKey); ok {
+				entry.UsageSchema, _ = plugin.Meta.UsageForModel(aliasTarget.Declared)
 			}
 		}
 		plugins := generation.PluginsByModel(name)
 		configuredVariants, _ := configured[billing_setting.PluginBillingExprOption].(map[string]any)
-		if len(plugins) >= 2 || len(configuredVariants) > 0 {
-			keys := make(map[string]bool, len(plugins)+len(configuredVariants))
+		if len(plugins) >= 2 || len(configuredVariants) > 0 || aliasResolved {
+			keys := make(map[string]bool, len(plugins)+len(configuredVariants)+1)
 			for _, plugin := range plugins {
 				keys[plugin.Meta.Key] = true
 			}
 			for key := range configuredVariants {
 				keys[key] = true
+			}
+			if aliasResolved {
+				keys[aliasTarget.PluginKey] = true
 			}
 			for _, key := range slices.Sorted(maps.Keys(keys)) {
 				configuredValue, overridden := configuredVariants[key]
@@ -464,6 +473,9 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 		return errors.New("model name is required")
 	}
 	generation := jsplugin.DefaultRegistry.Generation()
+	if target, resolved := ResolveTaskModelAlias(generation, name); resolved && target.Alias != name {
+		return fmt.Errorf("model name %q must use canonical alias spelling %q", name, target.Alias)
+	}
 	previousVariants, _ := previous[billing_setting.PluginBillingExprOption].(map[string]any)
 	variants := map[string]any{}
 	if value, exists := values[billing_setting.PluginBillingExprOption]; exists {
@@ -823,7 +835,7 @@ func mutateModelPricingOptionsDatabase(db *gorm.DB, mutate func(*gorm.DB, map[st
 			if claim.RowsAffected != 1 {
 				return errModelPricingCASMiss
 			}
-			values, existing, duplicated, err := readModelPricingMaps(tx)
+			values, existing, duplicated, err := readModelPricingMaps(lockForUpdate(tx))
 			if err != nil {
 				return err
 			}

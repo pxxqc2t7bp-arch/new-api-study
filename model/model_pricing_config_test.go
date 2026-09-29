@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
+	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -18,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func openModelPricingInstanceDatabases(t *testing.T) (*gorm.DB, *gorm.DB) {
@@ -58,86 +61,303 @@ func modelPricingCASEvidence(modelName, hashCharacter string) UpstreamPriceEvide
 	}
 }
 
-func TestUpdateModelPricingDatabaseUsesDurableCrossInstanceCAS(t *testing.T) {
+func TestNormalizeLegacyPricingEntriesUsesDeterministicCanonicalPrecedence(t *testing.T) {
+	const canonical = "gpt-4-gizmo-*"
+
+	t.Run("explicit canonical wins over conflicting aliases", func(t *testing.T) {
+		entries := map[string]any{
+			canonical:           float64(15),
+			"gpt-4-gizmo-alpha": float64(1),
+			"gpt-4-gizmo-beta":  float64(2),
+		}
+		for range 256 {
+			normalized, err := normalizeLegacyPricingEntries("ModelRatio", entries)
+			require.NoError(t, err)
+			assert.Equal(t, map[string]any{canonical: float64(15)}, normalized)
+		}
+	})
+
+	t.Run("conflicting aliases without canonical are rejected", func(t *testing.T) {
+		for range 256 {
+			_, err := normalizeLegacyPricingEntries("ModelRatio", map[string]any{
+				"gpt-4-gizmo-alpha": float64(1),
+				"gpt-4-gizmo-beta":  float64(2),
+			})
+			require.ErrorContains(t, err, "conflicting aliases for "+canonical)
+		}
+	})
+}
+
+func TestMutateModelPricingOptionsLocksPricingRowsBeforeMutation(t *testing.T) {
+	database, _ := openModelPricingInstanceDatabases(t)
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	common.SetDatabaseTypes(common.DatabaseTypeMySQL, previousLog)
+	t.Cleanup(func() {
+		common.SetDatabaseTypes(previousMain, previousLog)
+	})
+
+	type observation struct {
+		locked, orderedByKey bool
+	}
+	var observations []observation
+	var events []string
+	require.NoError(t, database.Callback().Query().Before("gorm:query").Register("observe_pricing_lock_order", func(tx *gorm.DB) {
+		if _, pricingRows := tx.Statement.Dest.(*[]Option); pricingRows {
+			_, locked := tx.Statement.Clauses["FOR"]
+			orderClause, ordered := tx.Statement.Clauses["ORDER BY"]
+			orderBy, validOrder := orderClause.Expression.(clause.OrderBy)
+			orderedByKey := ordered && validOrder && len(orderBy.Columns) == 1 &&
+				orderBy.Columns[0].Column.Name == "key" && !orderBy.Columns[0].Desc
+			observations = append(observations, observation{locked: locked, orderedByKey: orderedByKey})
+			events = append(events, "pricing")
+		}
+		// SQLite cannot execute FOR UPDATE; inspection above proves what the
+		// MySQL/PostgreSQL query builder received before local execution.
+		delete(tx.Statement.Clauses, "FOR")
+	}))
+
+	_, err := mutateModelPricingOptionsDatabase(database, func(_ *gorm.DB, _ map[string]map[string]any) error {
+		events = append(events, "mutation")
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"pricing", "mutation"}, events)
+	require.Equal(t, []observation{{locked: true, orderedByKey: true}}, observations)
+}
+
+type modelPricingCASResult struct {
+	database  *gorm.DB
+	errors    [2]error
+	anchors   [2]string
+	casMisses int64
+}
+
+func runModelPricingCASCollision(t *testing.T, modelNames [2]string, ratios [2]float64, withEvidence bool) modelPricingCASResult {
+	t.Helper()
 	first, second := openModelPricingInstanceDatabases(t)
 	emptyVersion := ModelPricingVersion(PricingValues{})
+	instances := [2]*gorm.DB{first, second}
+	type anchorRead struct {
+		index int
+		value string
+	}
+	type workerResult struct {
+		index int
+		err   error
+	}
+	anchorReads := make(chan anchorRead, 2)
+	results := make(chan workerResult, 2)
+	releases := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	var casMisses atomic.Int64
 
+	for index, instance := range instances {
+		var firstAnchorRead atomic.Bool
+		callbackSuffix := strconv.Itoa(index)
+		require.NoError(t, instance.Callback().Query().After("gorm:query").Register("coordinate_pricing_anchor_"+callbackSuffix, func(tx *gorm.DB) {
+			anchor, isOption := tx.Statement.Dest.(*Option)
+			if !isOption || tx.Error != nil || !firstAnchorRead.CompareAndSwap(false, true) {
+				return
+			}
+			anchorReads <- anchorRead{index: index, value: anchor.Value}
+			select {
+			case <-releases[index]:
+			case <-time.After(5 * time.Second):
+				tx.AddError(errors.New("timed out waiting to release model pricing revision read"))
+			}
+		}))
+		require.NoError(t, instance.Callback().Update().After("gorm:update").Register("observe_pricing_cas_miss_"+callbackSuffix, func(tx *gorm.DB) {
+			if tx.Error != nil || tx.RowsAffected != 0 {
+				return
+			}
+			for _, variable := range tx.Statement.Vars {
+				if key, ok := variable.(string); ok && key == modelPricingRevisionOptionKey {
+					casMisses.Add(1)
+					return
+				}
+			}
+		}))
+	}
+
+	for index, instance := range instances {
+		go func(index int, instance *gorm.DB) {
+			var afterPricing func(*gorm.DB) error
+			if withEvidence {
+				evidence := modelPricingCASEvidence(modelNames[index], string(rune('a'+index)))
+				afterPricing = func(tx *gorm.DB) error {
+					return tx.Create(&evidence).Error
+				}
+			}
+			_, err := updateModelPricingDatabase(instance, []ModelPricingChange{{
+				ModelName:       modelNames[index],
+				ExpectedVersion: emptyVersion,
+				Pricing:         PricingValues{"ModelRatio": ratios[index]},
+			}}, afterPricing)
+			results <- workerResult{index: index, err: err}
+		}(index, instance)
+	}
+
+	collision := modelPricingCASResult{database: first}
+	for range 2 {
+		select {
+		case read := <-anchorReads:
+			collision.anchors[read.index] = read.value
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "timed out waiting for model pricing revision reads")
+		}
+	}
+	close(releases[0])
+	select {
+	case result := <-results:
+		require.Equal(t, 0, result.index)
+		collision.errors[result.index] = result.err
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "timed out waiting for first model pricing writer")
+	}
+	close(releases[1])
+	select {
+	case result := <-results:
+		require.Equal(t, 1, result.index)
+		collision.errors[result.index] = result.err
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "timed out waiting for second model pricing writer")
+	}
+	collision.casMisses = casMisses.Load()
+	return collision
+}
+
+func TestUpdateModelPricingDatabaseUsesDurableCrossInstanceCAS(t *testing.T) {
 	t.Run("same model stale version commits once with evidence", func(t *testing.T) {
 		const modelName = "cross-instance-model"
-		results := make(chan error, 2)
-		var ready sync.WaitGroup
-		ready.Add(2)
-		start := make(chan struct{})
-		for index, instance := range []*gorm.DB{first, second} {
-			go func(index int, instance *gorm.DB) {
-				ready.Done()
-				<-start
-				evidence := modelPricingCASEvidence(modelName, string(rune('a'+index)))
-				_, err := updateModelPricingDatabase(instance, []ModelPricingChange{{
-					ModelName:       modelName,
-					ExpectedVersion: emptyVersion,
-					Pricing:         PricingValues{"ModelRatio": float64(index + 1)},
-				}}, func(tx *gorm.DB) error {
-					return tx.Create(&evidence).Error
-				})
-				results <- err
-			}(index, instance)
-		}
-		ready.Wait()
-		close(start)
-
-		successes, conflicts := 0, 0
-		for range 2 {
-			err := <-results
-			switch {
-			case err == nil:
-				successes++
-			case errors.Is(err, ErrModelPricingConflict):
-				conflicts++
-			default:
-				require.NoError(t, err)
-			}
-		}
-		assert.Equal(t, 1, successes)
-		assert.Equal(t, 1, conflicts)
+		collision := runModelPricingCASCollision(t,
+			[2]string{modelName, modelName},
+			[2]float64{1, 2},
+			true,
+		)
+		require.Equal(t, [2]string{"0", "0"}, collision.anchors)
+		require.NoError(t, collision.errors[0])
+		require.ErrorIs(t, collision.errors[1], ErrModelPricingConflict)
+		assert.Equal(t, int64(1), collision.casMisses)
 
 		var evidenceCount int64
-		require.NoError(t, first.Model(&UpstreamPriceEvidence{}).Where("model_name = ?", modelName).Count(&evidenceCount).Error)
+		require.NoError(t, collision.database.Model(&UpstreamPriceEvidence{}).Where("model_name = ?", modelName).Count(&evidenceCount).Error)
 		assert.Equal(t, int64(1), evidenceCount)
 		var revision Option
-		require.NoError(t, first.Where("key = ?", modelPricingRevisionOptionKey).First(&revision).Error)
-		assert.NotEmpty(t, revision.Value)
+		require.NoError(t, collision.database.Where("key = ?", modelPricingRevisionOptionKey).First(&revision).Error)
+		assert.Equal(t, "1", revision.Value)
+		var option Option
+		require.NoError(t, collision.database.Where("key = ?", "ModelRatio").First(&option).Error)
+		var storedRatios map[string]float64
+		require.NoError(t, common.UnmarshalJsonStr(option.Value, &storedRatios))
+		assert.Equal(t, float64(1), storedRatios[modelName])
 	})
 
 	t.Run("unrelated models both survive a CAS retry", func(t *testing.T) {
-		results := make(chan error, 2)
-		var ready sync.WaitGroup
-		ready.Add(2)
-		start := make(chan struct{})
-		for index, instance := range []*gorm.DB{first, second} {
-			go func(index int, instance *gorm.DB) {
-				ready.Done()
-				<-start
-				_, err := updateModelPricingDatabase(instance, []ModelPricingChange{{
-					ModelName:       "unrelated-" + string(rune('a'+index)),
-					ExpectedVersion: emptyVersion,
-					Pricing:         PricingValues{"ModelRatio": float64(index + 3)},
-				}}, nil)
-				results <- err
-			}(index, instance)
-		}
-		ready.Wait()
-		close(start)
-		for range 2 {
-			require.NoError(t, <-results)
-		}
+		collision := runModelPricingCASCollision(t,
+			[2]string{"unrelated-a", "unrelated-b"},
+			[2]float64{3, 4},
+			false,
+		)
+		require.Equal(t, [2]string{"0", "0"}, collision.anchors)
+		require.NoError(t, collision.errors[0])
+		require.NoError(t, collision.errors[1])
+		assert.Equal(t, int64(1), collision.casMisses)
 
+		var revision Option
+		require.NoError(t, collision.database.Where("key = ?", modelPricingRevisionOptionKey).First(&revision).Error)
+		assert.Equal(t, "2", revision.Value)
 		var option Option
-		require.NoError(t, first.Where("key = ?", "ModelRatio").First(&option).Error)
-		var ratios map[string]float64
-		require.NoError(t, common.UnmarshalJsonStr(option.Value, &ratios))
-		assert.Equal(t, float64(3), ratios["unrelated-a"])
-		assert.Equal(t, float64(4), ratios["unrelated-b"])
+		require.NoError(t, collision.database.Where("key = ?", "ModelRatio").First(&option).Error)
+		var storedRatios map[string]float64
+		require.NoError(t, common.UnmarshalJsonStr(option.Value, &storedRatios))
+		assert.Equal(t, float64(3), storedRatios["unrelated-a"])
+		assert.Equal(t, float64(4), storedRatios["unrelated-b"])
+	})
+}
+
+func useModelPricingOptionDatabase(t *testing.T) *gorm.DB {
+	t.Helper()
+	database, _ := openModelPricingInstanceDatabases(t)
+	previousDB := DB
+	DB = database
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
+	common.OptionMap = make(map[string]string)
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+		DB = previousDB
+	})
+	return database
+}
+
+func TestModelPricingRevisionIsInternalOnly(t *testing.T) {
+	for _, test := range []struct {
+		name, key string
+		bulk      bool
+	}{
+		{"single exact", modelPricingRevisionOptionKey, false},
+		{"single case folded", strings.ToUpper(modelPricingRevisionOptionKey), false},
+		{"bulk exact", modelPricingRevisionOptionKey, true},
+		{"bulk case folded", strings.ToUpper(modelPricingRevisionOptionKey), true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database := useModelPricingOptionDatabase(t)
+			require.NoError(t, database.Create(&Option{Key: modelPricingRevisionOptionKey, Value: "7"}).Error)
+			require.NoError(t, database.Create(&Option{Key: "public-option", Value: "before"}).Error)
+
+			var err error
+			if test.bulk {
+				err = UpdateOptionsBulk(map[string]string{test.key: "9", "public-option": "after"})
+			} else {
+				err = UpdateOption(test.key, "9")
+			}
+			require.ErrorContains(t, err, "protected option")
+
+			var revision Option
+			require.NoError(t, database.Where("key = ?", modelPricingRevisionOptionKey).First(&revision).Error)
+			assert.Equal(t, "7", revision.Value)
+			var foldedCount int64
+			require.NoError(t, database.Model(&Option{}).Where("key = ?", strings.ToUpper(modelPricingRevisionOptionKey)).Count(&foldedCount).Error)
+			assert.Zero(t, foldedCount)
+			var public Option
+			require.NoError(t, database.Where("key = ?", "public-option").First(&public).Error)
+			assert.Equal(t, "before", public.Value)
+		})
+	}
+
+	t.Run("database loading and generic listing hide revision rows", func(t *testing.T) {
+		database := useModelPricingOptionDatabase(t)
+		require.NoError(t, database.Create(&[]Option{
+			{Key: modelPricingRevisionOptionKey, Value: "7"},
+			{Key: strings.ToUpper(modelPricingRevisionOptionKey), Value: "stale"},
+			{Key: "public-option", Value: "visible"},
+		}).Error)
+
+		options, err := AllOption()
+		require.NoError(t, err)
+		keys := make([]string, 0, len(options))
+		for _, option := range options {
+			keys = append(keys, option.Key)
+		}
+		assert.Equal(t, []string{"public-option"}, keys)
+
+		loadOptionsFromDatabase()
+		common.OptionMapRWMutex.RLock()
+		loaded := maps.Clone(common.OptionMap)
+		common.OptionMapRWMutex.RUnlock()
+		assert.Equal(t, "visible", loaded["public-option"])
+		assert.NotContains(t, loaded, modelPricingRevisionOptionKey)
+		assert.NotContains(t, loaded, strings.ToUpper(modelPricingRevisionOptionKey))
+
+		_, err = mutateModelPricingOptionsDatabase(database, func(_ *gorm.DB, _ map[string]map[string]any) error {
+			return nil
+		})
+		require.NoError(t, err)
+		var revision Option
+		require.NoError(t, database.Where("key = ?", modelPricingRevisionOptionKey).First(&revision).Error)
+		assert.Equal(t, "8", revision.Value)
 	})
 }
 
@@ -257,11 +477,13 @@ func TestUpdateModelPricingOptionsRejectsRemovingActiveAliasVariant(t *testing.T
 	})
 
 	const (
-		alias       = "seedream-alias-variant-test"
-		canonical   = "seedream-canonical-variant-test"
-		pluginKey   = "seedream-alias-variant-plugin"
-		mainExpr    = `tier("request", fixed(0.01))`
-		variantExpr = `tier("task", u("seconds") * 1)`
+		alias             = "seedream-alias-variant-test"
+		canonical         = "seedream-canonical-variant-test"
+		pluginKey         = "seedream-alias-variant-plugin"
+		remappedCanonical = "seedream-remapped-canonical-test"
+		remappedPluginKey = "seedream-remap-plugin"
+		mainExpr          = `tier("request", fixed(0.01))`
+		variantExpr       = `tier("task", u("seconds") * 1)`
 	)
 	source := fmt.Sprintf(`
 export const meta = {
@@ -283,9 +505,27 @@ export function parseTaskResult() { return {}; }
 	_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
 	require.NoError(t, err)
 	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
+	remappedSource := fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: "1.0.0", author: {name: "Test"},
+  models: [%q], fetchMode: "per_task",
+  usageSchema: {frames: {type: "number", unit: "count"}},
+  usageExamples: [{label: "canonical frame", facts: {frames: 1}}]
+};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+`, remappedPluginKey, remappedPluginKey, remappedCanonical)
+	_, err = jsplugin.DefaultRegistry.Register(remappedSource, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(remappedPluginKey) })
 	plugin, exists := jsplugin.DefaultRegistry.Generation().Get(pluginKey)
 	require.True(t, exists)
 	schema, examples := plugin.Meta.UsageForModel(canonical)
+	remappedPlugin, exists := jsplugin.DefaultRegistry.Generation().Get(remappedPluginKey)
+	require.True(t, exists)
+	remappedSchema, remappedExamples := remappedPlugin.Meta.UsageForModel(remappedCanonical)
 	require.NoError(t, billing_setting.SmokeTestExpr(mainExpr))
 	require.ErrorContains(t, billing_setting.SmokeTestTaskExpr(mainExpr, schema), "fixed pricing is not supported")
 	require.NoError(t, billing_setting.SmokeTestTaskExpr(variantExpr, schema))
@@ -303,6 +543,14 @@ export function parseTaskResult() { return {}; }
 
 	initial, err := GetModelPricingSnapshot([]string{alias})
 	require.NoError(t, err)
+	require.Len(t, initial.Entries, 1)
+	if assert.Len(t, initial.Entries[0].PluginVariants, 1, "fresh aliases expose their active provider") {
+		freshVariant := initial.Entries[0].PluginVariants[0]
+		assert.Equal(t, pluginKey, freshVariant.PluginKey)
+		assert.False(t, freshVariant.Stale)
+		assert.Equal(t, schema, freshVariant.UsageSchema)
+		assert.Equal(t, examples, freshVariant.UsageExamples)
+	}
 	pricing := PricingValues{
 		"billing_setting.billing_mode":          billing_setting.BillingModeTieredExpr,
 		"billing_setting.billing_expr":          mainExpr,
@@ -332,6 +580,24 @@ export function parseTaskResult() { return {}; }
 	assert.Equal(t, variantExpr, activeVariant.Effective)
 	assert.True(t, activeVariant.Compatible)
 
+	remappedMapping := fmt.Sprintf(`{%q:%q}`, alias, remappedCanonical)
+	require.NoError(t, database.Model(&Channel{}).Where("id = ?", channel.Id).Update("model_mapping", remappedMapping).Error)
+	rebuildTaskAliasView()
+	remapped, err := GetModelPricingSnapshot([]string{alias})
+	require.NoError(t, err)
+	remappedVariants := make(map[string]ModelPricingPluginVariant)
+	for _, variant := range remapped.Entries[0].PluginVariants {
+		remappedVariants[variant.PluginKey] = variant
+	}
+	assert.Len(t, remappedVariants, 2, "remapped aliases retain stale overrides and expose the active provider")
+	assert.True(t, remappedVariants[pluginKey].Stale)
+	activeRemapped := remappedVariants[remappedPluginKey]
+	assert.False(t, activeRemapped.Stale)
+	assert.Equal(t, remappedSchema, activeRemapped.UsageSchema)
+	assert.Equal(t, remappedExamples, activeRemapped.UsageExamples)
+
+	require.NoError(t, database.Model(&Channel{}).Where("id = ?", channel.Id).Update("model_mapping", mapping).Error)
+	rebuildTaskAliasView()
 	require.NoError(t, database.Model(&Channel{}).Where("id = ?", channel.Id).Update("status", common.ChannelStatusManuallyDisabled).Error)
 	rebuildTaskAliasView()
 	stale, err := GetModelPricingSnapshot([]string{alias})

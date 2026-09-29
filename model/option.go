@@ -29,9 +29,16 @@ type Option struct {
 
 func AllOption() ([]*Option, error) {
 	var options []*Option
-	var err error
-	err = DB.Find(&options).Error
-	return options, err
+	if err := DB.Find(&options).Error; err != nil {
+		return nil, err
+	}
+	public := options[:0]
+	for _, option := range options {
+		if !isModelPricingRevisionOption(option.Key) {
+			public = append(public, option)
+		}
+	}
+	return public, nil
 }
 
 func InitOptionMap() {
@@ -312,7 +319,14 @@ func protectedOptionWriteError(key string) error {
 	return fmt.Errorf("protected option %q requires its controlled writer", key)
 }
 
+func isModelPricingRevisionOption(key string) bool {
+	return strings.EqualFold(strings.TrimSpace(key), modelPricingRevisionOptionKey)
+}
+
 func validateProtectedOptionKey(key string, writer optionWriteAuthority) error {
+	if isModelPricingRevisionOption(key) {
+		return protectedOptionWriteError(key)
+	}
 	normalized := strings.TrimSpace(key)
 	for _, group := range protectedOptionGroups() {
 		for _, canonical := range group.keys {
