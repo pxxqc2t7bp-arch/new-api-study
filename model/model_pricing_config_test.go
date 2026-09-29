@@ -23,10 +23,14 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+func modelPricingSQLiteDSN(path string) string {
+	return "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate"
+}
+
 func openModelPricingInstanceDatabases(t *testing.T) (*gorm.DB, *gorm.DB) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "model-pricing.sqlite")
-	dsn := "file:" + path + "?_busy_timeout=5000&_journal_mode=WAL"
+	dsn := modelPricingSQLiteDSN(path)
 	first, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
 	second, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
@@ -46,6 +50,23 @@ func openModelPricingInstanceDatabases(t *testing.T) (*gorm.DB, *gorm.DB) {
 		t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 	}
 	return first, second
+}
+
+func TestOpenModelPricingInstanceDatabasesUsesProductionSQLiteContract(t *testing.T) {
+	assert.Equal(t,
+		"file:model-pricing.sqlite?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate",
+		modelPricingSQLiteDSN("model-pricing.sqlite"),
+	)
+
+	first, second := openModelPricingInstanceDatabases(t)
+	for _, database := range []*gorm.DB{first, second} {
+		var busyTimeout int
+		require.NoError(t, database.Raw("PRAGMA busy_timeout").Scan(&busyTimeout).Error)
+		assert.Equal(t, 5000, busyTimeout)
+		var journalMode string
+		require.NoError(t, database.Raw("PRAGMA journal_mode").Scan(&journalMode).Error)
+		assert.Equal(t, "wal", strings.ToLower(journalMode))
+	}
 }
 
 func modelPricingCASEvidence(modelName, hashCharacter string) UpstreamPriceEvidence {
@@ -274,22 +295,48 @@ func TestUpdateModelPricingDatabaseUsesDurableCrossInstanceCAS(t *testing.T) {
 	})
 }
 
-func useModelPricingOptionDatabase(t *testing.T) *gorm.DB {
+func useModelPricingOptionDatabases(t *testing.T) (*gorm.DB, *gorm.DB) {
 	t.Helper()
-	database, _ := openModelPricingInstanceDatabases(t)
+	first, second := openModelPricingInstanceDatabases(t)
 	previousDB := DB
-	DB = database
+	previousConfig := config.GlobalConfig.ExportAllConfigs()
+	previousAliasView := taskAliasViewPtr.Load()
+	restoreRatios := []struct {
+		value   string
+		restore func(string) error
+	}{
+		{ratio_setting.ModelPrice2JSONString(), ratio_setting.UpdateModelPriceByJSONString},
+		{ratio_setting.ModelRatio2JSONString(), ratio_setting.UpdateModelRatioByJSONString},
+		{ratio_setting.CompletionRatio2JSONString(), ratio_setting.UpdateCompletionRatioByJSONString},
+		{ratio_setting.CacheRatio2JSONString(), ratio_setting.UpdateCacheRatioByJSONString},
+		{ratio_setting.CreateCacheRatio2JSONString(), ratio_setting.UpdateCreateCacheRatioByJSONString},
+		{ratio_setting.ImageRatio2JSONString(), ratio_setting.UpdateImageRatioByJSONString},
+		{ratio_setting.AudioRatio2JSONString(), ratio_setting.UpdateAudioRatioByJSONString},
+		{ratio_setting.AudioCompletionRatio2JSONString(), ratio_setting.UpdateAudioCompletionRatioByJSONString},
+	}
+	DB = first
 	common.OptionMapRWMutex.Lock()
 	previousOptions := common.OptionMap
 	common.OptionMap = make(map[string]string)
 	common.OptionMapRWMutex.Unlock()
 	t.Cleanup(func() {
+		for _, ratio := range restoreRatios {
+			require.NoError(t, ratio.restore(ratio.value))
+		}
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previousConfig))
+		taskAliasViewPtr.Store(previousAliasView)
 		common.OptionMapRWMutex.Lock()
 		common.OptionMap = previousOptions
 		common.OptionMapRWMutex.Unlock()
 		DB = previousDB
 	})
-	return database
+	return first, second
+}
+
+func useModelPricingOptionDatabase(t *testing.T) *gorm.DB {
+	t.Helper()
+	first, _ := useModelPricingOptionDatabases(t)
+	return first
 }
 
 func TestModelPricingRevisionIsInternalOnly(t *testing.T) {
@@ -416,7 +463,7 @@ func TestValidateModelPricingRejectsUnusableUnchangedMainExpressionAfterProvider
 	}
 
 	t.Run("all providers disappear", func(t *testing.T) {
-		err := validateModelPricing(modelName, previous, previous, nil)
+		err := validateModelPricing(modelName, previous, previous, nil, newTaskAliasView(jsplugin.DefaultRegistry.Generation()))
 		require.ErrorContains(t, err, "no task plugin usage schema")
 	})
 
@@ -437,9 +484,299 @@ export function parseTaskResult() { return {}; }
 		require.NoError(t, err)
 		t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
 
-		err = validateModelPricing(modelName, previous, previous, nil)
+		err = validateModelPricing(modelName, previous, previous, nil, newTaskAliasView(jsplugin.DefaultRegistry.Generation()))
 		require.ErrorContains(t, err, `usage key "seconds" is not declared`)
 	})
+}
+
+func TestGetModelPricingSnapshotUsesRuntimeAliasExpressionPrecedence(t *testing.T) {
+	database := useModelPricingOptionDatabase(t)
+	previousAliasView := taskAliasViewPtr.Load()
+	t.Cleanup(func() { taskAliasViewPtr.Store(previousAliasView) })
+
+	const (
+		alias              = "snapshot-runtime-alias"
+		mainTarget         = "snapshot-main-target"
+		overrideTarget     = "snapshot-override-target"
+		pluginKey          = "snapshot-runtime-plugin"
+		targetMainExpr     = `tier("target-main", u("seconds") * 1)`
+		targetFallbackExpr = `tier("target-fallback", u("seconds") * 2)`
+		targetProviderExpr = `tier("target-provider", u("seconds") * 3)`
+		aliasMainExpr      = `tier("alias-main", u("seconds") * 4)`
+		aliasProviderExpr  = `tier("alias-provider", u("seconds") * 5)`
+	)
+	source := fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: "1.0.0", author: {name: "Test"},
+  models: [%q, %q], fetchMode: "per_task",
+  usageSchema: {seconds: {type: "number", unit: "second"}}
+};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+`, pluginKey, pluginKey, mainTarget, overrideTarget)
+	_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
+
+	writeOption := func(key string, entries map[string]string) {
+		t.Helper()
+		encoded, marshalErr := common.Marshal(entries)
+		require.NoError(t, marshalErr)
+		require.NoError(t, database.Create(&Option{Key: key, Value: string(encoded)}).Error)
+	}
+	writeOption("billing_setting.billing_mode", map[string]string{
+		mainTarget:     billing_setting.BillingModeTieredExpr,
+		overrideTarget: billing_setting.BillingModeTieredExpr,
+	})
+	writeOption("billing_setting.billing_expr", map[string]string{
+		mainTarget:     targetMainExpr,
+		overrideTarget: targetFallbackExpr,
+	})
+	writeOption(billing_setting.PluginBillingExprOption, map[string]string{
+		billing_setting.PluginBillingExprKey(pluginKey, overrideTarget): targetProviderExpr,
+	})
+
+	mapping := fmt.Sprintf(`{%q:%q}`, alias, mainTarget)
+	channel := Channel{
+		Status: common.ChannelStatusEnabled, Name: "snapshot runtime alias",
+		Models: alias, ModelMapping: &mapping,
+	}
+	require.NoError(t, database.Create(&channel).Error)
+	rebuildTaskAliasView()
+
+	snapshot, err := GetModelPricingSnapshot([]string{alias})
+	require.NoError(t, err)
+	require.Len(t, snapshot.Entries, 1)
+	require.Len(t, snapshot.Entries[0].PluginVariants, 1)
+	assert.Empty(t, snapshot.Entries[0].Configured)
+	assert.Equal(t, snapshot.EmptyVersion, snapshot.Entries[0].Version)
+	assert.Equal(t, targetMainExpr, snapshot.Entries[0].PluginVariants[0].Effective)
+
+	remapped := fmt.Sprintf(`{%q:%q}`, alias, overrideTarget)
+	require.NoError(t, database.Model(&Channel{}).Where("id = ?", channel.Id).Update("model_mapping", remapped).Error)
+	rebuildTaskAliasView()
+	snapshot, err = GetModelPricingSnapshot([]string{alias})
+	require.NoError(t, err)
+	require.Len(t, snapshot.Entries[0].PluginVariants, 1)
+	assert.Empty(t, snapshot.Entries[0].Configured)
+	assert.Equal(t, snapshot.EmptyVersion, snapshot.Entries[0].Version)
+	assert.Equal(t, targetProviderExpr, snapshot.Entries[0].PluginVariants[0].Effective)
+
+	require.NoError(t, database.Model(&Option{}).
+		Where("key = ?", "billing_setting.billing_mode").
+		Update("value", fmt.Sprintf(`{%q:%q,%q:%q,%q:%q}`,
+			mainTarget, billing_setting.BillingModeTieredExpr,
+			overrideTarget, billing_setting.BillingModeTieredExpr,
+			alias, billing_setting.BillingModeTieredExpr)).Error)
+	require.NoError(t, database.Model(&Option{}).
+		Where("key = ?", "billing_setting.billing_expr").
+		Update("value", fmt.Sprintf(`{%q:%q,%q:%q,%q:%q}`, mainTarget, targetMainExpr, overrideTarget, targetFallbackExpr, alias, aliasMainExpr)).Error)
+	require.NoError(t, database.Model(&Channel{}).Where("id = ?", channel.Id).Update("model_mapping", mapping).Error)
+	rebuildTaskAliasView()
+	snapshot, err = GetModelPricingSnapshot([]string{alias})
+	require.NoError(t, err)
+	require.Len(t, snapshot.Entries[0].PluginVariants, 1)
+	assert.Equal(t, aliasMainExpr, snapshot.Entries[0].PluginVariants[0].Effective)
+
+	require.NoError(t, database.Model(&Option{}).
+		Where("key = ?", billing_setting.PluginBillingExprOption).
+		Update("value", fmt.Sprintf(`{%q:%q,%q:%q}`,
+			billing_setting.PluginBillingExprKey(pluginKey, overrideTarget), targetProviderExpr,
+			billing_setting.PluginBillingExprKey(pluginKey, alias), aliasProviderExpr)).Error)
+	require.NoError(t, database.Model(&Channel{}).Where("id = ?", channel.Id).Update("model_mapping", remapped).Error)
+	rebuildTaskAliasView()
+	snapshot, err = GetModelPricingSnapshot([]string{alias})
+	require.NoError(t, err)
+	require.Len(t, snapshot.Entries[0].PluginVariants, 1)
+	assert.Equal(t, aliasProviderExpr, snapshot.Entries[0].PluginVariants[0].Effective)
+}
+
+func TestModelPricingUsesAuthoritativeAliasViews(t *testing.T) {
+	registerPlugin := func(t *testing.T, key, model, usageField string) {
+		t.Helper()
+		source := fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: "1.0.0", author: {name: "Test"},
+  models: [%q], fetchMode: "per_task",
+  usageSchema: {%s: {type: "number", unit: "count"}}
+};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+`, key, key, model, usageField)
+		_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+		require.NoError(t, err)
+		t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(key) })
+	}
+
+	t.Run("public save rejects alias added after cached miss", func(t *testing.T) {
+		_, second := useModelPricingOptionDatabases(t)
+		const (
+			alias     = "authoritative-new-alias"
+			target    = "authoritative-new-target"
+			pluginKey = "authoritative-new-plugin"
+		)
+		registerPlugin(t, pluginKey, target, "seconds")
+		taskAliasViewPtr.Store(nil)
+		_, resolved := ResolveTaskModelAlias(jsplugin.DefaultRegistry.Generation(), alias)
+		require.False(t, resolved)
+
+		mapping := fmt.Sprintf(`{%q:%q}`, alias, target)
+		require.NoError(t, second.Create(&Channel{
+			Status: common.ChannelStatusEnabled, Name: "authoritative new alias",
+			Models: alias, ModelMapping: &mapping,
+		}).Error)
+		_, resolved = ResolveTaskModelAlias(jsplugin.DefaultRegistry.Generation(), strings.ToUpper(alias))
+		require.False(t, resolved, "the process cache remains stale for the regression setup")
+
+		err := UpdateModelPricing([]ModelPricingChange{{
+			ModelName:       strings.ToUpper(alias),
+			ExpectedVersion: ModelPricingVersion(PricingValues{}),
+			Pricing:         PricingValues{"ModelRatio": float64(1)},
+		}})
+		require.ErrorContains(t, err, "must use canonical alias spelling "+strconv.Quote(alias))
+	})
+
+	for _, operation := range []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "preview",
+			run: func() error {
+				_, err := PreviewModelPricing("authoritative-read-failure", PricingValues{"ModelRatio": float64(1)})
+				return err
+			},
+		},
+		{
+			name: "write",
+			run: func() error {
+				return UpdateModelPricing([]ModelPricingChange{{
+					ModelName:       "authoritative-read-failure",
+					ExpectedVersion: ModelPricingVersion(PricingValues{}),
+					Pricing:         PricingValues{"ModelRatio": float64(1)},
+				}})
+			},
+		},
+	} {
+		t.Run(operation.name+" fails closed when aliases cannot be read", func(t *testing.T) {
+			database := useModelPricingOptionDatabase(t)
+			taskAliasViewPtr.Store(nil)
+			readErr := errors.New("injected alias view read failure")
+			callbackName := "fail_authoritative_alias_read_" + operation.name
+			require.NoError(t, database.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if _, aliases := tx.Statement.Dest.(*[]Channel); aliases {
+					tx.AddError(readErr)
+				}
+			}))
+			t.Cleanup(func() { require.NoError(t, database.Callback().Query().Remove(callbackName)) })
+
+			require.ErrorIs(t, operation.run(), readErr)
+		})
+	}
+
+	t.Run("stale cached remap cannot remove a newly active override", func(t *testing.T) {
+		first, second := useModelPricingOptionDatabases(t)
+		const (
+			alias        = "authoritative-remapped-alias"
+			oldTarget    = "authoritative-old-target"
+			oldPluginKey = "authoritative-old-plugin"
+			newTarget    = "authoritative-new-remap-target"
+			newPluginKey = "authoritative-new-remap-plugin"
+			mainExpr     = `tier("main", u("credits") * 1)`
+			overrideExpr = `tier("provider", u("seconds") * 1)`
+		)
+		registerPlugin(t, oldPluginKey, oldTarget, "frames")
+		registerPlugin(t, newPluginKey, newTarget, "seconds")
+
+		oldMapping := fmt.Sprintf(`{%q:%q}`, alias, oldTarget)
+		channel := Channel{
+			Status: common.ChannelStatusEnabled, Name: "authoritative remapped alias",
+			Models: alias, ModelMapping: &oldMapping,
+		}
+		require.NoError(t, first.Create(&channel).Error)
+		taskAliasViewPtr.Store(nil)
+		target, resolved := ResolveTaskModelAlias(jsplugin.DefaultRegistry.Generation(), alias)
+		require.True(t, resolved)
+		require.Equal(t, oldPluginKey, target.PluginKey)
+
+		for _, row := range []Option{
+			{Key: "billing_setting.billing_mode", Value: fmt.Sprintf(`{%q:%q}`, alias, billing_setting.BillingModeTieredExpr)},
+			{Key: "billing_setting.billing_expr", Value: fmt.Sprintf(`{%q:%q}`, alias, mainExpr)},
+			{Key: billing_setting.PluginBillingExprOption, Value: fmt.Sprintf(`{%q:%q}`,
+				billing_setting.PluginBillingExprKey(newPluginKey, alias), overrideExpr)},
+		} {
+			require.NoError(t, second.Create(&row).Error)
+		}
+		newMapping := fmt.Sprintf(`{%q:%q}`, alias, newTarget)
+		require.NoError(t, second.Model(&Channel{}).Where("id = ?", channel.Id).Update("model_mapping", newMapping).Error)
+		target, resolved = ResolveTaskModelAlias(jsplugin.DefaultRegistry.Generation(), alias)
+		require.True(t, resolved)
+		require.Equal(t, oldPluginKey, target.PluginKey, "the process cache remains stale for the regression setup")
+
+		err := UpdateModelPricingOptions(map[string]string{billing_setting.PluginBillingExprOption: `{}`})
+		require.ErrorContains(t, err, `usage key "credits" is not declared`)
+
+		var stored Option
+		require.NoError(t, first.Where("key = ?", billing_setting.PluginBillingExprOption).First(&stored).Error)
+		var variants map[string]string
+		require.NoError(t, common.UnmarshalJsonStr(stored.Value, &variants))
+		assert.Equal(t, overrideExpr, variants[billing_setting.PluginBillingExprKey(newPluginKey, alias)])
+	})
+}
+
+func TestUpdateModelPricingBuildsAuthoritativeAliasViewAfterPricingLocks(t *testing.T) {
+	first, second := useModelPricingOptionDatabases(t)
+	DB = second
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	common.SetDatabaseTypes(common.DatabaseTypeMySQL, previousLog)
+	t.Cleanup(func() { common.SetDatabaseTypes(previousMain, previousLog) })
+	taskAliasViewPtr.Store(nil)
+
+	type channelObservation struct {
+		source              string
+		locked, orderedByID bool
+	}
+	var events []string
+	var channelQueries []channelObservation
+	registerObserver := func(database *gorm.DB, source string) {
+		t.Helper()
+		callbackName := "observe_authoritative_alias_order_" + source
+		require.NoError(t, database.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+			switch tx.Statement.Dest.(type) {
+			case *[]Option:
+				events = append(events, "pricing")
+			case *[]Channel:
+				_, locked := tx.Statement.Clauses["FOR"]
+				orderClause, ordered := tx.Statement.Clauses["ORDER BY"]
+				orderBy, validOrder := orderClause.Expression.(clause.OrderBy)
+				orderedByID := ordered && validOrder && len(orderBy.Columns) == 1 &&
+					orderBy.Columns[0].Column.Name == "id" && !orderBy.Columns[0].Desc
+				channelQueries = append(channelQueries, channelObservation{
+					source: source, locked: locked, orderedByID: orderedByID,
+				})
+				events = append(events, "channels")
+			}
+			delete(tx.Statement.Clauses, "FOR")
+		}))
+		t.Cleanup(func() { require.NoError(t, database.Callback().Query().Remove(callbackName)) })
+	}
+	registerObserver(first, "transaction")
+	registerObserver(second, "global")
+
+	_, err := updateModelPricingDatabase(first, []ModelPricingChange{{
+		ModelName:       "authoritative-lock-order",
+		ExpectedVersion: ModelPricingVersion(PricingValues{}),
+		Pricing:         PricingValues{"ModelRatio": float64(1)},
+	}}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pricing", "channels"}, events)
+	assert.Equal(t, []channelObservation{{
+		source: "transaction", locked: true, orderedByID: true,
+	}}, channelQueries)
 }
 
 func TestUpdateModelPricingOptionsRejectsRemovingActiveAliasVariant(t *testing.T) {

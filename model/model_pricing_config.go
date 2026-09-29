@@ -303,7 +303,11 @@ func PreviewModelPricing(name string, draft PricingValues) (PricingValues, error
 	if err != nil {
 		return nil, err
 	}
-	if err := validateModelPricing(name, draft, modelPricingValues(values, name), nil); err != nil {
+	aliasView, err := buildTaskAliasView(DB, jsplugin.DefaultRegistry.Generation())
+	if err != nil {
+		return nil, fmt.Errorf("read task model aliases: %w", err)
+	}
+	if err := validateModelPricing(name, draft, modelPricingValues(values, name), nil, aliasView); err != nil {
 		return nil, err
 	}
 	replaceModelPricing(values, name, draft)
@@ -324,7 +328,7 @@ func GetEffectiveModelPricingTx(tx *gorm.DB, names []string) (map[string]Pricing
 	return result, nil
 }
 
-func resolveActivePluginVariant(generation *jsplugin.RoutingGeneration, pluginKey, name string) (*jsplugin.LoadedPlugin, string, bool) {
+func resolveActivePluginVariant(generation *jsplugin.RoutingGeneration, aliases *taskAliasView, pluginKey, name string) (*jsplugin.LoadedPlugin, string, bool) {
 	plugin, exists := generation.Get(pluginKey)
 	if !exists {
 		return nil, "", false
@@ -332,12 +336,41 @@ func resolveActivePluginVariant(generation *jsplugin.RoutingGeneration, pluginKe
 	if slices.Contains(plugin.Meta.Models, name) {
 		return plugin, name, true
 	}
-	target, resolved := ResolveTaskModelAlias(generation, name)
+	target, resolved := resolveTaskModelAlias(aliases, name)
 	if !resolved || target.PluginKey != pluginKey || target.Declared == "" ||
 		!slices.Contains(plugin.Meta.Models, target.Declared) {
 		return plugin, "", false
 	}
 	return plugin, target.Declared, true
+}
+
+func effectiveTaskPluginPricingExpression(values map[string]map[string]any, configured, effective PricingValues, pluginKey, name, mappedModel string) string {
+	if variants, _ := configured[billing_setting.PluginBillingExprOption].(map[string]any); variants != nil {
+		if expression, ok := variants[pluginKey].(string); ok {
+			return expression
+		}
+	}
+	if mappedModel != "" && mappedModel != name {
+		mapped := modelPricingValues(values, mappedModel)
+		if variants, _ := mapped[billing_setting.PluginBillingExprOption].(map[string]any); variants != nil {
+			if expression, ok := variants[pluginKey].(string); ok {
+				return expression
+			}
+		}
+	}
+	if effective["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr {
+		if expression, ok := effective["billing_setting.billing_expr"].(string); ok {
+			return expression
+		}
+	}
+	if mappedModel != "" && mappedModel != name {
+		mapped := effectiveModelPricing(values, mappedModel)
+		if mapped["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr {
+			expression, _ := mapped["billing_setting.billing_expr"].(string)
+			return expression
+		}
+	}
+	return ""
 }
 
 func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
@@ -369,13 +402,14 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 	sort.Strings(names)
 	result := &ModelPricingSnapshot{Entries: make([]ModelPricingEntry, 0, len(names)), Options: make(map[string]string), EmptyVersion: ModelPricingVersion(PricingValues{})}
 	generation := jsplugin.DefaultRegistry.Generation()
+	aliasView := loadFreshTaskAliasView(generation)
 	for _, name := range names {
 		configured := modelPricingValues(values, name)
 		entry := ModelPricingEntry{ModelName: name, Version: ModelPricingVersion(configured), Configured: configured,
 			ModelPricingDescription: ModelPricingDescription{Effective: effectiveModelPricing(values, name)}}
 		entry.CacheWriteMode = ResolveCacheWriteMode(name, configured)
 		entry.BillingDetails = ResolveLegacyBillingDetails(name, entry.Effective, configured)
-		aliasTarget, aliasResolved := ResolveTaskModelAlias(generation, name)
+		aliasTarget, aliasResolved := resolveTaskModelAlias(aliasView, name)
 		if plugin, ok := generation.GetByModel(name); ok {
 			entry.UsageSchema, _ = plugin.Meta.UsageForModel(name)
 		} else if aliasResolved {
@@ -397,9 +431,9 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 				keys[aliasTarget.PluginKey] = true
 			}
 			for _, key := range slices.Sorted(maps.Keys(keys)) {
-				configuredValue, overridden := configuredVariants[key]
+				configuredValue := configuredVariants[key]
 				configuredExpr, _ := configuredValue.(string)
-				plugin, schemaModel, active := resolveActivePluginVariant(generation, key, name)
+				plugin, schemaModel, active := resolveActivePluginVariant(generation, aliasView, key, name)
 				if !active {
 					variant := ModelPricingPluginVariant{
 						PluginKey: key, PluginName: key, Configured: configuredExpr,
@@ -415,10 +449,7 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 				if schema == nil {
 					schema = map[string]jsplugin.UsageFieldSchema{}
 				}
-				expression := configuredExpr
-				if !overridden && entry.Effective["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr {
-					expression, _ = entry.Effective["billing_setting.billing_expr"].(string)
-				}
+				expression := effectiveTaskPluginPricingExpression(values, configured, entry.Effective, key, name, schemaModel)
 				entry.PluginVariants = append(entry.PluginVariants, ModelPricingPluginVariant{
 					PluginKey: plugin.Meta.Key, PluginName: plugin.Meta.Name, Icon: plugin.Meta.Icon,
 					UsageSchema: schema, UsageExamples: examples, Configured: configuredExpr, Effective: expression,
@@ -463,17 +494,25 @@ func ValidateModelPricing(name string, values PricingValues) error {
 	if expression, ok := billing_setting.GetBillingExpr(name); ok {
 		previous["billing_setting.billing_expr"] = expression
 	}
-	return validateModelPricing(name, values, previous, nil)
+	generation := jsplugin.DefaultRegistry.Generation()
+	if DB == nil {
+		return validateModelPricing(name, values, previous, nil, loadFreshTaskAliasView(generation))
+	}
+	aliasView, err := buildTaskAliasView(DB, generation)
+	if err != nil {
+		return fmt.Errorf("read task model aliases: %w", err)
+	}
+	return validateModelPricing(name, values, previous, nil, aliasView)
 }
 
 // Writes pass the locked database snapshot here, so allowing an unchanged stale
 // override cannot bypass validation through an out-of-date process-local cache.
-func validateModelPricing(name string, values, previous PricingValues, pluginValidationModels map[string]string) error {
+func validateModelPricing(name string, values, previous PricingValues, pluginValidationModels map[string]string, aliases *taskAliasView) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("model name is required")
 	}
 	generation := jsplugin.DefaultRegistry.Generation()
-	if target, resolved := ResolveTaskModelAlias(generation, name); resolved && target.Alias != name {
+	if target, resolved := resolveTaskModelAlias(aliases, name); resolved && target.Alias != name {
 		return fmt.Errorf("model name %q must use canonical alias spelling %q", name, target.Alias)
 	}
 	previousVariants, _ := previous[billing_setting.PluginBillingExprOption].(map[string]any)
@@ -498,7 +537,7 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 				plugin, active = generation.Get(key)
 				active = active && slices.Contains(plugin.Meta.Models, pluginModel)
 			} else {
-				plugin, pluginModel, active = resolveActivePluginVariant(generation, key, name)
+				plugin, pluginModel, active = resolveActivePluginVariant(generation, aliases, key, name)
 			}
 			if !active {
 				if previousVariants[key] == expression {
@@ -530,7 +569,7 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 			if !ok || strings.TrimSpace(expression) == "" {
 				return errors.New("billing expression is required")
 			}
-			if err := validateMainModelPricingExpression(name, expression, variants); err != nil {
+			if err := validateMainModelPricingExpression(name, expression, variants, aliases); err != nil {
 				return err
 			}
 			continue
@@ -546,7 +585,7 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 			if !builtin {
 				return errors.New("billing expression is required")
 			}
-			if err := validateMainModelPricingExpression(name, expression, variants); err != nil {
+			if err := validateMainModelPricingExpression(name, expression, variants, aliases); err != nil {
 				return err
 			}
 		}
@@ -554,7 +593,7 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 	return nil
 }
 
-func validateMainModelPricingExpression(name, expression string, variants map[string]any) error {
+func validateMainModelPricingExpression(name, expression string, variants map[string]any, aliases *taskAliasView) error {
 	if _, err := billingexpr.CompileFromCache(expression); err != nil {
 		return fmt.Errorf("model %s: %w", name, err)
 	}
@@ -583,7 +622,7 @@ func validateMainModelPricingExpression(name, expression string, variants map[st
 		}
 		return nil
 	}
-	if target, resolved := ResolveTaskModelAlias(generation, name); resolved {
+	if target, resolved := resolveTaskModelAlias(aliases, name); resolved {
 		if plugin, ok := generation.Get(target.PluginKey); ok {
 			schema, _ := plugin.Meta.UsageForModel(target.Declared)
 			if err := billing_setting.SmokeTestTaskExpr(expression, schema); err != nil {
@@ -663,7 +702,7 @@ func updateModelPricingDatabase(db *gorm.DB, changes []ModelPricingChange, after
 			return nil, ErrModelPricingConflict
 		}
 	}
-	return mutateModelPricingOptionsDatabase(db, func(tx *gorm.DB, values map[string]map[string]any) error {
+	return mutateModelPricingOptionsDatabaseWithAliases(db, func(tx *gorm.DB, values map[string]map[string]any, aliases *taskAliasView) error {
 		defaults := defaultPricingMaps()
 		for _, change := range changes {
 			previous := modelPricingValues(values, change.ModelName)
@@ -674,7 +713,7 @@ func updateModelPricingDatabase(db *gorm.DB, changes []ModelPricingChange, after
 			if change.Reset {
 				pricing = modelPricingValues(defaults, change.ModelName)
 			}
-			if err := validateModelPricing(change.ModelName, pricing, previous, change.PluginValidationModels); err != nil {
+			if err := validateModelPricing(change.ModelName, pricing, previous, change.PluginValidationModels, aliases); err != nil {
 				return err
 			}
 			replaceModelPricing(values, change.ModelName, pricing)
@@ -689,7 +728,7 @@ func updateModelPricingDatabase(db *gorm.DB, changes []ModelPricingChange, after
 // UpdateModelPricingOptions keeps legacy single-option callers on the same
 // locking, validation and transaction path as the model-level API.
 func UpdateModelPricingOptions(updates map[string]string) error {
-	return mutateModelPricingOptions(func(_ *gorm.DB, values map[string]map[string]any) error {
+	return mutateModelPricingOptionsWithAliases(func(_ *gorm.DB, values map[string]map[string]any, aliases *taskAliasView) error {
 		previous := maps.Clone(values)
 		names := make(map[string]bool)
 		updatedKeys := make(map[string]bool)
@@ -729,8 +768,8 @@ func UpdateModelPricingOptions(updates map[string]string) error {
 			if reflect.DeepEqual(before, after) {
 				continue
 			}
-			changed := legacyModelPricingValidationDraft(name, after, before, updatedKeys)
-			if err := validateModelPricing(name, changed, before, nil); err != nil {
+			changed := legacyModelPricingValidationDraft(name, after, before, updatedKeys, aliases)
+			if err := validateModelPricing(name, changed, before, nil, aliases); err != nil {
 				return err
 			}
 		}
@@ -738,7 +777,7 @@ func UpdateModelPricingOptions(updates map[string]string) error {
 	})
 }
 
-func legacyModelPricingValidationDraft(name string, after, before PricingValues, updatedKeys map[string]bool) PricingValues {
+func legacyModelPricingValidationDraft(name string, after, before PricingValues, updatedKeys map[string]bool, aliases *taskAliasView) PricingValues {
 	changed := make(PricingValues)
 	fieldChanged := func(key string) bool {
 		afterValue, afterExists := after[key]
@@ -761,7 +800,7 @@ func legacyModelPricingValidationDraft(name string, after, before PricingValues,
 	variantsChanged := fieldChanged(billing_setting.PluginBillingExprOption)
 	validateMain := mainChanged ||
 		(modeChanged && after["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr) ||
-		(variantsChanged && !onlyStalePluginOverridesRemoved(name, after, before))
+		(variantsChanged && !onlyStalePluginOverridesRemoved(name, after, before, aliases))
 	if !validateMain {
 		return changed
 	}
@@ -773,7 +812,7 @@ func legacyModelPricingValidationDraft(name string, after, before PricingValues,
 	return changed
 }
 
-func onlyStalePluginOverridesRemoved(name string, after, before PricingValues) bool {
+func onlyStalePluginOverridesRemoved(name string, after, before PricingValues, aliases *taskAliasView) bool {
 	afterVariants, _ := after[billing_setting.PluginBillingExprOption].(map[string]any)
 	beforeVariants, _ := before[billing_setting.PluginBillingExprOption].(map[string]any)
 	removed := false
@@ -786,7 +825,7 @@ func onlyStalePluginOverridesRemoved(name string, after, before PricingValues) b
 		if stillExists {
 			return false
 		}
-		if _, _, active := resolveActivePluginVariant(generation, key, name); active {
+		if _, _, active := resolveActivePluginVariant(generation, aliases, key, name); active {
 			return false
 		}
 		removed = true
@@ -800,9 +839,15 @@ func onlyStalePluginOverridesRemoved(name string, after, before PricingValues) b
 }
 
 func mutateModelPricingOptions(mutate func(*gorm.DB, map[string]map[string]any) error) error {
+	return mutateModelPricingOptionsWithAliases(func(tx *gorm.DB, values map[string]map[string]any, _ *taskAliasView) error {
+		return mutate(tx, values)
+	})
+}
+
+func mutateModelPricingOptionsWithAliases(mutate func(*gorm.DB, map[string]map[string]any, *taskAliasView) error) error {
 	modelPricingMutationMu.Lock()
 	defer modelPricingMutationMu.Unlock()
-	committed, err := mutateModelPricingOptionsDatabase(DB, mutate)
+	committed, err := mutateModelPricingOptionsDatabaseWithAliases(DB, mutate)
 	if err != nil {
 		return err
 	}
@@ -810,6 +855,12 @@ func mutateModelPricingOptions(mutate func(*gorm.DB, map[string]map[string]any) 
 }
 
 func mutateModelPricingOptionsDatabase(db *gorm.DB, mutate func(*gorm.DB, map[string]map[string]any) error) (map[string]map[string]any, error) {
+	return mutateModelPricingOptionsDatabaseWithAliases(db, func(tx *gorm.DB, values map[string]map[string]any, _ *taskAliasView) error {
+		return mutate(tx, values)
+	})
+}
+
+func mutateModelPricingOptionsDatabaseWithAliases(db *gorm.DB, mutate func(*gorm.DB, map[string]map[string]any, *taskAliasView) error) (map[string]map[string]any, error) {
 	revision := Option{Key: modelPricingRevisionOptionKey, Value: "0"}
 	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&revision).Error; err != nil {
 		return nil, err
@@ -835,14 +886,18 @@ func mutateModelPricingOptionsDatabase(db *gorm.DB, mutate func(*gorm.DB, map[st
 			if claim.RowsAffected != 1 {
 				return errModelPricingCASMiss
 			}
-			values, existing, duplicated, err := readModelPricingMaps(lockForUpdate(tx))
-			if err != nil {
-				return err
+			values, existing, duplicated, readErr := readModelPricingMaps(lockForUpdate(tx))
+			if readErr != nil {
+				return readErr
 			}
 			if len(duplicated) > 0 {
 				common.SysError("options table has duplicate pricing keys [" + strings.Join(duplicated, ", ") + "]; the table is missing a primary key")
 			}
-			if err := mutate(tx, values); err != nil {
+			aliases, aliasErr := buildTaskAliasView(lockForUpdate(tx), jsplugin.DefaultRegistry.Generation())
+			if aliasErr != nil {
+				return fmt.Errorf("read task model aliases: %w", aliasErr)
+			}
+			if err := mutate(tx, values, aliases); err != nil {
 				return err
 			}
 			defaults := defaultPricingMaps()
