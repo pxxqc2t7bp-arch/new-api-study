@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"gorm.io/gorm/utils/tests"
 )
 
 func modelPricingSQLiteDSN(path string) string {
@@ -244,6 +245,30 @@ func TestNormalizeLegacyPricingEntriesUsesDeterministicCanonicalPrecedence(t *te
 			require.ErrorContains(t, err, "conflicting aliases for "+canonical)
 		}
 	})
+}
+
+func TestReadModelPricingMapsQuotesKeyBeforeForUpdate(t *testing.T) {
+	database, err := gorm.Open(tests.DummyDialector{}, &gorm.Config{DryRun: true})
+	require.NoError(t, err)
+
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	common.SetDatabaseTypes(common.DatabaseTypeMySQL, previousLog)
+	t.Cleanup(func() {
+		common.SetDatabaseTypes(previousMain, previousLog)
+	})
+
+	var query string
+	require.NoError(t, database.Callback().Query().After("gorm:query").Register("capture_pricing_options_query", func(tx *gorm.DB) {
+		if _, ok := tx.Statement.Dest.(*[]Option); ok {
+			query = tx.Statement.SQL.String()
+		}
+	}))
+
+	_, _, _, err = readModelPricingMaps(lockForUpdate(database))
+	require.NoError(t, err)
+	require.NotEmpty(t, query)
+	assert.Contains(t, query, "ORDER BY `key` FOR UPDATE")
+	assert.NotRegexp(t, `(?i)ORDER BY[[:space:]]+key([[:space:],]|$)`, query)
 }
 
 func TestMutateModelPricingOptionsLocksPricingRowsWithoutQueryingAliases(t *testing.T) {
