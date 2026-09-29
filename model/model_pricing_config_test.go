@@ -222,6 +222,107 @@ export function parseTaskResult() { return {}; }
 	})
 }
 
+func TestUpdateModelPricingOptionsRejectsRemovingActiveAliasVariant(t *testing.T) {
+	database, _ := openModelPricingInstanceDatabases(t)
+	previousDB := DB
+	previousOptions := common.OptionMap
+	previousConfig := config.GlobalConfig.ExportAllConfigs()
+	previousAliasView := taskAliasViewPtr.Load()
+	restoreRatios := []struct {
+		value   string
+		restore func(string) error
+	}{
+		{ratio_setting.ModelPrice2JSONString(), ratio_setting.UpdateModelPriceByJSONString},
+		{ratio_setting.ModelRatio2JSONString(), ratio_setting.UpdateModelRatioByJSONString},
+		{ratio_setting.CompletionRatio2JSONString(), ratio_setting.UpdateCompletionRatioByJSONString},
+		{ratio_setting.CacheRatio2JSONString(), ratio_setting.UpdateCacheRatioByJSONString},
+		{ratio_setting.CreateCacheRatio2JSONString(), ratio_setting.UpdateCreateCacheRatioByJSONString},
+		{ratio_setting.ImageRatio2JSONString(), ratio_setting.UpdateImageRatioByJSONString},
+		{ratio_setting.AudioRatio2JSONString(), ratio_setting.UpdateAudioRatioByJSONString},
+		{ratio_setting.AudioCompletionRatio2JSONString(), ratio_setting.UpdateAudioCompletionRatioByJSONString},
+	}
+	DB = database
+	common.OptionMap = maps.Clone(previousOptions)
+	if common.OptionMap == nil {
+		common.OptionMap = make(map[string]string)
+	}
+	t.Cleanup(func() {
+		for _, ratio := range restoreRatios {
+			require.NoError(t, ratio.restore(ratio.value))
+		}
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previousConfig))
+		taskAliasViewPtr.Store(previousAliasView)
+		common.OptionMap = previousOptions
+		DB = previousDB
+	})
+
+	const (
+		alias       = "seedream-alias-variant-test"
+		canonical   = "seedream-canonical-variant-test"
+		pluginKey   = "seedream-alias-variant-plugin"
+		mainExpr    = `tier("request", fixed(0.01))`
+		variantExpr = `tier("task", u("seconds") * 1)`
+	)
+	source := fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: "1.0.0", author: {name: "Test"},
+  models: [%q], fetchMode: "per_task",
+  usageSchema: {seconds: {type: "number", unit: "second"}}
+};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+`, pluginKey, pluginKey, canonical)
+	_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
+	plugin, exists := jsplugin.DefaultRegistry.Generation().Get(pluginKey)
+	require.True(t, exists)
+	schema, _ := plugin.Meta.UsageForModel(canonical)
+	require.NoError(t, billing_setting.SmokeTestExpr(mainExpr))
+	require.ErrorContains(t, billing_setting.SmokeTestTaskExpr(mainExpr, schema), "fixed pricing is not supported")
+	require.NoError(t, billing_setting.SmokeTestTaskExpr(variantExpr, schema))
+
+	mapping := fmt.Sprintf(`{%q:%q}`, alias, canonical)
+	channel := Channel{
+		Id: 940, Status: common.ChannelStatusEnabled, Name: "seedream alias variant",
+		Models: alias, ModelMapping: &mapping,
+	}
+	require.NoError(t, database.Create(&channel).Error)
+	rebuildTaskAliasView()
+	target, resolved := ResolveTaskModelAlias(jsplugin.DefaultRegistry.Generation(), alias)
+	require.True(t, resolved)
+	assert.Equal(t, TaskAliasTarget{Alias: alias, Declared: canonical, PluginKey: pluginKey}, target)
+
+	initial, err := GetModelPricingSnapshot([]string{alias})
+	require.NoError(t, err)
+	require.NoError(t, UpdateModelPricing([]ModelPricingChange{{
+		ModelName:       alias,
+		ExpectedVersion: initial.Entries[0].Version,
+		Pricing: PricingValues{
+			"billing_setting.billing_mode":          billing_setting.BillingModeTieredExpr,
+			"billing_setting.billing_expr":          mainExpr,
+			billing_setting.PluginBillingExprOption: map[string]any{pluginKey: variantExpr},
+		},
+		PluginValidationModels: map[string]string{pluginKey: canonical},
+	}}))
+
+	err = UpdateModelPricingOptions(map[string]string{billing_setting.PluginBillingExprOption: `{}`})
+	require.ErrorContains(t, err, "plugin "+pluginKey)
+	active, err := GetModelPricingSnapshot([]string{alias})
+	require.NoError(t, err)
+	require.Equal(t, map[string]any{pluginKey: variantExpr}, active.Entries[0].Configured[billing_setting.PluginBillingExprOption])
+
+	require.NoError(t, database.Model(&Channel{}).Where("id = ?", channel.Id).Update("status", common.ChannelStatusManuallyDisabled).Error)
+	rebuildTaskAliasView()
+	require.NoError(t, UpdateModelPricingOptions(map[string]string{billing_setting.PluginBillingExprOption: `{}`}))
+	staleRemoved, err := GetModelPricingSnapshot([]string{alias})
+	require.NoError(t, err)
+	assert.NotContains(t, staleRemoved.Entries[0].Configured, billing_setting.PluginBillingExprOption)
+	assert.Equal(t, mainExpr, staleRemoved.Entries[0].Configured["billing_setting.billing_expr"])
+}
+
 func TestLegacyWildcardAliasUsesCanonicalConfiguredStateAndRuntimePublication(t *testing.T) {
 	database, _ := openModelPricingInstanceDatabases(t)
 	previousDB := DB

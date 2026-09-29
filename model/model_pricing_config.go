@@ -753,8 +753,15 @@ func onlyStalePluginOverridesRemoved(name string, after, before PricingValues) b
 			return false
 		}
 		plugin, exists := generation.Get(key)
-		if exists && slices.Contains(plugin.Meta.Models, name) {
-			return false
+		if exists {
+			if slices.Contains(plugin.Meta.Models, name) {
+				return false
+			}
+			if target, resolved := ResolveTaskModelAlias(generation, name); resolved &&
+				target.PluginKey == key && target.Declared != "" &&
+				slices.Contains(plugin.Meta.Models, target.Declared) {
+				return false
+			}
 		}
 		removed = true
 	}
