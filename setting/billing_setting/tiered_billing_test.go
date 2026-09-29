@@ -2,7 +2,11 @@ package billing_setting
 
 import (
 	"fmt"
+	"maps"
+	"runtime"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -12,6 +16,19 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func rawBillingSettingSnapshot() BillingSetting {
+	var snapshot BillingSetting
+	config.GlobalConfig.Read("billing_setting", func(value any) {
+		setting := value.(*BillingSetting)
+		snapshot = BillingSetting{
+			BillingMode:       maps.Clone(setting.BillingMode),
+			BillingExpr:       maps.Clone(setting.BillingExpr),
+			PluginBillingExpr: maps.Clone(setting.PluginBillingExpr),
+		}
+	})
+	return snapshot
+}
 
 func TestResolveModelBillingDecisionKeepsPublishedBundleCoherent(t *testing.T) {
 	const (
@@ -91,6 +108,188 @@ func TestGetBillingOptionSnapshotReturnsEffectiveIndependentCopies(t *testing.T)
 	assert.Equal(t, BillingModeTieredExpr, fresh.BillingMode[modelName])
 	assert.Equal(t, mainExpr, fresh.BillingExpr[modelName])
 	assert.Equal(t, providerExpr, fresh.PluginBillingExpr[PluginBillingExprKey(pluginKey, modelName)])
+}
+
+func TestUpdateBillingSettingOptionsRejectsInvalidMapsWithoutMutation(t *testing.T) {
+	const (
+		modelName      = "billing-update-rollback"
+		pluginKey      = "billing-update-provider"
+		previousExpr   = `tier("previous", p * 2 + c * 8)`
+		previousPlugin = `tier("previous-provider", u("image_count") * 0.03)`
+		nextExpr       = `tier("next", p * 3 + c * 9)`
+		nextPlugin     = `tier("next-provider", u("image_count") * 0.04)`
+	)
+
+	previous := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previous))
+	})
+	priorOptions := map[string]string{
+		BillingModeOption:       fmt.Sprintf(`{%q:%q}`, modelName, BillingModeRatio),
+		BillingExprOption:       fmt.Sprintf(`{%q:%q}`, modelName, previousExpr),
+		PluginBillingExprOption: fmt.Sprintf(`{%q:%q}`, PluginBillingExprKey(pluginKey, modelName), previousPlugin),
+	}
+	validNext := map[string]string{
+		BillingModeOption:       fmt.Sprintf(`{%q:%q}`, modelName, BillingModeTieredExpr),
+		BillingExprOption:       fmt.Sprintf(`{%q:%q}`, modelName, nextExpr),
+		PluginBillingExprOption: fmt.Sprintf(`{%q:%q}`, PluginBillingExprKey(pluginKey, modelName), nextPlugin),
+	}
+
+	tests := []struct {
+		name    string
+		key     string
+		invalid string
+	}{
+		{name: "malformed provider map after valid mode and main maps", key: PluginBillingExprOption, invalid: `{`},
+		{name: "null provider map after valid mode and main maps", key: PluginBillingExprOption, invalid: `null`},
+		{name: "malformed main map between valid mode and provider maps", key: BillingExprOption, invalid: `{`},
+		{name: "null main map between valid mode and provider maps", key: BillingExprOption, invalid: `null`},
+		{name: "malformed mode map before valid main and provider maps", key: BillingModeOption, invalid: `{`},
+		{name: "null mode map before valid main and provider maps", key: BillingModeOption, invalid: `null`},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			require.NoError(t, UpdateBillingSettingOptions(priorOptions))
+			before := rawBillingSettingSnapshot()
+			options := maps.Clone(validNext)
+			options[testCase.key] = testCase.invalid
+
+			err := UpdateBillingSettingOptions(options)
+
+			assert.Error(t, err)
+			assert.Equal(t, before, rawBillingSettingSnapshot())
+		})
+	}
+}
+
+func TestUpdateBillingSettingOptionsPreservesUnsuppliedMaps(t *testing.T) {
+	const (
+		modelName     = "billing-partial-update"
+		pluginKey     = "billing-partial-provider"
+		previousExpr  = "previous-main"
+		nextExpr      = "next-main"
+		providerExpr  = "previous-provider"
+		previousMode  = BillingModeRatio
+		providerEntry = pluginKey + "::" + modelName
+	)
+
+	previous := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previous))
+	})
+	require.NoError(t, UpdateBillingSettingOptions(map[string]string{
+		BillingModeOption:       fmt.Sprintf(`{%q:%q}`, modelName, previousMode),
+		BillingExprOption:       fmt.Sprintf(`{%q:%q}`, modelName, previousExpr),
+		PluginBillingExprOption: fmt.Sprintf(`{%q:%q}`, providerEntry, providerExpr),
+	}))
+	before := rawBillingSettingSnapshot()
+
+	require.NoError(t, UpdateBillingSettingOptions(map[string]string{
+		BillingExprOption: fmt.Sprintf(`{%q:%q}`, modelName, nextExpr),
+	}))
+
+	after := rawBillingSettingSnapshot()
+	assert.Equal(t, before.BillingMode, after.BillingMode)
+	assert.Equal(t, map[string]string{modelName: nextExpr}, after.BillingExpr)
+	assert.Equal(t, before.PluginBillingExpr, after.PluginBillingExpr)
+}
+
+func TestUpdateBillingSettingOptionsPublishesOnlyCompleteGenerations(t *testing.T) {
+	const (
+		modelName = "billing-generation-model"
+		pluginKey = "billing-generation-provider"
+	)
+	type generation [3]string
+
+	previous := config.GlobalConfig.ExportAllConfigs()
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previous))
+	})
+	oldGeneration := generation{BillingModeRatio, "old-main", "old-provider"}
+	newGeneration := generation{BillingModeTieredExpr, "new-main", "new-provider"}
+	optionsFor := func(values generation) map[string]string {
+		return map[string]string{
+			BillingModeOption:       fmt.Sprintf(`{%q:%q}`, modelName, values[0]),
+			BillingExprOption:       fmt.Sprintf(`{%q:%q}`, modelName, values[1]),
+			PluginBillingExprOption: fmt.Sprintf(`{%q:%q}`, PluginBillingExprKey(pluginKey, modelName), values[2]),
+		}
+	}
+	observe := func() generation {
+		snapshot := rawBillingSettingSnapshot()
+		return generation{
+			snapshot.BillingMode[modelName],
+			snapshot.BillingExpr[modelName],
+			snapshot.PluginBillingExpr[PluginBillingExprKey(pluginKey, modelName)],
+		}
+	}
+	require.NoError(t, UpdateBillingSettingOptions(optionsFor(oldGeneration)))
+
+	const readerCount = 8
+	start := make(chan struct{})
+	ready := make(chan struct{}, readerCount)
+	stop := make(chan struct{})
+	mixed := make(chan generation, 1)
+	var readers sync.WaitGroup
+	readers.Add(readerCount)
+	for range readerCount {
+		go func() {
+			defer readers.Done()
+			<-start
+			reportedReady := false
+			for {
+				observed := observe()
+				if !reportedReady {
+					ready <- struct{}{}
+					reportedReady = true
+				}
+				if observed != oldGeneration && observed != newGeneration {
+					select {
+					case mixed <- observed:
+					default:
+					}
+					return
+				}
+				select {
+				case <-stop:
+					return
+				default:
+					runtime.Gosched()
+				}
+			}
+		}()
+	}
+	close(start)
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for range readerCount {
+		select {
+		case <-ready:
+		case <-timer.C:
+			close(stop)
+			readers.Wait()
+			require.FailNow(t, "timed out waiting for generation readers")
+		}
+	}
+
+	var updateErr error
+	for index := range 200 {
+		next := newGeneration
+		if index%2 == 1 {
+			next = oldGeneration
+		}
+		if updateErr = UpdateBillingSettingOptions(optionsFor(next)); updateErr != nil {
+			break
+		}
+		runtime.Gosched()
+	}
+	close(stop)
+	readers.Wait()
+	require.NoError(t, updateErr)
+	select {
+	case observed := <-mixed:
+		t.Fatalf("observed mixed billing generation: mode=%q main=%q provider=%q", observed[0], observed[1], observed[2])
+	default:
+	}
 }
 
 func TestResolveTaskBillingDecisionKeepsModeAndSelectedExpressionCoherent(t *testing.T) {

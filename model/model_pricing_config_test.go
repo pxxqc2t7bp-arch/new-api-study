@@ -42,7 +42,7 @@ func (expression blockingBillingExpression) MarshalJSON() ([]byte, error) {
 	return []byte(strconv.Quote(expression.value)), nil
 }
 
-func TestPublishModelPricingOptionsPublishesBillingBundleAtomically(t *testing.T) {
+func TestPublishModelPricingOptionsDoesNotPublishBillingBeforePreEncodingCompletes(t *testing.T) {
 	const (
 		modelName   = "aggregate-seedream-publication"
 		pluginKey   = "doubao"

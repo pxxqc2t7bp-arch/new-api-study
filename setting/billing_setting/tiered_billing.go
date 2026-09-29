@@ -1,6 +1,7 @@
 package billing_setting
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
 	"math"
@@ -285,21 +286,37 @@ func IsBillingSettingOption(key string) bool {
 	}
 }
 
-// UpdateBillingSettingOptions publishes all supplied billing maps under the
-// ConfigManager write lock used by runtime readers.
+func validateBillingSettingMap(optionKey, value string) error {
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(value), &parsed); err != nil {
+		return fmt.Errorf("invalid billing setting option %s: %w", optionKey, err)
+	}
+	if parsed == nil {
+		return fmt.Errorf("invalid billing setting option %s: expected a non-null JSON object", optionKey)
+	}
+	return nil
+}
+
+// UpdateBillingSettingOptions validates every supplied map before publishing
+// the complete partial update under the ConfigManager write lock.
 func UpdateBillingSettingOptions(options map[string]string) error {
 	values := make(map[string]string, len(options))
 	for key, value := range options {
+		var field string
 		switch key {
 		case BillingModeOption:
-			values[BillingModeField] = value
+			field = BillingModeField
 		case BillingExprOption:
-			values[BillingExprField] = value
+			field = BillingExprField
 		case PluginBillingExprOption:
-			values["plugin_billing_expr"] = value
+			field = "plugin_billing_expr"
 		default:
 			return fmt.Errorf("unsupported billing setting option: %s", key)
 		}
+		if err := validateBillingSettingMap(key, value); err != nil {
+			return err
+		}
+		values[field] = value
 	}
 	if len(values) == 0 {
 		return nil
