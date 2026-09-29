@@ -379,33 +379,32 @@ func resolveActivePluginVariant(generation *jsplugin.RoutingGeneration, aliases 
 	return plugin, schemaModel, active
 }
 
-func effectiveTaskPluginPricingExpression(values map[string]map[string]any, configured, effective PricingValues, pluginKey, name, mappedModel string) string {
+func effectiveTaskPluginPricingExpression(values map[string]map[string]any, configured, effective PricingValues, pluginKey, name, mappedModel string) (string, bool) {
 	if variants, _ := configured[billing_setting.PluginBillingExprOption].(map[string]any); variants != nil {
 		if expression, ok := variants[pluginKey].(string); ok {
-			return expression
+			return expression, true
 		}
 	}
 	if mappedModel != "" && mappedModel != name {
 		mapped := modelPricingValues(values, mappedModel)
 		if variants, _ := mapped[billing_setting.PluginBillingExprOption].(map[string]any); variants != nil {
 			if expression, ok := variants[pluginKey].(string); ok {
-				return expression
+				return expression, true
 			}
 		}
 	}
 	if effective["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr {
-		if expression, ok := effective["billing_setting.billing_expr"].(string); ok {
-			return expression
-		}
+		expression, _ := effective["billing_setting.billing_expr"].(string)
+		return expression, true
 	}
 	if mappedModel != "" && mappedModel != name {
 		mapped := effectiveModelPricing(values, mappedModel)
 		if mapped["billing_setting.billing_mode"] == billing_setting.BillingModeTieredExpr {
 			expression, _ := mapped["billing_setting.billing_expr"].(string)
-			return expression
+			return expression, true
 		}
 	}
-	return ""
+	return "", false
 }
 
 func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
@@ -477,7 +476,7 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 				if schema == nil {
 					schema = map[string]jsplugin.UsageFieldSchema{}
 				}
-				expression := effectiveTaskPluginPricingExpression(values, configured, entry.Effective, key, name, schemaModel)
+				expression, _ := effectiveTaskPluginPricingExpression(values, configured, entry.Effective, key, name, schemaModel)
 				entry.PluginVariants = append(entry.PluginVariants, ModelPricingPluginVariant{
 					PluginKey: plugin.Meta.Key, PluginName: plugin.Meta.Name, Icon: plugin.Meta.Icon,
 					UsageSchema: schema, UsageExamples: examples, Configured: configuredExpr, Effective: expression,
@@ -647,7 +646,7 @@ func validateMainModelPricingExpression(name, expression string, variants map[st
 			} else if compatibilityErr == nil {
 				compatibilityErr = fmt.Errorf("model %s: plugin %s: %w", name, plugin.Meta.Key, mainErr)
 			}
-			selected := effectiveTaskPluginPricingExpression(
+			selected, _ := effectiveTaskPluginPricingExpression(
 				pricingMaps, configured, effective, plugin.Meta.Key, name, schemaModel,
 			)
 			if err := billing_setting.SmokeTestTaskExpr(selected, schema); err != nil {
@@ -671,9 +670,12 @@ func validateEffectiveTaskAliasPricing(name string, pricingMaps map[string]map[s
 	configured := modelPricingValues(pricingMaps, name)
 	effective := effectiveModelPricing(pricingMaps, name)
 	for _, plugin := range plugins {
-		expression := effectiveTaskPluginPricingExpression(
+		expression, selected := effectiveTaskPluginPricingExpression(
 			pricingMaps, configured, effective, plugin.Meta.Key, name, schemaModel,
 		)
+		if !selected {
+			continue
+		}
 		if strings.TrimSpace(expression) == "" {
 			return fmt.Errorf("model %s: plugin %s: billing expression is required", name, plugin.Meta.Key)
 		}

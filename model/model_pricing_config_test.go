@@ -712,6 +712,82 @@ func requireSharedAliasCandidateRejectionIsAtomic(t *testing.T, fixture sharedAl
 	return err
 }
 
+func TestUpdateModelPricingPreservesDependentAliasRatioFallback(t *testing.T) {
+	const secondsExpr = `tier("seconds", u("seconds") * 1)`
+
+	t.Run("accepts target-only ratio update", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "ratio-target")
+		initial := sharedAliasCandidateEntries(t, fixture)
+
+		require.NoError(t, UpdateModelPricing([]ModelPricingChange{{
+			ModelName:       fixture.target,
+			ExpectedVersion: initial[fixture.target].Version,
+			Pricing:         PricingValues{"ModelRatio": float64(2)},
+		}}))
+
+		saved := sharedAliasCandidateEntries(t, fixture)
+		assert.Equal(t, float64(2), saved[fixture.target].Configured["ModelRatio"])
+		assert.Empty(t, saved[fixture.alias].Configured)
+	})
+
+	t.Run("accepts alias-only ratio update", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "ratio-alias")
+		initial := sharedAliasCandidateEntries(t, fixture)
+
+		require.NoError(t, UpdateModelPricing([]ModelPricingChange{{
+			ModelName:       fixture.alias,
+			ExpectedVersion: initial[fixture.alias].Version,
+			Pricing:         PricingValues{"ModelRatio": float64(3)},
+		}}))
+
+		saved := sharedAliasCandidateEntries(t, fixture)
+		assert.Equal(t, float64(3), saved[fixture.alias].Configured["ModelRatio"])
+		assert.Empty(t, saved[fixture.target].Configured)
+	})
+
+	t.Run("accepts mixed-provider shared target ratio update", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "ratio-shared")
+		ratios, err := common.Marshal(map[string]float64{fixture.target: 1})
+		require.NoError(t, err)
+		require.NoError(t, fixture.database.Create(&Option{Key: "ModelRatio", Value: string(ratios)}).Error)
+		initial := sharedAliasCandidateEntries(t, fixture)
+		require.Len(t, initial[fixture.alias].PluginVariants, 2)
+
+		require.NoError(t, UpdateModelPricing([]ModelPricingChange{{
+			ModelName:       fixture.target,
+			ExpectedVersion: initial[fixture.target].Version,
+			Pricing:         PricingValues{"ModelRatio": float64(4)},
+		}}))
+
+		saved := sharedAliasCandidateEntries(t, fixture)
+		assert.Equal(t, float64(4), saved[fixture.target].Configured["ModelRatio"])
+		for _, variant := range saved[fixture.alias].PluginVariants {
+			assert.Empty(t, variant.Effective)
+			assert.False(t, variant.Compatible)
+		}
+	})
+
+	t.Run("rejects transition from ratio to invalid tiered state", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "ratio-invalid-tiered")
+		ratios, err := common.Marshal(map[string]float64{fixture.target: 1})
+		require.NoError(t, err)
+		require.NoError(t, fixture.database.Create(&Option{Key: "ModelRatio", Value: string(ratios)}).Error)
+		require.NoError(t, fixture.database.Create(&Option{Key: modelPricingRevisionOptionKey, Value: "7"}).Error)
+		initial := sharedAliasCandidateEntries(t, fixture)
+
+		err = requireSharedAliasCandidateRejectionIsAtomic(t, fixture, []ModelPricingChange{{
+			ModelName:       fixture.target,
+			ExpectedVersion: initial[fixture.target].Version,
+			Pricing: PricingValues{
+				"billing_setting.billing_mode": billing_setting.BillingModeTieredExpr,
+				"billing_setting.billing_expr": secondsExpr,
+			},
+		}})
+		assert.ErrorContains(t, err, "model "+fixture.target+": plugin "+fixture.betaPlugin)
+		assert.ErrorContains(t, err, `usage key "seconds" is not declared`)
+	})
+}
+
 func TestUpdateModelPricingValidatesFinalCandidateForDependentAliases(t *testing.T) {
 	const (
 		secondsExpr = `tier("seconds", u("seconds") * 1)`
