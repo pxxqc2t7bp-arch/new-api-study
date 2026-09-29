@@ -1796,3 +1796,74 @@ export function parseTaskResult(){return {};}
 		})
 	}
 }
+
+func TestModelPricingAliasPluginVariantUpdateEndpoint(t *testing.T) {
+	const (
+		alias       = "controller-alias-variant"
+		canonical   = "controller-canonical-variant"
+		pluginKey   = "controller-alias-plugin"
+		mainExpr    = `tier("request", fixed(0.01))`
+		variantExpr = `tier("task", u("seconds") * 1)`
+	)
+	for _, dialect := range []struct{ kind, env string }{{"sqlite", ""}, {"mysql", "TEST_MYSQL_DSN"}, {"postgres", "TEST_POSTGRES_DSN"}} {
+		t.Run(dialect.kind, func(t *testing.T) {
+			if dialect.env != "" && os.Getenv(dialect.env) == "" {
+				t.Skip("set " + dialect.env + " to run this database")
+			}
+			db := modelManagementDB(t, dialect.kind, os.Getenv(dialect.env))
+			require.NoError(t, db.AutoMigrate(&model.UpstreamPriceEvidence{}))
+			source := fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: "1.0.0", author: {name: "Test"},
+  models: [%q], fetchMode: "per_task",
+  usageSchema: {credits: {type: "number", unit: "credit"}},
+  usageProfiles: [{
+    models: [%q],
+    schema: {seconds: {type: "number", unit: "second"}}
+  }]
+};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+`, pluginKey, pluginKey, canonical, canonical)
+			_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+			require.NoError(t, err)
+			t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
+
+			mapping := fmt.Sprintf(`{%q:%q}`, alias, canonical)
+			require.NoError(t, db.Create(&model.Channel{
+				Status: common.ChannelStatusEnabled, Name: "controller alias variant",
+				Models: alias, ModelMapping: &mapping,
+			}).Error)
+			initial, err := model.GetModelPricingSnapshot([]string{alias})
+			require.NoError(t, err)
+			pricing := model.PricingValues{
+				"billing_setting.billing_mode":          billing_setting.BillingModeTieredExpr,
+				"billing_setting.billing_expr":          mainExpr,
+				billing_setting.PluginBillingExprOption: map[string]any{pluginKey: variantExpr},
+			}
+			var response struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+				Data    struct {
+					UpdatedModels []string `json:"updated_models"`
+				} `json:"data"`
+			}
+			recorder := modelManagementRequest(t, UpdateModelPricingConfig, http.MethodPatch, "/api/option/model_pricing", map[string]any{
+				"changes": []any{map[string]any{
+					"model_name":       alias,
+					"expected_version": initial.Entries[0].Version,
+					"pricing":          pricing,
+				}},
+			}, &response)
+			require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+			require.True(t, response.Success, response.Message)
+			assert.Equal(t, []string{alias}, response.Data.UpdatedModels)
+
+			saved, err := model.GetModelPricingSnapshot([]string{alias})
+			require.NoError(t, err)
+			assert.Equal(t, pricing, saved.Entries[0].Configured)
+		})
+	}
+}

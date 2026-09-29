@@ -303,15 +303,19 @@ export function parseTaskResult() { return {}; }
 
 	initial, err := GetModelPricingSnapshot([]string{alias})
 	require.NoError(t, err)
+	pricing := PricingValues{
+		"billing_setting.billing_mode":          billing_setting.BillingModeTieredExpr,
+		"billing_setting.billing_expr":          mainExpr,
+		billing_setting.PluginBillingExprOption: map[string]any{pluginKey: variantExpr},
+	}
+	preview, err := PreviewModelPricing(alias, pricing)
+	require.NoError(t, err)
+	assert.Equal(t, mainExpr, preview["billing_setting.billing_expr"])
+	assert.Equal(t, map[string]any{pluginKey: variantExpr}, preview[billing_setting.PluginBillingExprOption])
 	require.NoError(t, UpdateModelPricing([]ModelPricingChange{{
 		ModelName:       alias,
 		ExpectedVersion: initial.Entries[0].Version,
-		Pricing: PricingValues{
-			"billing_setting.billing_mode":          billing_setting.BillingModeTieredExpr,
-			"billing_setting.billing_expr":          mainExpr,
-			billing_setting.PluginBillingExprOption: map[string]any{pluginKey: variantExpr},
-		},
-		PluginValidationModels: map[string]string{pluginKey: canonical},
+		Pricing:         pricing,
 	}}))
 
 	err = UpdateModelPricingOptions(map[string]string{billing_setting.PluginBillingExprOption: `{}`})

@@ -478,11 +478,17 @@ func validateModelPricing(name string, values, previous PricingValues, pluginVal
 				return fmt.Errorf("model %s: plugin %s: billing expression is required", name, key)
 			}
 			pluginModel := name
-			if validationModel := strings.TrimSpace(pluginValidationModels[key]); validationModel != "" {
+			validationModel := strings.TrimSpace(pluginValidationModels[key])
+			var plugin *jsplugin.LoadedPlugin
+			var active bool
+			if validationModel != "" {
 				pluginModel = validationModel
+				plugin, active = generation.Get(key)
+				active = active && slices.Contains(plugin.Meta.Models, pluginModel)
+			} else {
+				plugin, pluginModel, active = resolveActivePluginVariant(generation, key, name)
 			}
-			plugin, exists := generation.Get(key)
-			if !exists || !slices.Contains(plugin.Meta.Models, pluginModel) {
+			if !active {
 				if previousVariants[key] == expression {
 					continue
 				}
