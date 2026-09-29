@@ -78,11 +78,15 @@ var legacyWildcardPricingOptionKeys = []string{
 }
 
 const (
-	modelPricingRevisionOptionKey = "model_pricing.revision"
-	modelPricingCASMaxAttempts    = 8
+	modelPricingRevisionOptionKey       = "model_pricing.revision"
+	modelPricingCASMaxAttempts          = 8
+	modelPricingAliasRefreshMaxAttempts = 3
 )
 
-var errModelPricingCASMiss = errors.New("model pricing revision changed")
+var (
+	errModelPricingCASMiss         = errors.New("model pricing revision changed")
+	errModelPricingAliasCacheStale = errors.New("task alias cache changed")
+)
 
 var modelPricingMutationMu sync.Mutex
 
@@ -335,20 +339,36 @@ func GetEffectiveModelPricingTx(tx *gorm.DB, names []string) (map[string]Pricing
 	return result, nil
 }
 
+func activeTaskPluginVariants(generation *jsplugin.RoutingGeneration, aliases *taskAliasView, name string) ([]*jsplugin.LoadedPlugin, string) {
+	if plugins := generation.PluginsByModel(name); len(plugins) > 0 {
+		return plugins, name
+	}
+	target, resolved := resolveTaskModelAlias(aliases, name)
+	if !resolved {
+		return nil, ""
+	}
+	if target.Declared == "" {
+		// A same-plugin alias with multiple canonical tails stays unpinned but
+		// retains that plugin's default usage metadata.
+		plugin, exists := generation.Get(target.PluginKey)
+		if !exists {
+			return nil, ""
+		}
+		return []*jsplugin.LoadedPlugin{plugin}, ""
+	}
+	return generation.PluginsByModel(target.Declared), target.Declared
+}
+
 func resolveActivePluginVariant(generation *jsplugin.RoutingGeneration, aliases *taskAliasView, pluginKey, name string) (*jsplugin.LoadedPlugin, string, bool) {
 	plugin, exists := generation.Get(pluginKey)
 	if !exists {
 		return nil, "", false
 	}
-	if slices.Contains(plugin.Meta.Models, name) {
-		return plugin, name, true
-	}
-	target, resolved := resolveTaskModelAlias(aliases, name)
-	if !resolved || target.PluginKey != pluginKey || target.Declared == "" ||
-		!slices.Contains(plugin.Meta.Models, target.Declared) {
-		return plugin, "", false
-	}
-	return plugin, target.Declared, true
+	plugins, schemaModel := activeTaskPluginVariants(generation, aliases, name)
+	active := slices.ContainsFunc(plugins, func(candidate *jsplugin.LoadedPlugin) bool {
+		return candidate == plugin
+	})
+	return plugin, schemaModel, active
 }
 
 func effectiveTaskPluginPricingExpression(values map[string]map[string]any, configured, effective PricingValues, pluginKey, name, mappedModel string) string {
@@ -416,26 +436,19 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 			ModelPricingDescription: ModelPricingDescription{Effective: effectiveModelPricing(values, name)}}
 		entry.CacheWriteMode = ResolveCacheWriteMode(name, configured)
 		entry.BillingDetails = ResolveLegacyBillingDetails(name, entry.Effective, configured)
-		aliasTarget, aliasResolved := resolveTaskModelAlias(aliasView, name)
-		if plugin, ok := generation.GetByModel(name); ok {
-			entry.UsageSchema, _ = plugin.Meta.UsageForModel(name)
-		} else if aliasResolved {
-			if plugin, ok := generation.Get(aliasTarget.PluginKey); ok {
-				entry.UsageSchema, _ = plugin.Meta.UsageForModel(aliasTarget.Declared)
-			}
+		_, aliasResolved := resolveTaskModelAlias(aliasView, name)
+		plugins, schemaModel := activeTaskPluginVariants(generation, aliasView, name)
+		if len(plugins) > 0 {
+			entry.UsageSchema, _ = plugins[0].Meta.UsageForModel(schemaModel)
 		}
-		plugins := generation.PluginsByModel(name)
 		configuredVariants, _ := configured[billing_setting.PluginBillingExprOption].(map[string]any)
 		if len(plugins) >= 2 || len(configuredVariants) > 0 || aliasResolved {
-			keys := make(map[string]bool, len(plugins)+len(configuredVariants)+1)
+			keys := make(map[string]bool, len(plugins)+len(configuredVariants))
 			for _, plugin := range plugins {
 				keys[plugin.Meta.Key] = true
 			}
 			for key := range configuredVariants {
 				keys[key] = true
-			}
-			if aliasResolved {
-				keys[aliasTarget.PluginKey] = true
 			}
 			for _, key := range slices.Sorted(maps.Keys(keys)) {
 				configuredValue := configuredVariants[key]
@@ -606,11 +619,11 @@ func validateMainModelPricingExpression(name, expression string, variants map[st
 	}
 	requestErr := smokeTestModelRequestExpr(expression)
 	generation := jsplugin.DefaultRegistry.Generation()
-	if plugins := generation.PluginsByModel(name); len(plugins) > 0 {
+	if plugins, schemaModel := activeTaskPluginVariants(generation, aliases, name); len(plugins) > 0 {
 		compatible := requestErr == nil
 		var compatibilityErr error
 		for _, plugin := range plugins {
-			schema, _ := plugin.Meta.UsageForModel(name)
+			schema, _ := plugin.Meta.UsageForModel(schemaModel)
 			err := billing_setting.SmokeTestTaskExpr(expression, schema)
 			if err == nil {
 				compatible = true
@@ -628,18 +641,6 @@ func validateMainModelPricingExpression(name, expression string, variants map[st
 			return compatibilityErr
 		}
 		return nil
-	}
-	if target, resolved := resolveTaskModelAlias(aliases, name); resolved {
-		if plugin, ok := generation.Get(target.PluginKey); ok {
-			schema, _ := plugin.Meta.UsageForModel(target.Declared)
-			if err := billing_setting.SmokeTestTaskExpr(expression, schema); err != nil {
-				if _, overridden := variants[target.PluginKey]; overridden && requestErr == nil {
-					return nil
-				}
-				return fmt.Errorf("model %s: plugin %s: %w", name, target.PluginKey, err)
-			}
-			return nil
-		}
 	}
 	if requestErr != nil {
 		return fmt.Errorf("model %s: %w", name, requestErr)
@@ -688,14 +689,20 @@ func UpdateModelPricingWithEvidence(changes []ModelPricingChange, evidence []Ups
 func updateModelPricing(changes []ModelPricingChange, afterPricing func(*gorm.DB) error) error {
 	modelPricingMutationMu.Lock()
 	defer modelPricingMutationMu.Unlock()
-	committed, err := updateModelPricingDatabase(DB, changes, afterPricing)
-	if err != nil {
-		return err
-	}
-	return publishModelPricingOptions(committed)
+	return commitModelPricingWithCoherentAliases(func(cachedAliases *taskAliasView) (map[string]map[string]any, error) {
+		return updateModelPricingDatabaseWithAliasCache(DB, changes, afterPricing, cachedAliases)
+	})
 }
 
 func updateModelPricingDatabase(db *gorm.DB, changes []ModelPricingChange, afterPricing func(*gorm.DB) error) (map[string]map[string]any, error) {
+	return updateModelPricingDatabaseCore(db, changes, afterPricing, nil, false)
+}
+
+func updateModelPricingDatabaseWithAliasCache(db *gorm.DB, changes []ModelPricingChange, afterPricing func(*gorm.DB) error, cachedAliases *taskAliasView) (map[string]map[string]any, error) {
+	return updateModelPricingDatabaseCore(db, changes, afterPricing, cachedAliases, true)
+}
+
+func updateModelPricingDatabaseCore(db *gorm.DB, changes []ModelPricingChange, afterPricing func(*gorm.DB) error, cachedAliases *taskAliasView, requireCoherentAliases bool) (map[string]map[string]any, error) {
 	if len(changes) == 0 {
 		return nil, errors.New("select model pricing changes before saving")
 	}
@@ -709,7 +716,7 @@ func updateModelPricingDatabase(db *gorm.DB, changes []ModelPricingChange, after
 			return nil, ErrModelPricingConflict
 		}
 	}
-	return mutateModelPricingOptionsDatabaseWithAliases(db, func(tx *gorm.DB, values map[string]map[string]any, aliases *taskAliasView) error {
+	return mutateModelPricingOptionsDatabaseWithAliasCache(db, cachedAliases, requireCoherentAliases, func(tx *gorm.DB, values map[string]map[string]any, aliases *taskAliasView) error {
 		defaults := defaultPricingMaps()
 		prepared := make([]PricingValues, len(changes))
 		type legacyStorageKey struct {
@@ -901,22 +908,45 @@ func mutateModelPricingOptions(mutate func(*gorm.DB, map[string]map[string]any) 
 func mutateModelPricingOptionsWithAliases(mutate func(*gorm.DB, map[string]map[string]any, *taskAliasView) error) error {
 	modelPricingMutationMu.Lock()
 	defer modelPricingMutationMu.Unlock()
-	committed, err := mutateModelPricingOptionsDatabaseWithAliases(DB, mutate)
-	if err != nil {
-		return err
+	return commitModelPricingWithCoherentAliases(func(cachedAliases *taskAliasView) (map[string]map[string]any, error) {
+		return mutateModelPricingOptionsDatabaseWithAliasCache(DB, cachedAliases, true, mutate)
+	})
+}
+
+func commitModelPricingWithCoherentAliases(commit func(*taskAliasView) (map[string]map[string]any, error)) error {
+	for attempt := range modelPricingAliasRefreshMaxAttempts {
+		taskAliasRebuildMu.Lock()
+		cachedAliases := taskAliasViewPtr.Load()
+		committed, err := commit(cachedAliases)
+		taskAliasRebuildMu.Unlock()
+		if err == nil {
+			return publishModelPricingOptions(committed)
+		}
+		if !errors.Is(err, errModelPricingAliasCacheStale) {
+			return err
+		}
+		if attempt+1 == modelPricingAliasRefreshMaxAttempts {
+			return fmt.Errorf("%w: routing changed during pricing save", ErrModelPricingConflict)
+		}
+		if err := refreshChannelCache(); err != nil {
+			return fmt.Errorf("refresh channel cache before model pricing save: %w", err)
+		}
 	}
-	return publishModelPricingOptions(committed)
+	return fmt.Errorf("%w: routing changed during pricing save", ErrModelPricingConflict)
 }
 
 func mutateModelPricingOptionsDatabase(db *gorm.DB, mutate func(*gorm.DB, map[string]map[string]any) error) (map[string]map[string]any, error) {
 	return mutateModelPricingOptionsDatabaseCore(db, mutate)
 }
 
-func mutateModelPricingOptionsDatabaseWithAliases(db *gorm.DB, mutate func(*gorm.DB, map[string]map[string]any, *taskAliasView) error) (map[string]map[string]any, error) {
+func mutateModelPricingOptionsDatabaseWithAliasCache(db *gorm.DB, cachedAliases *taskAliasView, requireCoherentAliases bool, mutate func(*gorm.DB, map[string]map[string]any, *taskAliasView) error) (map[string]map[string]any, error) {
 	return mutateModelPricingOptionsDatabaseCore(db, func(tx *gorm.DB, values map[string]map[string]any) error {
 		aliases, err := buildTaskAliasView(lockForUpdate(tx), jsplugin.DefaultRegistry.Generation())
 		if err != nil {
 			return fmt.Errorf("read task model aliases: %w", err)
+		}
+		if requireCoherentAliases && !taskAliasViewsSemanticallyEqual(cachedAliases, aliases) {
+			return errModelPricingAliasCacheStale
 		}
 		return mutate(tx, values, aliases)
 	})

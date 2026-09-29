@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -322,6 +323,132 @@ export function extractUsage(){return {old_units:2};}
 				assert.Nil(t, info.TieredBillingSnapshot)
 				assert.Equal(t, "model_price_error", taskErr.Code)
 			}
+		})
+	}
+}
+
+func TestRelayTaskSubmitCanonicalizesMappedBillingIdentityOnly(t *testing.T) {
+	const (
+		alias        = "r4-case-alias"
+		canonical    = "R4-MixedCase-Target"
+		rawMapped    = "r4-mixedcase-target"
+		pluginKey    = "r4-case-provider"
+		mainExpr     = `tier("main", u("seconds") * 2)`
+		providerExpr = `tier("provider", u("seconds") * 3)`
+	)
+	for _, test := range []struct {
+		name     string
+		variants map[string]string
+		wantExpr string
+	}{
+		{
+			name: "canonical provider override",
+			variants: map[string]string{
+				billing_setting.PluginBillingExprKey(pluginKey, canonical): providerExpr,
+			},
+			wantExpr: providerExpr,
+		},
+		{
+			name:     "canonical main fallback",
+			variants: map[string]string{},
+			wantExpr: mainExpr,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database := setupRelayChannelDB(t)
+			require.NoError(t, database.AutoMigrate(&model.Option{}))
+			saveBillingConfig(t)
+
+			source := fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: "1.0.0", author: {name: "Test"},
+  models: [%q], fetchMode: "per_task",
+  usageSchema: {seconds: {type: "number", unit: "second"}}
+};
+export function buildSubmitRequest(ctx) {
+  return {url: ctx.baseUrl+"/submit", method:"POST", body:{model:ctx.model, upstreamModel:ctx.upstreamModel}, action:"text_to_video"};
+}
+export function parseSubmitResponse() { return {taskId:"r4-case-task"}; }
+export function buildQueryRequest() { return {url:"https://provider.example"}; }
+export function parseTaskResult() { return {status:"SUCCESS"}; }
+export function extractUsage() { return {seconds:2}; }
+`, pluginKey, pluginKey, canonical)
+			plugin, err := pluginruntime.DefaultRegistry.Register(source, pluginruntime.Options{})
+			require.NoError(t, err)
+			t.Cleanup(func() { pluginruntime.DefaultRegistry.Unregister(pluginKey) })
+
+			mapping := fmt.Sprintf(`{%q:%q}`, alias, rawMapped)
+			require.NoError(t, database.Create(&model.Channel{
+				Status: common.ChannelStatusEnabled, Name: "R4 case alias",
+				Models: alias, ModelMapping: &mapping,
+			}).Error)
+			modes, err := common.Marshal(map[string]string{canonical: billing_setting.BillingModeTieredExpr})
+			require.NoError(t, err)
+			expressions, err := common.Marshal(map[string]string{canonical: mainExpr})
+			require.NoError(t, err)
+			rawVariants, err := common.Marshal(test.variants)
+			require.NoError(t, err)
+			for _, row := range []model.Option{
+				{Key: "billing_setting.billing_mode", Value: string(modes)},
+				{Key: "billing_setting.billing_expr", Value: string(expressions)},
+				{Key: billing_setting.PluginBillingExprOption, Value: string(rawVariants)},
+			} {
+				require.NoError(t, database.Create(&row).Error)
+			}
+			require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+				"billing_setting.billing_mode":          string(modes),
+				"billing_setting.billing_expr":          string(expressions),
+				billing_setting.PluginBillingExprOption: string(rawVariants),
+			}))
+			model.InitChannelCache()
+
+			snapshot, err := model.GetModelPricingSnapshot([]string{alias})
+			require.NoError(t, err)
+			require.Len(t, snapshot.Entries, 1)
+			require.Len(t, snapshot.Entries[0].PluginVariants, 1)
+			variant := snapshot.Entries[0].PluginVariants[0]
+			assert.Equal(t, pluginKey, variant.PluginKey)
+			assert.Empty(t, variant.Configured)
+			assert.Equal(t, test.wantExpr, variant.Effective)
+
+			type capturedRequest struct {
+				body map[string]any
+				err  error
+			}
+			requestBody := make(chan capturedRequest, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				var body map[string]any
+				decodeErr := common.DecodeJson(request.Body, &body)
+				requestBody <- capturedRequest{body: body, err: decodeErr}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"r4-case-task"}`))
+			}))
+			defer server.Close()
+
+			c, info := newTaskSubmitContext(t, alias, mapping)
+			common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, server.URL)
+			c.Set("group", "default")
+			c.Set("task_plugin_key", pluginKey)
+			c.Set(pluginruntime.ContextKeyPinnedPlugin, pluginruntime.PinnedPlugin{
+				Generation: pluginruntime.DefaultRegistry.Generation(),
+				Plugin:     plugin,
+			})
+			info.UserGroup, info.UsingGroup = "default", "default"
+			info.OriginModelName = alias
+			info.Billing = &imageReservation{limit: 1 << 30}
+
+			result, taskErr := RelayTaskSubmit(c, info)
+			require.Nil(t, taskErr, "submission error: %+v", taskErr)
+			require.NotNil(t, result)
+			require.NotNil(t, info.TieredBillingSnapshot)
+			assert.Equal(t, test.wantExpr, info.TieredBillingSnapshot.ExprString)
+			assert.Equal(t, rawMapped, info.UpstreamModelName)
+			captured := <-requestBody
+			require.NoError(t, captured.err)
+			assert.Equal(t, map[string]any{
+				"model":         alias,
+				"upstreamModel": rawMapped,
+			}, captured.body)
 		})
 	}
 }

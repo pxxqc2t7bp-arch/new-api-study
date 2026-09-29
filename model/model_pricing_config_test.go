@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
@@ -601,6 +603,164 @@ export function parseTaskResult() { return {}; }
 	assert.Equal(t, aliasProviderExpr, snapshot.Entries[0].PluginVariants[0].Effective)
 }
 
+type sharedAliasPricingFixture struct {
+	database                *gorm.DB
+	alias, target           string
+	alphaPlugin, betaPlugin string
+}
+
+func setupSharedAliasPricing(t *testing.T, suffix string) sharedAliasPricingFixture {
+	t.Helper()
+	database := useModelPricingOptionDatabase(t)
+	fixture := sharedAliasPricingFixture{
+		database:    database,
+		alias:       "r4-shared-alias-" + suffix,
+		target:      "r4-shared-target-" + suffix,
+		alphaPlugin: "r4-alpha-" + suffix,
+		betaPlugin:  "r4-beta-" + suffix,
+	}
+	for _, spec := range []struct {
+		key, field, unit string
+	}{
+		{fixture.alphaPlugin, "seconds", "second"},
+		{fixture.betaPlugin, "credits", "credit"},
+	} {
+		source := fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: "1.0.0", author: {name: "Test"},
+  models: [%q], fetchMode: "per_task",
+  usageSchema: {%s: {type: "number", unit: %q}}
+};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+`, spec.key, spec.key, fixture.target, spec.field, spec.unit)
+		_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+		require.NoError(t, err)
+		t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(spec.key) })
+	}
+	mapping := fmt.Sprintf(`{%q:%q}`, fixture.alias, fixture.target)
+	setting := fmt.Sprintf(`{"task_plugin_key":%q}`, fixture.betaPlugin)
+	require.NoError(t, database.Create(&Channel{
+		Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled,
+		Name: "R4 shared alias " + suffix, Models: fixture.alias, Group: "default",
+		ModelMapping: &mapping, Setting: &setting,
+	}).Error)
+	rebuildTaskAliasView()
+	return fixture
+}
+
+func TestAliasPricingUsesEveryProviderForCanonicalTarget(t *testing.T) {
+	const (
+		mainExpr = `tier("main", u("seconds") * 1)`
+		betaExpr = `tier("beta", u("credits") * 2)`
+	)
+
+	t.Run("snapshot exposes both provider schemas", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "snapshot")
+
+		snapshot, err := GetModelPricingSnapshot([]string{fixture.alias})
+		require.NoError(t, err)
+		require.Len(t, snapshot.Entries, 1)
+		require.Len(t, snapshot.Entries[0].PluginVariants, 2)
+		variants := make(map[string]ModelPricingPluginVariant)
+		for _, variant := range snapshot.Entries[0].PluginVariants {
+			variants[variant.PluginKey] = variant
+		}
+		assert.Contains(t, variants[fixture.alphaPlugin].UsageSchema, "seconds")
+		assert.Contains(t, variants[fixture.betaPlugin].UsageSchema, "credits")
+		assert.False(t, variants[fixture.alphaPlugin].Stale)
+		assert.False(t, variants[fixture.betaPlugin].Stale)
+	})
+
+	t.Run("second provider override saves", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "save")
+		initial, err := GetModelPricingSnapshot([]string{fixture.alias})
+		require.NoError(t, err)
+		require.Len(t, initial.Entries, 1)
+
+		require.NoError(t, UpdateModelPricing([]ModelPricingChange{{
+			ModelName:       fixture.alias,
+			ExpectedVersion: initial.Entries[0].Version,
+			Pricing: PricingValues{
+				"billing_setting.billing_mode":          billing_setting.BillingModeTieredExpr,
+				"billing_setting.billing_expr":          mainExpr,
+				billing_setting.PluginBillingExprOption: map[string]any{fixture.betaPlugin: betaExpr},
+			},
+		}}))
+		saved, err := GetModelPricingSnapshot([]string{fixture.alias})
+		require.NoError(t, err)
+		variants := make(map[string]ModelPricingPluginVariant)
+		for _, variant := range saved.Entries[0].PluginVariants {
+			variants[variant.PluginKey] = variant
+		}
+		assert.Equal(t, betaExpr, variants[fixture.betaPlugin].Configured)
+		assert.False(t, variants[fixture.betaPlugin].Stale)
+	})
+
+	t.Run("second provider override is not removable as stale", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "removal")
+		for _, row := range []Option{
+			{Key: "billing_setting.billing_mode", Value: fmt.Sprintf(`{%q:%q}`, fixture.alias, billing_setting.BillingModeTieredExpr)},
+			{Key: "billing_setting.billing_expr", Value: fmt.Sprintf(`{%q:%q}`, fixture.alias, mainExpr)},
+			{Key: billing_setting.PluginBillingExprOption, Value: fmt.Sprintf(`{%q:%q}`,
+				billing_setting.PluginBillingExprKey(fixture.betaPlugin, fixture.alias), betaExpr)},
+		} {
+			require.NoError(t, fixture.database.Create(&row).Error)
+		}
+
+		err := UpdateModelPricingOptions(map[string]string{billing_setting.PluginBillingExprOption: `{}`})
+		require.ErrorContains(t, err, "plugin "+fixture.betaPlugin)
+		var stored Option
+		require.NoError(t, fixture.database.Where("key = ?", billing_setting.PluginBillingExprOption).First(&stored).Error)
+		assert.Contains(t, stored.Value, billing_setting.PluginBillingExprKey(fixture.betaPlugin, fixture.alias))
+	})
+
+	t.Run("main fallback validates every unoverridden provider", func(t *testing.T) {
+		fixture := setupSharedAliasPricing(t, "fallback")
+
+		_, err := PreviewModelPricing(fixture.alias, PricingValues{
+			"billing_setting.billing_mode": billing_setting.BillingModeTieredExpr,
+			"billing_setting.billing_expr": mainExpr,
+		})
+		require.ErrorContains(t, err, "plugin "+fixture.betaPlugin)
+	})
+
+	t.Run("different canonical targets remain ambiguous", func(t *testing.T) {
+		database := useModelPricingOptionDatabase(t)
+		const (
+			alias       = "r4-ambiguous-alias"
+			firstTarget = "r4-ambiguous-first"
+			lastTarget  = "r4-ambiguous-last"
+		)
+		for index, target := range []string{firstTarget, lastTarget} {
+			key := fmt.Sprintf("r4-ambiguous-%d", index)
+			source := fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: "1.0.0", author: {name: "Test"},
+  models: [%q], fetchMode: "per_task"
+};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+`, key, key, target)
+			_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+			require.NoError(t, err)
+			t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(key) })
+			mapping := fmt.Sprintf(`{%q:%q}`, alias, target)
+			require.NoError(t, database.Create(&Channel{
+				Status: common.ChannelStatusEnabled, Name: key, Models: alias, ModelMapping: &mapping,
+			}).Error)
+		}
+		rebuildTaskAliasView()
+
+		_, resolved := ResolveTaskModelAlias(jsplugin.DefaultRegistry.Generation(), alias)
+		assert.False(t, resolved)
+	})
+}
+
 func TestModelPricingUsesAuthoritativeAliasViews(t *testing.T) {
 	registerPlugin := func(t *testing.T, key, model, usageField string) {
 		t.Helper()
@@ -734,6 +894,175 @@ export function parseTaskResult() { return {}; }
 		require.NoError(t, common.UnmarshalJsonStr(stored.Value, &variants))
 		assert.Equal(t, overrideExpr, variants[billing_setting.PluginBillingExprKey(newPluginKey, alias)])
 	})
+}
+
+type staleAliasCacheFixture struct {
+	first, second               *gorm.DB
+	channelID                   int
+	alias, oldTarget, newTarget string
+	oldPlugin, newPlugin        string
+	newExpr                     string
+}
+
+func setupStaleAliasCache(t *testing.T, suffix string) staleAliasCacheFixture {
+	t.Helper()
+	first, second := useModelPricingOptionDatabases(t)
+	fixture := staleAliasCacheFixture{
+		first:     first,
+		second:    second,
+		alias:     "r4-cache-alias-" + suffix,
+		oldTarget: "r4-cache-old-target-" + suffix,
+		newTarget: "r4-cache-new-target-" + suffix,
+		oldPlugin: "r4-cache-old-" + suffix,
+		newPlugin: "r4-cache-new-" + suffix,
+		newExpr:   `tier("new", u("credits") * 2)`,
+	}
+	for _, spec := range []struct {
+		key, model, field, unit string
+	}{
+		{fixture.oldPlugin, fixture.oldTarget, "frames", "count"},
+		{fixture.newPlugin, fixture.newTarget, "credits", "credit"},
+	} {
+		source := fmt.Sprintf(`
+export const meta = {
+  apiVersion: 1, key: %q, name: %q, version: "1.0.0", author: {name: "Test"},
+  models: [%q], fetchMode: "per_task",
+  usageSchema: {%s: {type: "number", unit: %q}}
+};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+`, spec.key, spec.key, spec.model, spec.field, spec.unit)
+		_, err := jsplugin.DefaultRegistry.Register(source, jsplugin.Options{})
+		require.NoError(t, err)
+		t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(spec.key) })
+	}
+
+	previousMemoryCache := common.MemoryCacheEnabled
+	channelSyncLock.Lock()
+	previousGroups := group2model2channels
+	previousChannels := channelsIDM
+	previousAdvanced := channel2advancedCustomConfig
+	channelSyncLock.Unlock()
+	t.Cleanup(func() {
+		channelSyncLock.Lock()
+		group2model2channels = previousGroups
+		channelsIDM = previousChannels
+		channel2advancedCustomConfig = previousAdvanced
+		channelSyncLock.Unlock()
+		common.MemoryCacheEnabled = previousMemoryCache
+	})
+	common.MemoryCacheEnabled = true
+	require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{
+		"billing_setting.billing_mode":          `{}`,
+		"billing_setting.billing_expr":          `{}`,
+		billing_setting.PluginBillingExprOption: `{}`,
+	}))
+
+	oldMapping := fmt.Sprintf(`{%q:%q}`, fixture.alias, fixture.oldTarget)
+	oldSetting := fmt.Sprintf(`{"task_plugin_key":%q}`, fixture.oldPlugin)
+	channel := Channel{
+		Type: constant.ChannelTypeTaskPlugin, Status: common.ChannelStatusEnabled,
+		Name: "R4 stale cache " + suffix, Models: fixture.alias, Group: "default",
+		ModelMapping: &oldMapping, Setting: &oldSetting,
+	}
+	require.NoError(t, first.Create(&channel).Error)
+	fixture.channelID = channel.Id
+	require.NoError(t, first.Create(&Ability{
+		Group: "default", Model: fixture.alias, ChannelId: channel.Id, Enabled: true,
+	}).Error)
+	InitChannelCache()
+
+	target, resolved := ResolveTaskModelAlias(jsplugin.DefaultRegistry.Generation(), fixture.alias)
+	require.True(t, resolved)
+	require.Equal(t, fixture.oldTarget, target.Declared)
+	cached, err := CacheGetChannel(channel.Id)
+	require.NoError(t, err)
+	require.Equal(t, fixture.oldPlugin, cached.GetSetting().TaskPluginKey)
+
+	newMapping := fmt.Sprintf(`{%q:%q}`, fixture.alias, fixture.newTarget)
+	newSetting := fmt.Sprintf(`{"task_plugin_key":%q}`, fixture.newPlugin)
+	require.NoError(t, second.Model(&Channel{}).Where("id = ?", channel.Id).Updates(map[string]any{
+		"model_mapping": newMapping,
+		"setting":       newSetting,
+	}).Error)
+	return fixture
+}
+
+func TestAliasAwarePricingSaveRefreshesRoutingCacheBeforeCommit(t *testing.T) {
+	fixture := setupStaleAliasCache(t, "success")
+	rebuildTaskAliasView()
+	target, resolved := ResolveTaskModelAlias(jsplugin.DefaultRegistry.Generation(), fixture.alias)
+	require.True(t, resolved)
+	require.Equal(t, fixture.newTarget, target.Declared, "the alias-only refresh sees the new database state")
+	staleChannel, err := CacheGetChannel(fixture.channelID)
+	require.NoError(t, err)
+	require.Equal(t, fixture.oldPlugin, staleChannel.GetSetting().TaskPluginKey, "the channel cache remains stale for the regression setup")
+
+	require.NoError(t, UpdateModelPricing([]ModelPricingChange{{
+		ModelName:       fixture.alias,
+		ExpectedVersion: ModelPricingVersion(PricingValues{}),
+		Pricing: PricingValues{
+			"billing_setting.billing_mode": billing_setting.BillingModeTieredExpr,
+			"billing_setting.billing_expr": fixture.newExpr,
+		},
+	}}))
+
+	target, resolved = ResolveTaskModelAlias(jsplugin.DefaultRegistry.Generation(), fixture.alias)
+	require.True(t, resolved)
+	assert.Equal(t, fixture.newTarget, target.Declared)
+	selected, err := GetRandomSatisfiedChannel("default", fixture.alias, 0, []dto.ChannelFilter{{
+		Kind:          dto.FilterTaskPluginIdentity,
+		TaskPluginKey: fixture.newPlugin,
+	}})
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, fixture.channelID, selected.Id)
+	assert.Equal(t, fixture.newPlugin, selected.GetSetting().TaskPluginKey)
+	expression, exists := billing_setting.GetBillingExpr(fixture.alias)
+	assert.True(t, exists)
+	assert.Equal(t, fixture.newExpr, expression)
+}
+
+func TestAliasAwarePricingSaveRefreshFailureRollsBackBeforeCommit(t *testing.T) {
+	fixture := setupStaleAliasCache(t, "failure")
+	require.NoError(t, fixture.first.Create(&Option{Key: modelPricingRevisionOptionKey, Value: "7"}).Error)
+	refreshErr := errors.New("injected channel cache refresh failure")
+	const callbackName = "fail_r4_channel_cache_refresh"
+	require.NoError(t, fixture.first.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if _, refreshing := tx.Statement.Dest.(*[]*Channel); refreshing {
+			tx.AddError(refreshErr)
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, fixture.first.Callback().Query().Remove(callbackName)) })
+
+	err := UpdateModelPricingWithEvidence([]ModelPricingChange{{
+		ModelName:       fixture.alias,
+		ExpectedVersion: ModelPricingVersion(PricingValues{}),
+		Pricing: PricingValues{
+			"billing_setting.billing_mode": billing_setting.BillingModeTieredExpr,
+			"billing_setting.billing_expr": fixture.newExpr,
+		},
+	}}, []UpstreamPriceEvidence{modelPricingCASEvidence(fixture.alias, "f")})
+	require.ErrorIs(t, err, refreshErr)
+
+	var revision Option
+	require.NoError(t, fixture.first.Where("key = ?", modelPricingRevisionOptionKey).First(&revision).Error)
+	assert.Equal(t, "7", revision.Value)
+	var evidenceCount int64
+	require.NoError(t, fixture.first.Model(&UpstreamPriceEvidence{}).Count(&evidenceCount).Error)
+	assert.Zero(t, evidenceCount)
+	var pricingRows int64
+	require.NoError(t, fixture.first.Model(&Option{}).
+		Where("key IN ?", modelPricingOptionKeys).
+		Count(&pricingRows).Error)
+	assert.Zero(t, pricingRows)
+	_, published := billing_setting.GetBillingExpr(fixture.alias)
+	assert.False(t, published)
+	cached, cacheErr := CacheGetChannel(fixture.channelID)
+	require.NoError(t, cacheErr)
+	assert.Equal(t, fixture.oldPlugin, cached.GetSetting().TaskPluginKey)
 }
 
 func TestUpdateModelPricingBuildsAuthoritativeAliasViewAfterPricingLocksBeforeValidation(t *testing.T) {

@@ -23,9 +23,10 @@ type TaskAliasTarget struct {
 }
 
 type taskAliasView struct {
-	generation uint64
-	expiresAt  time.Time
-	byFold     map[string]TaskAliasTarget
+	generation           uint64
+	expiresAt            time.Time
+	channelCacheCoherent bool
+	byFold               map[string]TaskAliasTarget
 }
 
 const taskAliasViewTTL = 60 * time.Second
@@ -81,6 +82,21 @@ func taskAliasViewFresh(view *taskAliasView, generation uint64) bool {
 	return view != nil && view.generation == generation && time.Now().Before(view.expiresAt)
 }
 
+func taskAliasViewsSemanticallyEqual(left, right *taskAliasView) bool {
+	if left == nil || right == nil || left.generation != right.generation || len(left.byFold) != len(right.byFold) {
+		return false
+	}
+	if common.MemoryCacheEnabled && !left.channelCacheCoherent {
+		return false
+	}
+	for fold, target := range left.byFold {
+		if target != right.byFold[fold] {
+			return false
+		}
+	}
+	return true
+}
+
 func rebuildTaskAliasView() {
 	taskAliasRebuildMu.Lock()
 	defer taskAliasRebuildMu.Unlock()
@@ -119,18 +135,30 @@ func buildTaskAliasView(db *gorm.DB, generation *jsplugin.RoutingGeneration) (*t
 	}
 
 	var channels []Channel
-	err := db.Select("id", "type", "models", "model_mapping").
+	err := db.Select("id", "type", "status", "models", "model_mapping").
 		Where("status = ?", common.ChannelStatusEnabled).
 		Order(clause.OrderByColumn{Column: clause.Column{Name: "id"}}).
 		Find(&channels).Error
 	if err != nil {
 		return nil, fmt.Errorf("read task alias channels: %w", err)
 	}
+	channelPointers := make([]*Channel, len(channels))
+	for i := range channels {
+		channelPointers[i] = &channels[i]
+	}
+	return buildTaskAliasViewFromChannels(channelPointers, generation)
+}
 
+func buildTaskAliasViewFromChannels(channels []*Channel, generation *jsplugin.RoutingGeneration) (*taskAliasView, error) {
+	if generation == nil {
+		return nil, errors.New("task alias routing generation is unavailable")
+	}
 	view := newTaskAliasView(generation)
 	drafts := make(map[string]*taskAliasDraft)
-	for i := range channels {
-		channel := &channels[i]
+	for _, channel := range channels {
+		if channel == nil || channel.Status != common.ChannelStatusEnabled {
+			continue
+		}
 		mappingJSON := channel.GetModelMapping()
 		if mappingJSON == "" || mappingJSON == "{}" {
 			continue
