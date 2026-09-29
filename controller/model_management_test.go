@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -107,6 +108,145 @@ func modelManagementRequest(t *testing.T, handler gin.HandlerFunc, method, path 
 		require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), output), recorder.Body.String())
 	}
 	return recorder
+}
+
+func TestUpdateOptionBillingExpressionReadsAreBounded(t *testing.T) {
+	db := modelManagementDB(t, "sqlite", "")
+	require.NoError(t, db.AutoMigrate(&model.UpstreamPriceEvidence{}))
+	const pluginKey = "bounded-read-plugin"
+	_, err := jsplugin.DefaultRegistry.Register(`
+export const meta = {
+  apiVersion: 1, key: "bounded-read-plugin", name: "Bounded Read Plugin", version: "1.0.0", author: {name: "Test"},
+  models: [
+    "bounded-plugin-model-0", "bounded-plugin-model-1", "bounded-plugin-model-2",
+    "bounded-plugin-model-3", "bounded-plugin-model-4", "bounded-plugin-model-5",
+    "bounded-plugin-model-6", "bounded-plugin-model-7", "bounded-plugin-model-8"
+  ],
+  fetchMode: "per_task", usageSchema: {seconds: {type: "number", unit: "second"}}
+};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+`, jsplugin.Options{})
+	require.NoError(t, err)
+	t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister(pluginKey) })
+	model.InitChannelCache()
+
+	var pricingReads, channelReads atomic.Int64
+	const callbackName = "count_update_option_billing_expression_reads"
+	require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		switch tx.Statement.Dest.(type) {
+		case *[]model.Option:
+			pricingReads.Add(1)
+		case *[]model.Channel:
+			channelReads.Add(1)
+		}
+	}))
+	t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove(callbackName)) })
+
+	type readCounts struct {
+		pricing  int64
+		channels int64
+	}
+	saveExpressions := func(optionKey string, expressions map[string]string) readCounts {
+		t.Helper()
+		raw, err := common.Marshal(expressions)
+		require.NoError(t, err)
+		pricingReads.Store(0)
+		channelReads.Store(0)
+		var response struct{ Success bool }
+		recorder := modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{
+			Key:   optionKey,
+			Value: string(raw),
+		}, &response)
+		require.True(t, response.Success, recorder.Body.String())
+		return readCounts{pricing: pricingReads.Load(), channels: channelReads.Load()}
+	}
+
+	for _, tc := range []struct {
+		name, optionKey, validExpression, invalidExpression, modelPrefix string
+		entryKey                                                         func(string) string
+	}{
+		{
+			name:              "main",
+			optionKey:         "billing_setting.billing_expr",
+			validExpression:   `tier("base", p * 1 + c * 2)`,
+			invalidExpression: `tier("base",`,
+			modelPrefix:       "bounded-read-model-",
+			entryKey:          func(modelName string) string { return modelName },
+		},
+		{
+			name:              "plugin",
+			optionKey:         billing_setting.PluginBillingExprOption,
+			validExpression:   `tier("task", u("seconds") * 1)`,
+			invalidExpression: `tier("task", u("missing") * 1)`,
+			modelPrefix:       "bounded-plugin-model-",
+			entryKey: func(modelName string) string {
+				return billing_setting.PluginBillingExprKey(pluginKey, modelName)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			singleExpressions := map[string]string{
+				tc.entryKey(tc.modelPrefix + "0"): tc.validExpression,
+			}
+			single := saveExpressions(tc.optionKey, singleExpressions)
+			manyExpressions := make(map[string]string)
+			for i := range 8 {
+				manyExpressions[tc.entryKey(fmt.Sprintf("%s%d", tc.modelPrefix, i))] = tc.validExpression
+			}
+			many := saveExpressions(tc.optionKey, manyExpressions)
+			t.Logf("pricing/channel reads: one entry=%d/%d, eight entries=%d/%d",
+				single.pricing, single.channels, many.pricing, many.channels)
+			assert.Equal(t, single.pricing, many.pricing, "pricing-map reads must not grow with request entries")
+			assert.Equal(t, single.channels, many.channels, "enabled-channel reads must not grow with request entries")
+
+			var before model.Option
+			require.NoError(t, db.Where("key = ?", tc.optionKey).First(&before).Error)
+			invalidExpressions := maps.Clone(manyExpressions)
+			invalidModel := tc.modelPrefix + "8"
+			invalidExpressions[tc.entryKey(invalidModel)] = tc.invalidExpression
+			raw, err := common.Marshal(invalidExpressions)
+			require.NoError(t, err)
+			pricingReads.Store(0)
+			channelReads.Store(0)
+			var response struct{ Success bool }
+			recorder := modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{
+				Key:   tc.optionKey,
+				Value: string(raw),
+			}, &response)
+			assert.False(t, response.Success, recorder.Body.String())
+			assert.Contains(t, recorder.Body.String(), invalidModel)
+			assert.EqualValues(t, 1, pricingReads.Load(), "semantic validation must use one pricing-map read")
+			assert.EqualValues(t, 1, channelReads.Load(), "semantic validation must use one enabled-channel read")
+			var after model.Option
+			require.NoError(t, db.Where("key = ?", tc.optionKey).First(&after).Error)
+			assert.Equal(t, before.Value, after.Value, "invalid expressions must not be persisted")
+		})
+	}
+
+	for _, tc := range []struct {
+		name, optionKey, value, message string
+	}{
+		{"main shape", "billing_setting.billing_expr", `[]`, "JSON"},
+		{"plugin shape", billing_setting.PluginBillingExprOption, `[]`, "JSON object"},
+		{"plugin key", billing_setting.PluginBillingExprOption, `{"invalid-key":"1"}`, "invalid plugin billing expression key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pricingReads.Store(0)
+			channelReads.Store(0)
+			var response struct{ Success bool }
+			recorder := modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{
+				Key:   tc.optionKey,
+				Value: tc.value,
+			}, &response)
+			assert.False(t, response.Success, recorder.Body.String())
+			assert.Contains(t, recorder.Body.String(), tc.message)
+			assert.Zero(t, pricingReads.Load(), "controller diagnostics must reject before pricing reads")
+			assert.Zero(t, channelReads.Load(), "controller diagnostics must reject before channel reads")
+		})
+	}
 }
 
 func TestModelPricingConversionDatabaseMatrix(t *testing.T) {

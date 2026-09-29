@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -397,32 +396,14 @@ func UpdateOption(c *gin.Context) {
 			return
 		}
 	case "billing_setting.billing_expr":
-		expressions := make(map[string]string)
+		var expressions map[string]string
 		if err = common.UnmarshalJsonStr(option.Value.(string), &expressions); err != nil {
 			common.ApiErrorMsg(c, "计费表达式配置必须是模型到表达式的 JSON 对象: "+err.Error())
 			return
 		}
-		models := make([]string, 0, len(expressions))
-		for modelName := range expressions {
-			models = append(models, modelName)
-		}
-		sort.Strings(models)
-		storedVariants := billing_setting.GetPluginBillingExprCopy()
-		for _, modelName := range models {
-			variants := make(map[string]any)
-			for key, expression := range storedVariants {
-				if plugin, name, ok := billing_setting.SplitPluginBillingExprKey(key); ok && name == modelName {
-					variants[plugin] = expression
-				}
-			}
-			err = model.ValidateModelPricing(modelName, model.PricingValues{
-				"billing_setting.billing_expr":          expressions[modelName],
-				billing_setting.PluginBillingExprOption: variants,
-			})
-			if err != nil {
-				common.ApiErrorMsg(c, fmt.Sprintf("模型 %s 的计费表达式无效: %v", modelName, err))
-				return
-			}
+		if expressions == nil {
+			common.ApiErrorMsg(c, "计费表达式配置必须是模型到表达式的 JSON 对象")
+			return
 		}
 	case billing_setting.PluginBillingExprOption:
 		var expressions map[string]string
@@ -430,16 +411,10 @@ func UpdateOption(c *gin.Context) {
 			common.ApiErrorMsg(c, "plugin billing expressions must be a JSON object")
 			return
 		}
-		for key, expression := range expressions {
-			plugin, name, valid := billing_setting.SplitPluginBillingExprKey(key)
+		for key := range expressions {
+			_, _, valid := billing_setting.SplitPluginBillingExprKey(key)
 			if !valid {
 				common.ApiErrorMsg(c, "invalid plugin billing expression key: "+key)
-				return
-			}
-			if err = model.ValidateModelPricing(name, model.PricingValues{
-				billing_setting.PluginBillingExprOption: map[string]any{plugin: expression},
-			}); err != nil {
-				common.ApiErrorMsg(c, err.Error())
 				return
 			}
 		}
