@@ -109,8 +109,8 @@ func TestNormalizeLegacyPricingEntriesUsesDeterministicCanonicalPrecedence(t *te
 	})
 }
 
-func TestMutateModelPricingOptionsLocksPricingRowsBeforeMutation(t *testing.T) {
-	database, _ := openModelPricingInstanceDatabases(t)
+func TestMutateModelPricingOptionsLocksPricingRowsWithoutQueryingAliases(t *testing.T) {
+	database := useModelPricingOptionDatabase(t)
 	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
 	common.SetDatabaseTypes(common.DatabaseTypeMySQL, previousLog)
 	t.Cleanup(func() {
@@ -122,8 +122,10 @@ func TestMutateModelPricingOptionsLocksPricingRowsBeforeMutation(t *testing.T) {
 	}
 	var observations []observation
 	var events []string
+	var channelQueries, channelsBeforeMutation int
 	require.NoError(t, database.Callback().Query().Before("gorm:query").Register("observe_pricing_lock_order", func(tx *gorm.DB) {
-		if _, pricingRows := tx.Statement.Dest.(*[]Option); pricingRows {
+		switch tx.Statement.Dest.(type) {
+		case *[]Option:
 			_, locked := tx.Statement.Clauses["FOR"]
 			orderClause, ordered := tx.Statement.Clauses["ORDER BY"]
 			orderBy, validOrder := orderClause.Expression.(clause.OrderBy)
@@ -131,19 +133,25 @@ func TestMutateModelPricingOptionsLocksPricingRowsBeforeMutation(t *testing.T) {
 				orderBy.Columns[0].Column.Name == "key" && !orderBy.Columns[0].Desc
 			observations = append(observations, observation{locked: locked, orderedByKey: orderedByKey})
 			events = append(events, "pricing")
+		case *[]Channel:
+			channelQueries++
+			events = append(events, "channels")
 		}
 		// SQLite cannot execute FOR UPDATE; inspection above proves what the
 		// MySQL/PostgreSQL query builder received before local execution.
 		delete(tx.Statement.Clauses, "FOR")
 	}))
 
-	_, err := mutateModelPricingOptionsDatabase(database, func(_ *gorm.DB, _ map[string]map[string]any) error {
+	err := mutateModelPricingOptions(func(_ *gorm.DB, _ map[string]map[string]any) error {
+		channelsBeforeMutation = channelQueries
 		events = append(events, "mutation")
 		return nil
 	})
 	require.NoError(t, err)
 	require.Equal(t, []string{"pricing", "mutation"}, events)
 	require.Equal(t, []observation{{locked: true, orderedByKey: true}}, observations)
+	assert.Zero(t, channelsBeforeMutation)
+	assert.Zero(t, channelQueries)
 }
 
 type modelPricingCASResult struct {
@@ -728,7 +736,7 @@ export function parseTaskResult() { return {}; }
 	})
 }
 
-func TestUpdateModelPricingBuildsAuthoritativeAliasViewAfterPricingLocks(t *testing.T) {
+func TestUpdateModelPricingBuildsAuthoritativeAliasViewAfterPricingLocksBeforeValidation(t *testing.T) {
 	first, second := useModelPricingOptionDatabases(t)
 	DB = second
 	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
@@ -770,9 +778,9 @@ func TestUpdateModelPricingBuildsAuthoritativeAliasViewAfterPricingLocks(t *test
 	_, err := updateModelPricingDatabase(first, []ModelPricingChange{{
 		ModelName:       "authoritative-lock-order",
 		ExpectedVersion: ModelPricingVersion(PricingValues{}),
-		Pricing:         PricingValues{"ModelRatio": float64(1)},
+		Pricing:         PricingValues{"unsupported": float64(1)},
 	}}, nil)
-	require.NoError(t, err)
+	require.ErrorContains(t, err, "unsupported pricing field")
 	assert.Equal(t, []string{"pricing", "channels"}, events)
 	assert.Equal(t, []channelObservation{{
 		source: "transaction", locked: true, orderedByID: true,
@@ -1032,4 +1040,123 @@ func TestLegacyWildcardAliasUsesCanonicalConfiguredStateAndRuntimePublication(t 
 	assert.True(t, configured)
 	assert.Equal(t, float64(15), ratio)
 	assert.Equal(t, canonical, resolvedName)
+}
+
+func TestUpdateModelPricingPreflightsSharedWildcardStorage(t *testing.T) {
+	const (
+		canonical  = "gpt-4-gizmo-*"
+		firstName  = "gpt-4-gizmo-alpha"
+		secondName = "gpt-4-gizmo-beta"
+	)
+
+	t.Run("identical updates use the immutable initial versions", func(t *testing.T) {
+		database := useModelPricingOptionDatabase(t)
+		initial, err := GetModelPricingSnapshot([]string{firstName, secondName})
+		require.NoError(t, err)
+		require.Len(t, initial.Entries, 2)
+		require.Equal(t, initial.Entries[0].Version, initial.Entries[1].Version)
+
+		require.NoError(t, UpdateModelPricing([]ModelPricingChange{
+			{
+				ModelName:       firstName,
+				ExpectedVersion: initial.Entries[0].Version,
+				Pricing:         PricingValues{"ModelRatio": float64(21)},
+			},
+			{
+				ModelName:       secondName,
+				ExpectedVersion: initial.Entries[1].Version,
+				Pricing:         PricingValues{"ModelRatio": float64(21)},
+			},
+		}))
+
+		updated, err := GetModelPricingSnapshot([]string{firstName, secondName})
+		require.NoError(t, err)
+		assert.Equal(t, float64(21), updated.Entries[0].Configured["ModelRatio"])
+		assert.Equal(t, float64(21), updated.Entries[1].Configured["ModelRatio"])
+		var option Option
+		require.NoError(t, database.Where("key = ?", "ModelRatio").First(&option).Error)
+		var ratios map[string]float64
+		require.NoError(t, common.UnmarshalJsonStr(option.Value, &ratios))
+		assert.Equal(t, float64(21), ratios[canonical])
+		assert.NotContains(t, ratios, firstName)
+		assert.NotContains(t, ratios, secondName)
+		var revision Option
+		require.NoError(t, database.Where("key = ?", modelPricingRevisionOptionKey).First(&revision).Error)
+		assert.Equal(t, "1", revision.Value)
+	})
+
+	t.Run("reset and equivalent explicit defaults are compatible", func(t *testing.T) {
+		useModelPricingOptionDatabase(t)
+		initial, err := GetModelPricingSnapshot([]string{firstName, secondName})
+		require.NoError(t, err)
+		require.Len(t, initial.Entries, 2)
+		require.Equal(t, initial.Entries[0].Version, initial.Entries[1].Version)
+
+		require.NoError(t, UpdateModelPricing([]ModelPricingChange{
+			{
+				ModelName:       firstName,
+				ExpectedVersion: initial.Entries[0].Version,
+				Reset:           true,
+			},
+			{
+				ModelName:       secondName,
+				ExpectedVersion: initial.Entries[1].Version,
+				Pricing:         maps.Clone(initial.Entries[1].Configured),
+			},
+		}))
+	})
+
+	for _, test := range []struct {
+		name          string
+		secondPricing PricingValues
+	}{
+		{name: "conflicting values", secondPricing: PricingValues{"ModelRatio": float64(22)}},
+		{name: "presence conflicts with omission", secondPricing: PricingValues{}},
+	} {
+		t.Run(test.name+" fail atomically as payload conflicts", func(t *testing.T) {
+			database := useModelPricingOptionDatabase(t)
+			require.NoError(t, database.Create(&[]Option{
+				{Key: modelPricingRevisionOptionKey, Value: "7"},
+				{Key: "ModelRatio", Value: `{"gpt-4-gizmo-*":15,"unrelated-model":9}`},
+			}).Error)
+			baselineEvidence := modelPricingCASEvidence("existing-evidence", "a")
+			require.NoError(t, database.Create(&baselineEvidence).Error)
+
+			initial, err := GetModelPricingSnapshot([]string{firstName, secondName})
+			require.NoError(t, err)
+			require.Len(t, initial.Entries, 2)
+			require.Equal(t, initial.Entries[0].Version, initial.Entries[1].Version)
+			var beforeOptions []Option
+			require.NoError(t, database.Order("key").Find(&beforeOptions).Error)
+
+			rejectedEvidence := modelPricingCASEvidence("rejected-evidence", "b")
+			err = UpdateModelPricingWithEvidence([]ModelPricingChange{
+				{
+					ModelName:       firstName,
+					ExpectedVersion: initial.Entries[0].Version,
+					Pricing:         PricingValues{"ModelRatio": float64(21)},
+				},
+				{
+					ModelName:       secondName,
+					ExpectedVersion: initial.Entries[1].Version,
+					Pricing:         test.secondPricing,
+				},
+			}, []UpstreamPriceEvidence{rejectedEvidence})
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrModelPricingPayloadConflict)
+			assert.ErrorContains(t, err, "conflicting model pricing payload")
+			assert.NotErrorIs(t, err, ErrModelPricingConflict)
+
+			var afterOptions []Option
+			require.NoError(t, database.Order("key").Find(&afterOptions).Error)
+			assert.Equal(t, beforeOptions, afterOptions)
+			var revision Option
+			require.NoError(t, database.Where("key = ?", modelPricingRevisionOptionKey).First(&revision).Error)
+			assert.Equal(t, "7", revision.Value)
+			var evidence []UpstreamPriceEvidence
+			require.NoError(t, database.Order("id").Find(&evidence).Error)
+			require.Len(t, evidence, 1)
+			assert.Equal(t, baselineEvidence.EvidenceHash, evidence[0].EvidenceHash)
+		})
+	}
 }

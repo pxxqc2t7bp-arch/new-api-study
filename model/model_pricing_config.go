@@ -62,7 +62,10 @@ type ModelPricingSnapshot struct {
 	EmptyVersion string              `json:"empty_version"`
 }
 
-var ErrModelPricingConflict = errors.New("model pricing changed; reload before saving")
+var (
+	ErrModelPricingConflict        = errors.New("model pricing changed; reload before saving")
+	ErrModelPricingPayloadConflict = errors.New("conflicting model pricing payload")
+)
 
 var modelPricingOptionKeys = []string{
 	"AudioCompletionRatio", "AudioRatio", "CacheRatio", "CompletionRatio",
@@ -199,45 +202,49 @@ func modelPricingValues(values map[string]map[string]any, name string) PricingVa
 	return result
 }
 
-func removeModelPricing(values map[string]map[string]any, name string) {
-	for key, entries := range values {
-		if key == billing_setting.PluginBillingExprOption {
-			for variant := range entries {
-				if _, model, ok := billing_setting.SplitPluginBillingExprKey(variant); ok && model == name {
-					delete(entries, variant)
-				}
+func replaceModelPricingKey(values map[string]map[string]any, key, name string, draft PricingValues) {
+	entries := values[key]
+	if key == billing_setting.PluginBillingExprOption {
+		for variant := range entries {
+			if _, model, ok := billing_setting.SplitPluginBillingExprKey(variant); ok && model == name {
+				delete(entries, variant)
 			}
-			continue
 		}
-		if !slices.Contains(legacyWildcardPricingOptionKeys, key) {
-			delete(entries, name)
-			continue
+		variants, _ := draft[key].(map[string]any)
+		for plugin, expr := range variants {
+			entries[billing_setting.PluginBillingExprKey(plugin, name)] = expr
 		}
+		return
+	}
+	if slices.Contains(legacyWildcardPricingOptionKeys, key) {
 		storageName := modelPricingStorageName(key, name)
 		for existingName := range entries {
 			if modelPricingStorageName(key, existingName) == storageName {
 				delete(entries, existingName)
 			}
 		}
+		if value, exists := draft[key]; exists {
+			entries[storageName] = value
+		}
+		return
+	}
+	delete(entries, name)
+	if value, exists := draft[key]; exists {
+		entries[name] = value
+	}
+}
+
+func removeModelPricing(values map[string]map[string]any, name string) {
+	for _, key := range modelPricingOptionKeys {
+		replaceModelPricingKey(values, key, name, PricingValues{})
 	}
 }
 
 // replaceModelPricing writes one complete model draft into the option maps.
 // Plugin expressions are grouped in the draft and flattened only in storage.
 func replaceModelPricing(values map[string]map[string]any, name string, draft PricingValues) {
-	removeModelPricing(values, name)
 	for _, key := range modelPricingOptionKeys {
-		if key == billing_setting.PluginBillingExprOption {
-			variants, _ := draft[key].(map[string]any)
-			for plugin, expr := range variants {
-				values[key][billing_setting.PluginBillingExprKey(plugin, name)] = expr
-			}
-			continue
-		}
-		storageName := modelPricingStorageName(key, name)
-		if value, exists := draft[key]; exists {
-			values[key][storageName] = value
-		}
+		replaceModelPricingKey(values, key, name, draft)
 	}
 }
 
@@ -704,7 +711,18 @@ func updateModelPricingDatabase(db *gorm.DB, changes []ModelPricingChange, after
 	}
 	return mutateModelPricingOptionsDatabaseWithAliases(db, func(tx *gorm.DB, values map[string]map[string]any, aliases *taskAliasView) error {
 		defaults := defaultPricingMaps()
-		for _, change := range changes {
+		prepared := make([]PricingValues, len(changes))
+		type legacyStorageKey struct {
+			option, model string
+		}
+		type legacyStorageIntent struct {
+			value   any
+			present bool
+			source  string
+		}
+		legacyIntents := make(map[legacyStorageKey]legacyStorageIntent)
+		legacyOrder := make([]legacyStorageKey, 0)
+		for index, change := range changes {
 			previous := modelPricingValues(values, change.ModelName)
 			if ModelPricingVersion(previous) != change.ExpectedVersion {
 				return fmt.Errorf("%w: %s", ErrModelPricingConflict, change.ModelName)
@@ -716,7 +734,39 @@ func updateModelPricingDatabase(db *gorm.DB, changes []ModelPricingChange, after
 			if err := validateModelPricing(change.ModelName, pricing, previous, change.PluginValidationModels, aliases); err != nil {
 				return err
 			}
-			replaceModelPricing(values, change.ModelName, pricing)
+			prepared[index] = pricing
+			for _, key := range legacyWildcardPricingOptionKeys {
+				storageKey := legacyStorageKey{option: key, model: modelPricingStorageName(key, change.ModelName)}
+				value, present := pricing[key]
+				intent, exists := legacyIntents[storageKey]
+				if !exists {
+					legacyIntents[storageKey] = legacyStorageIntent{
+						value: value, present: present, source: change.ModelName,
+					}
+					legacyOrder = append(legacyOrder, storageKey)
+					continue
+				}
+				if intent.present != present || present && !reflect.DeepEqual(intent.value, value) {
+					return fmt.Errorf("%w: %s %q has incompatible intents for %q and %q",
+						ErrModelPricingPayloadConflict, key, storageKey.model, intent.source, change.ModelName)
+				}
+			}
+		}
+		for index, change := range changes {
+			for _, key := range modelPricingOptionKeys {
+				if slices.Contains(legacyWildcardPricingOptionKeys, key) {
+					continue
+				}
+				replaceModelPricingKey(values, key, change.ModelName, prepared[index])
+			}
+		}
+		for _, storageKey := range legacyOrder {
+			intent := legacyIntents[storageKey]
+			draft := make(PricingValues)
+			if intent.present {
+				draft[storageKey.option] = intent.value
+			}
+			replaceModelPricingKey(values, storageKey.option, storageKey.model, draft)
 		}
 		if afterPricing != nil {
 			return afterPricing(tx)
@@ -839,9 +889,13 @@ func onlyStalePluginOverridesRemoved(name string, after, before PricingValues, a
 }
 
 func mutateModelPricingOptions(mutate func(*gorm.DB, map[string]map[string]any) error) error {
-	return mutateModelPricingOptionsWithAliases(func(tx *gorm.DB, values map[string]map[string]any, _ *taskAliasView) error {
-		return mutate(tx, values)
-	})
+	modelPricingMutationMu.Lock()
+	defer modelPricingMutationMu.Unlock()
+	committed, err := mutateModelPricingOptionsDatabase(DB, mutate)
+	if err != nil {
+		return err
+	}
+	return publishModelPricingOptions(committed)
 }
 
 func mutateModelPricingOptionsWithAliases(mutate func(*gorm.DB, map[string]map[string]any, *taskAliasView) error) error {
@@ -855,12 +909,20 @@ func mutateModelPricingOptionsWithAliases(mutate func(*gorm.DB, map[string]map[s
 }
 
 func mutateModelPricingOptionsDatabase(db *gorm.DB, mutate func(*gorm.DB, map[string]map[string]any) error) (map[string]map[string]any, error) {
-	return mutateModelPricingOptionsDatabaseWithAliases(db, func(tx *gorm.DB, values map[string]map[string]any, _ *taskAliasView) error {
-		return mutate(tx, values)
-	})
+	return mutateModelPricingOptionsDatabaseCore(db, mutate)
 }
 
 func mutateModelPricingOptionsDatabaseWithAliases(db *gorm.DB, mutate func(*gorm.DB, map[string]map[string]any, *taskAliasView) error) (map[string]map[string]any, error) {
+	return mutateModelPricingOptionsDatabaseCore(db, func(tx *gorm.DB, values map[string]map[string]any) error {
+		aliases, err := buildTaskAliasView(lockForUpdate(tx), jsplugin.DefaultRegistry.Generation())
+		if err != nil {
+			return fmt.Errorf("read task model aliases: %w", err)
+		}
+		return mutate(tx, values, aliases)
+	})
+}
+
+func mutateModelPricingOptionsDatabaseCore(db *gorm.DB, mutate func(*gorm.DB, map[string]map[string]any) error) (map[string]map[string]any, error) {
 	revision := Option{Key: modelPricingRevisionOptionKey, Value: "0"}
 	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&revision).Error; err != nil {
 		return nil, err
@@ -893,11 +955,7 @@ func mutateModelPricingOptionsDatabaseWithAliases(db *gorm.DB, mutate func(*gorm
 			if len(duplicated) > 0 {
 				common.SysError("options table has duplicate pricing keys [" + strings.Join(duplicated, ", ") + "]; the table is missing a primary key")
 			}
-			aliases, aliasErr := buildTaskAliasView(lockForUpdate(tx), jsplugin.DefaultRegistry.Generation())
-			if aliasErr != nil {
-				return fmt.Errorf("read task model aliases: %w", aliasErr)
-			}
-			if err := mutate(tx, values, aliases); err != nil {
+			if err := mutate(tx, values); err != nil {
 				return err
 			}
 			defaults := defaultPricingMaps()
