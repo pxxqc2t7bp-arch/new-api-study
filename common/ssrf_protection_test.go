@@ -71,6 +71,7 @@ func TestSSRFProtectionDomainFilterRules(t *testing.T) {
 	}{
 		{"wildcard whitelist allows subdomain", wildcardDomains, true, "ARK-PROJECT.TOS-CN-BEIJING.VOLCES.COM", true, true},
 		{"wildcard whitelist rejects apex", wildcardDomains, true, "tos-cn-beijing.volces.com", false, false},
+		{"wildcard whitelist rejects empty leading label", wildcardDomains, true, ".tos-cn-beijing.volces.com", false, false},
 		{"wildcard whitelist rejects prefix lookalike", wildcardDomains, true, "evil-tos-cn-beijing.volces.com", false, false},
 		{"wildcard whitelist rejects suffix lookalike", wildcardDomains, true, "tos-cn-beijing.volces.com.evil", false, false},
 		{"exact whitelist allows apex", exactDomains, true, "tos-cn-beijing.volces.com", true, true},
