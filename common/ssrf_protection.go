@@ -220,7 +220,7 @@ func isDomainListed(domain string, list []string) bool {
 		// 通配符匹配 (*.example.com)
 		if after, ok := strings.CutPrefix(item, "*."); ok {
 			suffix := after
-			if strings.HasSuffix(domain, "."+suffix) || domain == suffix {
+			if strings.HasSuffix(domain, "."+suffix) {
 				return true
 			}
 		}

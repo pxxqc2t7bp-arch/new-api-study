@@ -57,3 +57,39 @@ func TestNewSSRFProtectionFromFetchSettingParsesPortRanges(t *testing.T) {
 	require.NoError(t, protection.ValidateNetworkTarget("example.com", 8001))
 	require.Error(t, protection.ValidateNetworkTarget("example.com", 9000))
 }
+
+func TestSSRFProtectionWildcardRequiresSubdomain(t *testing.T) {
+	domainList := []string{"  *.TOS-CN-BEIJING.VOLCES.COM  "}
+	validate := func(domain string) error {
+		return ValidateURLWithFetchSetting(
+			"https://"+domain+"/object",
+			true, false, true, false,
+			domainList, nil, []string{"443"}, false,
+		)
+	}
+	tests := []struct {
+		name    string
+		domain  string
+		allowed bool
+	}{
+		{name: "subdomain", domain: "ARK-PROJECT.TOS-CN-BEIJING.VOLCES.COM", allowed: true},
+		{name: "apex", domain: "tos-cn-beijing.volces.com", allowed: false},
+		{name: "lookalike prefix", domain: "evil-tos-cn-beijing.volces.com", allowed: false},
+		{name: "lookalike suffix", domain: "tos-cn-beijing.volces.com.evil", allowed: false},
+	}
+
+	for _, context := range []string{"initial", "redirect"} {
+		t.Run(context, func(t *testing.T) {
+			for _, test := range tests {
+				t.Run(test.name, func(t *testing.T) {
+					require.Equal(t, test.allowed, isDomainListed(test.domain, domainList))
+					if test.allowed {
+						require.NoError(t, validate(test.domain))
+					} else {
+						require.Error(t, validate(test.domain))
+					}
+				})
+			}
+		})
+	}
+}
