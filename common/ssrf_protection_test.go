@@ -79,9 +79,15 @@ func TestSSRFProtectionDomainFilterRules(t *testing.T) {
 		{"exact whitelist allows apex", exactDomains, true, "tos-cn-beijing.volces.com", true, true},
 		{"exact whitelist rejects subdomain", exactDomains, true, "ark-project.tos-cn-beijing.volces.com", false, false},
 		{"wildcard blacklist rejects subdomain", wildcardDomains, false, "ark-project.tos-cn-beijing.volces.com", true, false},
+		{"wildcard blacklist rejects case-insensitive subdomain", wildcardDomains, false, "ARK-PROJECT.TOS-CN-BEIJING.VOLCES.COM", true, false},
+		{"wildcard blacklist rejects trailing dot", wildcardDomains, false, "ark-project.tos-cn-beijing.volces.com.", false, false},
+		{"wildcard blacklist rejects empty interior label", wildcardDomains, false, "ark-project..tos-cn-beijing.volces.com", false, false},
 		{"wildcard blacklist allows apex", wildcardDomains, false, "tos-cn-beijing.volces.com", false, true},
 		{"wildcard blacklist allows prefix lookalike", wildcardDomains, false, "evil-tos-cn-beijing.volces.com", false, true},
 		{"wildcard blacklist allows suffix lookalike", wildcardDomains, false, "tos-cn-beijing.volces.com.evil", false, true},
+		{"exact blacklist rejects case-insensitive apex", exactDomains, false, "TOS-CN-BEIJING.VOLCES.COM", true, false},
+		{"exact blacklist rejects trailing dot", exactDomains, false, "tos-cn-beijing.volces.com.", false, false},
+		{"exact blacklist rejects empty interior label", exactDomains, false, "tos-cn-beijing..volces.com", false, false},
 	}
 
 	for _, test := range tests {

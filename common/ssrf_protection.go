@@ -337,6 +337,9 @@ func (p *SSRFProtection) ValidateNetworkTarget(host string, port int) error {
 		return nil
 	}
 
+	if !isValidASCIIDNSHostname(host) {
+		return fmt.Errorf("invalid domain: %s", host)
+	}
 	if !p.isDomainAllowed(host) {
 		if p.DomainFilterMode {
 			return fmt.Errorf("domain not in whitelist: %s", host)
