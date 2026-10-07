@@ -58,6 +58,8 @@ func TestTaskMediaWildcardDomainBoundary(t *testing.T) {
 		{name: "valid subdomain", host: "ark-project.tos-cn-beijing.volces.com", allowed: true},
 		{name: "apex", host: "tos-cn-beijing.volces.com", allowed: false},
 		{name: "empty leading label", host: ".tos-cn-beijing.volces.com", allowed: false},
+		{name: "two empty leading labels", host: "..tos-cn-beijing.volces.com", allowed: false},
+		{name: "empty interior label", host: "a..tos-cn-beijing.volces.com", allowed: false},
 		{name: "prefix lookalike", host: "evil-tos-cn-beijing.volces.com", allowed: false},
 		{name: "suffix lookalike", host: "tos-cn-beijing.volces.com.evil", allowed: false},
 	}

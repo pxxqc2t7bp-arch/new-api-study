@@ -201,6 +201,33 @@ func (p *SSRFProtection) isAllowedPort(port int) bool {
 	return slices.Contains(p.AllowedPorts, port)
 }
 
+func isASCIIAlphanumeric(c byte) bool {
+	return c >= 'a' && c <= 'z' ||
+		c >= 'A' && c <= 'Z' ||
+		c >= '0' && c <= '9'
+}
+
+func isValidASCIIDNSHostname(host string) bool {
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if !isASCIIAlphanumeric(label[0]) || !isASCIIAlphanumeric(label[len(label)-1]) {
+			return false
+		}
+		for i := 1; i < len(label)-1; i++ {
+			if !isASCIIAlphanumeric(label[i]) && label[i] != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // isDomainWhitelisted 检查域名是否在白名单中
 func isDomainListed(domain string, list []string) bool {
 	if len(list) == 0 {
@@ -208,21 +235,29 @@ func isDomainListed(domain string, list []string) bool {
 	}
 
 	domain = strings.ToLower(domain)
+	if !isValidASCIIDNSHostname(domain) {
+		return false
+	}
+
 	for _, item := range list {
 		item = strings.ToLower(strings.TrimSpace(item))
 		if item == "" {
 			continue
 		}
-		// 精确匹配
-		if domain == item {
-			return true
-		}
 		// 通配符匹配 (*.example.com)
 		if after, ok := strings.CutPrefix(item, "*."); ok {
 			suffix := after
+			if !isValidASCIIDNSHostname(suffix) {
+				continue
+			}
 			if len(domain) > len(suffix)+1 && strings.HasSuffix(domain, "."+suffix) {
 				return true
 			}
+			continue
+		}
+		// 精确匹配
+		if isValidASCIIDNSHostname(item) && domain == item {
+			return true
 		}
 	}
 	return false

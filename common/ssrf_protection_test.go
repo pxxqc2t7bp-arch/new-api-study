@@ -72,6 +72,8 @@ func TestSSRFProtectionDomainFilterRules(t *testing.T) {
 		{"wildcard whitelist allows subdomain", wildcardDomains, true, "ARK-PROJECT.TOS-CN-BEIJING.VOLCES.COM", true, true},
 		{"wildcard whitelist rejects apex", wildcardDomains, true, "tos-cn-beijing.volces.com", false, false},
 		{"wildcard whitelist rejects empty leading label", wildcardDomains, true, ".tos-cn-beijing.volces.com", false, false},
+		{"wildcard whitelist rejects two empty leading labels", wildcardDomains, true, "..tos-cn-beijing.volces.com", false, false},
+		{"wildcard whitelist rejects empty interior label", wildcardDomains, true, "a..tos-cn-beijing.volces.com", false, false},
 		{"wildcard whitelist rejects prefix lookalike", wildcardDomains, true, "evil-tos-cn-beijing.volces.com", false, false},
 		{"wildcard whitelist rejects suffix lookalike", wildcardDomains, true, "tos-cn-beijing.volces.com.evil", false, false},
 		{"exact whitelist allows apex", exactDomains, true, "tos-cn-beijing.volces.com", true, true},
@@ -84,18 +86,22 @@ func TestSSRFProtectionDomainFilterRules(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			require.Equal(t, test.listed, isDomainListed(test.domain, test.domainList))
+			t.Run("matcher", func(t *testing.T) {
+				require.Equal(t, test.listed, isDomainListed(test.domain, test.domainList))
+			})
 
-			err := ValidateURLWithFetchSetting(
-				"https://"+test.domain+"/object",
-				true, false, test.domainFilterMode, false,
-				test.domainList, nil, []string{"443"}, false,
-			)
-			if test.allowed {
-				require.NoError(t, err)
-			} else {
-				require.Error(t, err)
-			}
+			t.Run("URL validation", func(t *testing.T) {
+				err := ValidateURLWithFetchSetting(
+					"https://"+test.domain+"/object",
+					true, false, test.domainFilterMode, false,
+					test.domainList, nil, []string{"443"}, false,
+				)
+				if test.allowed {
+					require.NoError(t, err)
+				} else {
+					require.Error(t, err)
+				}
+			})
 		})
 	}
 }
