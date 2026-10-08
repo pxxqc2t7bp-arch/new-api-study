@@ -210,3 +210,54 @@ func TestTaskMediaBlacklistRejectsInvalidDNSHostnames(t *testing.T) {
 		})
 	}
 }
+
+func TestTaskMediaRejectsEmptyConfiguredDomainEntries(t *testing.T) {
+	fetchSetting := system_setting.GetFetchSetting()
+	original := *fetchSetting
+	original.DomainList = slices.Clone(fetchSetting.DomainList)
+	original.IpList = slices.Clone(fetchSetting.IpList)
+	original.AllowedPorts = slices.Clone(fetchSetting.AllowedPorts)
+	t.Cleanup(func() {
+		*fetchSetting = original
+	})
+
+	configurations := []struct {
+		name             string
+		domainFilterMode bool
+		domainList       []string
+	}{
+		{name: "empty whitelist", domainFilterMode: true, domainList: []string{""}},
+		{name: "whitespace-only whitelist", domainFilterMode: true, domainList: []string{" \t\n\v\f\r "}},
+		{name: "empty blacklist", domainFilterMode: false, domainList: []string{""}},
+		{name: "whitespace-only blacklist", domainFilterMode: false, domainList: []string{" \t\n\v\f\r "}},
+	}
+
+	for _, configuration := range configurations {
+		t.Run(configuration.name, func(t *testing.T) {
+			*fetchSetting = system_setting.FetchSetting{
+				EnableSSRFProtection:   true,
+				AllowPrivateIp:         false,
+				DomainFilterMode:       configuration.domainFilterMode,
+				IpFilterMode:           false,
+				DomainList:             configuration.domainList,
+				AllowedPorts:           []string{"443"},
+				ApplyIPFilterForDomain: false,
+			}
+
+			require.Error(t, validateTaskMediaURL("https://allowed.example.com/object", ""))
+
+			redirectClient := taskMediaRedirectClient(&http.Client{}, "", nil, nil, true)
+			request, err := http.NewRequest(
+				http.MethodGet,
+				"https://allowed.example.com/object",
+				nil,
+			)
+			require.NoError(t, err)
+			require.ErrorIs(
+				t,
+				redirectClient.CheckRedirect(request, nil),
+				errTaskMediaRequestRejected,
+			)
+		})
+	}
+}

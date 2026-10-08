@@ -103,6 +103,10 @@ func TestSSRFProtectionDomainFilterRules(t *testing.T) {
 		{"exact blacklist rejects unicode-space target", exactDomains, false, "\u00a0tos-cn-beijing.volces.com", false, false},
 		{"malformed exact blacklist fails closed", malformedExactBlacklist, false, "blocked.example.com", false, false},
 		{"malformed wildcard blacklist fails closed", malformedWildcardBlacklist, false, "media.blocked.example.com", false, false},
+		{"empty whitelist entry fails closed", []string{""}, true, "allowed.example.com", false, false},
+		{"whitespace-only whitelist entry fails closed", []string{" \t\n\v\f\r "}, true, "allowed.example.com", false, false},
+		{"empty blacklist entry fails closed", []string{""}, false, "allowed.example.com", false, false},
+		{"whitespace-only blacklist entry fails closed", []string{" \t\n\v\f\r "}, false, "allowed.example.com", false, false},
 	}
 
 	for _, test := range tests {

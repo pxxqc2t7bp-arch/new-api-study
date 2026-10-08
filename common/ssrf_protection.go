@@ -236,7 +236,7 @@ func isValidDomainList(list []string) bool {
 	for _, item := range list {
 		item = trimASCIIWhitespace(item)
 		if item == "" {
-			continue
+			return false
 		}
 		if suffix, ok := strings.CutPrefix(item, "*."); ok {
 			if !isValidASCIIDNSHostname(suffix) {
