@@ -234,13 +234,13 @@ func isDomainListed(domain string, list []string) bool {
 		return false
 	}
 
-	domain = strings.ToLower(domain)
 	if !isValidASCIIDNSHostname(domain) {
 		return false
 	}
+	domain = strings.ToLower(domain)
 
 	for _, item := range list {
-		item = strings.ToLower(strings.TrimSpace(item))
+		item = strings.TrimSpace(item)
 		if item == "" {
 			continue
 		}
@@ -250,13 +250,14 @@ func isDomainListed(domain string, list []string) bool {
 			if !isValidASCIIDNSHostname(suffix) {
 				continue
 			}
+			suffix = strings.ToLower(suffix)
 			if len(domain) > len(suffix)+1 && strings.HasSuffix(domain, "."+suffix) {
 				return true
 			}
 			continue
 		}
 		// 精确匹配
-		if isValidASCIIDNSHostname(item) && domain == item {
+		if isValidASCIIDNSHostname(item) && domain == strings.ToLower(item) {
 			return true
 		}
 	}
