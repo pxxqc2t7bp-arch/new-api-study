@@ -207,6 +207,10 @@ func isASCIIAlphanumeric(c byte) bool {
 		c >= '0' && c <= '9'
 }
 
+func trimASCIIWhitespace(value string) string {
+	return strings.Trim(value, " \t\n\v\f\r")
+}
+
 func isValidASCIIDNSHostname(host string) bool {
 	if len(host) == 0 || len(host) > 253 {
 		return false
@@ -240,7 +244,7 @@ func isDomainListed(domain string, list []string) bool {
 	domain = strings.ToLower(domain)
 
 	for _, item := range list {
-		item = strings.TrimSpace(item)
+		item = trimASCIIWhitespace(item)
 		if item == "" {
 			continue
 		}
@@ -320,7 +324,7 @@ func (p *SSRFProtection) ipAccessError(host string, ip net.IP) error {
 
 // ValidateNetworkTarget validates the host and port before dialing.
 func (p *SSRFProtection) ValidateNetworkTarget(host string, port int) error {
-	host = strings.TrimSpace(host)
+	host = trimASCIIWhitespace(host)
 	if host == "" {
 		return fmt.Errorf("invalid host")
 	}

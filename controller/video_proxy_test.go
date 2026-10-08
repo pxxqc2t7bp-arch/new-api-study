@@ -63,6 +63,7 @@ func TestTaskMediaWildcardDomainBoundary(t *testing.T) {
 		{name: "prefix lookalike", host: "evil-tos-cn-beijing.volces.com", allowed: false},
 		{name: "suffix lookalike", host: "tos-cn-beijing.volces.com.evil", allowed: false},
 		{name: "unicode case-fold lookalike", host: "ar\u212A-project.tos-cn-beijing.volces.com", allowed: false},
+		{name: "unicode-space target", host: "\u00a0ark-project.tos-cn-beijing.volces.com", allowed: false},
 	}
 
 	for _, path := range paths {
