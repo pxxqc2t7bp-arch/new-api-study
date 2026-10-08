@@ -65,6 +65,8 @@ func TestSSRFProtectionDomainFilterRules(t *testing.T) {
 	malformedWildcardDomains := []string{"*.\u212A.example.com"}
 	unicodeSpaceExactDomains := []string{"\u00a0tos-cn-beijing.volces.com"}
 	unicodeSpaceWildcardDomains := []string{"\u00a0*.tos-cn-beijing.volces.com"}
+	malformedExactBlacklist := []string{"\u00a0blocked.example.com"}
+	malformedWildcardBlacklist := []string{"\u00a0*.blocked.example.com"}
 	tests := []struct {
 		name             string
 		domainList       []string
@@ -99,6 +101,8 @@ func TestSSRFProtectionDomainFilterRules(t *testing.T) {
 		{"exact blacklist rejects trailing dot", exactDomains, false, "tos-cn-beijing.volces.com.", false, false},
 		{"exact blacklist rejects empty interior label", exactDomains, false, "tos-cn-beijing..volces.com", false, false},
 		{"exact blacklist rejects unicode-space target", exactDomains, false, "\u00a0tos-cn-beijing.volces.com", false, false},
+		{"malformed exact blacklist fails closed", malformedExactBlacklist, false, "blocked.example.com", false, false},
+		{"malformed wildcard blacklist fails closed", malformedWildcardBlacklist, false, "media.blocked.example.com", false, false},
 	}
 
 	for _, test := range tests {

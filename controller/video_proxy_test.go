@@ -152,6 +152,30 @@ func TestTaskMediaBlacklistRejectsInvalidDNSHostnames(t *testing.T) {
 				{name: "empty interior label", host: "media..blocked.example.com", allowed: false},
 			},
 		},
+		{
+			name:       "malformed exact",
+			domainList: []string{"\u00a0blocked.example.com"},
+			tests: []struct {
+				name    string
+				host    string
+				allowed bool
+			}{
+				{name: "configured host", host: "blocked.example.com", allowed: false},
+				{name: "unrelated host", host: "allowed.example.com", allowed: false},
+			},
+		},
+		{
+			name:       "malformed wildcard",
+			domainList: []string{"\u00a0*.blocked.example.com"},
+			tests: []struct {
+				name    string
+				host    string
+				allowed bool
+			}{
+				{name: "configured subdomain", host: "media.blocked.example.com", allowed: false},
+				{name: "unrelated host", host: "allowed.example.com", allowed: false},
+			},
+		},
 	}
 
 	for _, configuration := range configurations {

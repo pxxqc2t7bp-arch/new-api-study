@@ -232,6 +232,25 @@ func isValidASCIIDNSHostname(host string) bool {
 	return true
 }
 
+func isValidDomainList(list []string) bool {
+	for _, item := range list {
+		item = trimASCIIWhitespace(item)
+		if item == "" {
+			continue
+		}
+		if suffix, ok := strings.CutPrefix(item, "*."); ok {
+			if !isValidASCIIDNSHostname(suffix) {
+				return false
+			}
+			continue
+		}
+		if !isValidASCIIDNSHostname(item) {
+			return false
+		}
+	}
+	return true
+}
+
 // isDomainWhitelisted 检查域名是否在白名单中
 func isDomainListed(domain string, list []string) bool {
 	if len(list) == 0 {
@@ -269,6 +288,9 @@ func isDomainListed(domain string, list []string) bool {
 }
 
 func (p *SSRFProtection) isDomainAllowed(domain string) bool {
+	if !isValidDomainList(p.DomainList) {
+		return false
+	}
 	listed := isDomainListed(domain, p.DomainList)
 	if p.DomainFilterMode { // 白名单
 		return listed
