@@ -1336,13 +1336,33 @@ func TestOpenAppPluginModelDBDefaultSQLiteConfiguration(t *testing.T) {
 	require.Equal(t, 1, conflicts)
 }
 
+func TestAppPluginTestSQLiteFileURLWindowsDrivePaths(t *testing.T) {
+	const rawQuery = "_pragma=busy_timeout%2830000%29&_txlock=immediate"
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{name: "native path", path: `C:\tmp\template.sqlite`},
+		{name: "slash-normalized path", path: "C:/tmp/template.sqlite"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			databaseURL := appPluginTestSQLiteFileURL(test.path, rawQuery)
+			parsed, err := url.Parse(databaseURL.String())
+			require.NoError(t, err)
+			assert.Equal(t, "file", parsed.Scheme)
+			assert.Empty(t, parsed.Host)
+			assert.Equal(t, "/C:/tmp/template.sqlite", parsed.Path)
+			assert.Equal(t, rawQuery, parsed.RawQuery)
+		})
+	}
+}
+
 func TestOpenAppPluginModelDBExplicitSQLiteTemplateIsPrivate(t *testing.T) {
 	t.Setenv("APP_PLUGIN_TEST_DIALECT", "sqlite")
-	templateURL := url.URL{
-		Scheme:   "file",
-		Path:     filepath.Join(t.TempDir(), "template.sqlite"),
-		RawQuery: "_pragma=busy_timeout%2830000%29&_pragma=journal_mode%28WAL%29&_txlock=immediate",
-	}
+	templateURL := appPluginTestSQLiteFileURL(
+		filepath.Join(t.TempDir(), "template.sqlite"),
+		"_pragma=busy_timeout%2830000%29&_pragma=journal_mode%28WAL%29&_txlock=immediate",
+	)
 	t.Setenv("APP_PLUGIN_TEST_DSN", templateURL.String())
 
 	first := openAppPluginModelDB(t)
@@ -2249,7 +2269,44 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 			eagerSQLiteFixture, err = appPluginSQLiteEagerTransaction(dialector.DSN)
 			require.NoError(t, err)
 		}
-		if db.Dialector.Name() == "sqlite" && !eagerSQLiteFixture {
+		upgradeDB := db
+		switch {
+		case db.Dialector.Name() == "sqlite" && eagerSQLiteFixture:
+			beginner, ok := db.Statement.ConnPool.(gorm.TxBeginner)
+			require.True(t, ok)
+			observer := &appPluginTxBeginObserver{
+				ConnPool: db.Statement.ConnPool,
+				beginTx: func(ctx context.Context, options *sql.TxOptions) (*sql.Tx, error) {
+					worker, _ := ctx.Value(workerKey{}).(string)
+					if worker == "3.0.0" {
+						select {
+						case waiterAttempted <- struct{}{}:
+						case <-barrierCtx.Done():
+							return nil, fmt.Errorf("different-version SQLite waiter begin barrier: %w", barrierCtx.Err())
+						}
+					}
+					transaction, beginErr := beginner.BeginTx(ctx, options)
+					if worker != "2.0.0" || beginErr != nil {
+						return transaction, beginErr
+					}
+					select {
+					case holderReady <- struct{}{}:
+					case <-barrierCtx.Done():
+						_ = transaction.Rollback()
+						return nil, fmt.Errorf("different-version SQLite holder begin barrier: %w", barrierCtx.Err())
+					}
+					select {
+					case <-releaseHolder:
+					case <-barrierCtx.Done():
+						_ = transaction.Rollback()
+						return nil, fmt.Errorf("different-version SQLite holder release: %w", barrierCtx.Err())
+					}
+					return transaction, nil
+				},
+			}
+			upgradeDB = db.Session(&gorm.Session{NewDB: true})
+			upgradeDB.Statement.ConnPool = observer
+		case db.Dialector.Name() == "sqlite":
 			const callbackName = "test:app_plugin_different_version_sqlite_start"
 			workersReady := make(chan struct{}, 2)
 			var coordinated sync.Map
@@ -2278,7 +2335,7 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 				require.NoError(t, db.Callback().Create().Remove(callbackName))
 			})
 			holderReady = workersReady
-		} else {
+		default:
 			ownershipClaimKey := appKeyClaim(v1.AppKey, "").ClaimKey
 			var holderCoordinated atomic.Bool
 			const holderCallback = "test:app_plugin_different_version_ownership_holder"
@@ -2337,7 +2394,7 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 			wg.Go(func() {
 				ctx := context.WithValue(barrierCtx, workerKey{}, version)
 				req := appPluginModelInstallRequest("concurrent-upgrade", version, "https://apps.example.com/concurrent-upgrade-v"+string(version[0])+"/")
-				result, installErr := InstallAppVersion(ctx, db, AppIdempotencyScope{ActorID: 34, Key: "concurrent-upgrade-v" + string(version[0])}, req)
+				result, installErr := InstallAppVersion(ctx, upgradeDB, AppIdempotencyScope{ActorID: 34, Key: "concurrent-upgrade-v" + string(version[0])}, req)
 				results <- result
 				errs <- installErr
 			})
@@ -2345,8 +2402,20 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 
 		if db.Dialector.Name() == "sqlite" {
 			runUpgrade("2.0.0")
-			runUpgrade("3.0.0")
-			if !eagerSQLiteFixture {
+			if eagerSQLiteFixture {
+				select {
+				case <-holderReady:
+				case <-barrierCtx.Done():
+					t.Fatalf("different-version SQLite holder did not begin its eager transaction: %v", barrierCtx.Err())
+				}
+				runUpgrade("3.0.0")
+				select {
+				case <-waiterAttempted:
+				case <-barrierCtx.Done():
+					t.Fatalf("different-version SQLite waiter did not attempt transaction begin while the first transaction was held: %v", barrierCtx.Err())
+				}
+			} else {
+				runUpgrade("3.0.0")
 				for range 2 {
 					select {
 					case <-holderReady:
@@ -2492,14 +2561,21 @@ func appPluginSQLiteDSN(t *testing.T, template string) (string, error) {
 		}
 	}
 
-	fixturePath := filepath.ToSlash(filepath.Join(t.TempDir(), "app_plugin.sqlite"))
-	if appPluginWindowsDriveAbsolute(fixturePath) {
-		fixturePath = "/" + fixturePath
+	fixtureURL := appPluginTestSQLiteFileURL(
+		filepath.Join(t.TempDir(), "app_plugin.sqlite"),
+		sqliteURL.RawQuery,
+	)
+	fixtureURL.ForceQuery = sqliteURL.ForceQuery
+	return fixtureURL.String(), nil
+}
+
+func appPluginTestSQLiteFileURL(path, rawQuery string) url.URL {
+	if appPluginWindowsDriveAbsolute(path) {
+		path = "/" + strings.ReplaceAll(path, `\`, "/")
+	} else {
+		path = filepath.ToSlash(path)
 	}
-	sqliteURL.Scheme = "file"
-	sqliteURL.Path = fixturePath
-	sqliteURL.RawPath = ""
-	return sqliteURL.String(), nil
+	return url.URL{Scheme: "file", Path: path, RawQuery: rawQuery}
 }
 
 func appPluginWindowsDriveAbsolute(path string) bool {
@@ -2520,6 +2596,15 @@ func appPluginSQLiteEagerTransaction(dsn string) (bool, error) {
 	}
 	lockMode := query.Get("_txlock")
 	return strings.EqualFold(lockMode, "immediate") || strings.EqualFold(lockMode, "exclusive"), nil
+}
+
+type appPluginTxBeginObserver struct {
+	gorm.ConnPool
+	beginTx func(context.Context, *sql.TxOptions) (*sql.Tx, error)
+}
+
+func (observer *appPluginTxBeginObserver) BeginTx(ctx context.Context, options *sql.TxOptions) (*sql.Tx, error) {
+	return observer.beginTx(ctx, options)
 }
 
 func logAppPluginDBVersion(t *testing.T, db *gorm.DB) {

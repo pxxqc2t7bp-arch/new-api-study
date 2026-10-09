@@ -1,12 +1,13 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,7 +55,7 @@ func setupManageUserTestDBWithOptions(t *testing.T, options manageUserTestDBOpti
 	require.Contains(t, databaseTypes, dialect)
 	dsn := os.Getenv("TEST_" + strings.ToUpper(dialect) + "_DSN")
 	if options.deferredSQLite && dialect == "sqlite" {
-		databaseURL := url.URL{Scheme: "file", Path: t.TempDir() + "/manage-user.db"}
+		databaseURL := controllerTestSQLiteFileURL(filepath.Join(t.TempDir(), "manage-user.db"), "")
 		query := databaseURL.Query()
 		query.Add("_pragma", "busy_timeout(30000)")
 		query.Add("_pragma", "journal_mode(WAL)")
@@ -106,7 +107,7 @@ func probeConcurrentSQLiteWrite(t *testing.T, db *gorm.DB) error {
 	require.NoError(t, db.Raw("PRAGMA database_list").Scan(&database).Error)
 	require.NotEmpty(t, database.File)
 
-	contenderURL := url.URL{Scheme: "file", Path: database.File}
+	contenderURL := controllerTestSQLiteFileURL(database.File, "")
 	query := contenderURL.Query()
 	query.Add("_pragma", "busy_timeout(0)")
 	contenderURL.RawQuery = query.Encode()
@@ -1304,44 +1305,92 @@ func TestManageUserQuotaConcurrentSnapshots(t *testing.T) {
 	db := setupManageUserTestDBWithOptions(t, manageUserTestDBOptions{deferredSQLite: true})
 	user := model.User{Username: "concurrent-quota", Quota: 1000}
 	require.NoError(t, db.Create(&user).Error)
-	var ready sync.WaitGroup
-	ready.Add(2)
-	release := make(chan struct{})
-	require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:concurrent_quota_start", func(tx *gorm.DB) {
-		if tx.Statement.Table == "users" {
-			ready.Done()
-			<-release
-		}
-	}))
-	type result struct {
+	barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelBarrier()
+	model.DB = db.WithContext(barrierCtx)
+	sqliteSnapshots := common.UsingMainDatabase(common.DatabaseTypeSQLite)
+	snapshotsReady := make(chan struct{}, 2)
+	releaseSnapshots := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseSnapshots)
+		})
+	}
+	defer release()
+	const callbackName = "test:concurrent_quota_snapshots"
+	if sqliteSnapshots {
+		require.NoError(t, db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+			snapshot, ok := tx.Statement.Dest.(*model.User)
+			if tx.Statement.Table != "users" || !ok || snapshot.Id != user.Id || snapshot.Quota != 1000 {
+				return
+			}
+			select {
+			case snapshotsReady <- struct{}{}:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("quota snapshot barrier: %w", barrierCtx.Err()))
+				return
+			}
+			select {
+			case <-releaseSnapshots:
+			case <-barrierCtx.Done():
+				tx.AddError(fmt.Errorf("quota snapshot release: %w", barrierCtx.Err()))
+			}
+		}))
+		t.Cleanup(func() {
+			require.NoError(t, db.Callback().Query().Remove(callbackName))
+		})
+	}
+	type quotaResult struct {
 		adjustment *model.UserQuotaAdjustment
 		err        error
 		value      int
 	}
-	results := make(chan result, 2)
+	results := make(chan quotaResult, 2)
 	for _, value := range []int{10, 20} {
 		go func(value int) {
 			adjustment, err := model.AdjustUserQuota(user.Id, common.RoleRootUser, "add", value)
-			results <- result{adjustment, err, value}
+			results <- quotaResult{adjustment, err, value}
 		}(value)
 	}
-	ready.Wait()
-	close(release)
+	if sqliteSnapshots {
+		for range 2 {
+			select {
+			case <-snapshotsReady:
+			case <-barrierCtx.Done():
+				t.Fatalf("both quota SELECT snapshots did not complete before either UPDATE: %v", barrierCtx.Err())
+			}
+		}
+		release()
+	}
 	var committed []model.UserQuotaAdjustment
+	failures := 0
 	for range 2 {
-		result := <-results
-		if result.err != nil {
-			require.True(t, common.UsingMainDatabase(common.DatabaseTypeSQLite), "row-locking databases must serialize both adjustments: %v", result.err)
-			assert.Contains(t, strings.ToLower(result.err.Error()), "locked")
-			assert.Nil(t, result.adjustment)
+		var outcome quotaResult
+		select {
+		case outcome = <-results:
+		case <-barrierCtx.Done():
+			t.Fatalf("concurrent quota adjustments did not finish: %v", barrierCtx.Err())
+		}
+		if outcome.err != nil {
+			failures++
+			require.True(t, sqliteSnapshots, "row-locking databases must serialize both adjustments: %v", outcome.err)
+			assert.Contains(t, strings.ToLower(outcome.err.Error()), "locked")
+			assert.Nil(t, outcome.adjustment)
 			continue
 		}
-		require.NotNil(t, result.adjustment)
-		assert.Equal(t, result.value, result.adjustment.After-result.adjustment.Before)
-		committed = append(committed, *result.adjustment)
+		require.NotNil(t, outcome.adjustment)
+		assert.Equal(t, outcome.value, outcome.adjustment.After-outcome.adjustment.Before)
+		committed = append(committed, *outcome.adjustment)
 	}
-	require.NoError(t, db.Callback().Query().Remove("test:concurrent_quota_start"))
-	require.NotEmpty(t, committed)
+	if sqliteSnapshots {
+		require.Len(t, committed, 1, "both deferred transactions must read the same pre-update quota snapshot")
+		assert.Equal(t, 1, failures)
+		assert.Equal(t, 1000, committed[0].Before)
+	} else {
+		require.Len(t, committed, 2, "row-locking databases must serialize both adjustments")
+		assert.Zero(t, failures)
+	}
 	sort.Slice(committed, func(i, j int) bool { return committed[i].Before < committed[j].Before })
 	balance := 1000
 	for _, adjustment := range committed {
@@ -1350,6 +1399,9 @@ func TestManageUserQuotaConcurrentSnapshots(t *testing.T) {
 	}
 	require.NoError(t, db.First(&user, user.Id).Error)
 	assert.Equal(t, balance, user.Quota)
+	if !sqliteSnapshots {
+		assert.Equal(t, 1030, user.Quota)
+	}
 }
 
 func TestManageUserQuotaCacheUsesCommittedIntegerDifference(t *testing.T) {

@@ -491,14 +491,21 @@ func newAuditSQLiteDSN(t *testing.T, dsn string) string {
 		require.True(t, auditWindowsDriveAbsolute(databaseURL.Path) || strings.HasPrefix(databaseURL.Path, "/"))
 	}
 
-	fixturePath := filepath.ToSlash(filepath.Join(t.TempDir(), "audit.db"))
-	if auditWindowsDriveAbsolute(fixturePath) {
-		fixturePath = "/" + fixturePath
+	fixtureURL := controllerTestSQLiteFileURL(
+		filepath.Join(t.TempDir(), "audit.db"),
+		databaseURL.RawQuery,
+	)
+	fixtureURL.ForceQuery = databaseURL.ForceQuery
+	return fixtureURL.String()
+}
+
+func controllerTestSQLiteFileURL(path, rawQuery string) url.URL {
+	if auditWindowsDriveAbsolute(path) {
+		path = "/" + strings.ReplaceAll(path, `\`, "/")
+	} else {
+		path = filepath.ToSlash(path)
 	}
-	databaseURL.Scheme = "file"
-	databaseURL.Path = fixturePath
-	databaseURL.RawPath = ""
-	return databaseURL.String()
+	return url.URL{Scheme: "file", Path: path, RawQuery: rawQuery}
 }
 
 func auditWindowsDriveAbsolute(path string) bool {
@@ -585,8 +592,29 @@ func TestNewAuditTestDatabaseSQLiteUsesProductionLockingPragmas(t *testing.T) {
 	assert.Equal(t, "wal", strings.ToLower(journalMode))
 }
 
+func TestControllerTestSQLiteFileURLWindowsDrivePaths(t *testing.T) {
+	const rawQuery = "_pragma=busy_timeout%2812345%29&_txlock=deferred"
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{name: "native path", path: `C:\tmp\shared-audit.db`},
+		{name: "slash-normalized path", path: "C:/tmp/shared-audit.db"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			databaseURL := controllerTestSQLiteFileURL(test.path, rawQuery)
+			parsed, err := url.Parse(databaseURL.String())
+			require.NoError(t, err)
+			assert.Equal(t, "file", parsed.Scheme)
+			assert.Empty(t, parsed.Host)
+			assert.Equal(t, "/C:/tmp/shared-audit.db", parsed.Path)
+			assert.Equal(t, rawQuery, parsed.RawQuery)
+		})
+	}
+}
+
 func TestNewAuditTestDatabaseSQLiteIsolatesExplicitTemplates(t *testing.T) {
-	templateURL := url.URL{Scheme: "file", Path: t.TempDir() + "/shared-audit.db"}
+	templateURL := controllerTestSQLiteFileURL(filepath.Join(t.TempDir(), "shared-audit.db"), "")
 	query := templateURL.Query()
 	query.Add("_pragma", "busy_timeout(12345)")
 	query.Add("_pragma", "journal_mode(WAL)")
