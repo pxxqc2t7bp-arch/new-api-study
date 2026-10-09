@@ -455,9 +455,16 @@ func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 	t.Helper()
 	if kind == "sqlite" {
 		path := t.TempDir() + "/audit.db"
-		db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+		databaseURL := url.URL{Scheme: "file", Path: path}
+		query := databaseURL.Query()
+		query.Add("_pragma", "busy_timeout(30000)")
+		query.Add("_pragma", "journal_mode(WAL)")
+		query.Set("_txlock", "immediate")
+		databaseURL.RawQuery = query.Encode()
+		isolatedDSN := databaseURL.String()
+		db, err := gorm.Open(sqlite.Open(isolatedDSN), &gorm.Config{})
 		require.NoError(t, err)
-		return db, path
+		return db, isolatedDSN
 	}
 	require.NotEmpty(t, dsn)
 	name := fmt.Sprintf("newapi_audit_%d", time.Now().UnixNano())
@@ -509,6 +516,18 @@ func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 		}
 	})
 	return db, newDSN
+}
+
+func TestNewAuditTestDatabaseSQLiteUsesProductionLockingPragmas(t *testing.T) {
+	db, _ := newAuditTestDatabase(t, "sqlite", "")
+
+	var busyTimeout int
+	require.NoError(t, db.Raw("PRAGMA busy_timeout").Scan(&busyTimeout).Error)
+	assert.Equal(t, 30000, busyTimeout)
+
+	var journalMode string
+	require.NoError(t, db.Raw("PRAGMA journal_mode").Scan(&journalMode).Error)
+	assert.Equal(t, "wal", strings.ToLower(journalMode))
 }
 
 func verifyAuditRoleStorage(t *testing.T) {
