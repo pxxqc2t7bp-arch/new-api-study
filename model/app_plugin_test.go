@@ -1471,6 +1471,7 @@ func TestAppPluginSQLiteDSNRejectsUnsafeTemplates(t *testing.T) {
 		{name: "empty path", dsn: "file:"},
 		{name: "backslash UNC path", dsn: `\\server\share\app_plugin.sqlite`},
 		{name: "slash UNC path", dsn: "//server/share/app_plugin.sqlite"},
+		{name: "file URI UNC path", dsn: "file:////server/share/app_plugin.sqlite?_txlock=immediate"},
 		{name: "drive-relative path", dsn: `C:app_plugin.sqlite`},
 		{name: "relative path", dsn: "app_plugin.sqlite"},
 	}
@@ -2481,6 +2482,8 @@ func appPluginSQLiteDSN(t *testing.T, template string) (string, error) {
 			return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not be opaque")
 		case sqliteURL.Path == "":
 			return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must contain a path")
+		case strings.HasPrefix(sqliteURL.Path, "//"):
+			return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not contain a UNC path")
 		case !appPluginWindowsDriveAbsolute(sqliteURL.Path) && !strings.HasPrefix(sqliteURL.Path, "/"):
 			return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must contain an absolute path")
 		}

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -486,6 +487,7 @@ func newAuditSQLiteDSN(t *testing.T, dsn string) string {
 		require.Nil(t, databaseURL.User)
 		require.Empty(t, databaseURL.Fragment)
 		require.NotEmpty(t, databaseURL.Path)
+		require.False(t, strings.HasPrefix(databaseURL.Path, "//"))
 		require.True(t, auditWindowsDriveAbsolute(databaseURL.Path) || strings.HasPrefix(databaseURL.Path, "/"))
 	}
 
@@ -670,6 +672,33 @@ func TestNewAuditTestDatabaseClosesSQLitePool(t *testing.T) {
 	require.NotNil(t, pool)
 	require.Error(t, pool.Ping())
 	assert.Zero(t, pool.Stats().OpenConnections)
+}
+
+func TestNewAuditSQLiteDSNRejectsUnsafeTemplates(t *testing.T) {
+	const unsafeDSNEnv = "NEW_API_AUDIT_UNSAFE_SQLITE_DSN"
+	if dsn := os.Getenv(unsafeDSNEnv); dsn != "" {
+		_ = newAuditSQLiteDSN(t, dsn)
+		return
+	}
+
+	tests := []struct {
+		name string
+		dsn  string
+	}{
+		{name: "backslash UNC path", dsn: `\\server\share\audit.db`},
+		{name: "slash UNC path", dsn: "//server/share/audit.db"},
+		{name: "file URI UNC path", dsn: "file:////server/share/audit.db?_txlock=immediate"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			command := exec.Command(os.Args[0], "-test.run=^TestNewAuditSQLiteDSNRejectsUnsafeTemplates$")
+			command.Env = append(os.Environ(), unsafeDSNEnv+"="+test.dsn)
+			err := command.Run()
+			var exitErr *exec.ExitError
+			require.ErrorAs(t, err, &exitErr)
+			assert.Equal(t, 1, exitErr.ExitCode())
+		})
+	}
 }
 
 func verifyAuditRoleStorage(t *testing.T) {
