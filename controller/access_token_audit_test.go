@@ -451,19 +451,34 @@ func (releasedAuditLog) TableName() string { return "logs" }
 
 // External tests create a new database per case on a loopback-only disposable
 // instance. They never drop databases or tables supplied through an environment variable.
+func newAuditSQLiteDSN(t *testing.T, dsn string) string {
+	t.Helper()
+	if dsn == "" {
+		databaseURL := url.URL{Scheme: "file", Path: t.TempDir() + "/audit.db"}
+		query := databaseURL.Query()
+		query.Add("_pragma", "busy_timeout(30000)")
+		query.Add("_pragma", "journal_mode(WAL)")
+		query.Set("_txlock", "immediate")
+		databaseURL.RawQuery = query.Encode()
+		return databaseURL.String()
+	}
+
+	databaseURL, err := url.Parse(dsn)
+	require.NoError(t, err)
+	require.Equal(t, "file", databaseURL.Scheme)
+	require.Empty(t, databaseURL.Opaque)
+	require.Empty(t, databaseURL.Host)
+	require.Nil(t, databaseURL.User)
+	require.Empty(t, databaseURL.Fragment)
+	require.NotEmpty(t, databaseURL.Path)
+	databaseURL.Path = t.TempDir() + "/audit.db"
+	return databaseURL.String()
+}
+
 func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 	t.Helper()
 	if kind == "sqlite" {
-		if dsn == "" {
-			path := t.TempDir() + "/audit.db"
-			databaseURL := url.URL{Scheme: "file", Path: path}
-			query := databaseURL.Query()
-			query.Add("_pragma", "busy_timeout(30000)")
-			query.Add("_pragma", "journal_mode(WAL)")
-			query.Set("_txlock", "immediate")
-			databaseURL.RawQuery = query.Encode()
-			dsn = databaseURL.String()
-		}
+		dsn = newAuditSQLiteDSN(t, dsn)
 		db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 		require.NoError(t, err)
 		return db, dsn
@@ -530,6 +545,35 @@ func TestNewAuditTestDatabaseSQLiteUsesProductionLockingPragmas(t *testing.T) {
 	var journalMode string
 	require.NoError(t, db.Raw("PRAGMA journal_mode").Scan(&journalMode).Error)
 	assert.Equal(t, "wal", strings.ToLower(journalMode))
+}
+
+func TestNewAuditTestDatabaseSQLiteIsolatesExplicitTemplates(t *testing.T) {
+	templateURL := url.URL{Scheme: "file", Path: t.TempDir() + "/shared-audit.db"}
+	query := templateURL.Query()
+	query.Add("_pragma", "busy_timeout(12345)")
+	query.Add("_pragma", "journal_mode(WAL)")
+	query.Set("_txlock", "deferred")
+	templateURL.RawQuery = query.Encode()
+
+	firstDB, firstDSN := newAuditTestDatabase(t, "sqlite", templateURL.String())
+	secondDB, secondDSN := newAuditTestDatabase(t, "sqlite", templateURL.String())
+
+	require.NotEqual(t, firstDSN, secondDSN)
+	for _, isolatedDSN := range []string{firstDSN, secondDSN} {
+		parsed, err := url.Parse(isolatedDSN)
+		require.NoError(t, err)
+		assert.Equal(t, templateURL.RawQuery, parsed.RawQuery)
+		assert.True(t, strings.HasSuffix(parsed.Path, "/audit.db"))
+		assert.NotEqual(t, templateURL.Path, parsed.Path)
+	}
+
+	require.NoError(t, firstDB.Exec("CREATE TABLE audit_fixture_marker (id INTEGER PRIMARY KEY)").Error)
+	var markerTables int64
+	require.NoError(t, secondDB.Raw(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type = ? AND name = ?",
+		"table", "audit_fixture_marker",
+	).Scan(&markerTables).Error)
+	assert.Zero(t, markerTables)
 }
 
 func verifyAuditRoleStorage(t *testing.T) {

@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/alicebob/miniredis/v2"
+	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 
 	"github.com/gin-gonic/gin"
@@ -29,6 +30,15 @@ import (
 )
 
 func setupManageUserTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	return setupManageUserTestDBWithOptions(t, manageUserTestDBOptions{})
+}
+
+type manageUserTestDBOptions struct {
+	deferredSQLite bool
+}
+
+func setupManageUserTestDBWithOptions(t *testing.T, options manageUserTestDBOptions) *gorm.DB {
 	t.Helper()
 	require.NoError(t, i18n.Init())
 	previousDB, previousLogDB := model.DB, model.LOG_DB
@@ -43,27 +53,18 @@ func setupManageUserTestDB(t *testing.T) *gorm.DB {
 	}
 	require.Contains(t, databaseTypes, dialect)
 	dsn := os.Getenv("TEST_" + strings.ToUpper(dialect) + "_DSN")
-	defaultSQLiteDSN := dsn == "" && dialect == "sqlite"
-	newDeferredSQLiteDSN := func() string {
+	if options.deferredSQLite && dialect == "sqlite" {
 		databaseURL := url.URL{Scheme: "file", Path: t.TempDir() + "/manage-user.db"}
 		query := databaseURL.Query()
 		query.Add("_pragma", "busy_timeout(30000)")
 		query.Add("_pragma", "journal_mode(WAL)")
 		databaseURL.RawQuery = query.Encode()
-		return databaseURL.String()
-	}
-	if defaultSQLiteDSN {
-		// Deferred BEGIN lets both quota workers reach the pre-query barrier.
-		dsn = newDeferredSQLiteDSN()
+		dsn = databaseURL.String()
 	}
 	db, _ := newAuditTestDatabase(t, dialect, dsn)
 	logDB := db
 	if os.Getenv("TEST_MANAGE_USER_SEPARATE_LOG_DB") == "1" {
-		logDSN := dsn
-		if defaultSQLiteDSN {
-			logDSN = newDeferredSQLiteDSN()
-		}
-		logDB, _ = newAuditTestDatabase(t, dialect, logDSN)
+		logDB, _ = newAuditTestDatabase(t, dialect, dsn)
 	}
 	model.DB, model.LOG_DB = db, logDB
 	common.RedisEnabled = false
@@ -94,6 +95,41 @@ func setupManageUserTestDB(t *testing.T) *gorm.DB {
 	require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
 	t.Logf("database: %s %s, separate log database: %v", dialect, version, logDB != db)
 	return db
+}
+
+func probeConcurrentSQLiteWrite(t *testing.T, db *gorm.DB) error {
+	t.Helper()
+	require.NoError(t, db.Exec("CREATE TABLE manage_user_lock_probe (id INTEGER PRIMARY KEY)").Error)
+	var database struct {
+		File string `gorm:"column:file"`
+	}
+	require.NoError(t, db.Raw("PRAGMA database_list").Scan(&database).Error)
+	require.NotEmpty(t, database.File)
+
+	contenderURL := url.URL{Scheme: "file", Path: database.File}
+	query := contenderURL.Query()
+	query.Add("_pragma", "busy_timeout(0)")
+	contenderURL.RawQuery = query.Encode()
+	contender, err := gorm.Open(sqlite.Open(contenderURL.String()), &gorm.Config{})
+	require.NoError(t, err)
+	contenderSQL, err := contender.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = contenderSQL.Close() })
+
+	tx := db.Begin()
+	require.NoError(t, tx.Error)
+	defer func() { require.NoError(t, tx.Rollback().Error) }()
+	return contender.Exec("INSERT INTO manage_user_lock_probe (id) VALUES (1)").Error
+}
+
+func TestSetupManageUserTestDBSQLiteDefaultsToImmediateLocking(t *testing.T) {
+	t.Setenv("TEST_MANAGE_USER_DIALECT", "sqlite")
+	t.Setenv("TEST_SQLITE_DSN", "")
+	t.Setenv("TEST_MANAGE_USER_SEPARATE_LOG_DB", "")
+
+	err := probeConcurrentSQLiteWrite(t, setupManageUserTestDB(t))
+	require.Error(t, err)
+	assert.Contains(t, strings.ToLower(err.Error()), "locked")
 }
 
 func performManageUserRequest(t *testing.T, body string) *httptest.ResponseRecorder {
@@ -1265,7 +1301,7 @@ func TestManageUserQuotaMiddlewareKeepsOneOperationPerRequest(t *testing.T) {
 }
 
 func TestManageUserQuotaConcurrentSnapshots(t *testing.T) {
-	db := setupManageUserTestDB(t)
+	db := setupManageUserTestDBWithOptions(t, manageUserTestDBOptions{deferredSQLite: true})
 	user := model.User{Username: "concurrent-quota", Quota: 1000}
 	require.NoError(t, db.Create(&user).Error)
 	var ready sync.WaitGroup
