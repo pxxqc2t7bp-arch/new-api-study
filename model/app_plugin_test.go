@@ -1527,6 +1527,30 @@ func TestAppPluginSQLiteEagerTransactionMatchesDriverCasePolicy(t *testing.T) {
 	}
 }
 
+func TestAppPluginWaitForDBInUseRejectsWrapperEntryOnly(t *testing.T) {
+	t.Setenv("APP_PLUGIN_TEST_DIALECT", "sqlite")
+	t.Setenv("APP_PLUGIN_TEST_DSN", "")
+	db := openAppPluginModelDB(t)
+	pool, err := db.DB()
+	require.NoError(t, err)
+
+	held, err := pool.Conn(context.Background())
+	require.NoError(t, err)
+	defer held.Close()
+	require.Equal(t, 1, pool.Stats().InUse)
+
+	wrapperEntered := make(chan struct{}, 1)
+	wrapperEntered <- struct{}{}
+	<-wrapperEntered
+
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelWait()
+	err = appPluginWaitForDBInUse(waitCtx, pool, 2)
+	require.ErrorIs(t, err, context.DeadlineExceeded,
+		"wrapper entry alone must not prove that a second database/sql connection is in use")
+	assert.Contains(t, err.Error(), "InUse >= 2 (last InUse=1)")
+}
+
 func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 	db := openAppPluginModelDB(t)
 	logAppPluginDBVersion(t, db)
@@ -2270,8 +2294,11 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 			require.NoError(t, err)
 		}
 		upgradeDB := db
+		var eagerSQLitePool *sql.DB
 		switch {
 		case db.Dialector.Name() == "sqlite" && eagerSQLiteFixture:
+			eagerSQLitePool, err = db.DB()
+			require.NoError(t, err)
 			beginner, ok := db.Statement.ConnPool.(gorm.TxBeginner)
 			require.True(t, ok)
 			observer := &appPluginTxBeginObserver{
@@ -2413,6 +2440,9 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 				case <-waiterAttempted:
 				case <-barrierCtx.Done():
 					t.Fatalf("different-version SQLite waiter did not attempt transaction begin while the first transaction was held: %v", barrierCtx.Err())
+				}
+				if waitErr := appPluginWaitForDBInUse(barrierCtx, eagerSQLitePool, 2); waitErr != nil {
+					t.Fatalf("different-version SQLite waiter did not check out a second database/sql connection while the first transaction was held: %v", waitErr)
 				}
 			} else {
 				runUpgrade("3.0.0")
@@ -2605,6 +2635,29 @@ type appPluginTxBeginObserver struct {
 
 func (observer *appPluginTxBeginObserver) BeginTx(ctx context.Context, options *sql.TxOptions) (*sql.Tx, error) {
 	return observer.beginTx(ctx, options)
+}
+
+func appPluginWaitForDBInUse(ctx context.Context, pool *sql.DB, minimum int) error {
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		stats := pool.Stats()
+		if stats.InUse >= minimum {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			stats = pool.Stats()
+			if stats.InUse >= minimum {
+				return nil
+			}
+			return fmt.Errorf(
+				"database/sql pool did not reach InUse >= %d (last InUse=%d): %w",
+				minimum, stats.InUse, ctx.Err(),
+			)
+		case <-ticker.C:
+		}
+	}
 }
 
 func logAppPluginDBVersion(t *testing.T, db *gorm.DB) {
