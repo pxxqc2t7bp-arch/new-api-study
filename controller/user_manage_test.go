@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -42,10 +43,27 @@ func setupManageUserTestDB(t *testing.T) *gorm.DB {
 	}
 	require.Contains(t, databaseTypes, dialect)
 	dsn := os.Getenv("TEST_" + strings.ToUpper(dialect) + "_DSN")
+	defaultSQLiteDSN := dsn == "" && dialect == "sqlite"
+	newDeferredSQLiteDSN := func() string {
+		databaseURL := url.URL{Scheme: "file", Path: t.TempDir() + "/manage-user.db"}
+		query := databaseURL.Query()
+		query.Add("_pragma", "busy_timeout(30000)")
+		query.Add("_pragma", "journal_mode(WAL)")
+		databaseURL.RawQuery = query.Encode()
+		return databaseURL.String()
+	}
+	if defaultSQLiteDSN {
+		// Deferred BEGIN lets both quota workers reach the pre-query barrier.
+		dsn = newDeferredSQLiteDSN()
+	}
 	db, _ := newAuditTestDatabase(t, dialect, dsn)
 	logDB := db
 	if os.Getenv("TEST_MANAGE_USER_SEPARATE_LOG_DB") == "1" {
-		logDB, _ = newAuditTestDatabase(t, dialect, dsn)
+		logDSN := dsn
+		if defaultSQLiteDSN {
+			logDSN = newDeferredSQLiteDSN()
+		}
+		logDB, _ = newAuditTestDatabase(t, dialect, logDSN)
 	}
 	model.DB, model.LOG_DB = db, logDB
 	common.RedisEnabled = false

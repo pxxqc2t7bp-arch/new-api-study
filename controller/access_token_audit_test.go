@@ -454,17 +454,19 @@ func (releasedAuditLog) TableName() string { return "logs" }
 func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 	t.Helper()
 	if kind == "sqlite" {
-		path := t.TempDir() + "/audit.db"
-		databaseURL := url.URL{Scheme: "file", Path: path}
-		query := databaseURL.Query()
-		query.Add("_pragma", "busy_timeout(30000)")
-		query.Add("_pragma", "journal_mode(WAL)")
-		query.Set("_txlock", "immediate")
-		databaseURL.RawQuery = query.Encode()
-		isolatedDSN := databaseURL.String()
-		db, err := gorm.Open(sqlite.Open(isolatedDSN), &gorm.Config{})
+		if dsn == "" {
+			path := t.TempDir() + "/audit.db"
+			databaseURL := url.URL{Scheme: "file", Path: path}
+			query := databaseURL.Query()
+			query.Add("_pragma", "busy_timeout(30000)")
+			query.Add("_pragma", "journal_mode(WAL)")
+			query.Set("_txlock", "immediate")
+			databaseURL.RawQuery = query.Encode()
+			dsn = databaseURL.String()
+		}
+		db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 		require.NoError(t, err)
-		return db, isolatedDSN
+		return db, dsn
 	}
 	require.NotEmpty(t, dsn)
 	name := fmt.Sprintf("newapi_audit_%d", time.Now().UnixNano())
