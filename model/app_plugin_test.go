@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/url"
@@ -1374,22 +1375,40 @@ func TestOpenAppPluginModelDBExplicitSQLiteTemplateIsPrivate(t *testing.T) {
 func TestOpenAppPluginModelDBLocalSQLitePathTemplateIsPrivate(t *testing.T) {
 	tests := []struct {
 		name     string
+		windows  bool
 		rawQuery string
 	}{
-		{name: "without query"},
+		{name: "unix without query"},
 		{
-			name:     "with query",
+			name:     "unix with query",
+			rawQuery: "_pragma=busy_timeout%2830000%29&_pragma=journal_mode%28WAL%29&_txlock=immediate",
+		},
+		{name: "windows drive without query", windows: true},
+		{
+			name:     "windows drive with query",
+			windows:  true,
 			rawQuery: "_pragma=busy_timeout%2830000%29&_pragma=journal_mode%28WAL%29&_txlock=immediate",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Setenv("APP_PLUGIN_TEST_DIALECT", "sqlite")
+			templatePath := filepath.Join(t.TempDir(), "template.sqlite")
+			if test.windows {
+				templatePath = `C:\tmp\template.sqlite`
+			}
 			templateURL := url.URL{
-				Path:     filepath.Join(t.TempDir(), "template.sqlite"),
+				Path:     templatePath,
 				RawQuery: test.rawQuery,
 			}
-			t.Setenv("APP_PLUGIN_TEST_DSN", templateURL.String())
+			template := templateURL.String()
+			if test.windows {
+				template = templatePath
+				if test.rawQuery != "" {
+					template += "?" + test.rawQuery
+				}
+			}
+			t.Setenv("APP_PLUGIN_TEST_DSN", template)
 
 			first := openAppPluginModelDB(t)
 			second := openAppPluginModelDB(t)
@@ -1422,6 +1441,23 @@ func TestOpenAppPluginModelDBLocalSQLitePathTemplateIsPrivate(t *testing.T) {
 	}
 }
 
+func TestOpenAppPluginModelDBClosesSQLitePool(t *testing.T) {
+	var pool *sql.DB
+	t.Run("fixture owner", func(t *testing.T) {
+		t.Setenv("APP_PLUGIN_TEST_DIALECT", "sqlite")
+		t.Setenv("APP_PLUGIN_TEST_DSN", "")
+		db := openAppPluginModelDB(t)
+		var err error
+		pool, err = db.DB()
+		require.NoError(t, err)
+		require.NoError(t, pool.Ping())
+	})
+
+	require.NotNil(t, pool)
+	require.Error(t, pool.Ping())
+	assert.Zero(t, pool.Stats().OpenConnections)
+}
+
 func TestAppPluginSQLiteDSNRejectsUnsafeTemplates(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1433,6 +1469,10 @@ func TestAppPluginSQLiteDSNRejectsUnsafeTemplates(t *testing.T) {
 		{name: "fragment", dsn: "file:/tmp/app_plugin.sqlite#fragment"},
 		{name: "opaque URI", dsn: "file:app_plugin.sqlite"},
 		{name: "empty path", dsn: "file:"},
+		{name: "backslash UNC path", dsn: `\\server\share\app_plugin.sqlite`},
+		{name: "slash UNC path", dsn: "//server/share/app_plugin.sqlite"},
+		{name: "drive-relative path", dsn: `C:app_plugin.sqlite`},
+		{name: "relative path", dsn: "app_plugin.sqlite"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -2375,6 +2415,12 @@ func openAppPluginModelDB(t *testing.T) *gorm.DB {
 		dsn, err = appPluginSQLiteDSN(t, dsn)
 		require.NoError(t, err)
 		db, err = gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+		require.NoError(t, err)
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = sqlDB.Close()
+		})
 	case "mysql":
 		common.SetMainDatabaseType(common.DatabaseTypeMySQL)
 		require.NotEmpty(t, dsn, "APP_PLUGIN_TEST_DSN is required for mysql")
@@ -2392,40 +2438,69 @@ func openAppPluginModelDB(t *testing.T) *gorm.DB {
 
 func appPluginSQLiteDSN(t *testing.T, template string) (string, error) {
 	t.Helper()
+	var sqliteURL *url.URL
 	if template == "" {
-		sqliteURL := url.URL{
-			Scheme: "file",
-			Path:   filepath.Join(t.TempDir(), "app_plugin.sqlite"),
+		sqliteURL = &url.URL{
+			RawQuery: url.Values{
+				"_pragma": {"busy_timeout(30000)", "journal_mode(WAL)"},
+				"_txlock": {"immediate"},
+			}.Encode(),
 		}
-		sqliteURL.RawQuery = url.Values{
-			"_pragma": {"busy_timeout(30000)", "journal_mode(WAL)"},
-			"_txlock": {"immediate"},
-		}.Encode()
-		return sqliteURL.String(), nil
+	} else {
+		templatePath, rawQuery, hasQuery := strings.Cut(template, "?")
+		if appPluginWindowsDriveAbsolute(templatePath) {
+			queryURL, err := url.Parse("file:/fixture?" + rawQuery)
+			if err != nil {
+				return "", fmt.Errorf("parse APP_PLUGIN_TEST_DSN: %w", err)
+			}
+			if strings.Contains(templatePath, "#") || queryURL.Fragment != "" {
+				return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not contain a fragment")
+			}
+			sqliteURL = &url.URL{
+				Path:       templatePath,
+				RawQuery:   rawQuery,
+				ForceQuery: hasQuery && rawQuery == "",
+			}
+		} else {
+			var err error
+			sqliteURL, err = url.Parse(template)
+			if err != nil {
+				return "", fmt.Errorf("parse APP_PLUGIN_TEST_DSN: %w", err)
+			}
+		}
+		switch {
+		case sqliteURL.Scheme != "" && sqliteURL.Scheme != "file":
+			return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must use a file URI")
+		case sqliteURL.Host != "":
+			return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not contain an authority")
+		case sqliteURL.User != nil:
+			return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not contain user info")
+		case sqliteURL.Fragment != "":
+			return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not contain a fragment")
+		case sqliteURL.Opaque != "":
+			return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not be opaque")
+		case sqliteURL.Path == "":
+			return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must contain a path")
+		case !appPluginWindowsDriveAbsolute(sqliteURL.Path) && !strings.HasPrefix(sqliteURL.Path, "/"):
+			return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must contain an absolute path")
+		}
 	}
 
-	sqliteURL, err := url.Parse(template)
-	if err != nil {
-		return "", fmt.Errorf("parse APP_PLUGIN_TEST_DSN: %w", err)
-	}
-	switch {
-	case sqliteURL.Scheme != "" && sqliteURL.Scheme != "file":
-		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must use a file URI")
-	case sqliteURL.Host != "":
-		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not contain an authority")
-	case sqliteURL.User != nil:
-		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not contain user info")
-	case sqliteURL.Fragment != "":
-		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not contain a fragment")
-	case sqliteURL.Opaque != "":
-		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not be opaque")
-	case sqliteURL.Path == "":
-		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must contain a path")
+	fixturePath := filepath.ToSlash(filepath.Join(t.TempDir(), "app_plugin.sqlite"))
+	if appPluginWindowsDriveAbsolute(fixturePath) {
+		fixturePath = "/" + fixturePath
 	}
 	sqliteURL.Scheme = "file"
-	sqliteURL.Path = filepath.Join(t.TempDir(), "app_plugin.sqlite")
+	sqliteURL.Path = fixturePath
 	sqliteURL.RawPath = ""
 	return sqliteURL.String(), nil
+}
+
+func appPluginWindowsDriveAbsolute(path string) bool {
+	if len(path) < 3 || path[1] != ':' || (path[2] != '/' && path[2] != '\\') {
+		return false
+	}
+	return path[0] >= 'A' && path[0] <= 'Z' || path[0] >= 'a' && path[0] <= 'z'
 }
 
 func appPluginSQLiteImmediate(dsn string) (bool, error) {

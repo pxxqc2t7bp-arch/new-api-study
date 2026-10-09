@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -453,28 +455,55 @@ func (releasedAuditLog) TableName() string { return "logs" }
 // instance. They never drop databases or tables supplied through an environment variable.
 func newAuditSQLiteDSN(t *testing.T, dsn string) string {
 	t.Helper()
+	var databaseURL *url.URL
 	if dsn == "" {
-		databaseURL := url.URL{Scheme: "file", Path: t.TempDir() + "/audit.db"}
+		databaseURL = &url.URL{}
 		query := databaseURL.Query()
 		query.Add("_pragma", "busy_timeout(30000)")
 		query.Add("_pragma", "journal_mode(WAL)")
 		query.Set("_txlock", "immediate")
 		databaseURL.RawQuery = query.Encode()
-		return databaseURL.String()
+	} else {
+		templatePath, rawQuery, hasQuery := strings.Cut(dsn, "?")
+		if auditWindowsDriveAbsolute(templatePath) {
+			queryURL, err := url.Parse("file:/fixture?" + rawQuery)
+			require.NoError(t, err)
+			require.NotContains(t, templatePath, "#")
+			require.Empty(t, queryURL.Fragment)
+			databaseURL = &url.URL{
+				Path:       templatePath,
+				RawQuery:   rawQuery,
+				ForceQuery: hasQuery && rawQuery == "",
+			}
+		} else {
+			var err error
+			databaseURL, err = url.Parse(dsn)
+			require.NoError(t, err)
+		}
+		require.True(t, databaseURL.Scheme == "" || databaseURL.Scheme == "file")
+		require.Empty(t, databaseURL.Opaque)
+		require.Empty(t, databaseURL.Host)
+		require.Nil(t, databaseURL.User)
+		require.Empty(t, databaseURL.Fragment)
+		require.NotEmpty(t, databaseURL.Path)
+		require.True(t, auditWindowsDriveAbsolute(databaseURL.Path) || strings.HasPrefix(databaseURL.Path, "/"))
 	}
 
-	databaseURL, err := url.Parse(dsn)
-	require.NoError(t, err)
-	require.True(t, databaseURL.Scheme == "" || databaseURL.Scheme == "file")
-	require.Empty(t, databaseURL.Opaque)
-	require.Empty(t, databaseURL.Host)
-	require.Nil(t, databaseURL.User)
-	require.Empty(t, databaseURL.Fragment)
-	require.NotEmpty(t, databaseURL.Path)
+	fixturePath := filepath.ToSlash(filepath.Join(t.TempDir(), "audit.db"))
+	if auditWindowsDriveAbsolute(fixturePath) {
+		fixturePath = "/" + fixturePath
+	}
 	databaseURL.Scheme = "file"
-	databaseURL.Path = t.TempDir() + "/audit.db"
+	databaseURL.Path = fixturePath
 	databaseURL.RawPath = ""
 	return databaseURL.String()
+}
+
+func auditWindowsDriveAbsolute(path string) bool {
+	if len(path) < 3 || path[1] != ':' || (path[2] != '/' && path[2] != '\\') {
+		return false
+	}
+	return path[0] >= 'A' && path[0] <= 'Z' || path[0] >= 'a' && path[0] <= 'z'
 }
 
 func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
@@ -483,6 +512,11 @@ func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 		dsn = newAuditSQLiteDSN(t, dsn)
 		db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 		require.NoError(t, err)
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_ = sqlDB.Close()
+		})
 		return db, dsn
 	}
 	require.NotEmpty(t, dsn)
@@ -581,13 +615,19 @@ func TestNewAuditTestDatabaseSQLiteIsolatesExplicitTemplates(t *testing.T) {
 func TestNewAuditTestDatabaseSQLiteIsolatesPathTemplates(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
+		windows  bool
 		rawQuery string
 	}{
-		{name: "without query"},
-		{name: "with query", rawQuery: "_pragma=busy_timeout%2812345%29&_pragma=journal_mode%28WAL%29&_txlock=deferred"},
+		{name: "unix without query"},
+		{name: "unix with query", rawQuery: "_pragma=busy_timeout%2812345%29&_pragma=journal_mode%28WAL%29&_txlock=deferred"},
+		{name: "windows drive without query", windows: true},
+		{name: "windows drive with query", windows: true, rawQuery: "_pragma=busy_timeout%2812345%29&_pragma=journal_mode%28WAL%29&_txlock=deferred"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			templatePath := t.TempDir() + "/shared-audit.db"
+			if tc.windows {
+				templatePath = `C:\tmp\shared-audit.db`
+			}
 			template := templatePath
 			if tc.rawQuery != "" {
 				template += "?" + tc.rawQuery
@@ -615,6 +655,21 @@ func TestNewAuditTestDatabaseSQLiteIsolatesPathTemplates(t *testing.T) {
 			assert.Zero(t, markerTables)
 		})
 	}
+}
+
+func TestNewAuditTestDatabaseClosesSQLitePool(t *testing.T) {
+	var pool *sql.DB
+	t.Run("fixture owner", func(t *testing.T) {
+		db, _ := newAuditTestDatabase(t, "sqlite", "")
+		var err error
+		pool, err = db.DB()
+		require.NoError(t, err)
+		require.NoError(t, pool.Ping())
+	})
+
+	require.NotNil(t, pool)
+	require.Error(t, pool.Ping())
+	assert.Zero(t, pool.Stats().OpenConnections)
 }
 
 func verifyAuditRoleStorage(t *testing.T) {
