@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1273,6 +1274,67 @@ func TestAppInstallRouteCollisionIsAtomic(t *testing.T) {
 	})
 }
 
+func TestOpenAppPluginModelDBDefaultSQLiteConfiguration(t *testing.T) {
+	t.Setenv("APP_PLUGIN_TEST_DIALECT", "sqlite")
+	t.Setenv("APP_PLUGIN_TEST_DSN", "")
+
+	db := openAppPluginModelDB(t)
+	var busyTimeout int
+	require.NoError(t, db.Raw("PRAGMA busy_timeout").Scan(&busyTimeout).Error)
+	require.Equal(t, 30000, busyTimeout)
+	var journalMode string
+	require.NoError(t, db.Raw("PRAGMA journal_mode").Scan(&journalMode).Error)
+	require.Equal(t, "wal", journalMode)
+
+	require.NoError(t, MigrateAppPluginTables(db))
+	seedAppPluginModelPolicy(t, db, "policy-basic")
+	req := appPluginModelInstallRequest("fixture-concurrent-cas", "1.0.0", "https://apps.example.com/fixture-concurrent-cas/")
+	installation, err := InstallAppVersion(
+		context.Background(),
+		db,
+		AppIdempotencyScope{ActorID: 30, Key: "fixture-concurrent-cas"},
+		req,
+	)
+	require.NoError(t, err)
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, target := range []string{AppInstallationStatusEnabled, AppInstallationStatusRevoked} {
+		wg.Add(1)
+		go func(next string) {
+			defer wg.Done()
+			<-start
+			_, updateErr := CompareAndSwapAppInstallationStatus(
+				context.Background(),
+				db,
+				installation.InstallationID,
+				installation.Revision,
+				next,
+			)
+			errs <- updateErr
+		}(target)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	successes := 0
+	conflicts := 0
+	for updateErr := range errs {
+		switch {
+		case updateErr == nil:
+			successes++
+		case errors.Is(updateErr, ErrAppInstallationRevisionConflict), errors.Is(updateErr, ErrAppInstallationRevoked):
+			conflicts++
+		default:
+			require.NoError(t, updateErr)
+		}
+	}
+	require.Equal(t, 1, successes)
+	require.Equal(t, 1, conflicts)
+}
+
 func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 	db := openAppPluginModelDB(t)
 	logAppPluginDBVersion(t, db)
@@ -2008,7 +2070,8 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		}
 		defer release()
 
-		if db.Dialector.Name() == "sqlite" {
+		defaultSQLiteFixture := db.Dialector.Name() == "sqlite" && os.Getenv("APP_PLUGIN_TEST_DSN") == ""
+		if db.Dialector.Name() == "sqlite" && !defaultSQLiteFixture {
 			const callbackName = "test:app_plugin_different_version_sqlite_start"
 			workersReady := make(chan struct{}, 2)
 			var coordinated sync.Map
@@ -2105,11 +2168,13 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		if db.Dialector.Name() == "sqlite" {
 			runUpgrade("2.0.0")
 			runUpgrade("3.0.0")
-			for range 2 {
-				select {
-				case <-holderReady:
-				case <-barrierCtx.Done():
-					t.Fatalf("different-version SQLite workers did not reach the start barrier: %v", barrierCtx.Err())
+			if !defaultSQLiteFixture {
+				for range 2 {
+					select {
+					case <-holderReady:
+					case <-barrierCtx.Done():
+						t.Fatalf("different-version SQLite workers did not reach the start barrier: %v", barrierCtx.Err())
+					}
 				}
 			}
 		} else {
@@ -2174,7 +2239,15 @@ func openAppPluginModelDB(t *testing.T) *gorm.DB {
 	case "sqlite":
 		common.SetMainDatabaseType(common.DatabaseTypeSQLite)
 		if dsn == "" {
-			dsn = filepath.Join(t.TempDir(), "app_plugin.sqlite")
+			sqliteURL := url.URL{
+				Scheme: "file",
+				Path:   filepath.Join(t.TempDir(), "app_plugin.sqlite"),
+			}
+			sqliteURL.RawQuery = url.Values{
+				"_pragma": {"busy_timeout(30000)", "journal_mode(WAL)"},
+				"_txlock": {"immediate"},
+			}.Encode()
+			dsn = sqliteURL.String()
 		}
 		db, err = gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	case "mysql":
