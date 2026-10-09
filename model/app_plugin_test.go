@@ -1371,6 +1371,57 @@ func TestOpenAppPluginModelDBExplicitSQLiteTemplateIsPrivate(t *testing.T) {
 	assert.Zero(t, secondTableCount)
 }
 
+func TestOpenAppPluginModelDBLocalSQLitePathTemplateIsPrivate(t *testing.T) {
+	tests := []struct {
+		name     string
+		rawQuery string
+	}{
+		{name: "without query"},
+		{
+			name:     "with query",
+			rawQuery: "_pragma=busy_timeout%2830000%29&_pragma=journal_mode%28WAL%29&_txlock=immediate",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("APP_PLUGIN_TEST_DIALECT", "sqlite")
+			templateURL := url.URL{
+				Path:     filepath.Join(t.TempDir(), "template.sqlite"),
+				RawQuery: test.rawQuery,
+			}
+			t.Setenv("APP_PLUGIN_TEST_DSN", templateURL.String())
+
+			first := openAppPluginModelDB(t)
+			second := openAppPluginModelDB(t)
+			firstDialector, ok := first.Dialector.(*sqlite.Dialector)
+			require.True(t, ok)
+			secondDialector, ok := second.Dialector.(*sqlite.Dialector)
+			require.True(t, ok)
+			firstURL, err := url.Parse(firstDialector.DSN)
+			require.NoError(t, err)
+			secondURL, err := url.Parse(secondDialector.DSN)
+			require.NoError(t, err)
+
+			assert.Equal(t, "file", firstURL.Scheme)
+			assert.Equal(t, "file", secondURL.Scheme)
+			assert.Equal(t, templateURL.RawQuery, firstURL.RawQuery)
+			assert.Equal(t, templateURL.RawQuery, secondURL.RawQuery)
+			assert.NotEqual(t, templateURL.Path, firstURL.Path)
+			assert.NotEqual(t, templateURL.Path, secondURL.Path)
+			assert.NotEqual(t, firstURL.Path, secondURL.Path)
+
+			require.NoError(t, first.Exec("CREATE TABLE app_plugin_local_path_isolation (value TEXT NOT NULL)").Error)
+			require.NoError(t, first.Exec("INSERT INTO app_plugin_local_path_isolation (value) VALUES (?)", "first").Error)
+			var secondTableCount int64
+			require.NoError(t, second.Raw(
+				"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+				"app_plugin_local_path_isolation",
+			).Scan(&secondTableCount).Error)
+			assert.Zero(t, secondTableCount)
+		})
+	}
+}
+
 func TestAppPluginSQLiteDSNRejectsUnsafeTemplates(t *testing.T) {
 	tests := []struct {
 		name string
@@ -2358,7 +2409,7 @@ func appPluginSQLiteDSN(t *testing.T, template string) (string, error) {
 		return "", fmt.Errorf("parse APP_PLUGIN_TEST_DSN: %w", err)
 	}
 	switch {
-	case sqliteURL.Scheme != "file":
+	case sqliteURL.Scheme != "" && sqliteURL.Scheme != "file":
 		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must use a file URI")
 	case sqliteURL.Host != "":
 		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not contain an authority")
@@ -2371,6 +2422,7 @@ func appPluginSQLiteDSN(t *testing.T, template string) (string, error) {
 	case sqliteURL.Path == "":
 		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must contain a path")
 	}
+	sqliteURL.Scheme = "file"
 	sqliteURL.Path = filepath.Join(t.TempDir(), "app_plugin.sqlite")
 	sqliteURL.RawPath = ""
 	return sqliteURL.String(), nil
