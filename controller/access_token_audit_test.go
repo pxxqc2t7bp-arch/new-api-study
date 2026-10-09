@@ -465,13 +465,15 @@ func newAuditSQLiteDSN(t *testing.T, dsn string) string {
 
 	databaseURL, err := url.Parse(dsn)
 	require.NoError(t, err)
-	require.Equal(t, "file", databaseURL.Scheme)
+	require.True(t, databaseURL.Scheme == "" || databaseURL.Scheme == "file")
 	require.Empty(t, databaseURL.Opaque)
 	require.Empty(t, databaseURL.Host)
 	require.Nil(t, databaseURL.User)
 	require.Empty(t, databaseURL.Fragment)
 	require.NotEmpty(t, databaseURL.Path)
+	databaseURL.Scheme = "file"
 	databaseURL.Path = t.TempDir() + "/audit.db"
+	databaseURL.RawPath = ""
 	return databaseURL.String()
 }
 
@@ -574,6 +576,45 @@ func TestNewAuditTestDatabaseSQLiteIsolatesExplicitTemplates(t *testing.T) {
 		"table", "audit_fixture_marker",
 	).Scan(&markerTables).Error)
 	assert.Zero(t, markerTables)
+}
+
+func TestNewAuditTestDatabaseSQLiteIsolatesPathTemplates(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rawQuery string
+	}{
+		{name: "without query"},
+		{name: "with query", rawQuery: "_pragma=busy_timeout%2812345%29&_pragma=journal_mode%28WAL%29&_txlock=deferred"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			templatePath := t.TempDir() + "/shared-audit.db"
+			template := templatePath
+			if tc.rawQuery != "" {
+				template += "?" + tc.rawQuery
+			}
+
+			firstDB, firstDSN := newAuditTestDatabase(t, "sqlite", template)
+			secondDB, secondDSN := newAuditTestDatabase(t, "sqlite", template)
+
+			require.NotEqual(t, firstDSN, secondDSN)
+			for _, isolatedDSN := range []string{firstDSN, secondDSN} {
+				parsed, err := url.Parse(isolatedDSN)
+				require.NoError(t, err)
+				assert.Equal(t, "file", parsed.Scheme)
+				assert.Equal(t, tc.rawQuery, parsed.RawQuery)
+				assert.True(t, strings.HasSuffix(parsed.Path, "/audit.db"))
+				assert.NotEqual(t, templatePath, parsed.Path)
+			}
+
+			require.NoError(t, firstDB.Exec("CREATE TABLE audit_fixture_marker (id INTEGER PRIMARY KEY)").Error)
+			var markerTables int64
+			require.NoError(t, secondDB.Raw(
+				"SELECT COUNT(*) FROM sqlite_master WHERE type = ? AND name = ?",
+				"table", "audit_fixture_marker",
+			).Scan(&markerTables).Error)
+			assert.Zero(t, markerTables)
+		})
+	}
 }
 
 func verifyAuditRoleStorage(t *testing.T) {
