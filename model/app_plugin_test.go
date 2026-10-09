@@ -1335,6 +1335,83 @@ func TestOpenAppPluginModelDBDefaultSQLiteConfiguration(t *testing.T) {
 	require.Equal(t, 1, conflicts)
 }
 
+func TestOpenAppPluginModelDBExplicitSQLiteTemplateIsPrivate(t *testing.T) {
+	t.Setenv("APP_PLUGIN_TEST_DIALECT", "sqlite")
+	templateURL := url.URL{
+		Scheme:   "file",
+		Path:     filepath.Join(t.TempDir(), "template.sqlite"),
+		RawQuery: "_pragma=busy_timeout%2830000%29&_pragma=journal_mode%28WAL%29&_txlock=immediate",
+	}
+	t.Setenv("APP_PLUGIN_TEST_DSN", templateURL.String())
+
+	first := openAppPluginModelDB(t)
+	second := openAppPluginModelDB(t)
+	firstDialector, ok := first.Dialector.(*sqlite.Dialector)
+	require.True(t, ok)
+	secondDialector, ok := second.Dialector.(*sqlite.Dialector)
+	require.True(t, ok)
+	firstURL, err := url.Parse(firstDialector.DSN)
+	require.NoError(t, err)
+	secondURL, err := url.Parse(secondDialector.DSN)
+	require.NoError(t, err)
+
+	assert.Equal(t, templateURL.RawQuery, firstURL.RawQuery)
+	assert.Equal(t, templateURL.RawQuery, secondURL.RawQuery)
+	assert.NotEqual(t, templateURL.Path, firstURL.Path)
+	assert.NotEqual(t, templateURL.Path, secondURL.Path)
+	assert.NotEqual(t, firstURL.Path, secondURL.Path)
+
+	require.NoError(t, first.Exec("CREATE TABLE app_plugin_fixture_isolation (value TEXT NOT NULL)").Error)
+	require.NoError(t, first.Exec("INSERT INTO app_plugin_fixture_isolation (value) VALUES (?)", "first").Error)
+	var secondTableCount int64
+	require.NoError(t, second.Raw(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+		"app_plugin_fixture_isolation",
+	).Scan(&secondTableCount).Error)
+	assert.Zero(t, secondTableCount)
+}
+
+func TestAppPluginSQLiteDSNRejectsUnsafeTemplates(t *testing.T) {
+	tests := []struct {
+		name string
+		dsn  string
+	}{
+		{name: "non-file scheme", dsn: "https:///tmp/app_plugin.sqlite"},
+		{name: "authority", dsn: "file://localhost/tmp/app_plugin.sqlite"},
+		{name: "user info", dsn: "file://user@localhost/tmp/app_plugin.sqlite"},
+		{name: "fragment", dsn: "file:/tmp/app_plugin.sqlite#fragment"},
+		{name: "opaque URI", dsn: "file:app_plugin.sqlite"},
+		{name: "empty path", dsn: "file:"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := appPluginSQLiteDSN(t, test.dsn)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestAppPluginSQLiteImmediateMatchesDriverCasePolicy(t *testing.T) {
+	tests := []struct {
+		name      string
+		rawQuery  string
+		immediate bool
+	}{
+		{name: "lowercase", rawQuery: "_txlock=immediate", immediate: true},
+		{name: "uppercase value", rawQuery: "_txlock=IMMEDIATE", immediate: true},
+		{name: "mixed-case value", rawQuery: "_txlock=Immediate", immediate: true},
+		{name: "deferred", rawQuery: "_txlock=deferred", immediate: false},
+		{name: "case-sensitive key", rawQuery: "_TXLOCK=immediate", immediate: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			immediate, err := appPluginSQLiteImmediate("file:/tmp/app_plugin.sqlite?" + test.rawQuery)
+			require.NoError(t, err)
+			assert.Equal(t, test.immediate, immediate)
+		})
+	}
+}
+
 func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 	db := openAppPluginModelDB(t)
 	logAppPluginDBVersion(t, db)
@@ -2070,8 +2147,14 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		}
 		defer release()
 
-		defaultSQLiteFixture := db.Dialector.Name() == "sqlite" && os.Getenv("APP_PLUGIN_TEST_DSN") == ""
-		if db.Dialector.Name() == "sqlite" && !defaultSQLiteFixture {
+		immediateSQLiteFixture := false
+		if db.Dialector.Name() == "sqlite" {
+			dialector, ok := db.Dialector.(*sqlite.Dialector)
+			require.True(t, ok)
+			immediateSQLiteFixture, err = appPluginSQLiteImmediate(dialector.DSN)
+			require.NoError(t, err)
+		}
+		if db.Dialector.Name() == "sqlite" && !immediateSQLiteFixture {
 			const callbackName = "test:app_plugin_different_version_sqlite_start"
 			workersReady := make(chan struct{}, 2)
 			var coordinated sync.Map
@@ -2168,7 +2251,7 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		if db.Dialector.Name() == "sqlite" {
 			runUpgrade("2.0.0")
 			runUpgrade("3.0.0")
-			if !defaultSQLiteFixture {
+			if !immediateSQLiteFixture {
 				for range 2 {
 					select {
 					case <-holderReady:
@@ -2238,17 +2321,8 @@ func openAppPluginModelDB(t *testing.T) *gorm.DB {
 	switch dialect {
 	case "sqlite":
 		common.SetMainDatabaseType(common.DatabaseTypeSQLite)
-		if dsn == "" {
-			sqliteURL := url.URL{
-				Scheme: "file",
-				Path:   filepath.Join(t.TempDir(), "app_plugin.sqlite"),
-			}
-			sqliteURL.RawQuery = url.Values{
-				"_pragma": {"busy_timeout(30000)", "journal_mode(WAL)"},
-				"_txlock": {"immediate"},
-			}.Encode()
-			dsn = sqliteURL.String()
-		}
+		dsn, err = appPluginSQLiteDSN(t, dsn)
+		require.NoError(t, err)
 		db, err = gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	case "mysql":
 		common.SetMainDatabaseType(common.DatabaseTypeMySQL)
@@ -2263,6 +2337,55 @@ func openAppPluginModelDB(t *testing.T) *gorm.DB {
 	}
 	require.NoError(t, err)
 	return db
+}
+
+func appPluginSQLiteDSN(t *testing.T, template string) (string, error) {
+	t.Helper()
+	if template == "" {
+		sqliteURL := url.URL{
+			Scheme: "file",
+			Path:   filepath.Join(t.TempDir(), "app_plugin.sqlite"),
+		}
+		sqliteURL.RawQuery = url.Values{
+			"_pragma": {"busy_timeout(30000)", "journal_mode(WAL)"},
+			"_txlock": {"immediate"},
+		}.Encode()
+		return sqliteURL.String(), nil
+	}
+
+	sqliteURL, err := url.Parse(template)
+	if err != nil {
+		return "", fmt.Errorf("parse APP_PLUGIN_TEST_DSN: %w", err)
+	}
+	switch {
+	case sqliteURL.Scheme != "file":
+		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must use a file URI")
+	case sqliteURL.Host != "":
+		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not contain an authority")
+	case sqliteURL.User != nil:
+		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not contain user info")
+	case sqliteURL.Fragment != "":
+		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not contain a fragment")
+	case sqliteURL.Opaque != "":
+		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must not be opaque")
+	case sqliteURL.Path == "":
+		return "", fmt.Errorf("APP_PLUGIN_TEST_DSN must contain a path")
+	}
+	sqliteURL.Path = filepath.Join(t.TempDir(), "app_plugin.sqlite")
+	sqliteURL.RawPath = ""
+	return sqliteURL.String(), nil
+}
+
+func appPluginSQLiteImmediate(dsn string) (bool, error) {
+	sqliteURL, err := url.Parse(dsn)
+	if err != nil {
+		return false, err
+	}
+	query, err := url.ParseQuery(sqliteURL.RawQuery)
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(query.Get("_txlock"), "immediate"), nil
 }
 
 func logAppPluginDBVersion(t *testing.T, db *gorm.DB) {
