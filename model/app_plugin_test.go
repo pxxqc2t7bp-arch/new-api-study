@@ -1483,23 +1483,26 @@ func TestAppPluginSQLiteDSNRejectsUnsafeTemplates(t *testing.T) {
 	}
 }
 
-func TestAppPluginSQLiteImmediateMatchesDriverCasePolicy(t *testing.T) {
+func TestAppPluginSQLiteEagerTransactionMatchesDriverCasePolicy(t *testing.T) {
 	tests := []struct {
-		name      string
-		rawQuery  string
-		immediate bool
+		name     string
+		rawQuery string
+		eager    bool
 	}{
-		{name: "lowercase", rawQuery: "_txlock=immediate", immediate: true},
-		{name: "uppercase value", rawQuery: "_txlock=IMMEDIATE", immediate: true},
-		{name: "mixed-case value", rawQuery: "_txlock=Immediate", immediate: true},
-		{name: "deferred", rawQuery: "_txlock=deferred", immediate: false},
-		{name: "case-sensitive key", rawQuery: "_TXLOCK=immediate", immediate: false},
+		{name: "lowercase immediate", rawQuery: "_txlock=immediate", eager: true},
+		{name: "uppercase immediate", rawQuery: "_txlock=IMMEDIATE", eager: true},
+		{name: "mixed-case immediate", rawQuery: "_txlock=Immediate", eager: true},
+		{name: "lowercase exclusive", rawQuery: "_txlock=exclusive", eager: true},
+		{name: "mixed-case exclusive", rawQuery: "_txlock=ExClUsIvE", eager: true},
+		{name: "deferred", rawQuery: "_txlock=deferred", eager: false},
+		{name: "missing", rawQuery: "_pragma=busy_timeout%2830000%29", eager: false},
+		{name: "case-sensitive key", rawQuery: "_TXLOCK=immediate", eager: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			immediate, err := appPluginSQLiteImmediate("file:/tmp/app_plugin.sqlite?" + test.rawQuery)
+			eager, err := appPluginSQLiteEagerTransaction("file:/tmp/app_plugin.sqlite?" + test.rawQuery)
 			require.NoError(t, err)
-			assert.Equal(t, test.immediate, immediate)
+			assert.Equal(t, test.eager, eager)
 		})
 	}
 }
@@ -2239,14 +2242,14 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		}
 		defer release()
 
-		immediateSQLiteFixture := false
+		eagerSQLiteFixture := false
 		if db.Dialector.Name() == "sqlite" {
 			dialector, ok := db.Dialector.(*sqlite.Dialector)
 			require.True(t, ok)
-			immediateSQLiteFixture, err = appPluginSQLiteImmediate(dialector.DSN)
+			eagerSQLiteFixture, err = appPluginSQLiteEagerTransaction(dialector.DSN)
 			require.NoError(t, err)
 		}
-		if db.Dialector.Name() == "sqlite" && !immediateSQLiteFixture {
+		if db.Dialector.Name() == "sqlite" && !eagerSQLiteFixture {
 			const callbackName = "test:app_plugin_different_version_sqlite_start"
 			workersReady := make(chan struct{}, 2)
 			var coordinated sync.Map
@@ -2343,7 +2346,7 @@ func TestAppLifecycleCASAndRevokedTerminal(t *testing.T) {
 		if db.Dialector.Name() == "sqlite" {
 			runUpgrade("2.0.0")
 			runUpgrade("3.0.0")
-			if !immediateSQLiteFixture {
+			if !eagerSQLiteFixture {
 				for range 2 {
 					select {
 					case <-holderReady:
@@ -2506,7 +2509,7 @@ func appPluginWindowsDriveAbsolute(path string) bool {
 	return path[0] >= 'A' && path[0] <= 'Z' || path[0] >= 'a' && path[0] <= 'z'
 }
 
-func appPluginSQLiteImmediate(dsn string) (bool, error) {
+func appPluginSQLiteEagerTransaction(dsn string) (bool, error) {
 	sqliteURL, err := url.Parse(dsn)
 	if err != nil {
 		return false, err
@@ -2515,7 +2518,8 @@ func appPluginSQLiteImmediate(dsn string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return strings.EqualFold(query.Get("_txlock"), "immediate"), nil
+	lockMode := query.Get("_txlock")
+	return strings.EqualFold(lockMode, "immediate") || strings.EqualFold(lockMode, "exclusive"), nil
 }
 
 func logAppPluginDBVersion(t *testing.T, db *gorm.DB) {
