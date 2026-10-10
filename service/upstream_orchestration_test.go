@@ -2038,11 +2038,8 @@ func TestManagedRouteRecoveryBackoff(t *testing.T) {
 
 func TestEnqueueStaleManagedRouteProbesUnlimitedSchedulesEveryRoute(t *testing.T) {
 	setupUpstreamOrchestrationTest(t)
-	setting := operation_setting.GetUpstreamOrchestrationSetting()
-	original := *setting
-	setting.CandidateLimit = 0
-	t.Cleanup(func() {
-		*setting = original
+	updateUpstreamOrchestrationForTest(t, func(setting *operation_setting.UpstreamOrchestrationSetting) {
+		setting.CandidateLimit = 0
 	})
 
 	now := time.Unix(1_788_320_000, 0).Unix()
@@ -2127,11 +2124,8 @@ func TestEnqueueStaleManagedRouteProbesUnlimitedSchedulesEveryRoute(t *testing.T
 
 func TestEnqueueStaleManagedRouteProbesPositiveLimitSchedulesOrderedSubset(t *testing.T) {
 	setupUpstreamOrchestrationTest(t)
-	setting := operation_setting.GetUpstreamOrchestrationSetting()
-	original := *setting
-	setting.CandidateLimit = 2
-	t.Cleanup(func() {
-		*setting = original
+	updateUpstreamOrchestrationForTest(t, func(setting *operation_setting.UpstreamOrchestrationSetting) {
+		setting.CandidateLimit = 2
 	})
 
 	now := time.Unix(1_788_320_000, 0).Unix()
