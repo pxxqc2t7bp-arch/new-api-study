@@ -530,6 +530,112 @@ func TestAdaptorConvertsResponsesRequestToOpenAIChatUpstream(t *testing.T) {
 	assert.Equal(t, "/v1/chat/completions", parsedURL.Path)
 }
 
+func TestAdaptorNormalizesNativeArkResponsesHistory(t *testing.T) {
+	adaptor := &Adaptor{}
+	info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
+		Routes: []dto.AdvancedCustomRoute{{
+			IncomingPath: "/v1/responses",
+			UpstreamPath: "/responses",
+			Converter:    relayconvert.ConverterNone,
+		}},
+	})
+	info.RelayFormat = types.RelayFormatOpenAIResponses
+	info.RelayMode = relayconstant.RelayModeResponses
+	info.RequestURLPath = "/v1/responses"
+	info.ChannelBaseUrl = "https://ark.cn-beijing.volces.com/api/v3"
+
+	converted, err := adaptor.ConvertOpenAIResponsesRequest(
+		advancedCustomGinContext("/v1/responses"),
+		info,
+		dto.OpenAIResponsesRequest{
+			Model: "glm-5.3",
+			Input: mustAdvancedCustomRawMessage(t, []map[string]any{
+				{"role": "user", "content": "start"},
+				{
+					"type":      "function_call",
+					"call_id":   "call_1",
+					"name":      "lookup",
+					"arguments": "{}",
+				},
+				{
+					"type":    "function_call_output",
+					"call_id": "call_1",
+					"output":  "result",
+				},
+			}),
+		},
+	)
+	require.NoError(t, err)
+
+	request, ok := converted.(dto.OpenAIResponsesRequest)
+	require.True(t, ok)
+	var items []map[string]any
+	require.NoError(t, common.Unmarshal(request.Input, &items))
+	require.Len(t, items, 3)
+	assert.Equal(t, "message", items[0]["type"])
+	assert.Equal(t, "completed", items[1]["status"])
+	assert.Equal(t, "completed", items[2]["status"])
+}
+
+func TestAdaptorPreservesNativeResponsesHistoryForNonArkUpstream(t *testing.T) {
+	adaptor := &Adaptor{}
+	info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
+		Routes: []dto.AdvancedCustomRoute{{
+			IncomingPath: "/v1/responses",
+			UpstreamPath: "/responses",
+			Converter:    relayconvert.ConverterNone,
+		}},
+	})
+	info.RelayFormat = types.RelayFormatOpenAIResponses
+	info.RelayMode = relayconstant.RelayModeResponses
+	info.RequestURLPath = "/v1/responses"
+	input := mustAdvancedCustomRawMessage(t, []map[string]any{{
+		"role":    "user",
+		"content": "start",
+	}})
+
+	converted, err := adaptor.ConvertOpenAIResponsesRequest(
+		advancedCustomGinContext("/v1/responses"),
+		info,
+		dto.OpenAIResponsesRequest{Model: "gpt-test", Input: input},
+	)
+	require.NoError(t, err)
+
+	request, ok := converted.(dto.OpenAIResponsesRequest)
+	require.True(t, ok)
+	assert.JSONEq(t, string(input), string(request.Input))
+}
+
+func TestIsArkResponsesTargetRequiresExactRegionalHost(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		requestURL string
+		want       bool
+	}{
+		{
+			name:       "regional ark host",
+			requestURL: "https://ark.cn-beijing.volces.com/api/v3/responses",
+			want:       true,
+		},
+		{
+			name:       "nested proxy host",
+			requestURL: "https://ark.proxy.internal.volces.com/responses",
+		},
+		{
+			name:       "lookalike suffix",
+			requestURL: "https://ark.cn-beijing.volces.com.example/responses",
+		},
+		{
+			name:       "non ark host",
+			requestURL: "https://fallback.example/responses",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			assert.Equal(t, testCase.want, isArkResponsesTarget(testCase.requestURL))
+		})
+	}
+}
+
 func TestAdaptorSelectsDuplicateResponsesRoutesByModel(t *testing.T) {
 	config := &dto.AdvancedCustomConfig{
 		Routes: []dto.AdvancedCustomRoute{

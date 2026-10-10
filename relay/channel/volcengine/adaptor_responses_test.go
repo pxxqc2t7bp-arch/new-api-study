@@ -55,3 +55,13 @@ func TestConvertOpenAIResponsesRequestPreservesScalarInput(t *testing.T) {
 	require.True(t, ok)
 	assert.True(t, bytes.Equal(input, request.Input))
 }
+
+func TestConvertOpenAIResponsesRequestReturnsNilOnMalformedInput(t *testing.T) {
+	converted, err := (&Adaptor{}).ConvertOpenAIResponsesRequest(nil, nil, dto.OpenAIResponsesRequest{
+		Model: "glm-5.3",
+		Input: json.RawMessage(`[{"role":"user"}`),
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, converted)
+}

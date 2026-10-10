@@ -328,6 +328,16 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 }
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
+	normalized, err := NormalizeOpenAIResponsesRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	return normalized, nil
+}
+
+// NormalizeOpenAIResponsesRequest applies Ark's stricter requirements to
+// historical Responses input items without changing scalar input.
+func NormalizeOpenAIResponsesRequest(request dto.OpenAIResponsesRequest) (dto.OpenAIResponsesRequest, error) {
 	input := bytes.TrimSpace(request.Input)
 	if len(input) == 0 || input[0] != '[' {
 		return request, nil
@@ -335,7 +345,7 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 
 	var items []json.RawMessage
 	if err := common.Unmarshal(request.Input, &items); err != nil {
-		return nil, fmt.Errorf("failed to parse Volcengine Responses input: %w", err)
+		return dto.OpenAIResponsesRequest{}, fmt.Errorf("failed to parse Volcengine Responses input: %w", err)
 	}
 
 	changed := false
@@ -347,7 +357,7 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 
 		var item map[string]json.RawMessage
 		if err := common.Unmarshal(rawItem, &item); err != nil {
-			return nil, fmt.Errorf("failed to parse Volcengine Responses input item %d: %w", index, err)
+			return dto.OpenAIResponsesRequest{}, fmt.Errorf("failed to parse Volcengine Responses input item %d: %w", index, err)
 		}
 
 		itemChanged := false
@@ -378,7 +388,7 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 		}
 		changedItem, err := common.Marshal(item)
 		if err != nil {
-			return nil, fmt.Errorf("failed to encode Volcengine Responses input item %d: %w", index, err)
+			return dto.OpenAIResponsesRequest{}, fmt.Errorf("failed to encode Volcengine Responses input item %d: %w", index, err)
 		}
 		items[index] = changedItem
 	}
@@ -386,7 +396,7 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 	if changed {
 		normalizedInput, err := common.Marshal(items)
 		if err != nil {
-			return nil, fmt.Errorf("failed to encode Volcengine Responses input: %w", err)
+			return dto.OpenAIResponsesRequest{}, fmt.Errorf("failed to encode Volcengine Responses input: %w", err)
 		}
 		request.Input = normalizedInput
 	}

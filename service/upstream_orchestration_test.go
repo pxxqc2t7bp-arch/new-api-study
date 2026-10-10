@@ -1202,6 +1202,41 @@ func TestSelectUpstreamCandidateGroupsCapsAtFiveWithSourceDiversity(t *testing.T
 	assert.Len(t, sourceIDs, 5)
 }
 
+func TestSelectUpstreamCandidateGroupsUnlimitedReturnsAllSortedCandidates(t *testing.T) {
+	candidates := []upstreamRouteCandidate{
+		{source: model.UpstreamSource{ID: 1, Key: "expensive"}, group: model.UpstreamGroup{SourceID: 1, ExternalID: "expensive", Platform: "openai", EffectiveMultiplier: 0.3}, models: []string{"gpt-test"}},
+		{source: model.UpstreamSource{ID: 2, Key: "cheap"}, group: model.UpstreamGroup{SourceID: 2, ExternalID: "cheap", Platform: "openai", EffectiveMultiplier: 0.1}, models: []string{"gpt-test"}},
+		{source: model.UpstreamSource{ID: 3, Key: "middle"}, group: model.UpstreamGroup{SourceID: 3, ExternalID: "middle", Platform: "openai", EffectiveMultiplier: 0.2}, models: []string{"gpt-test"}},
+	}
+
+	selected := selectUpstreamCandidateGroups(candidates, 0)
+
+	require.Len(t, selected, 3)
+	for index, externalID := range []string{"cheap", "middle", "expensive"} {
+		require.Equal(t, externalID, selected[index].group.ExternalID)
+		require.Equal(t, []string{"gpt-test"}, selected[index].models)
+	}
+}
+
+func TestSelectUpstreamCandidateGroupsNegativeLimitReturnsNone(t *testing.T) {
+	candidates := []upstreamRouteCandidate{
+		{
+			source: model.UpstreamSource{ID: 91, Key: "negative-limit-source"},
+			group: model.UpstreamGroup{
+				SourceID:            91,
+				ExternalID:          "negative-limit-group",
+				Platform:            "openai",
+				EffectiveMultiplier: 0.1,
+			},
+			models: []string{"gpt-negative-limit"},
+		},
+	}
+
+	selected := selectUpstreamCandidateGroups(candidates, -1)
+
+	assert.Nil(t, selected)
+}
+
 func TestSelectUpstreamCandidateGroupsPrunesSharedModelsFromExtraGroups(t *testing.T) {
 	candidates := []upstreamRouteCandidate{
 		{source: model.UpstreamSource{ID: 1, Key: "a"}, group: model.UpstreamGroup{SourceID: 1, ExternalID: "a", Platform: "openai", EffectiveMultiplier: 0.01}, models: []string{"gpt-shared"}},
@@ -1998,6 +2033,164 @@ func TestManagedRouteRecoveryBackoff(t *testing.T) {
 		}
 		assert.GreaterOrEqual(t, stored.NextProbeAt, before+expectedDelay)
 		assert.LessOrEqual(t, stored.NextProbeAt, common.GetTimestamp()+expectedDelay)
+	}
+}
+
+func TestEnqueueStaleManagedRouteProbesUnlimitedSchedulesEveryRoute(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	original := *setting
+	setting.CandidateLimit = 0
+	t.Cleanup(func() {
+		*setting = original
+	})
+
+	now := time.Unix(1_788_320_000, 0).Unix()
+	groupIDs := []string{
+		"unlimited-due-1",
+		"unlimited-due-2",
+		"unlimited-due-3",
+		"unlimited-due-4",
+		"unlimited-due-5",
+		"unlimited-due-6",
+	}
+	routes := make([]model.UpstreamManagedRoute, 0, len(groupIDs)+2)
+	for index, groupID := range groupIDs {
+		routes = append(routes, model.UpstreamManagedRoute{
+			SourceID:        int64(101 + index),
+			ExternalGroupID: groupID,
+			Platform:        "openai",
+			Protocol:        model.UpstreamProtocolOpenAI,
+			ChannelID:       7101 + index,
+			State:           model.UpstreamRouteStateActive,
+			Rank:            index + 1,
+			LastSuccessAt:   now - 120,
+		})
+	}
+	routes = append(routes,
+		model.UpstreamManagedRoute{
+			SourceID:        107,
+			ExternalGroupID: "unlimited-future-probe",
+			Platform:        "openai",
+			Protocol:        model.UpstreamProtocolOpenAI,
+			ChannelID:       7107,
+			State:           model.UpstreamRouteStateActive,
+			Rank:            7,
+			LastSuccessAt:   now - 120,
+			NextProbeAt:     now + 60,
+		},
+		model.UpstreamManagedRoute{
+			SourceID:        108,
+			ExternalGroupID: "unlimited-fresh",
+			Platform:        "openai",
+			Protocol:        model.UpstreamProtocolOpenAI,
+			ChannelID:       7108,
+			State:           model.UpstreamRouteStateActive,
+			Rank:            8,
+			LastSuccessAt:   now,
+			NextProbeAt:     now - 30,
+		},
+	)
+	require.NoError(t, model.DB.Create(&routes).Error)
+	updateCount := 0
+	const callbackName = "test:count-unlimited-managed-route-probe-updates"
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register(callbackName, func(*gorm.DB) {
+		updateCount++
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, model.DB.Callback().Update().Remove(callbackName))
+	})
+	current := &model.UpstreamManagedRoute{
+		SourceID:        199,
+		ExternalGroupID: "unlimited-current",
+		Platform:        "openai",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       7199,
+		State:           model.UpstreamRouteStateActive,
+	}
+
+	enqueueStaleManagedRouteProbes(current, now, 60)
+
+	assert.Equal(t, 1, updateCount)
+	for _, groupID := range groupIDs {
+		var stored model.UpstreamManagedRoute
+		require.NoError(t, model.DB.Where("external_group_id = ?", groupID).First(&stored).Error)
+		assert.Equal(t, now, stored.NextProbeAt)
+	}
+	var futureProbe model.UpstreamManagedRoute
+	require.NoError(t, model.DB.Where("external_group_id = ?", "unlimited-future-probe").First(&futureProbe).Error)
+	assert.Equal(t, now+60, futureProbe.NextProbeAt)
+	var fresh model.UpstreamManagedRoute
+	require.NoError(t, model.DB.Where("external_group_id = ?", "unlimited-fresh").First(&fresh).Error)
+	assert.Equal(t, now-30, fresh.NextProbeAt)
+}
+
+func TestEnqueueStaleManagedRouteProbesPositiveLimitSchedulesOrderedSubset(t *testing.T) {
+	setupUpstreamOrchestrationTest(t)
+	setting := operation_setting.GetUpstreamOrchestrationSetting()
+	original := *setting
+	setting.CandidateLimit = 2
+	t.Cleanup(func() {
+		*setting = original
+	})
+
+	now := time.Unix(1_788_320_000, 0).Unix()
+	routes := []model.UpstreamManagedRoute{
+		{
+			SourceID:        201,
+			ExternalGroupID: "positive-limit-rank-30",
+			Platform:        "openai",
+			Protocol:        model.UpstreamProtocolOpenAI,
+			ChannelID:       7201,
+			State:           model.UpstreamRouteStateActive,
+			Rank:            30,
+			LastSuccessAt:   now - 120,
+			NextProbeAt:     now - 30,
+		},
+		{
+			SourceID:        202,
+			ExternalGroupID: "positive-limit-rank-10",
+			Platform:        "openai",
+			Protocol:        model.UpstreamProtocolOpenAI,
+			ChannelID:       7202,
+			State:           model.UpstreamRouteStateActive,
+			Rank:            10,
+			LastSuccessAt:   now - 120,
+			NextProbeAt:     now - 30,
+		},
+		{
+			SourceID:        203,
+			ExternalGroupID: "positive-limit-rank-20",
+			Platform:        "openai",
+			Protocol:        model.UpstreamProtocolOpenAI,
+			ChannelID:       7203,
+			State:           model.UpstreamRouteStateActive,
+			Rank:            20,
+			LastSuccessAt:   now - 120,
+			NextProbeAt:     now - 30,
+		},
+	}
+	require.NoError(t, model.DB.Create(&routes).Error)
+	current := &model.UpstreamManagedRoute{
+		SourceID:        299,
+		ExternalGroupID: "positive-limit-current",
+		Platform:        "openai",
+		Protocol:        model.UpstreamProtocolOpenAI,
+		ChannelID:       7299,
+		State:           model.UpstreamRouteStateActive,
+	}
+
+	enqueueStaleManagedRouteProbes(current, now, 60)
+
+	expectedNextProbeAt := map[string]int64{
+		"positive-limit-rank-10": now,
+		"positive-limit-rank-20": now,
+		"positive-limit-rank-30": now - 30,
+	}
+	for groupID, expected := range expectedNextProbeAt {
+		var stored model.UpstreamManagedRoute
+		require.NoError(t, model.DB.Where("external_group_id = ?", groupID).First(&stored).Error)
+		assert.Equal(t, expected, stored.NextProbeAt)
 	}
 }
 
