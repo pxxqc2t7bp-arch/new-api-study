@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"net/http"
@@ -141,6 +142,109 @@ func TestTryTieredSettleUsesFrozenRequestInput(t *testing.T) {
 	}
 	if result == nil || result.MatchedTier != "fast" {
 		t.Fatalf("matched tier = %v, want fast", result)
+	}
+}
+
+func TestTryTieredSettleSeedreamScalarQuantity(t *testing.T) {
+	const expr = `param("layer_decomposition") == true ? tier("layers", fixed(images_up_to_1_5k * 0.02054794520547945 + images_above_1_5k * 0.0410958904109589 + max(input_images - 1, 0) * 0.0027397260273972603)) : tier("regular", fixed(images_up_to_1_5k * 0.0410958904109589 + images_above_1_5k * 0.0821917808219178 + max(input_images - 1, 0) * 0.0027397260273972603))`
+	for _, tc := range []struct {
+		name       string
+		reserved   int
+		actual     *int
+		lower      *float64
+		higher     *float64
+		references float64
+		layered    bool
+		wantCNY    float64
+	}{
+		{"seventeen layers settle two low outputs", 17, common.GetPointer(2), common.GetPointer(17.0), common.GetPointer(0.0), 1, true, 0.30},
+		{"seventeen layers settle two high outputs", 17, common.GetPointer(2), common.GetPointer(0.0), common.GetPointer(17.0), 1, true, 0.60},
+		{"regular references stay constant", 15, common.GetPointer(2), common.GetPointer(15.0), common.GetPointer(0.0), 3, false, 0.64},
+		{"higher actual count uses same bucket", 1, common.GetPointer(2), common.GetPointer(0.0), common.GetPointer(1.0), 2, false, 1.22},
+		{"missing actual keeps reservation", 17, nil, common.GetPointer(17.0), common.GetPointer(0.0), 1, true, 2.55},
+		{"zero actual keeps reservation", 17, common.GetPointer(0), common.GetPointer(17.0), common.GetPointer(0.0), 1, true, 2.55},
+		{"negative actual keeps reservation", 17, common.GetPointer(-1), common.GetPointer(17.0), common.GetPointer(0.0), 1, true, 2.55},
+		{"oversized actual keeps reservation", 17, common.GetPointer(dto.MaxImageN + 1), common.GetPointer(17.0), common.GetPointer(0.0), 1, true, 2.55},
+		{"mismatched scalar sum stays frozen", 17, common.GetPointer(2), common.GetPointer(16.0), common.GetPointer(0.0), 1, true, 2.40},
+		{"mixed integer buckets stay frozen", 17, common.GetPointer(2), common.GetPointer(16.0), common.GetPointer(1.0), 1, true, 2.70},
+		{"fractional buckets keep error fallback", 17, common.GetPointer(2), common.GetPointer(16.5), common.GetPointer(0.5), 1, true, -1},
+		{"missing bucket keeps error fallback", 17, common.GetPointer(2), nil, common.GetPointer(0.0), 1, true, -1},
+		{"nonfinite bucket keeps error fallback", 17, common.GetPointer(2), common.GetPointer(math.Inf(1)), common.GetPointer(0.0), 1, true, -1},
+		{"zero reservation stays frozen", 0, common.GetPointer(2), common.GetPointer(0.0), common.GetPointer(0.0), 1, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(fmt.Sprintf(`{"layer_decomposition":%t}`, tc.layered))
+			input := &billingexpr.RequestInput{
+				Body:            body,
+				ImageCount:      common.GetPointer(tc.reserved),
+				ImagesUpTo1_5K:  tc.lower,
+				ImagesAbove1_5K: tc.higher,
+				InputImages:     common.GetPointer(tc.references),
+			}
+			info := &relaycommon.RelayInfo{
+				Request: &dto.ImageRequest{
+					Model:              "doubao-seedream-5-0-pro-260628",
+					LayerDecomposition: common.GetPointer(!tc.layered),
+				},
+				TieredBillingSnapshot: makeSnapshot(expr, 1, 0, 0),
+				BillingRequestInput:   input,
+				BillingImageCount:     tc.actual,
+				FinalPreConsumedQuota: 321,
+			}
+			info.TieredBillingSnapshot.EstimatedImageCount = common.GetPointer(tc.reserved)
+			info.TieredBillingSnapshot.EstimatedTier = "regular"
+			for attempt := 0; attempt < 2; attempt++ {
+				ok, quota, result := TryTieredSettle(info, billingexpr.TokenParams{})
+				require.True(t, ok)
+				if tc.wantCNY < 0 {
+					assert.Equal(t, 321, quota)
+					assert.Nil(t, result)
+					continue
+				}
+				require.NotNil(t, result)
+				assert.Equal(t, billingexpr.QuotaRound(tc.wantCNY/7.3*testQuotaPerUnit), quota)
+				assert.Equal(t, billingexpr.BillingUnitRequest, result.BillingUnit)
+				wantTier := "regular"
+				if tc.layered {
+					wantTier = "layers"
+				}
+				assert.Equal(t, wantTier, result.MatchedTier)
+				require.NotNil(t, result.FixedPrice)
+				assert.InDelta(t, tc.wantCNY/7.3, *result.FixedPrice, 1e-10)
+			}
+			assert.Equal(t, body, input.Body)
+			assert.Equal(t, tc.reserved, *input.ImageCount)
+			assert.Equal(t, tc.references, *input.InputImages)
+			assert.Equal(t, tc.lower, input.ImagesUpTo1_5K)
+			assert.Equal(t, tc.higher, input.ImagesAbove1_5K)
+		})
+	}
+}
+
+func TestTryTieredSettleNonSeedreamQuantityUnchanged(t *testing.T) {
+	const expr = `tier("image", fixed(0.1)) * image_count`
+	for _, count := range []int{0, -1, 2, dto.MaxImageN, dto.MaxImageN + 1} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			info := &relaycommon.RelayInfo{
+				Request:               &dto.ImageRequest{Model: "other-image"},
+				TieredBillingSnapshot: makeSnapshot(expr, 1, 0, 0),
+				FinalPreConsumedQuota: 321,
+				BillingImageCount:     common.GetPointer(count),
+				BillingRequestInput:   &billingexpr.RequestInput{ImageCount: common.GetPointer(17)},
+			}
+			info.BillingRequestInput.ImagesUpTo1_5K = common.GetPointer(17.0)
+			info.BillingRequestInput.ImagesAbove1_5K = common.GetPointer(0.0)
+			ok, quota, result := TryTieredSettle(info, billingexpr.TokenParams{})
+			require.True(t, ok)
+			if count <= 0 || count > dto.MaxImageN {
+				assert.Equal(t, 321, quota)
+				assert.Nil(t, result)
+			} else {
+				require.NotNil(t, result)
+				assert.Equal(t, count*50_000, quota)
+			}
+			assert.Equal(t, 17.0, *info.BillingRequestInput.ImagesUpTo1_5K)
+		})
 	}
 }
 

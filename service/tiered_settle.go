@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
@@ -217,8 +218,29 @@ func TryTieredSettle(relayInfo *relaycommon.RelayInfo, params billingexpr.TokenP
 	if relayInfo.BillingRequestInput != nil {
 		requestInput = *relayInfo.BillingRequestInput
 	}
-	if relayInfo.BillingImageCount != nil {
-		requestInput.ImageCount = relayInfo.BillingImageCount
+	request, isImageRequest := relayInfo.Request.(*dto.ImageRequest)
+	seedreamPro := isImageRequest && request != nil &&
+		(strings.TrimSpace(request.Model) == "doubao-seedream-5-0-pro" ||
+			strings.TrimSpace(request.Model) == "doubao-seedream-5-0-pro-260628")
+	actual := relayInfo.BillingImageCount
+	if actual != nil && (!seedreamPro || (*actual > 0 && *actual <= dto.MaxImageN)) {
+		reserved := requestInput.ImageCount
+		if reserved == nil {
+			reserved = snap.EstimatedImageCount
+		}
+		// Seedream freezes all outputs in one pixel bucket. Replace only a
+		// matching, bounded reservation; references and request probes stay frozen.
+		if seedreamPro && reserved != nil && *reserved > 0 && *reserved <= dto.MaxImageN &&
+			(snap.EstimatedImageCount == nil || *snap.EstimatedImageCount == *reserved) &&
+			requestInput.ImagesUpTo1_5K != nil && requestInput.ImagesAbove1_5K != nil {
+			lower, higher := *requestInput.ImagesUpTo1_5K, *requestInput.ImagesAbove1_5K
+			if lower == float64(*reserved) && higher == 0 {
+				requestInput.ImagesUpTo1_5K = common.GetPointer(float64(*actual))
+			} else if higher == float64(*reserved) && lower == 0 {
+				requestInput.ImagesAbove1_5K = common.GetPointer(float64(*actual))
+			}
+		}
+		requestInput.ImageCount = actual
 	} else if snap.EstimatedImageCount != nil {
 		requestInput.ImageCount = snap.EstimatedImageCount
 	}

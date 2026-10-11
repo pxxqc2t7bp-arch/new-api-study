@@ -58,6 +58,8 @@ func imageRequestScalar(t *testing.T, input billingexpr.RequestInput, fieldName 
 	}
 }
 
+const seedreamProHTTPExpr = `param("layer_decomposition") == true ? tier("layers", fixed(images_up_to_1_5k * 0.02054794520547945 + images_above_1_5k * 0.0410958904109589 + max(input_images - 1, 0) * 0.0027397260273972603)) : tier("regular", fixed(images_up_to_1_5k * 0.0410958904109589 + images_above_1_5k * 0.0821917808219178 + max(input_images - 1, 0) * 0.0027397260273972603))`
+
 func TestResolveIncomingBillingExprRequestInput(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
@@ -139,6 +141,7 @@ func TestResolveImageBillingRequestInputDerivesOnlyBoundedSeedreamScalars(t *tes
 		{name: "pixel above boundary is higher tier", body: `{"model":"doubao-seedream-5-0-pro-260628","size":"1501*1740"}`, wantHigher: 1},
 		{name: "multiple outputs stay in one tier", body: `{"model":"doubao-seedream-5-0-pro-260628","size":"1K","n":3}`, wantLower: 3},
 		{name: "reference array stores only its count", body: `{"model":"doubao-seedream-5-0-pro-260628","size":"1K","image":["https://secret.example/a.png","data:image/png;base64,c2VjcmV0"]}`, wantLower: 1, wantInputs: 2},
+		{name: "explicit false keeps regular price and extra references", body: `{"model":"doubao-seedream-5-0-pro-260628","size":"1K","n":2,"image":["https://secret.example/a.png","b","c"],"layer_decomposition":false}`, wantLower: 2, wantInputs: 3},
 		{name: "layer decomposition reserves seventeen lower outputs", body: `{"model":"doubao-seedream-5-0-pro-260628","size":"1K","image":"https://secret.example/a.png","layer_decomposition":true}`, wantLower: 17, wantInputs: 1},
 		{name: "layer decomposition default is conservative", body: `{"model":"doubao-seedream-5-0-pro-260628","image":"https://secret.example/a.png","layer_decomposition":true}`, wantHigher: 17, wantInputs: 1},
 		{name: "unknown size is conservative", body: `{"model":"doubao-seedream-5-0-pro-260628","size":"provider-auto"}`, wantHigher: 1},
@@ -162,10 +165,24 @@ func TestResolveImageBillingRequestInputDerivesOnlyBoundedSeedreamScalars(t *tes
 				return
 			}
 			require.NoError(t, err)
-			require.Empty(t, input.Body, "image billing snapshots retain only scalar counts")
+			wantTier := "regular"
+			wantCNY := testCase.wantLower*0.30 + testCase.wantHigher*0.60 + max(testCase.wantInputs-1, 0)*0.02
+			if request.LayerDecomposition == nil {
+				assert.Empty(t, input.Body, "absent flags stay absent")
+			} else {
+				assert.JSONEq(t, fmt.Sprintf(`{"layer_decomposition":%t}`, *request.LayerDecomposition), string(input.Body))
+				if *request.LayerDecomposition {
+					wantTier = "layers"
+					wantCNY = testCase.wantLower*0.15 + testCase.wantHigher*0.30
+				}
+			}
 			assert.Equal(t, testCase.wantLower, imageRequestScalar(t, input, "ImagesUpTo1_5K"))
 			assert.Equal(t, testCase.wantHigher, imageRequestScalar(t, input, "ImagesAbove1_5K"))
 			assert.Equal(t, testCase.wantInputs, imageRequestScalar(t, input, "InputImages"))
+			cost, trace, exprErr := billingexpr.RunExprWithRequest(seedreamProHTTPExpr, billingexpr.TokenParams{}, input)
+			require.NoError(t, exprErr)
+			assert.Equal(t, wantTier, trace.MatchedTier)
+			assert.InDelta(t, wantCNY, cost/1_000_000*7.3, 1e-10)
 			encoded, marshalErr := common.Marshal(input)
 			require.NoError(t, marshalErr)
 			assert.NotContains(t, string(encoded), "secret")
@@ -177,15 +194,18 @@ func TestResolveImageBillingRequestInputDerivesOnlyBoundedSeedreamScalars(t *tes
 
 func TestResolveIncomingBillingExprRequestInputClonesSeedreamScalars(t *testing.T) {
 	request := &dto.ImageRequest{}
-	require.NoError(t, common.Unmarshal([]byte(`{"model":"doubao-seedream-5-0-pro-260628","size":"1K"}`), request))
+	require.NoError(t, common.Unmarshal([]byte(`{"model":"doubao-seedream-5-0-pro-260628","size":"1K","image":"secret","layer_decomposition":true}`), request))
 	input, err := ResolveImageBillingRequestInput(nil, &relaycommon.RelayInfo{Request: request}, billingexpr.RequestInput{})
 	require.NoError(t, err)
 
 	cloned, err := ResolveIncomingBillingExprRequestInput(nil, &relaycommon.RelayInfo{BillingRequestInput: &input})
 	require.NoError(t, err)
+	require.JSONEq(t, `{"layer_decomposition":true}`, string(cloned.Body))
+	input.Body[0] = ' '
 	require.NotNil(t, input.ImagesUpTo1_5K)
 	*input.ImagesUpTo1_5K = 9
-	assert.Equal(t, float64(1), imageRequestScalar(t, cloned, "ImagesUpTo1_5K"))
+	assert.Equal(t, float64(17), imageRequestScalar(t, cloned, "ImagesUpTo1_5K"))
+	assert.JSONEq(t, `{"layer_decomposition":true}`, string(cloned.Body))
 }
 
 func TestResolveIncomingBillingExprRequestInputFreezesSeedreamScalars(t *testing.T) {
@@ -194,22 +214,28 @@ func TestResolveIncomingBillingExprRequestInputFreezesSeedreamScalars(t *testing
 		"model":"doubao-seedream-5-0-pro-260628",
 		"prompt":"secret prompt",
 		"size":"2K",
-		"image":["https://secret.example/a.png","https://secret.example/b.png"]
+		"image":["https://secret.example/a.png","https://secret.example/b.png"],
+		"layer_decomposition":false
 	}`), request))
 	input, err := ResolveIncomingBillingExprRequestInput(nil, &relaycommon.RelayInfo{Request: request})
 	require.NoError(t, err)
-	require.Empty(t, input.Body)
+	require.JSONEq(t, `{"layer_decomposition":false}`, string(input.Body))
 
+	info := &relaycommon.RelayInfo{Request: request, BillingRequestInput: &input}
 	request.Size = "1K"
 	request.Image = nil
+	*request.LayerDecomposition = true
+	retried, err := ResolveIncomingBillingExprRequestInput(nil, info)
+	require.NoError(t, err)
 	cost, trace, err := billingexpr.RunExprWithRequest(
-		`tier("seedream", fixed(images_up_to_1_5k * 0.1 + images_above_1_5k * 0.2 + max(input_images - 1, 0) * 0.01))`,
+		seedreamProHTTPExpr,
 		billingexpr.TokenParams{},
-		input,
+		retried,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, billingexpr.BillingUnitRequest, trace.BillingUnit)
-	assert.InDelta(t, 210000, cost, 1e-9)
+	assert.Equal(t, "regular", trace.MatchedTier)
+	assert.InDelta(t, 0.62, cost/1_000_000*7.3, 1e-10)
 }
 
 func TestResolveOutboundImageBillingJSONPreservesOriginIdentity(t *testing.T) {
@@ -1426,6 +1452,7 @@ func TestResolveOutboundImageBillingMultipartCountsIndexedSeedreamFiles(t *testi
 		assert.Equal(t, 17, resolved.Count)
 		require.NotNil(t, resolved.Input.ImageCount)
 		assert.Equal(t, 17, *resolved.Input.ImageCount)
+		assert.JSONEq(t, `{"layer_decomposition":true}`, string(resolved.Input.Body))
 	})
 
 	t.Run("two indexed references reject layer decomposition", func(t *testing.T) {
@@ -1480,14 +1507,14 @@ func TestResolveOutboundImageBillingSeedreamLayerCountUsesEffectiveOutputs(t *te
 	assert.Equal(t, 17, *resolved.Input.ImageCount)
 
 	cost, trace, err := billingexpr.RunExprWithRequest(
-		`tier("layer", fixed(0.01)) * image_count`,
+		seedreamProHTTPExpr,
 		billingexpr.TokenParams{},
 		resolved.Input,
 	)
 	require.NoError(t, err)
-	require.NotNil(t, trace.ImageCount)
-	assert.Equal(t, 17, *trace.ImageCount)
-	assert.InDelta(t, 170_000, cost, 1e-9)
+	assert.Equal(t, "layers", trace.MatchedTier)
+	assert.JSONEq(t, `{"layer_decomposition":true}`, string(resolved.Input.Body))
+	assert.InDelta(t, 2.55, cost/1_000_000*7.3, 1e-10, "seventeen low-tier layers must not cost CNY 5.10")
 }
 
 func TestResolveOutboundImageBillingMultipartRejectsExplicitZero(t *testing.T) {

@@ -192,6 +192,13 @@ func ResolveImageBillingRequestInput(c *gin.Context, info *relaycommon.RelayInfo
 		}
 		references := float64(referenceImages)
 		input.Body = nil
+		if request.LayerDecomposition != nil {
+			body, marshalErr := common.Marshal(map[string]bool{"layer_decomposition": *request.LayerDecomposition})
+			if marshalErr != nil {
+				return input, marshalErr
+			}
+			input.Body = body
+		}
 		input.ImageCount = &count
 		input.ImagesUpTo1_5K = &lower
 		input.ImagesAbove1_5K = &higher
