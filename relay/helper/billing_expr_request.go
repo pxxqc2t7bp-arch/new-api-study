@@ -83,13 +83,33 @@ type seedreamRequestProfile struct {
 }
 
 // OutboundImageBilling contains only the final price-bearing image fields.
-// Request keeps the client model as billing identity; Input is safe to retain
-// because prompts, image bytes, and image URLs are excluded.
+// Request keeps the client model as billing identity. Failed attempts retain
+// Input only when the resolver explicitly marks its shape safe.
 type OutboundImageBilling struct {
-	Request     *dto.ImageRequest
-	PromptTexts []string
-	Input       billingexpr.RequestInput
-	Count       int
+	Request                    *dto.ImageRequest
+	PromptTexts                []string
+	Input                      billingexpr.RequestInput
+	Count                      int
+	InputSafeToRetainOnFailure bool
+}
+
+func imageBillingInputSafeToRetainOnFailure(seedream bool, input billingexpr.RequestInput) bool {
+	if len(input.Body) == 0 {
+		return true
+	}
+	if !seedream {
+		return false
+	}
+	body, err := imageBillingObject(input.Body, "Seedream billing input")
+	if err != nil || len(body) != 1 {
+		return false
+	}
+	raw, exists := body["layer_decomposition"]
+	if !exists {
+		return false
+	}
+	var enabled bool
+	return common.Unmarshal(raw, &enabled) == nil
 }
 
 func seedreamProfile(model string) (seedreamRequestProfile, bool) {
@@ -1445,10 +1465,11 @@ func resolveOutboundImageBilling(
 		resolved = input
 	}
 	return &OutboundImageBilling{
-		Request:     billingRequest,
-		PromptTexts: append([]string(nil), promptTexts...),
-		Input:       resolved,
-		Count:       count,
+		Request:                    billingRequest,
+		PromptTexts:                append([]string(nil), promptTexts...),
+		Input:                      resolved,
+		Count:                      count,
+		InputSafeToRetainOnFailure: imageBillingInputSafeToRetainOnFailure(seedream, resolved),
 	}, nil
 }
 

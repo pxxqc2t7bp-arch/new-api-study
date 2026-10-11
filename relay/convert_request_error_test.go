@@ -101,7 +101,7 @@ func TestSeedreamLayerDecompositionOutboundMatchesFrozenSettlement(t *testing.T)
 	assert.Equal(t, float64(17), *input.ImagesUpTo1_5K)
 	assert.Equal(t, float64(0), *input.ImagesAbove1_5K)
 	assert.Equal(t, float64(1), *input.InputImages)
-	assert.Empty(t, input.Body)
+	assert.JSONEq(t, `{"layer_decomposition":true}`, string(input.Body))
 	frozenJSON, err := common.Marshal(input)
 	require.NoError(t, err)
 	assert.NotContains(t, string(frozenJSON), "observatory")
@@ -163,6 +163,7 @@ func TestSeedreamFinalOutboundOverridesMatchReservationAndSettlement(t *testing.
 		wantInputs       float64
 		wantImageCount   int
 		wantFixedPrice   float64
+		wantFrozenBody   string
 	}{
 		{
 			name:             "n",
@@ -205,6 +206,7 @@ func TestSeedreamFinalOutboundOverridesMatchReservationAndSettlement(t *testing.
 			wantInputs:       1,
 			wantImageCount:   17,
 			wantFixedPrice:   17 * 0.08219178082,
+			wantFrozenBody:   `{"layer_decomposition":true}`,
 		},
 	}
 
@@ -285,7 +287,11 @@ func TestSeedreamFinalOutboundOverridesMatchReservationAndSettlement(t *testing.
 			assert.Equal(t, "must-not-freeze", gjson.GetBytes(outbound, "vendor_private.secret").String())
 
 			require.NotNil(t, info.BillingRequestInput)
-			assert.Empty(t, info.BillingRequestInput.Body)
+			if tc.wantFrozenBody == "" {
+				assert.Empty(t, info.BillingRequestInput.Body)
+			} else {
+				assert.JSONEq(t, tc.wantFrozenBody, string(info.BillingRequestInput.Body))
+			}
 			assert.Empty(t, info.BillingRequestInput.Usage)
 			assert.Equal(t, int64(1_800_000_000), info.BillingRequestInput.EvaluatedAtUnix)
 			assert.Equal(t, "kept", info.BillingRequestInput.Headers["X-Billing-Test"])

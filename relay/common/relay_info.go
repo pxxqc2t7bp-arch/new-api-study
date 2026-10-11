@@ -246,10 +246,33 @@ func (info *RelayInfo) UpdateImageCount(count int64) {
 	if info.PriceData.UsePrice {
 		info.PriceData.AddOtherRatio("n", float64(count))
 	}
-	if info.TieredBillingSnapshot != nil && info.TieredBillingSnapshot.EstimatedImageCount != nil {
+	if info.TieredBillingSnapshot != nil &&
+		(info.TieredBillingSnapshot.EstimatedImageCount != nil || info.hasFrozenSeedreamProImageReservation()) {
 		n := int(count)
 		info.BillingImageCount = &n
 	}
+}
+
+func (info *RelayInfo) hasFrozenSeedreamProImageReservation() bool {
+	request, ok := info.Request.(*dto.ImageRequest)
+	if !ok || request == nil {
+		return false
+	}
+	model := strings.TrimSpace(request.Model)
+	if model != "doubao-seedream-5-0-pro" && model != "doubao-seedream-5-0-pro-260628" {
+		return false
+	}
+	snapshot := info.TieredBillingSnapshot
+	input := info.BillingRequestInput
+	if snapshot == nil || snapshot.BillingMode != "tiered_expr" ||
+		snapshot.EstimatedBillingUnit != billingexpr.BillingUnitRequest ||
+		input == nil || input.ImageCount == nil ||
+		*input.ImageCount <= 0 || *input.ImageCount > dto.MaxImageN ||
+		input.ImagesUpTo1_5K == nil || input.ImagesAbove1_5K == nil {
+		return false
+	}
+	usedVars := billingexpr.UsedVarsByHash(snapshot.ExprString, snapshot.ExprHash)
+	return usedVars["images_up_to_1_5k"] || usedVars["images_above_1_5k"]
 }
 
 func (info *RelayInfo) RequestedImageCount() int {

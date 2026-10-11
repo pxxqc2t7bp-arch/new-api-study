@@ -199,7 +199,7 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	billingRequest = outboundBilling.Request
 	imageCount = outboundBilling.Count
 	info.BillingRequestInput = &outboundBilling.Input
-	retainFailedAttemptBillingInput = len(outboundBilling.Input.Body) == 0
+	retainFailedAttemptBillingInput = outboundBilling.InputSafeToRetainOnFailure
 
 	promptTexts := outboundBilling.PromptTexts
 	billingRequest.Prompt = strings.Join(promptTexts, "\n")

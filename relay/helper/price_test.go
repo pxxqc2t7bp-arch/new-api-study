@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -73,6 +74,54 @@ func TestModelPriceHelperTieredUsesAlreadyResolvedExpression(t *testing.T) {
 	require.NotNil(t, info.TieredBillingSnapshot)
 	assert.Equal(t, expression, info.TieredBillingSnapshot.ExprString)
 	assert.Equal(t, "resolved", info.TieredBillingSnapshot.EstimatedTier)
+}
+
+func TestSeedreamProScalarSettlementUsesActualHTTPCount(t *testing.T) {
+	const modelName = "doubao-seedream-5-0-pro-260628"
+	info := outboundImageBillingInfo(constant.APITypeVolcEngine, modelName)
+	info.OriginModelName = modelName
+
+	outbound, err := ResolveOutboundImageBillingJSON(info, []byte(`{
+		"model":"doubao-seedream-5-0-pro-260628",
+		"prompt":"private prompt",
+		"size":"1K",
+		"image":"https://private.invalid/reference.png",
+		"layer_decomposition":true
+	}`))
+	require.NoError(t, err)
+	require.NotNil(t, outbound)
+	require.Equal(t, billingexpr.MaxRequestImageOutputs, outbound.Count)
+	info.BillingRequestInput = &outbound.Input
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	price, err := modelPriceHelperTiered(
+		ctx,
+		info,
+		modelName,
+		seedreamProHTTPExpr,
+		true,
+		0,
+		hosttypes.GroupRatioInfo{GroupRatio: 1},
+	)
+	require.NoError(t, err)
+	reservedQuota := billingexpr.QuotaRound(2.55 / 7.3 * common.QuotaPerUnit)
+	assert.Equal(t, reservedQuota, price.QuotaToPreConsume)
+	require.NotNil(t, info.TieredBillingSnapshot)
+	assert.Nil(t, info.TieredBillingSnapshot.EstimatedImageCount)
+
+	info.UpdateImageCount(2)
+	if assert.NotNil(t, info.BillingImageCount) {
+		assert.Equal(t, 2, *info.BillingImageCount)
+	}
+
+	ok, settledQuota, result := service.TryTieredSettle(info, billingexpr.TokenParams{})
+	require.True(t, ok)
+	require.NotNil(t, result)
+	assert.Equal(t, billingexpr.QuotaRound(0.30/7.3*common.QuotaPerUnit), settledQuota)
+	require.NotNil(t, result.FixedPrice)
+	assert.InDelta(t, 0.30/7.3, *result.FixedPrice, 1e-12)
+	assert.Equal(t, "layers", result.MatchedTier)
 }
 
 func TestModelPriceHelperTieredUsesPreloadedRequestInput(t *testing.T) {

@@ -60,6 +60,28 @@ func imageRequestScalar(t *testing.T, input billingexpr.RequestInput, fieldName 
 
 const seedreamProHTTPExpr = `param("layer_decomposition") == true ? tier("layers", fixed(images_up_to_1_5k * 0.02054794520547945 + images_above_1_5k * 0.0410958904109589 + max(input_images - 1, 0) * 0.0027397260273972603)) : tier("regular", fixed(images_up_to_1_5k * 0.0410958904109589 + images_above_1_5k * 0.0821917808219178 + max(input_images - 1, 0) * 0.0027397260273972603))`
 
+func TestImageBillingInputSafeToRetainOnFailure(t *testing.T) {
+	tests := []struct {
+		name     string
+		seedream bool
+		body     []byte
+		want     bool
+	}{
+		{name: "empty scalar input remains safe", want: true},
+		{name: "sanitized Seedream boolean is safe", seedream: true, body: []byte(`{"layer_decomposition":true}`), want: true},
+		{name: "ordinary full body is not safe", body: []byte(`{"model":"gpt-image-2","n":4}`)},
+		{name: "Seedream body with private field is not safe", seedream: true, body: []byte(`{"layer_decomposition":true,"prompt":"private"}`)},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			assert.Equal(t, testCase.want, imageBillingInputSafeToRetainOnFailure(
+				testCase.seedream,
+				billingexpr.RequestInput{Body: testCase.body},
+			))
+		})
+	}
+}
+
 func TestResolveIncomingBillingExprRequestInput(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
