@@ -3079,7 +3079,8 @@ func TestRelaySeedreamValidRequestBillsOnceAroundProviderDispatch(t *testing.T) 
 	fixture := newSeedreamBillingOrderFixture(t)
 	quotaMutations := recordUserQuotaMutations(t, fixture.db)
 	const initialQuota = 500_000
-	expectedQuota := billingexpr.QuotaRound(2 * 0.04109589041 * common.QuotaPerUnit)
+	reservedQuota := billingexpr.QuotaRound(2 * 0.04109589041 * common.QuotaPerUnit)
+	settledQuota := billingexpr.QuotaRound(0.04109589041 * common.QuotaPerUnit)
 	override := map[string]any{"operations": []any{
 		map[string]any{"path": "n", "mode": "set", "value": 2},
 	}}
@@ -3127,25 +3128,26 @@ func TestRelaySeedreamValidRequestBillsOnceAroundProviderDispatch(t *testing.T) 
 		snapshot := <-dispatched
 		require.NoError(t, snapshot.err)
 		assert.Equal(t, int64(2), gjson.GetBytes(snapshot.body, "n").Int())
-		assert.Equal(t, initialQuota-expectedQuota, snapshot.userQuota)
-		assert.Equal(t, initialQuota-expectedQuota, snapshot.tokenQuota)
+		assert.Equal(t, initialQuota-reservedQuota, snapshot.userQuota)
+		assert.Equal(t, initialQuota-reservedQuota, snapshot.tokenQuota)
 
 		var user model.User
 		var token model.Token
 		require.NoError(t, fixture.db.First(&user, fixture.user.Id).Error)
 		require.NoError(t, fixture.db.First(&token, fixture.token.Id).Error)
-		assert.Equal(t, initialQuota-expectedQuota, user.Quota)
-		assert.Equal(t, expectedQuota, user.UsedQuota)
+		assert.Equal(t, initialQuota-settledQuota, user.Quota)
+		assert.Equal(t, settledQuota, user.UsedQuota)
 		assert.Equal(t, 1, user.RequestCount)
-		assert.Equal(t, initialQuota-expectedQuota, token.RemainQuota)
-		assert.Equal(t, expectedQuota, token.UsedQuota)
-		assert.Equal(t, int32(1), quotaMutations.Load(), "one wallet reservation must cover the request")
+		assert.Equal(t, initialQuota-settledQuota, token.RemainQuota)
+		assert.Equal(t, settledQuota, token.UsedQuota)
+		assert.Equal(t, int32(2), quotaMutations.Load(), "reservation and settlement adjustment must both mutate the wallet")
 
-		var consumeLogs int64
-		require.NoError(t, model.LOG_DB.Model(&model.Log{}).
+		var consumeLogs []model.Log
+		require.NoError(t, model.LOG_DB.
 			Where("request_id = ? AND type = ?", "seedream-valid-settle", model.LogTypeConsume).
-			Count(&consumeLogs).Error)
-		assert.Equal(t, int64(1), consumeLogs, "successful request must settle and log exactly once")
+			Find(&consumeLogs).Error)
+		require.Len(t, consumeLogs, 1, "successful request must settle and log exactly once")
+		assert.Equal(t, settledQuota, consumeLogs[0].Quota)
 	})
 
 	t.Run("refunds once after failed dispatch", func(t *testing.T) {
@@ -3188,8 +3190,8 @@ func TestRelaySeedreamValidRequestBillsOnceAroundProviderDispatch(t *testing.T) 
 		require.Len(t, dispatched, 1)
 		snapshot := <-dispatched
 		require.NoError(t, snapshot.err)
-		assert.Equal(t, initialQuota-expectedQuota, snapshot.userQuota)
-		assert.Equal(t, initialQuota-expectedQuota, snapshot.tokenQuota)
+		assert.Equal(t, initialQuota-reservedQuota, snapshot.userQuota)
+		assert.Equal(t, initialQuota-reservedQuota, snapshot.tokenQuota)
 		require.Eventually(t, func() bool {
 			var user model.User
 			var token model.Token
