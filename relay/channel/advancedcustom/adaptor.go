@@ -584,7 +584,7 @@ func isArkResponsesTarget(requestURL string) bool {
 	if err != nil {
 		return false
 	}
-	host := strings.ToLower(parsedURL.Hostname())
+	host := strings.TrimSuffix(strings.ToLower(parsedURL.Hostname()), ".")
 	labels := strings.Split(host, ".")
 	return len(labels) == 4 &&
 		labels[0] == "ark" &&

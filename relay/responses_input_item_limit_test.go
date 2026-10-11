@@ -88,6 +88,11 @@ func TestCountResponsesInputItems(t *testing.T) {
 		wantIsArray bool
 		wantErr     bool
 	}{
+		{name: "empty input"},
+		{name: "whitespace input", input: json.RawMessage(" \n\t")},
+		{name: "object bypass", input: json.RawMessage(`{"input":[]}`)},
+		{name: "null bypass", input: json.RawMessage(`null`)},
+		{name: "empty array", input: json.RawMessage(`[]`), wantIsArray: true},
 		{
 			name:  "scalar bypass",
 			input: json.RawMessage(`"hello"`),
@@ -101,15 +106,35 @@ func TestCountResponsesInputItems(t *testing.T) {
 		{
 			name:        "malformed array",
 			input:       json.RawMessage(`[{},`),
+			wantCount:   1,
+			wantIsArray: true,
+			wantErr:     true,
+		},
+		{
+			name:        "invalid tail after array",
+			input:       json.RawMessage(`[{}] invalid`),
+			wantCount:   1,
 			wantIsArray: true,
 			wantErr:     true,
 		},
 		{
 			name:        "additional token after array",
 			input:       json.RawMessage(`[{}] true`),
+			wantCount:   1,
 			wantIsArray: true,
 			wantErr:     true,
 		},
+		{
+			name:        "second array",
+			input:       json.RawMessage(`[{}] []`),
+			wantCount:   1,
+			wantIsArray: true,
+			wantErr:     true,
+		},
+		{name: "900 items", input: responsesInputItems(900), wantCount: 900, wantIsArray: true},
+		{name: "901 items", input: responsesInputItems(901), wantCount: 901, wantIsArray: true},
+		{name: "1000 items", input: responsesInputItems(1000), wantCount: 1000, wantIsArray: true},
+		{name: "1001 items", input: responsesInputItems(1001), wantCount: 1001, wantIsArray: true},
 	}
 
 	for _, tt := range tests {
@@ -117,12 +142,12 @@ func TestCountResponsesInputItems(t *testing.T) {
 			count, isArray, err := countResponsesInputItems(tt.input)
 
 			assert.Equal(t, tt.wantIsArray, isArray)
+			assert.Equal(t, tt.wantCount, count)
 			if tt.wantErr {
 				require.Error(t, err)
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, tt.wantCount, count)
 		})
 	}
 }
@@ -164,6 +189,8 @@ func TestArkResponsesInputItemLimit(t *testing.T) {
 		{name: "soft limit boundary", count: 900, header: "900"},
 		{name: "soft limit overflow", count: 901, header: "900", wantLimit: 900, wantErr: true},
 		{name: "scalar input bypass", input: json.RawMessage(`"hello"`)},
+		{name: "object input bypass", input: json.RawMessage(`{"input":[]}`)},
+		{name: "empty array", input: json.RawMessage(`[]`)},
 	}
 
 	for _, tt := range tests {
@@ -199,6 +226,38 @@ func TestArkResponsesInputItemLimit(t *testing.T) {
 			}
 			requireResponsesInputItemLimitError(t, apiErr, tt.count, tt.wantLimit)
 		})
+	}
+}
+
+func TestArkResponsesInputItemLimitRejectsMalformedTailBeforeOverflow(t *testing.T) {
+	for _, itemCount := range []int{900, 901, 1000, 1001} {
+		for _, tail := range []string{" invalid", " []"} {
+			t.Run(fmt.Sprintf("%d/%s", itemCount, strings.TrimSpace(tail)), func(t *testing.T) {
+				c, info, request := newResponsesInputItemLimitContext(
+					t,
+					append(responsesInputItems(itemCount), tail...),
+					nil,
+					constant.ChannelTypeVolcEngine,
+					"https://ark.cn-beijing.volces.com/api/v3",
+					dto.ChannelOtherSettings{},
+				)
+				c.Request.Header.Set(responsesInputItemSoftLimitHeaderForTest, "900")
+
+				apiErr := enforceArkResponsesInputItemLimit(
+					c, info, "https://ark.cn-beijing.volces.com/api/v3/responses", request,
+				)
+
+				require.NotNil(t, apiErr)
+				assert.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+				assert.Equal(t, types.ErrorCodeInvalidRequest, apiErr.GetErrorCode())
+				assert.True(t, types.IsSkipRetryError(apiErr))
+				openAIError := apiErr.ToOpenAIError()
+				assert.Equal(t, "invalid_request_error", openAIError.Type)
+				assert.Equal(t, "input", openAIError.Param)
+				assert.Contains(t, openAIError.Message, "Invalid Responses input array:")
+				assert.Empty(t, c.Request.Header.Get(responsesInputItemSoftLimitHeaderForTest))
+			})
+		}
 	}
 }
 
@@ -604,7 +663,7 @@ func responsesInputItems(count int) json.RawMessage {
 			"content": fmt.Sprintf("item-%d", index),
 		}
 	}
-	raw, err := json.Marshal(items)
+	raw, err := common.Marshal(items)
 	if err != nil {
 		panic(err)
 	}

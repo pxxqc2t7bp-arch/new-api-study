@@ -531,50 +531,58 @@ func TestAdaptorConvertsResponsesRequestToOpenAIChatUpstream(t *testing.T) {
 }
 
 func TestAdaptorNormalizesNativeArkResponsesHistory(t *testing.T) {
-	adaptor := &Adaptor{}
-	info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
-		Routes: []dto.AdvancedCustomRoute{{
-			IncomingPath: "/v1/responses",
-			UpstreamPath: "/responses",
-			Converter:    relayconvert.ConverterNone,
-		}},
-	})
-	info.RelayFormat = types.RelayFormatOpenAIResponses
-	info.RelayMode = relayconstant.RelayModeResponses
-	info.RequestURLPath = "/v1/responses"
-	info.ChannelBaseUrl = "https://ark.cn-beijing.volces.com/api/v3"
+	for _, baseURL := range []string{
+		"https://ark.cn-beijing.volces.com/api/v3",
+		"https://ark.cn-beijing.volces.com./api/v3",
+		"https://ARK.CN-BEIJING.VOLCES.COM.:443/api/v3",
+	} {
+		t.Run(baseURL, func(t *testing.T) {
+			adaptor := &Adaptor{}
+			info := advancedCustomRelayInfo(&dto.AdvancedCustomConfig{
+				Routes: []dto.AdvancedCustomRoute{{
+					IncomingPath: "/v1/responses",
+					UpstreamPath: "/responses",
+					Converter:    relayconvert.ConverterNone,
+				}},
+			})
+			info.RelayFormat = types.RelayFormatOpenAIResponses
+			info.RelayMode = relayconstant.RelayModeResponses
+			info.RequestURLPath = "/v1/responses"
+			info.ChannelBaseUrl = baseURL
 
-	converted, err := adaptor.ConvertOpenAIResponsesRequest(
-		advancedCustomGinContext("/v1/responses"),
-		info,
-		dto.OpenAIResponsesRequest{
-			Model: "glm-5.3",
-			Input: mustAdvancedCustomRawMessage(t, []map[string]any{
-				{"role": "user", "content": "start"},
-				{
-					"type":      "function_call",
-					"call_id":   "call_1",
-					"name":      "lookup",
-					"arguments": "{}",
+			converted, err := adaptor.ConvertOpenAIResponsesRequest(
+				advancedCustomGinContext("/v1/responses"),
+				info,
+				dto.OpenAIResponsesRequest{
+					Model: "glm-5.3",
+					Input: mustAdvancedCustomRawMessage(t, []map[string]any{
+						{"role": "user", "content": "start"},
+						{
+							"type":      "function_call",
+							"call_id":   "call_1",
+							"name":      "lookup",
+							"arguments": "{}",
+						},
+						{
+							"type":    "function_call_output",
+							"call_id": "call_1",
+							"output":  "result",
+						},
+					}),
 				},
-				{
-					"type":    "function_call_output",
-					"call_id": "call_1",
-					"output":  "result",
-				},
-			}),
-		},
-	)
-	require.NoError(t, err)
+			)
+			require.NoError(t, err)
 
-	request, ok := converted.(dto.OpenAIResponsesRequest)
-	require.True(t, ok)
-	var items []map[string]any
-	require.NoError(t, common.Unmarshal(request.Input, &items))
-	require.Len(t, items, 3)
-	assert.Equal(t, "message", items[0]["type"])
-	assert.Equal(t, "completed", items[1]["status"])
-	assert.Equal(t, "completed", items[2]["status"])
+			request, ok := converted.(dto.OpenAIResponsesRequest)
+			require.True(t, ok)
+			var items []map[string]any
+			require.NoError(t, common.Unmarshal(request.Input, &items))
+			require.Len(t, items, 3)
+			assert.Equal(t, "message", items[0]["type"])
+			assert.Equal(t, "completed", items[1]["status"])
+			assert.Equal(t, "completed", items[2]["status"])
+		})
+	}
 }
 
 func TestAdaptorPreservesNativeResponsesHistoryForNonArkUpstream(t *testing.T) {
@@ -618,12 +626,30 @@ func TestIsArkResponsesTargetRequiresExactRegionalHost(t *testing.T) {
 			want:       true,
 		},
 		{
+			name:       "regional ark host with trailing dot",
+			requestURL: "https://ark.cn-beijing.volces.com./api/v3/responses",
+			want:       true,
+		},
+		{
+			name:       "uppercase regional ark host with trailing dot and port",
+			requestURL: "https://ARK.CN-BEIJING.VOLCES.COM.:443/api/v3/responses",
+			want:       true,
+		},
+		{
 			name:       "nested proxy host",
 			requestURL: "https://ark.proxy.internal.volces.com/responses",
 		},
 		{
 			name:       "lookalike suffix",
 			requestURL: "https://ark.cn-beijing.volces.com.example/responses",
+		},
+		{
+			name:       "lookalike suffix with trailing dot",
+			requestURL: "https://ark.cn-beijing.volces.com.example./responses",
+		},
+		{
+			name:       "multiple trailing dots",
+			requestURL: "https://ark.cn-beijing.volces.com../responses",
 		},
 		{
 			name:       "non ark host",

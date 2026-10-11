@@ -466,7 +466,7 @@ func selectUpstreamCandidateGroups(candidates []upstreamRouteCandidate, limit in
 	for key, perModel := range modelCandidates {
 		modelName := strings.SplitN(key, "\x00", 2)[1]
 		seenSources := make(map[int64]struct{})
-		chosen := make([]upstreamRouteCandidate, 0, limit)
+		chosen := make([]upstreamRouteCandidate, 0, min(limit, len(perModel)))
 		for _, candidate := range perModel {
 			if _, exists := seenSources[candidate.source.ID]; exists {
 				continue

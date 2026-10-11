@@ -1,15 +1,14 @@
 package relay
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -64,34 +63,7 @@ func isNativeArkResponsesURL(rawURL string) bool {
 }
 
 func countResponsesInputItems(raw json.RawMessage) (count int, isArray bool, err error) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || trimmed[0] != '[' {
-		return 0, false, nil
-	}
-
-	decoder := json.NewDecoder(bytes.NewReader(trimmed))
-	if _, err := decoder.Token(); err != nil {
-		return 0, true, err
-	}
-
-	var item json.RawMessage
-	for decoder.More() {
-		if err := decoder.Decode(&item); err != nil {
-			return count, true, err
-		}
-		count++
-		item = item[:0]
-	}
-	if _, err := decoder.Token(); err != nil {
-		return count, true, err
-	}
-	if _, err := decoder.Token(); err != io.EOF {
-		if err == nil {
-			err = fmt.Errorf("unexpected JSON token after input array")
-		}
-		return count, true, err
-	}
-	return count, true, nil
+	return common.CountJSONArrayItems(raw)
 }
 
 func enforceArkResponsesInputItemLimit(

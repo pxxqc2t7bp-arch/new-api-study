@@ -2,6 +2,7 @@ package common
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -44,6 +45,71 @@ func TestJsonRawMessageToString(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			require.Equal(t, tt.want, JsonRawMessageToString(tt.data))
 		})
+	}
+}
+
+func TestCountJSONArrayItems(t *testing.T) {
+	tests := []struct {
+		name        string
+		raw         json.RawMessage
+		wantCount   int
+		wantIsArray bool
+		wantErr     bool
+	}{
+		{name: "empty input"},
+		{name: "whitespace input", raw: json.RawMessage(" \n\t")},
+		{name: "string", raw: json.RawMessage(`"hello"`)},
+		{name: "object", raw: json.RawMessage(`{"input":[]}`)},
+		{name: "null", raw: json.RawMessage(`null`)},
+		{name: "number", raw: json.RawMessage(`123`)},
+		{name: "boolean", raw: json.RawMessage(`true`)},
+		{name: "empty array", raw: json.RawMessage(`[]`), wantIsArray: true},
+		{name: "empty array with whitespace", raw: json.RawMessage(" \n[ ]\t"), wantIsArray: true},
+		{name: "mixed and nested items", raw: json.RawMessage(` [{}, null, [1,2], {"a":[3,4]}, "],["] `), wantCount: 5, wantIsArray: true},
+		{name: "missing close", raw: json.RawMessage(`[{},`), wantCount: 1, wantIsArray: true, wantErr: true},
+		{name: "trailing comma", raw: json.RawMessage(`[{},]`), wantCount: 1, wantIsArray: true, wantErr: true},
+		{name: "invalid tail", raw: json.RawMessage(`[{}] invalid`), wantCount: 1, wantIsArray: true, wantErr: true},
+		{name: "second scalar", raw: json.RawMessage(`[{}] true`), wantCount: 1, wantIsArray: true, wantErr: true},
+		{name: "second array", raw: json.RawMessage(`[{}] []`), wantCount: 1, wantIsArray: true, wantErr: true},
+		{name: "second object", raw: json.RawMessage(`[{}] {}`), wantCount: 1, wantIsArray: true, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			count, isArray, err := CountJSONArrayItems(tt.raw)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantCount, count)
+			assert.Equal(t, tt.wantIsArray, isArray)
+		})
+	}
+}
+
+func TestCountJSONArrayItemsCountsPastResponsesLimits(t *testing.T) {
+	for _, itemCount := range []int{900, 901, 1000, 1001} {
+		for _, tail := range []struct {
+			name    string
+			value   string
+			wantErr bool
+		}{
+			{name: "complete", value: "\n\t"},
+			{name: "invalid tail", value: " invalid", wantErr: true},
+			{name: "second JSON", value: " []", wantErr: true},
+		} {
+			t.Run(fmt.Sprintf("%d/%s", itemCount, tail.name), func(t *testing.T) {
+				raw := json.RawMessage("[" + strings.Repeat("0,", itemCount-1) + "0]" + tail.value)
+				count, isArray, err := CountJSONArrayItems(raw)
+				if tail.wantErr {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+				assert.True(t, isArray)
+				assert.Equal(t, itemCount, count)
+			})
+		}
 	}
 }
 

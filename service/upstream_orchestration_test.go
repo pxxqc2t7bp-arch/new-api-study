@@ -1202,6 +1202,27 @@ func TestSelectUpstreamCandidateGroupsCapsAtFiveWithSourceDiversity(t *testing.T
 	assert.Len(t, sourceIDs, 5)
 }
 
+func TestSelectUpstreamCandidateGroupsMaxIntLimitDoesNotPanic(t *testing.T) {
+	candidates := []upstreamRouteCandidate{{
+		source: model.UpstreamSource{ID: 1, Key: "only-source"},
+		group: model.UpstreamGroup{
+			SourceID:            1,
+			ExternalID:          "only-group",
+			Platform:            "openai",
+			EffectiveMultiplier: 0.1,
+		},
+		models: []string{"gpt-test"},
+	}}
+	var selected []upstreamRouteCandidate
+
+	require.NotPanics(t, func() {
+		selected = selectUpstreamCandidateGroups(candidates, int(^uint(0)>>1))
+	})
+
+	require.Len(t, selected, 1)
+	assert.Equal(t, candidates, selected)
+}
+
 func TestSelectUpstreamCandidateGroupsUnlimitedReturnsAllSortedCandidates(t *testing.T) {
 	candidates := []upstreamRouteCandidate{
 		{source: model.UpstreamSource{ID: 1, Key: "expensive"}, group: model.UpstreamGroup{SourceID: 1, ExternalID: "expensive", Platform: "openai", EffectiveMultiplier: 0.3}, models: []string{"gpt-test"}},
