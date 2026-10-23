@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"time"
 
 	"smart-router/api"
@@ -136,7 +137,7 @@ func (service Service) Submit(ctx context.Context, evidence Evidence) (Record, e
 func snapshotProbeEvidence(e Evidence) Evidence {
 	e.Samples = append([]Sample(nil), e.Samples...)
 	for i := range e.Samples {
-		e.Samples[i].Numbers = append([]int(nil), e.Samples[i].Numbers...)
+		e.Samples[i].Numbers = slices.Clone(e.Samples[i].Numbers)
 	}
 	return e
 }

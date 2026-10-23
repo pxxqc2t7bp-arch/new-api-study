@@ -735,10 +735,13 @@ export const native = {
     return Object.assign({}, data, { id: task.task_id });
   },
   taskStatus: function (ctx, task) {
-    if (task.data && typeof task.data === "object" && !Array.isArray(task.data)) return Object.assign({}, task.data, { id: task.task_id });
+    const data = task.data && typeof task.data === "object" && !Array.isArray(task.data) ? task.data : null;
     const statusMap = { NOT_START: "queued", SUBMITTED: "queued", QUEUED: "queued", IN_PROGRESS: "running", SUCCESS: "succeeded", FAILURE: "failed" };
-    const output = { id: task.task_id, status: statusMap[task.status] || "queued" };
-    if (task.fail_reason) output.error = { message: task.fail_reason };
+    const output = Object.assign({}, data || {}, { id: task.task_id });
+    if (!data || task.status === "SUCCESS" || task.status === "FAILURE") output.status = statusMap[task.status] || "queued";
+    if (task.status === "FAILURE") output.error = Object.assign({}, output.error || {}, { message: task.fail_reason || "task failed" });
+    else if (task.status === "SUCCESS") delete output.error;
+    else if (!data && task.fail_reason) output.error = { message: task.fail_reason };
     return output;
   },
   createImage: function (ctx) {

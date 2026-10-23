@@ -20,9 +20,7 @@ FORBIDDEN_MODULES = (
 BANK_ENVIRONMENT_KEY = "SMART_ROUTER_MODELTRACE_BANK"
 MAX_BANK_BYTES = 16 * 1024 * 1024
 MAX_STDIN_BYTES = 256 * 1024
-PYTHON_EXECUTABLE = (
-    "/private/tmp/smart-router-modeltrace-evidence-20261012/venv/bin/python"
-)
+PYTHON_EXECUTABLE = os.environ.get("MODELTRACE_TEST_PYTHON") or sys.executable
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 VENDORED_BANK_PATH = (
     REPOSITORY_ROOT
@@ -675,6 +673,28 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(1, result["schema_version"])
         self.assertEqual(revision, result["bank_revision"])
         self.assertEqual("challenge-1", result["diagnostics"][0]["challenge_id"])
+
+    def test_stdio_empty_python_override_uses_current_interpreter(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "unittest",
+                "modeltrace_runtime.tests.test_worker.WorkerTest."
+                "test_stdio_success_writes_exactly_one_json_result",
+            ],
+            cwd=REPOSITORY_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "MODELTRACE_TEST_PYTHON": "",
+            },
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr.decode("utf-8"))
 
     def test_stdio_rejects_strict_or_oversized_input_with_redacted_error(self):
         bank_bytes = VENDORED_BANK_PATH.read_bytes()

@@ -69,7 +69,7 @@
         <div class="page-header"><h1>Bank management</h1><div class="library-actions"><button id="rebuild" class="button secondary" type="button">Explicit rebuild</button><button id="reload" class="button secondary" type="button">Reload view only</button></div></div>
         <section class="inventory-panel"><div class="form-heading"><strong>Current generation</strong><span id="bank-revision"></span></div><div id="bank-inventory" class="fingerprint-list"></div></section>
         <form id="create-bank-form" class="form-panel">
-          <div class="form-grid two"><label>New family ID<input id="new-bank-id" pattern="[a-z0-9][a-z0-9-]{0,63}" required></label><label>New family label<input id="new-bank-name" maxlength="1024" required></label></div>
+          <div class="form-grid two"><label>New family ID<input id="new-bank-id" pattern="[a-z0-9][a-z0-9\-]{0,63}" required></label><label>New family label<input id="new-bank-name" maxlength="1024" required></label></div>
           <div class="form-footer"><button class="button primary" type="submit">Create family once</button></div>
         </form>
         <form id="auto-enrollment" class="form-panel">
@@ -83,7 +83,7 @@
             <label>Enrollment protocol<select id="enroll-protocol"><option value="openai">OpenAI Chat</option><option value="anthropic">Anthropic Messages</option></select></label>
             <label>Slots (3 to 36)<input id="sample-count" type="number" min="3" max="36" value="3" required></label>
           </div>
-          <div class="form-footer"><button class="button primary" type="submit">Collect enrollment once</button><button id="publish-enrollment" class="button secondary" type="button" disabled>Publish completed enrollment once</button></div>
+          <div class="form-footer"><button class="button primary" type="submit">Collect enrollment once</button><button id="lookup-enrollment" class="button secondary" type="button" disabled>Read owned enrollment operation</button><button id="publish-enrollment" class="button secondary" type="button" disabled>Publish completed enrollment once</button></div>
           <pre id="enrollment-status" aria-live="polite"></pre>
         </form>
       </section>

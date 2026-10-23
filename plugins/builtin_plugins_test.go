@@ -6,12 +6,95 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 var expectedKeys = []string{"alibaba", "doubao", "google", "hailuo", "jimeng", "kling", "sora", "sunoapi", "vertex-ai", "vidu"}
+
+func TestNativeChainedQueryProjectsHostTerminalStatus(t *testing.T) {
+	generation := jsplugin.DefaultRegistry.Generation()
+	require.NotNil(t, generation)
+	for _, key := range []string{"alibaba", "doubao"} {
+		t.Run(key, func(t *testing.T) {
+			plugin, found := generation.Get(key)
+			require.True(t, found)
+			for _, tc := range []struct {
+				name, hostStatus, vendorStatus, wantStatus string
+				noData                                     bool
+			}{
+				{"host failure after pending", "FAILURE", "pending", "FAILURE", false},
+				{"host failure after running", "FAILURE", "running", "FAILURE", false},
+				{"host failure without snapshot", "FAILURE", "", "FAILURE", true},
+				{"host success after pending", "SUCCESS", "pending", "SUCCESS", false},
+				{"nonterminal vendor snapshot", "IN_PROGRESS", "running", "IN_PROGRESS", false},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					data := map[string]any{"request_id": "vendor-request", "vendor_extension": map[string]any{"keep": true}}
+					if key == "alibaba" {
+						data["output"] = map[string]any{
+							"task_id": "task_public", "task_status": strings.ToUpper(tc.vendorStatus),
+							"message": "stale vendor reason", "output_extension": "keep",
+						}
+						data["message"] = "stale vendor reason"
+					} else {
+						data["id"] = "task_public"
+						data["status"] = tc.vendorStatus
+						data["error"] = map[string]any{"message": "stale vendor reason", "vendor_detail": "keep"}
+					}
+					view := dto.TaskView{TaskID: "task_public", Status: tc.hostStatus, Data: data}
+					if tc.hostStatus == "FAILURE" {
+						view.FailReason = "host stopped polling: provider task not found"
+					}
+					if tc.noData {
+						view.Data = nil
+					}
+					encoded, err := common.Marshal(view)
+					require.NoError(t, err)
+					var task map[string]any
+					require.NoError(t, common.Unmarshal(encoded, &task))
+					before, err := common.Marshal(task)
+					require.NoError(t, err)
+					value, err := plugin.Engine.CallPath(t.Context(), "native", []string{"taskStatus"}, map[string]any{}, task)
+					require.NoError(t, err)
+					encoded, err = common.Marshal(value)
+					require.NoError(t, err)
+					var rendered map[string]any
+					require.NoError(t, common.Unmarshal(encoded, &rendered))
+					after, err := common.Marshal(task)
+					require.NoError(t, err)
+					assert.JSONEq(t, string(before), string(after), "presentation must not mutate the persisted snapshot")
+					if !tc.noData {
+						assert.Equal(t, data["request_id"], rendered["request_id"])
+						assert.Equal(t, data["vendor_extension"], rendered["vendor_extension"])
+						if key == "alibaba" {
+							assert.Equal(t, "keep", rendered["output"].(map[string]any)["output_extension"])
+						} else if tc.hostStatus == "FAILURE" {
+							assert.Equal(t, "keep", rendered["error"].(map[string]any)["vendor_detail"])
+						}
+					}
+					parsed, err := plugin.Engine.Call(t.Context(), "parseTaskResult",
+						map[string]any{"upstream": map[string]any{"kind": "new_api"}}, rendered)
+					require.NoError(t, err)
+					encoded, err = common.Marshal(parsed)
+					require.NoError(t, err)
+					var result map[string]any
+					require.NoError(t, common.Unmarshal(encoded, &result))
+					assert.Equal(t, tc.wantStatus, result["status"])
+					if tc.hostStatus == "FAILURE" {
+						assert.Equal(t, view.FailReason, result["reason"])
+					}
+					if tc.hostStatus == "SUCCESS" {
+						assert.NotContains(t, rendered, "error")
+						assert.NotContains(t, rendered, "message")
+					}
+				})
+			}
+		})
+	}
+}
 
 func TestBuiltInVendorPluginsDeclareNativeRoutesAndLegacyChannelTypes(t *testing.T) {
 	generation := jsplugin.DefaultRegistry.Generation()

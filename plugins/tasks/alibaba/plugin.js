@@ -675,8 +675,8 @@ function imageUsage(ctx, body) {
   const reported = usage.image_count !== undefined ? usage.image_count : usage.output_image_count;
   let count;
   if (reported !== undefined) {
-    // Do not let fractional, negative or oversized upstream counts change billing.
-    if (!Number.isInteger(reported) || reported < 0 || reported > MAX_IMAGE_OUTPUTS || (images.length && reported === 0))
+    // Reject invalid or payload-inconsistent counts instead of changing billing.
+    if (!Number.isInteger(reported) || reported < 0 || reported > MAX_IMAGE_OUTPUTS || reported !== images.length)
       throw new Error("invalid upstream image count");
     count = reported;
   } else if (content.length) count = images.length;
@@ -1263,7 +1263,19 @@ export const native = {
   taskStatus: function (ctx, task) {
     const data = task.data || {},
       output = Object.assign({}, data.output || {}, { task_id: task.task_id });
-    return Object.assign({}, data, { output: output });
+    const result = Object.assign({}, data, { output: output });
+    if (task.status === "FAILURE") {
+      output.task_status = "FAILED";
+      output.message = task.fail_reason || "task failed";
+      result.message = output.message;
+    } else if (task.status === "SUCCESS") {
+      output.task_status = "SUCCEEDED";
+      delete output.code;
+      delete output.message;
+      delete result.code;
+      delete result.message;
+    }
+    return result;
   },
   error: function (ctx, error) {
     return { code: error.code, message: error.message, request_id: "" };

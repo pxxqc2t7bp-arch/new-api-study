@@ -11,16 +11,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"smart-router/internal/testutil"
 )
-
-const ownedTestRoot = "/Users/bytedance/.local/share/modeltrace-evidence-20261013/task5-implementation/tmp"
 
 func configDir(t *testing.T) string {
 	t.Helper()
-	root, err := os.MkdirTemp(ownedTestRoot, "config-d-")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(root)) })
-	return root
+	return testutil.OwnedDir(t)
 }
 
 func configHash(data []byte) string {

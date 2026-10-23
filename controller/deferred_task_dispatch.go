@@ -139,8 +139,7 @@ func (h deferredTaskDispatchHandler) Run(ctx context.Context, systemTask *model.
 				continue
 			}
 			if task.DispatchStatus == model.TaskDispatchStatusUncertain &&
-				!safeBeforeProviderIO &&
-				!taskErr.ProviderAccepted {
+				!safeBeforeProviderIO {
 				if _, recordErr := model.RecordDeferredTaskUncertainty(task, owner, reason); recordErr != nil {
 					logger.LogWarn(ctx, fmt.Sprintf(
 						"record deferred task %s uncertainty failed: %v",

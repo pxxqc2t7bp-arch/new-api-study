@@ -21,13 +21,11 @@ import (
 	"golang.org/x/sys/unix"
 	"smart-router/api"
 	"smart-router/config"
+	"smart-router/internal/testutil"
 	"smart-router/modeltrace"
 	"smart-router/modeltraceapi"
 	"smart-router/store"
 )
-
-const ownedTestRoot = "/Users/bytedance/.local/share/modeltrace-evidence-20261013/task5-implementation/tmp"
-const pinnedPython = "/Users/bytedance/.local/share/mise/installs/python/3.14.7/bin/python3.14"
 
 var daemonKey = []byte("synthetic-daemon-ingest-key-at-least-32")
 
@@ -52,9 +50,8 @@ func daemonJSON(t *testing.T, path string, value any) []byte {
 
 func daemonFixture(t *testing.T, blocking bool) (config.ModelTraceConfig, modeltrace.Evidence, string) {
 	t.Helper()
-	root, err := os.MkdirTemp(ownedTestRoot, "daemon-d-")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(root)) })
+	pinnedPython := testutil.Python(t)
+	root := testutil.OwnedDir(t)
 	marker := filepath.Join(root, "owned-pid")
 	runtime := filepath.Join(root, "runtime")
 	body := "import json,sys,os,time\nr=json.load(sys.stdin)\n"

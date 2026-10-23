@@ -96,6 +96,7 @@ textarea:focus, input:focus, .form-grid select:focus { border-color: #84adff; bo
 .compact-form label { flex: 1; }
 .form-heading { display: flex; flex-direction: column; gap: 4px; padding: 15px 17px; border-bottom: 1px solid var(--line); }
 .form-heading span { color: var(--muted); font-size: 11px; }
+#bank-revision { overflow-wrap: anywhere; }
 .form-grid { display: grid; gap: 14px; padding: 17px; }
 .form-grid.two { grid-template-columns: 1fr 1fr; }
 .form-grid.one-narrow { grid-template-columns: minmax(220px, .35fr) 1fr; }
@@ -138,7 +139,7 @@ label code { color: var(--primary-dark); }
 .diagnostic.accepted { color: var(--success); background: var(--success-soft); }
 .diagnostic.rejected { color: var(--danger); background: var(--danger-soft); }
 .result-note { display: flex; justify-content: space-between; gap: 16px; padding: 10px 17px; color: var(--muted); font-size: 10px; border-top: 1px solid var(--line); }
-.result-guidance { padding: 12px 17px; color: var(--muted); font-size: 11px; line-height: 1.7; border-top: 1px solid var(--line); }
+.result-guidance { padding: 12px 17px; color: var(--muted); font-size: 11px; line-height: 1.7; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
 .result-guidance p { margin: 0; }
 .result-guidance p + p { margin-top: 4px; }
 

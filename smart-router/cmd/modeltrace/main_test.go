@@ -19,21 +19,17 @@ import (
 	"github.com/stretchr/testify/require"
 	"smart-router/api"
 	"smart-router/config"
+	"smart-router/internal/testutil"
 	"smart-router/modeltrace"
 	"smart-router/modeltraceapi"
+	"smart-router/store"
 )
-
-const ownedTestRoot = "/Users/bytedance/.local/share/modeltrace-evidence-20261013/task5-implementation/tmp"
-const pinnedPython = "/Users/bytedance/.local/share/mise/installs/python/3.14.7/bin/python3.14"
 
 var cliKey = []byte("synthetic-command-ingest-key-at-least-32")
 
 func cliDir(t *testing.T) string {
 	t.Helper()
-	root, err := os.MkdirTemp(ownedTestRoot, "cli-d-")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(root)) })
-	return root
+	return testutil.OwnedDir(t)
 }
 
 func cliHash(data []byte) string {
@@ -67,6 +63,7 @@ func cliEvidence() modeltrace.Evidence {
 
 func cliFixture(t *testing.T) ([]string, config.ModelTracePins, string) {
 	t.Helper()
+	pinnedPython := testutil.Python(t)
 	root := cliDir(t)
 	input := filepath.Join(root, "evidence.json")
 	cliJSON(t, input, cliEvidence())
@@ -226,8 +223,81 @@ func TestCLISubmitAndGetUseSignedTransportOnly(t *testing.T) {
 	}
 }
 
+type cliCountingEngine struct {
+	modeltrace.Engine
+	calls int
+}
+
+func (engine *cliCountingEngine) Analyze(ctx context.Context, evidence modeltrace.Evidence) (modeltrace.Result, error) {
+	engine.calls++
+	return engine.Engine.Analyze(ctx, evidence)
+}
+
+func TestCLISignedPartialSubmitPreservesDurableDigest(t *testing.T) {
+	ctx := context.Background()
+	args, pins, root := cliFixture(t)
+	e := cliEvidence()
+	e.Samples = append(e.Samples, modeltrace.Sample{ChallengeID: "empty", Numbers: []int{}})
+	data := cliJSON(t, args[2], e)
+	digest, err := e.Digest()
+	require.NoError(t, err)
+	process, err := config.ModelTraceProcess(args[4], filepath.Join(root, "runtime", "worker.py"),
+		args[8], args[10], args[6], cliDir(t), pins)
+	require.NoError(t, err)
+	child, err := modeltrace.NewProcessEngine(process)
+	require.NoError(t, err)
+	engine := &cliCountingEngine{Engine: child}
+	db, err := store.OpenSQLite(ctx, filepath.Join(root, "probes.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	require.NoError(t, db.UpsertSource(ctx, store.Source{ID: "cli-source", Connector: "fixture", Enabled: true}))
+	require.NoError(t, db.UpsertBinding(ctx, store.BindingRecord{
+		ID: e.BindingID, SourceID: "cli-source", Group: "default", Model: e.ClaimedModel,
+		Protocol: e.Protocol, ProtocolPlugin: "chat-v1", Enabled: true,
+	}))
+	backend := struct {
+		modeltrace.Service
+		modeltrace.Repository
+	}{modeltrace.Service{Repository: db, Engine: engine}, db}
+	handler, err := modeltraceapi.NewServer(modeltraceapi.Options{Backend: backend, Key: cliKey})
+	require.NoError(t, err)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	submit := []string{"submit", "-input", args[2], "-url", server.URL}
+	var first modeltraceapi.Record
+	for attempt := range 2 {
+		var output, errors bytes.Buffer
+		code := run(ctx, submit, func(string) string { return string(cliKey) }, config.ModelTracePins{}, &output, &errors)
+		require.Equal(t, 0, code, errors.String())
+		assert.Empty(t, errors.String())
+		record, err := modeltraceapi.DecodeRecord(output.Bytes())
+		require.NoError(t, err)
+		assert.Equal(t, digest, record.EvidenceSHA256)
+		assert.Equal(t, modeltrace.StateSucceeded, record.State)
+		require.NotNil(t, record.Result)
+		assert.Equal(t, 1, record.Result.UsedOutputs)
+		if attempt == 0 {
+			first = record
+		} else {
+			assert.Equal(t, first, record)
+		}
+	}
+	assert.Equal(t, 1, engine.calls)
+	durable, err := db.GetProbe(ctx, e.ProbeID)
+	require.NoError(t, err)
+	assert.Equal(t, first, modeltraceapi.Record(durable))
+
+	cliPut(t, args[2], bytes.Replace(data, []byte(`"numbers":[]`), []byte(`"numbers":null`), 1))
+	var output, errors bytes.Buffer
+	code := run(ctx, submit, func(string) string { return string(cliKey) }, config.ModelTracePins{}, &output, &errors)
+	assert.NotZero(t, code)
+	assert.Empty(t, output.String())
+	assert.Equal(t, "modeltrace: invalid_request\n", errors.String())
+	assert.Equal(t, 1, engine.calls)
+}
+
 func TestCLITransportRejectsUntrustedResponsesWithoutDisclosure(t *testing.T) {
-	for _, mode := range []string{"status", "invalid", "oversize", "redirect", "wrong_id"} {
+	for _, mode := range []string{"status", "invalid", "oversize", "redirect", "wrong_id", "wrong_digest"} {
 		t.Run(mode, func(t *testing.T) {
 			calls := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -242,9 +312,13 @@ func TestCLITransportRejectsUntrustedResponsesWithoutDisclosure(t *testing.T) {
 					_, _ = w.Write(bytes.Repeat([]byte(" "), modeltraceapi.MaxBodyBytes+1))
 				case "redirect":
 					http.Redirect(w, r, "/other", http.StatusFound)
-				case "wrong_id":
+				case "wrong_id", "wrong_digest":
 					record := cliRecord(t)
-					record.ProbeID = "different-id"
+					if mode == "wrong_id" {
+						record.ProbeID = "different-id"
+					} else {
+						record.EvidenceSHA256 = strings.Repeat("c", 64)
+					}
 					data, err := modeltraceapi.EncodeRecord(record)
 					require.NoError(t, err)
 					_, _ = w.Write(data)
@@ -252,13 +326,22 @@ func TestCLITransportRejectsUntrustedResponsesWithoutDisclosure(t *testing.T) {
 			}))
 			defer server.Close()
 			var output, errors bytes.Buffer
-			code := run(context.Background(), []string{"get", "-probe-id", "probe-cli", "-url", server.URL},
+			args := []string{"get", "-probe-id", "probe-cli", "-url", server.URL}
+			if mode == "wrong_digest" {
+				input := filepath.Join(cliDir(t), "evidence.json")
+				cliJSON(t, input, cliEvidence())
+				args = []string{"submit", "-input", input, "-url", server.URL}
+			}
+			code := run(context.Background(), args,
 				func(string) string { return string(cliKey) }, config.ModelTracePins{}, &output, &errors)
 			assert.NotZero(t, code)
 			assert.Empty(t, output.String())
 			assert.Less(t, errors.Len(), 80)
 			assert.NotContains(t, errors.String(), "raw-synthetic")
 			assert.Equal(t, 1, calls)
+			if mode == "wrong_digest" {
+				assert.Equal(t, "modeltrace: invalid_record\n", errors.String())
+			}
 		})
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"regexp"
+	"slices"
 	"time"
 
 	"smart-router/api"
@@ -21,7 +22,7 @@ var probeDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 func (database *DB) BeginProbe(ctx context.Context, evidence modeltrace.Evidence, digest string, at time.Time) (modeltrace.Record, bool, error) {
 	evidence.Samples = append([]modeltrace.Sample(nil), evidence.Samples...)
 	for i := range evidence.Samples {
-		evidence.Samples[i].Numbers = append([]int(nil), evidence.Samples[i].Numbers...)
+		evidence.Samples[i].Numbers = slices.Clone(evidence.Samples[i].Numbers)
 	}
 	actualDigest, err := evidence.Digest()
 	if err != nil || digest != actualDigest {

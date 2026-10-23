@@ -209,6 +209,42 @@ func TestServiceReplayNeverExecutes(t *testing.T) {
 	}
 }
 
+func TestServicePartialEvidencePreservesDigestOnReplay(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		numbers []int
+	}{
+		{"empty", []int{}},
+		{"nil-typed", nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			e := serviceEvidence("partial-" + test.name)
+			e.Samples = append(e.Samples, trace.Sample{ChallengeID: "short", Numbers: test.numbers})
+			digest, err := e.Digest()
+			require.NoError(t, err)
+			db := serviceDB(t, e)
+			calls := 0
+			service := trace.Service{Repository: db, Engine: serviceEngine(func(_ context.Context, input trace.Evidence) (trace.Result, error) {
+				calls++
+				got, err := input.Digest()
+				require.NoError(t, err)
+				assert.Equal(t, digest, got)
+				return serviceResult(input), nil
+			})}
+			record, err := service.Submit(context.Background(), e)
+			require.NoError(t, err)
+			assert.Equal(t, trace.StateSucceeded, record.State)
+			assert.Equal(t, digest, record.EvidenceSHA256)
+			require.NotNil(t, record.Result)
+			assert.Equal(t, 1, record.Result.UsedOutputs)
+			replay, err := service.Submit(context.Background(), e)
+			require.NoError(t, err)
+			assert.Equal(t, record, replay)
+			assert.Equal(t, 1, calls)
+		})
+	}
+}
+
 func TestServiceAdmissionErrorsNeverExecute(t *testing.T) {
 	for _, admissionErr := range []error{trace.ErrProbeStorage, trace.ErrBindingMissing, trace.ErrBindingMismatch} {
 		t.Run(admissionErr.Error(), func(t *testing.T) {

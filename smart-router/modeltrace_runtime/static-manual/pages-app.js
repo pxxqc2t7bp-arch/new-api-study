@@ -3,7 +3,10 @@ import { analyzeGlobalOutputs, parseNumbers } from "./fingerprint-core.js";
 import { generateChallenges } from "./challenge-browser.js";
 
 const REVISION = "f267d0513aa06981d024ec5394746fceddf44e4e8a75fa6bf8304255f4b32d6d";
-const state = { bank: null, challenges: [], samples: null, evidence: null, session: null, submitted: false };
+const state = {
+  bank: null, challenges: [], samples: null, evidence: null, session: null,
+  submission: null, exportInFlight: false,
+};
 const byId = (id) => document.getElementById(id);
 const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, (character) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
@@ -19,11 +22,10 @@ function message(text, type = "error") {
 function regenerate() {
   state.challenges = generateChallenges(3);
   state.samples = state.evidence = null;
-  state.submitted = false;
   byId("result").hidden = true;
   byId("download-evidence").disabled = byId("submit-evidence").disabled = true;
-  byId("read-probe").disabled = true;
-  byId("probe-id").value = "";
+  byId("read-probe").disabled = !state.submission;
+  byId("probe-id").value = state.submission?.evidence.probe_id || "";
   byId("binding-select").disabled = false;
   byId("challenge-list").innerHTML = state.challenges.map((challenge, index) => `
     <article class="challenge-item"><div class="challenge-header"><strong>挑战 ${index + 1}</strong>
@@ -77,12 +79,12 @@ function analyze() {
     const payload = analyzeGlobalOutputs(outputs, state.bank);
     state.samples = samples;
     state.evidence = null;
-    state.submitted = false;
     byId("binding-select").disabled = false;
-    byId("probe-id").value = "";
+    byId("probe-id").value = state.submission?.evidence.probe_id || "";
     renderResult(payload);
-    byId("download-evidence").disabled = byId("submit-evidence").disabled = !state.session?.bindings.length;
-    byId("read-probe").disabled = true;
+    byId("download-evidence").disabled = !state.session?.bindings.length;
+    byId("submit-evidence").disabled = !state.session?.bindings.length || Boolean(state.submission) || state.exportInFlight;
+    byId("read-probe").disabled = !state.submission;
     message("本地计算完成 / Local analysis complete.", "success");
   } catch {
     state.samples = null;
@@ -113,7 +115,7 @@ function evidence() {
       ...state.session.bindings[Number(byId("binding-select").value)],
       bank_revision: REVISION, samples: state.samples,
     };
-    byId("probe-id").value = state.evidence.probe_id;
+    if (!state.submission) byId("probe-id").value = state.evidence.probe_id;
     byId("binding-select").disabled = true;
   }
   return state.evidence;
@@ -134,24 +136,45 @@ byId("download-evidence").addEventListener("click", () => {
   }
 });
 byId("submit-evidence").addEventListener("click", async () => {
-  if (state.submitted) return;
-  state.submitted = true;
-  byId("submit-evidence").disabled = true;
+  if (state.exportInFlight || state.submission) return;
+  let submission;
   try {
     const value = evidence();
+    submission = { evidence: value, receipt: null, readback: null, readbackVersion: 0 };
+    state.submission = submission;
+    state.exportInFlight = true;
+    byId("submit-evidence").disabled = true;
     byId("read-probe").disabled = false;
-    byId("export-status").textContent = JSON.stringify(await api("/api/export", {
+    byId("export-status").textContent = "Submission pending; never automatically reposted.";
+    const result = await api("/api/export", {
       action_id: crypto.randomUUID(), evidence: value,
-    }), null, 2);
+    });
+    if (state.submission === submission) {
+      submission.receipt = result;
+      if (!submission.readback) byId("export-status").textContent = JSON.stringify(result, null, 2);
+    }
   } catch {
-    byId("export-status").textContent = "Submission rejected or unknown. No retry; preserve probe ID and pinned revision.";
+    if (state.submission === submission && !submission?.readback) {
+      byId("export-status").textContent = "Submission rejected or unknown. No retry; preserve probe ID and pinned revision.";
+    }
+  } finally {
+    state.exportInFlight = false;
   }
 });
 byId("read-probe").addEventListener("click", async () => {
+  const submission = state.submission;
+  if (!submission) return;
+  const version = ++submission.readbackVersion;
   try {
-    byId("export-status").textContent = JSON.stringify(await api(`/api/probes/${state.evidence.probe_id}`), null, 2);
+    const result = await api(`/api/probes/${submission.evidence.probe_id}`);
+    if (state.submission === submission && submission.readbackVersion === version) {
+      submission.readback = result;
+      byId("export-status").textContent = JSON.stringify(result, null, 2);
+    }
   } catch {
-    byId("export-status").textContent = "Readback unavailable. No POST was sent.";
+    if (state.submission === submission && submission.readbackVersion === version) {
+      byId("export-status").textContent = "Readback unavailable. No POST was sent.";
+    }
   }
 });
 

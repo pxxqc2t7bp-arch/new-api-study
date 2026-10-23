@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"smart-router/internal/testutil"
 )
 
 func TestProcessBridgeRetainsGo123Compatibility(t *testing.T) {
@@ -36,17 +37,9 @@ func TestProcessBridgeRetainsGo123Compatibility(t *testing.T) {
 	})
 }
 
-const pinnedPython = "/Users/bytedance/.local/share/mise/installs/python/3.14.7/bin/python3.14"
-const ownedTestRoot = "/Users/bytedance/.local/share/modeltrace-evidence-20261013/task5-implementation/tmp"
-
 func ownedDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp(ownedTestRoot, "bridge-")
-	if err != nil {
-		t.Fatal("owned temporary directory unavailable")
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	return dir
+	return testutil.OwnedDir(t)
 }
 
 func put(t *testing.T, path string, data []byte) {
@@ -68,6 +61,7 @@ func putJSON(t *testing.T, path string, value any) []byte {
 
 func processFixture(t *testing.T, body string) (ProcessConfig, Evidence, string) {
 	t.Helper()
+	pinnedPython := testutil.Python(t)
 	root := ownedDir(t)
 	body = strings.ReplaceAll(body, "MARKER_PATH", strconvQuote(filepath.Join(root, "launched")))
 	runtimeRoot := filepath.Join(root, "modeltrace_runtime")
@@ -507,6 +501,7 @@ func TestRealPythonBridgeSafeCustomModelLabels(t *testing.T) {
 }
 
 func TestActualBridgePreservesEmptyShortSample(t *testing.T) {
+	pinnedPython := testutil.Python(t)
 	repo, err := filepath.Abs("..")
 	if err != nil {
 		t.Fatal("repository location unavailable")
@@ -600,6 +595,7 @@ func TestActualBridgePreservesEmptyShortSample(t *testing.T) {
 }
 
 func realPythonBridgeMatchesVendorOracle(t *testing.T, custom bool) {
+	pinnedPython := testutil.Python(t)
 	t.Helper()
 	repo, err := filepath.Abs("..")
 	if err != nil {

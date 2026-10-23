@@ -58,6 +58,7 @@ func TestProbeSurvivesSQLiteReopen(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
 	evidence := probeEvidence("reopen-probe")
+	evidence.Samples = append(evidence.Samples, modeltrace.Sample{ChallengeID: "empty", Numbers: []int{}})
 	seedProbeBinding(t, database, evidence)
 	digest, err := evidence.Digest()
 	require.NoError(t, err)
@@ -66,6 +67,7 @@ func TestProbeSurvivesSQLiteReopen(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, created)
 	assert.Equal(t, modeltrace.StateRunning, running.State)
+	assert.Equal(t, digest, running.EvidenceSHA256)
 	result := probeResult(evidence)
 	require.NoError(t, database.CompleteProbe(ctx, evidence.ProbeID, result, at.Add(time.Second)))
 	before, err := database.GetProbe(ctx, evidence.ProbeID)
@@ -81,6 +83,10 @@ func TestProbeSurvivesSQLiteReopen(t *testing.T) {
 		Protocol: evidence.Protocol, EvidenceSHA256: digest, State: modeltrace.StateSucceeded,
 		ObservedAt: at, Result: &result,
 	}, after)
+	replay, created, err := database.BeginProbe(ctx, evidence, digest, at.Add(2*time.Second))
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, after, replay)
 }
 
 func openProbeDB(t *testing.T) *DB {

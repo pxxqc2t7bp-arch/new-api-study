@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/pkg/jsplugin"
@@ -20,6 +21,8 @@ import (
 	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	taskplugin "github.com/QuantumNous/new-api/relay/channel/task/jsplugin"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1305,6 +1308,7 @@ func TestAlibabaOpenAIImageCountDerivationAndRender(t *testing.T) {
 	plugin := newAlibabaPlugin(t)
 	const first, second = "https://cdn.example/first.png", "https://cdn.example/second.png"
 	twoImagesOneChoice := []any{map[string]any{"finish_reason": "stop", "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"image": first}, map[string]any{"image": second}}}}}
+	oneImageOneChoice := []any{map[string]any{"message": map[string]any{"content": []any{map[string]any{"image": first}}}}}
 	for _, tc := range []struct {
 		name, model string
 		output      map[string]any
@@ -1326,6 +1330,14 @@ func TestAlibabaOpenAIImageCountDerivationAndRender(t *testing.T) {
 			map[string]any{"image_count": float64(1)}, 1, false},
 		{"inconsistent zero count retains the reservation", "qwen-image-3.0-pro", map[string]any{"choices": twoImagesOneChoice}, map[string]any{"output_image_count": 0},
 			nil, 2, true},
+		{"positive output count underreports delivered images", "qwen-image-3.0-pro", map[string]any{"choices": twoImagesOneChoice}, map[string]any{"output_image_count": 1},
+			nil, 2, true},
+		{"positive output count overreports delivered images", "qwen-image-3.0-pro", map[string]any{"choices": oneImageOneChoice}, map[string]any{"output_image_count": 2},
+			nil, 1, true},
+		{"positive preferred count underreports delivered images", "wan2.6-t2i", map[string]any{"choices": twoImagesOneChoice}, map[string]any{"image_count": 1, "output_image_count": 2},
+			nil, 2, true},
+		{"positive preferred count overreports delivered images", "wan2.6-t2i", map[string]any{"choices": oneImageOneChoice}, map[string]any{"image_count": 2},
+			nil, 1, true},
 		{"fractional count retains the reservation", "wan2.6-t2i", map[string]any{"choices": twoImagesOneChoice}, map[string]any{"image_count": 1.5},
 			nil, 2, true},
 	} {
@@ -1358,6 +1370,57 @@ func TestAlibabaOpenAIImageCountDerivationAndRender(t *testing.T) {
 			assert.Equal(t, "task_public", parsed.UpstreamTaskID, "synchronous results keep the host task id")
 			if tc.wantErr {
 				assert.Nil(t, parsed.Immediate.UsageFacts, "an unrecognized count must not replace the reservation")
+				assert.Empty(t, adaptor.AdjustBillingOnSubmit(info, parsed.TaskData), "invalid facts must not change legacy ratios")
+				for _, mode := range []string{"expression", "legacy"} {
+					t.Run(mode+" retains reserved charge", func(t *testing.T) {
+						service.InitHttpClient()
+						providerCalls := 0
+						upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							assert.Equal(t, http.MethodPost, r.Method)
+							providerCalls++
+							w.Header().Set("Content-Type", "application/json")
+							_, _ = w.Write(encoded)
+						}))
+						defer upstream.Close()
+						reservedQuota := common.QuotaRound(0.3 * common.QuotaPerUnit)
+						submitInfo := &relaycommon.RelayInfo{
+							OriginModelName: tc.model,
+							TaskRelayInfo:   &relaycommon.TaskRelayInfo{PublicTaskID: "task_public"},
+							PriceData: types.PriceData{
+								Quota: reservedQuota, ModelPrice: 0.1, UsePrice: true,
+								GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+							},
+						}
+						submitInfo.PriceData.AddOtherRatio("image_count", 3)
+						if mode == "expression" {
+							submitInfo.TieredBillingSnapshot = &billingexpr.BillingSnapshot{
+								ExprString:  `tier("image", u("image_count") * 0.1)`,
+								ExprVersion: 1, TaskUsageBilling: true,
+								QuotaPerUnit: common.QuotaPerUnit, GroupRatio: 1,
+								UsageFacts: map[string]any{"image_count": float64(3)},
+							}
+						}
+						submitContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+						submitContext.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+						submitContext.Set("task_request", request)
+						submitContext.Set(jsplugin.ContextKeyPinnedPlugin, jsplugin.PinnedPlugin{
+							Generation: jsplugin.DefaultRegistry.Generation(), Plugin: plugin,
+						})
+						common.SetContextKey(submitContext, constant.ContextKeyChannelBaseUrl, upstream.URL)
+						common.SetContextKey(submitContext, constant.ContextKeyOriginalModel, tc.model)
+						result, taskErr := relay.RelayDeferredTaskSubmit(submitContext, submitInfo,
+							constant.TaskPlatform("alibaba"), reservedQuota, func() error { return nil })
+						require.Nil(t, taskErr)
+						require.NotNil(t, result.Immediate)
+						assert.Equal(t, "SUCCESS", result.Immediate.Status)
+						assert.Equal(t, reservedQuota, result.Quota)
+						assert.Equal(t, float64(3), submitInfo.PriceData.OtherRatios()["image_count"])
+						if mode == "expression" {
+							assert.Equal(t, float64(3), submitInfo.TieredBillingSnapshot.UsageFacts["image_count"])
+						}
+						assert.Equal(t, 1, providerCalls)
+					})
+				}
 			} else {
 				assert.Equal(t, tc.wantFacts, parsed.Immediate.UsageFacts)
 				ratios := adaptor.AdjustBillingOnSubmit(info, parsed.TaskData)
@@ -1371,6 +1434,9 @@ func TestAlibabaOpenAIImageCountDerivationAndRender(t *testing.T) {
 			require.Len(t, data, tc.wantData)
 			assert.Equal(t, first, data[0].(map[string]any)["url"])
 			assert.NotContains(t, data[0], "b64_json")
+			if tc.wantData == 2 {
+				assert.Equal(t, second, data[1].(map[string]any)["url"])
+			}
 		})
 	}
 

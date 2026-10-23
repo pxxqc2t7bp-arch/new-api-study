@@ -410,6 +410,91 @@ func TestDeferredAcceptedCompletionFailureCannotBeRedispatched(t *testing.T) {
 	assert.Equal(t, user.Quota, storedUser.Quota, "accepted provider work must not be refunded")
 }
 
+func TestDeferredAcceptedParseFailurePreservesOperatorRecovery(t *testing.T) {
+	service.InitHttpClient()
+	for _, tc := range []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{"truncated 200", http.StatusOK, `{"code":0,"data":`},
+		{"unrecognized 201", http.StatusCreated, `{"code":0,"data":{}}`},
+		{"throwing hook 202", http.StatusAccepted, `{"message":"accepted shape not recognized"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var providerCalls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodPost, r.Method)
+				providerCalls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.statusCode)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer upstream.Close()
+			database, user, task := setupDeferredDispatchFailureFixture(
+				t, upstream.URL, "", "task_deferred_accepted_parse_failure",
+			)
+			for _, runnerID := range []string{"runner-first", "runner-second"} {
+				runDeferredDispatcher(t, runnerID)
+			}
+
+			var stored model.Task
+			require.NoError(t, database.First(&stored, task.ID).Error)
+			assert.EqualValues(t, 1, providerCalls.Load())
+			assert.Equal(t, 1, stored.DispatchAttempts)
+			assert.Equal(t, model.TaskStatus(model.TaskStatusNotStart), stored.Status)
+			assert.Equal(t, model.TaskDispatchStatusUncertain, stored.DispatchStatus)
+			assert.True(t, stored.RequiresOperatorResolution())
+			assert.NotEmpty(t, stored.DispatchError)
+			assert.Empty(t, stored.PrivateData.UpstreamTaskID)
+			require.NotNil(t, task.PrivateData.DeferredRequest)
+			require.NotNil(t, stored.PrivateData.DeferredRequest)
+			expectedRequest := *task.PrivateData.DeferredRequest
+			storedRequest := *stored.PrivateData.DeferredRequest
+			assert.JSONEq(t, string(expectedRequest.RouteBody), string(storedRequest.RouteBody))
+			assert.JSONEq(t, string(expectedRequest.RequestBody), string(storedRequest.RequestBody))
+			// Native JSON storage may normalize formatting; every other field stays exact.
+			expectedRequest.RouteBody, storedRequest.RouteBody = nil, nil
+			expectedRequest.RequestBody, storedRequest.RequestBody = nil, nil
+			assert.Equal(t, expectedRequest, storedRequest)
+			assert.Equal(t, task.Quota, stored.Quota)
+			var storedUser model.User
+			require.NoError(t, database.First(&storedUser, user.Id).Error)
+			assert.Equal(t, user.Quota, storedUser.Quota)
+			var summaryTask model.SystemTask
+			require.NoError(t, database.Order("id DESC").First(&summaryTask).Error)
+			var summary deferredTaskDispatchSummary
+			require.NoError(t, common.UnmarshalJsonStr(summaryTask.Result, &summary))
+			assert.Equal(t, 1, summary.Uncertain)
+			afterLeaseExpiry := time.Now().Add(deferredDispatchLease + time.Second).Unix()
+			_, reclaimed, err := model.ClaimDeferredTask(
+				task.ID, "runner-after-lease", afterLeaseExpiry,
+				afterLeaseExpiry+int64(deferredDispatchLease.Seconds()),
+			)
+			require.NoError(t, err)
+			assert.False(t, reclaimed, "accepted work must never be replayed")
+
+			router, accessToken := makeDeferredResolutionRoot(t, database, user)
+			response := postDeferredResolution(t, router, task.TaskID, accessToken,
+				`{"resolution":"provider_accepted","upstream_task_id":"verified-provider-task","reason":"verified by operator"}`)
+			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+			require.NoError(t, database.First(&stored, task.ID).Error)
+			assert.Equal(t, model.TaskDispatchStatusDispatched, stored.DispatchStatus)
+			assert.Equal(t, model.TaskStatus(model.TaskStatusSubmitted), stored.Status)
+			assert.Equal(t, "verified-provider-task", stored.PrivateData.UpstreamTaskID)
+			assert.Nil(t, stored.PrivateData.DeferredRequest)
+			assert.Equal(t, task.Quota, stored.Quota)
+			require.NoError(t, database.First(&storedUser, user.Id).Error)
+			assert.Equal(t, user.Quota, storedUser.Quota)
+			var refundLogs int64
+			require.NoError(t, database.Model(&model.Log{}).
+				Where("type = ?", model.LogTypeRefund).Count(&refundLogs).Error)
+			assert.Zero(t, refundLogs)
+			assert.EqualValues(t, 1, providerCalls.Load())
+		})
+	}
+}
+
 func TestDeferredTransportAmbiguityCannotBeRedispatchedOrRefunded(t *testing.T) {
 	service.InitHttpClient()
 	var providerRequests atomic.Int32
@@ -1262,7 +1347,8 @@ func makeDeferredResolutionRoot(
 	user *model.User,
 ) (*gin.Engine, string) {
 	t.Helper()
-	accessToken := "deferred-resolution-root-" + user.Username
+	accessToken := common.GetUUID()
+	require.Len(t, accessToken, 32)
 	user.Role = common.RoleRootUser
 	user.AccessToken = stringPointer(accessToken)
 	user.AuthVersion = 1
