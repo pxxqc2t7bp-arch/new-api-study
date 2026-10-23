@@ -115,7 +115,7 @@ func NextAction(outcome api.Outcome, remainingAttempts int, retryAfterMS int64) 
 			}
 		}
 		return Action{Kind: ActionRetry, Retry: true}
-	case api.OutcomeUpstream5xx, api.OutcomeTransportPreWrite:
+	case api.OutcomeUpstream5xx, api.OutcomeTransportPreWrite, api.OutcomeSubscriptionExpired:
 		return Action{Kind: ActionRetry, Retry: true}
 	default:
 		return Action{Kind: ActionStop}
@@ -124,7 +124,7 @@ func NextAction(outcome api.Outcome, remainingAttempts int, retryAfterMS int64) 
 
 func CooldownUntil(outcome api.Outcome, now time.Time, retryAfterMS int64, consecutiveFailures int) time.Time {
 	switch outcome {
-	case api.OutcomeAuth401:
+	case api.OutcomeAuth401, api.OutcomeSubscriptionExpired:
 		return now.Add(15 * time.Minute)
 	case api.OutcomeRateLimited429:
 		if retryAfterMS < 0 || retryAfterMS > api.MaximumRetryAfterMS {

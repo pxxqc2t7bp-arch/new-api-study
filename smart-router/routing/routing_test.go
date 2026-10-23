@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	"smart-router/api"
 )
 
@@ -96,6 +98,12 @@ func TestNextActionImplementsAttemptPolicy(t *testing.T) {
 		{"401 stops", api.OutcomeAuth401, 4, 0, Action{Kind: ActionStop}},
 		{"429 honors delay", api.OutcomeRateLimited429, 3, 5000, Action{Kind: ActionRetryAfter, Retry: true, Delay: 5 * time.Second}},
 		{"5xx retries", api.OutcomeUpstream5xx, 2, 0, Action{Kind: ActionRetry, Retry: true}},
+		{"subscription expired retries", api.Outcome("subscription_expired"), 1, 0, Action{Kind: ActionRetry, Retry: true}},
+		{"subscription expired ignores delay", api.Outcome("subscription_expired"), 2, 5000, Action{Kind: ActionRetry, Retry: true}},
+		{"subscription expired exhausted", api.Outcome("subscription_expired"), 0, 0, Action{Kind: ActionStop}},
+		{"subscription expired negative budget", api.Outcome("subscription_expired"), -1, 0, Action{Kind: ActionStop}},
+		{"client 4xx stops", api.OutcomeClient4xx, 4, 0, Action{Kind: ActionStop}},
+		{"unsupported stops", api.Outcome("unsupported"), 4, 0, Action{Kind: ActionStop}},
 		{"transport retries", api.OutcomeTransportPreWrite, 1, 0, Action{Kind: ActionRetry, Retry: true}},
 		{"write unknown stops", api.OutcomeWriteUnknown, 4, 0, Action{Kind: ActionStop}},
 		{"committed stops", api.OutcomeResponseCommitted, 4, 0, Action{Kind: ActionStop}},
@@ -103,10 +111,7 @@ func TestNextActionImplementsAttemptPolicy(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := NextAction(tt.outcome, tt.remaining, tt.retryMS)
-			if got != tt.want {
-				t.Fatalf("NextAction() = %#v, want %#v", got, tt.want)
-			}
+			assert.Equal(t, tt.want, NextAction(tt.outcome, tt.remaining, tt.retryMS))
 		})
 	}
 }
@@ -153,18 +158,23 @@ func TestCooldownUntil(t *testing.T) {
 		want     time.Time
 	}{
 		{api.OutcomeAuth401, 0, 1, now.Add(15 * time.Minute)},
+		{api.Outcome("subscription_expired"), 0, 1, now.Add(15 * time.Minute)},
+		{api.Outcome("subscription_expired"), 7000, 4, now.Add(15 * time.Minute)},
+		{api.Outcome("subscription_expired"), api.MaximumRetryAfterMS, 0, now.Add(15 * time.Minute)},
 		{api.OutcomeRateLimited429, 7000, 1, now.Add(7 * time.Second)},
 		{api.OutcomeRateLimited429, -1, 1, now.Add(24 * time.Hour)},
 		{api.OutcomeRateLimited429, (24 * time.Hour).Milliseconds() + 1, 1, now.Add(24 * time.Hour)},
 		{api.OutcomeUpstream5xx, 0, 1, now.Add(30 * time.Second)},
 		{api.OutcomeUpstream5xx, 0, 4, now.Add(4 * time.Minute)},
 		{api.OutcomeSuccess, 0, 1, time.Time{}},
+		{api.OutcomeClient4xx, 0, 1, time.Time{}},
+		{api.OutcomeWriteUnknown, 0, 1, time.Time{}},
+		{api.OutcomeResponseCommitted, 0, 1, time.Time{}},
+		{api.Outcome("unsupported"), 0, 1, time.Time{}},
 	}
 	for _, tt := range tests {
 		got := CooldownUntil(tt.outcome, now, tt.retryMS, tt.failures)
-		if !got.Equal(tt.want) {
-			t.Fatalf("CooldownUntil(%s) = %v, want %v", tt.outcome, got, tt.want)
-		}
+		assert.Equal(t, tt.want, got, "CooldownUntil(%s, retryMS=%d, failures=%d)", tt.outcome, tt.retryMS, tt.failures)
 	}
 }
 

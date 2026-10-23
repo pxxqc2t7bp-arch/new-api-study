@@ -1,6 +1,7 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -9,6 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"smart-router/api"
 	"smart-router/internal/catalog"
@@ -118,6 +122,182 @@ func TestMockHostProviderFlowUsesOpaqueBindingsAndPersistsCooldown(t *testing.T)
 		!strings.Contains(string(body), `route="outcome",status="204"} 3`) {
 		t.Fatalf("metrics = %q", body)
 	}
+}
+
+func TestSubscriptionExpiredOutcomeEjectsBindingAndPersistsAcrossReopen(t *testing.T) {
+	const (
+		firstBindingID   = "bnd_AAAAAAAAAAAAAAAAAAAAAAAA"
+		secondBindingID  = "bnd_BBBBBBBBBBBBBBBBBBBBBBBB"
+		siblingBindingID = "bnd_CCCCCCCCCCCCCCCCCCCCCCCC"
+	)
+	ctx := context.Background()
+	fixture := &sqliteRouterHTTPFixture{
+		path: t.TempDir() + "/router.db",
+		key:  []byte(strings.Repeat("k", 32)),
+		now:  time.Unix(1700000000, 0).UTC(),
+	}
+	fixture.open(t)
+	t.Cleanup(func() { _ = fixture.database.Close() })
+	require.NoError(t, fixture.database.UpsertSource(ctx, store.Source{
+		ID: "fixture-source", Connector: "ebond", Enabled: true,
+	}))
+	for _, binding := range []store.BindingRecord{
+		{
+			ID: firstBindingID, SourceID: "fixture-source", Group: "default",
+			Model: "model-a", Protocol: api.ProtocolChat,
+			ProtocolPlugin: "chat-v1", Enabled: true, CostMicrounits: 10,
+		},
+		{
+			ID: secondBindingID, SourceID: "fixture-source", Group: "default",
+			Model: "model-a", Protocol: api.ProtocolChat,
+			ProtocolPlugin: "chat-v1", Enabled: true, CostMicrounits: 20,
+		},
+		{
+			ID: siblingBindingID, SourceID: "fixture-source", Group: "default",
+			Model: "model-c", Protocol: api.ProtocolChat,
+			ProtocolPlugin: "chat-v1", Enabled: true, CostMicrounits: 5,
+		},
+	} {
+		require.NoError(t, fixture.database.UpsertBinding(ctx, binding))
+		require.NoError(t, fixture.database.SetObservation(ctx, binding.ID, store.Observation{
+			Health: routing.HealthHealthy, Fingerprint: strings.Repeat("f", 64),
+			ObservedAt: fixture.now,
+		}))
+	}
+	want := fixture.candidates(t)
+	require.Len(t, want, 3)
+	for _, candidate := range want {
+		require.Equal(t, routing.HealthHealthy, candidate.Health)
+		require.True(t, candidate.CooldownUntil.IsZero())
+	}
+	initial := fixture.route(t, "req-initial", "model-a", firstBindingID, secondBindingID)
+	sibling := fixture.route(t, "req-sibling", "model-c", siblingBindingID)
+	initialSnapshot := fixture.snapshot(t)
+	assert.Equal(t, []api.SnapshotRoute{
+		{Group: "default", Model: "model-a", Protocol: api.ProtocolChat, Bindings: initial.Bindings},
+		{Group: "default", Model: "model-c", Protocol: api.ProtocolChat, Bindings: sibling.Bindings},
+	}, initialSnapshot.Routes)
+
+	outcome := api.AttemptOutcome{
+		Kind: "attempt_outcome", SchemaVersion: 1, EventID: "evt-expired",
+		RequestID: initial.RequestID, BindingID: firstBindingID,
+		Protocol: api.ProtocolChat, Outcome: api.Outcome("subscription_expired"),
+	}
+	deadline := fixture.now.Add(15 * time.Minute)
+	fixture.request(t, http.MethodPost, "/v1/outcomes", outcome, http.StatusNoContent, nil)
+	first := want[firstBindingID]
+	first.Health = routing.HealthDegraded
+	first.CooldownUntil = deadline
+	want[firstBindingID] = first
+	assert.Equal(t, want, fixture.candidates(t))
+	fresh := fixture.route(t, "req-fresh", "model-a", secondBindingID)
+	fixture.route(t, "req-sibling-fresh", "model-c", siblingBindingID)
+	freshSnapshot := fixture.snapshot(t)
+	assert.NotEqual(t, initialSnapshot.Revision, freshSnapshot.Revision)
+	assert.Equal(t, fresh.SnapshotRevision, freshSnapshot.Revision)
+	assert.Equal(t, []api.SnapshotRoute{
+		{Group: "default", Model: "model-a", Protocol: api.ProtocolChat, Bindings: fresh.Bindings},
+		{Group: "default", Model: "model-c", Protocol: api.ProtocolChat, Bindings: sibling.Bindings},
+	}, freshSnapshot.Routes)
+
+	var contractError api.ContractError
+	fixture.request(t, http.MethodPost, "/v1/route", api.RouteRequest{
+		Kind: "route_request", SchemaVersion: 1, RequestID: "req-stale",
+		Group: "default", Model: "model-a", Protocol: api.ProtocolChat,
+		AttemptLimit: 2, SnapshotRevision: initialSnapshot.Revision,
+	}, http.StatusConflict, &contractError)
+	assert.Equal(t, api.ErrorContractMismatch, contractError.Code)
+
+	fixture.now = fixture.now.Add(time.Minute)
+	fixture.request(t, http.MethodPost, "/v1/outcomes", outcome, http.StatusNoContent, nil)
+	assert.Equal(t, want, fixture.candidates(t), "duplicate must not extend cooldown")
+	conflict := outcome
+	conflict.LatencyMS = 1
+	fixture.request(t, http.MethodPost, "/v1/outcomes", conflict, http.StatusConflict, &contractError)
+	assert.Equal(t, api.ErrorOutcomeConflict, contractError.Code)
+	assert.Equal(t, want, fixture.candidates(t), "conflict must not mutate state")
+
+	for _, invalid := range []api.AttemptOutcome{
+		{
+			Kind: "attempt_outcome", SchemaVersion: 1, EventID: "evt-wrong-protocol",
+			RequestID: initial.RequestID, BindingID: secondBindingID,
+			Protocol: api.ProtocolMessages, Outcome: api.Outcome("subscription_expired"),
+		},
+		{
+			Kind: "attempt_outcome", SchemaVersion: 1, EventID: "evt-missing-binding",
+			RequestID: initial.RequestID, BindingID: "bnd_DDDDDDDDDDDDDDDDDDDDDDDD",
+			Protocol: api.ProtocolChat, Outcome: api.Outcome("subscription_expired"),
+		},
+	} {
+		fixture.request(t, http.MethodPost, "/v1/outcomes", invalid, http.StatusServiceUnavailable, &contractError)
+		assert.Equal(t, api.ErrorBindingUnavailable, contractError.Code)
+		assert.Equal(t, want, fixture.candidates(t), "invalid binding/protocol must not affect siblings")
+	}
+	for _, terminal := range []api.Outcome{
+		api.OutcomeClient4xx, api.OutcomeWriteUnknown, api.OutcomeResponseCommitted,
+	} {
+		control := outcome
+		control.EventID = "evt-control-" + string(terminal)
+		control.BindingID = secondBindingID
+		control.Outcome = terminal
+		fixture.request(t, http.MethodPost, "/v1/outcomes", control, http.StatusNoContent, nil)
+		assert.Equal(t, want, fixture.candidates(t), "terminal outcome %s must not eject", terminal)
+	}
+	for _, unsupported := range []api.Outcome{
+		api.Outcome("unsupported"), api.Outcome("subscription_expired_future"),
+	} {
+		control := outcome
+		control.EventID = "evt-unsupported-" + string(unsupported)
+		control.BindingID = secondBindingID
+		control.Outcome = unsupported
+		fixture.request(t, http.MethodPost, "/v1/outcomes", control, http.StatusBadRequest, &contractError)
+		assert.Equal(t, api.ErrorInvalidRequest, contractError.Code)
+		assert.Equal(t, want, fixture.candidates(t))
+	}
+
+	require.NoError(t, fixture.database.Close())
+	fixture.open(t)
+	assert.Equal(t, want, fixture.candidates(t))
+	fixture.route(t, "req-reopened", "model-a", secondBindingID)
+	fixture.now = deadline.Add(-time.Millisecond)
+	fixture.route(t, "req-before-deadline", "model-a", secondBindingID)
+	fixture.now = deadline
+	fixture.route(t, "req-at-deadline", "model-a", firstBindingID, secondBindingID)
+	assert.Equal(t, want, fixture.candidates(t), "expiry permits degraded bindings without resetting health")
+
+	outcome.EventID = "evt-expired-again"
+	fixture.request(t, http.MethodPost, "/v1/outcomes", outcome, http.StatusNoContent, nil)
+	first.CooldownUntil = fixture.now.Add(15 * time.Minute)
+	want[firstBindingID] = first
+	assert.Equal(t, want, fixture.candidates(t))
+	fixture.route(t, "req-ejected-again", "model-a", secondBindingID)
+	outcome.EventID = "evt-distinct-success"
+	outcome.Outcome = api.OutcomeSuccess
+	fixture.request(t, http.MethodPost, "/v1/outcomes", outcome, http.StatusNoContent, nil)
+	first.Health = routing.HealthHealthy
+	first.CooldownUntil = time.Time{}
+	want[firstBindingID] = first
+	assert.Equal(t, want, fixture.candidates(t))
+	fixture.route(t, "req-recovered", "model-a", firstBindingID, secondBindingID)
+
+	auth := outcome
+	auth.EventID = "evt-auth-control"
+	auth.BindingID = siblingBindingID
+	auth.Outcome = api.OutcomeAuth401
+	fixture.request(t, http.MethodPost, "/v1/outcomes", auth, http.StatusNoContent, nil)
+	authDeadline := fixture.now.Add(15 * time.Minute)
+	candidate := want[siblingBindingID]
+	candidate.Health = routing.HealthUnhealthy
+	candidate.CooldownUntil = authDeadline
+	want[siblingBindingID] = candidate
+	assert.Equal(t, want, fixture.candidates(t))
+	fixture.now = authDeadline
+	fixture.request(t, http.MethodPost, "/v1/route", api.RouteRequest{
+		Kind: "route_request", SchemaVersion: 1, RequestID: "req-auth-at-deadline",
+		Group: "default", Model: "model-c", Protocol: api.ProtocolChat, AttemptLimit: 2,
+	}, http.StatusServiceUnavailable, &contractError)
+	assert.Equal(t, api.ErrorBindingUnavailable, contractError.Code)
+	assert.Equal(t, want, fixture.candidates(t), "auth_401 must remain unhealthy after its deadline")
 }
 
 func TestMockHostWaitsForRetryAfterBeforeNextProviderAttempt(t *testing.T) {
@@ -446,6 +626,89 @@ func TestMockHostFailsClosedOnMalformedRetryAfter(t *testing.T) {
 			secondProvider.Calls(),
 		)
 	}
+}
+
+type sqliteRouterHTTPFixture struct {
+	path     string
+	key      []byte
+	now      time.Time
+	database *store.DB
+	handler  http.Handler
+}
+
+func (fixture *sqliteRouterHTTPFixture) open(t *testing.T) {
+	t.Helper()
+	database, err := store.OpenSQLite(context.Background(), fixture.path)
+	require.NoError(t, err)
+	fixture.database = database
+	runtime := catalog.NewRuntime(catalog.RuntimeConfig{
+		Store: database, SigningKey: fixture.key, Now: func() time.Time { return fixture.now },
+		SnapshotTTL: time.Minute, HysteresisMicrounits: 0,
+		ConfigSHA256: strings.Repeat("a", 64), PluginManifestSHA256: strings.Repeat("b", 64),
+	})
+	fixture.handler = api.NewServer(runtime, metrics.New())
+}
+
+func (fixture *sqliteRouterHTTPFixture) request(
+	t *testing.T, method, path string, value any, status int, response api.Validatable,
+) {
+	t.Helper()
+	var body []byte
+	if value != nil {
+		var err error
+		body, err = json.Marshal(value)
+		require.NoError(t, err)
+	}
+	request := httptest.NewRequest(method, path, bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(recorder, request)
+	require.Equal(t, status, recorder.Code, "%s %s: %s", method, path, recorder.Body.String())
+	if response != nil {
+		require.NoError(t, api.DecodeStrict(recorder.Body, response))
+	} else {
+		assert.Empty(t, recorder.Body.String())
+	}
+}
+
+func (fixture *sqliteRouterHTTPFixture) route(
+	t *testing.T, requestID, model string, bindingIDs ...string,
+) api.RouteResponse {
+	t.Helper()
+	var response api.RouteResponse
+	fixture.request(t, http.MethodPost, "/v1/route", api.RouteRequest{
+		Kind: "route_request", SchemaVersion: 1, RequestID: requestID,
+		Group: "default", Model: model, Protocol: api.ProtocolChat, AttemptLimit: 2,
+	}, http.StatusOK, &response)
+	require.NoError(t, signing.Verify(response, fixture.key, response.Signature))
+	assert.Equal(t, requestID, response.RequestID)
+	require.Len(t, response.Bindings, len(bindingIDs))
+	for index, bindingID := range bindingIDs {
+		assert.Equal(t, bindingID, response.Bindings[index].BindingID)
+		assert.Equal(t, index+1, response.Bindings[index].Rank)
+	}
+	return response
+}
+
+func (fixture *sqliteRouterHTTPFixture) snapshot(t *testing.T) api.SignedSnapshot {
+	t.Helper()
+	var snapshot api.SignedSnapshot
+	fixture.request(t, http.MethodGet, "/v1/snapshot", nil, http.StatusOK, &snapshot)
+	require.NoError(t, signing.Verify(snapshot, fixture.key, snapshot.Signature))
+	return snapshot
+}
+
+func (fixture *sqliteRouterHTTPFixture) candidates(t *testing.T) map[string]routing.Candidate {
+	t.Helper()
+	result := make(map[string]routing.Candidate)
+	for _, model := range []string{"model-a", "model-c"} {
+		candidates, err := fixture.database.ListCandidates(context.Background(), "default", model, api.ProtocolChat)
+		require.NoError(t, err)
+		for _, candidate := range candidates {
+			result[candidate.BindingID] = candidate
+		}
+	}
+	return result
 }
 
 type fakeClock struct {

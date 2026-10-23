@@ -148,7 +148,8 @@ func (outcome AttemptOutcome) Validate() error {
 	}
 	switch outcome.Outcome {
 	case OutcomeSuccess, OutcomeAuth401, OutcomeRateLimited429, OutcomeUpstream5xx,
-		OutcomeClient4xx, OutcomeTransportPreWrite, OutcomeWriteUnknown, OutcomeResponseCommitted:
+		OutcomeClient4xx, OutcomeTransportPreWrite, OutcomeWriteUnknown, OutcomeResponseCommitted,
+		OutcomeSubscriptionExpired:
 	default:
 		return fmt.Errorf("unsupported outcome %q", outcome.Outcome)
 	}

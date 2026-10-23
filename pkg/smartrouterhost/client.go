@@ -229,7 +229,7 @@ func (c *Client) ReportOutcome(ctx context.Context, outcome AttemptOutcome) erro
 		return ErrRequest
 	}
 	switch outcome.Outcome {
-	case OutcomeSuccess, OutcomeAuth401, OutcomeRateLimited429, OutcomeUpstream5xx, OutcomeClient4xx,
+	case OutcomeSuccess, OutcomeAuth401, OutcomeSubscriptionExpired, OutcomeRateLimited429, OutcomeUpstream5xx, OutcomeClient4xx,
 		OutcomeTransportPreWrite, OutcomeWriteUnknown, OutcomeResponseCommitted:
 	default:
 		return ErrRequest

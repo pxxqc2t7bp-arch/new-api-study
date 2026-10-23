@@ -379,6 +379,7 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError,
 			maxRetries-retryParam.GetRetry(),
 		)
+		retry = retry && smartRouterRetry
 		decision := service.DecideRelayRetry(c, newAPIError, maxRetries-retryParam.GetRetry())
 		if retry != (decision.Action == "retry") {
 			decision.Action = "stop"
@@ -392,7 +393,7 @@ func relayDirect(c *gin.Context, relayFormat types.RelayFormat) {
 		if replacement != nil {
 			newAPIError = replacement
 		}
-		if !retry || !smartRouterRetry {
+		if !retry {
 			break
 		}
 		if err := service.WaitSmartRouterRetry(c); err != nil {
@@ -565,13 +566,18 @@ func retryDecision(
 		retry = true
 	} else if retryTimes > 0 {
 		code := openaiErr.StatusCode
+		state := host.StateFor(c)
 		switch {
 		case code >= 200 && code < 300:
 			retry = false
 		case code < 100 || code > 599:
 			retry = true
-		case operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()):
+		case operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) ||
+			operation_setting.IsAlwaysSkipRetryStatusCode(code):
 			retry = false
+		case state != nil && state.AcknowledgedSubscriptionRetry() &&
+			c.Request != nil && c.Request.Context().Err() == nil:
+			retry = true
 		default:
 			retry = operation_setting.ShouldRetryByStatusCode(code)
 		}

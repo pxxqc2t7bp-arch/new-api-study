@@ -42,6 +42,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	kitdto "github.com/QuantumNous/new-api/relaykit/dto"
+	kittypes "github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -282,9 +283,26 @@ func requireRealSidecarBilling(t *testing.T, user *model.User, count int, channe
 
 func TestSmartRouterRealSidecarEndToEnd(t *testing.T) {
 	require.NoError(t, i18n.Init())
+	originalTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 5
+	t.Cleanup(func() { constant.StreamingTimeout = originalTimeout })
 	for _, protocol := range []host.Protocol{host.ProtocolChat, host.ProtocolResponses, host.ProtocolMessages} {
-		for _, failover := range []bool{false, true} {
-			name := string(protocol) + "/" + map[bool]string{false: "healthy", true: "429_then_success"}[failover]
+		// All subscription diagnostics here are synthetic, not captured provider wording.
+		for _, scenario := range []struct {
+			name, diagnostic string
+			mapped, stream   bool
+		}{
+			{name: "healthy"},
+			{name: "429_then_success"},
+			{name: "subscription_object_code", diagnostic: `{"error":{"code":"invalid_request","message":"Your AgentPlan subscription is invalid or expired."}}`},
+			{name: "subscription_object_reason", diagnostic: `{"error":{"reason":"invalid_request","message":"Your AgentPlan subscription has expired."}}`},
+			{name: "subscription_root_message", diagnostic: `{"code":"invalid_request","message":"Your AgentPlan subscription has expired."}`},
+			{name: "subscription_root_error", diagnostic: `{"reason":"invalid_request","error":"AgentPlan 已过期，请续订后重试。"}`},
+			{name: "subscription_chinese_mapped", diagnostic: `{"error":{"code":"invalid_request","message":"您的 AgentPlan 订阅已失效。"}}`, mapped: true},
+			{name: "subscription_preoutput_stream", diagnostic: `{"error":{"code":"invalid_request","message":"Your AgentPlan subscription has expired."}}`, stream: true},
+		} {
+			failover := scenario.name != "healthy"
+			name := string(protocol) + "/" + scenario.name
 			t.Run(name, func(t *testing.T) {
 				fixture := startRealSidecarFixture(t)
 				engine, user := setupSmartRouterHostTest(t)
@@ -304,17 +322,35 @@ func TestSmartRouterRealSidecarEndToEnd(t *testing.T) {
 				if failover {
 					status, firstPayload = http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error","message":"synthetic"}}`
 				}
+				if scenario.diagnostic != "" {
+					status, firstPayload = http.StatusBadRequest, scenario.diagnostic
+				}
 				first := newSmartRouterProtocolUpstream(t, protocol, status, firstPayload)
-				second := newSmartRouterProtocolUpstream(t, protocol, http.StatusOK, payload)
+				streamPayload := "data: " + payload + "\n\ndata: [DONE]\n\n"
+				if protocol == host.ProtocolResponses {
+					streamPayload = "data: {\"type\":\"response.completed\",\"response\":" + payload + "}\n\n"
+				} else if protocol == host.ProtocolMessages {
+					streamPayload = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-synthetic\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-3.5-turbo\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n" +
+						"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+						"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" +
+						"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+						"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" +
+						"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+				}
+				second := newSmartRouterProtocolUpstream(t, protocol, http.StatusOK, payload, streamPayload)
 				for i, provider := range []*failoverUpstream{first, second} {
 					channel := addRelayFailoverChannel(t, 7301+i, int64(30-i*10), provider)
+					if i == 0 && scenario.mapped {
+						require.NoError(t, model.DB.Model(&channel).Update("status_code_mapping", `{"400":"500"}`).Error)
+					}
 					if protocol == host.ProtocolMessages {
 						require.NoError(t, model.DB.Model(&channel).Update("type", constant.ChannelTypeAnthropic).Error)
 					}
 				}
 				initializeRelayFailoverChannels()
 				entries := configureRealSidecarHost(t, fixture, protocol)
-				response := performSmartRouterProtocolRequest(t, engine, protocol)
+				before := fixture.state(t)
+				response := performSmartRouterProtocolRequest(t, engine, protocol, scenario.stream)
 				require.Equal(t, http.StatusOK, response.Code)
 				assert.Equal(t, 1, first.callCount())
 				state := fixture.state(t)
@@ -347,11 +383,43 @@ func TestSmartRouterRealSidecarEndToEnd(t *testing.T) {
 					requireRealSidecarBilling(t, user, 1, channel)
 					return
 				}
-				assert.Equal(t, host.OutcomeRateLimited429, state.Outcomes[0].Outcome.Outcome)
+				expected := host.OutcomeRateLimited429
+				if scenario.diagnostic != "" {
+					expected = host.Outcome("subscription_expired")
+					cooldown := int64((15 * time.Minute).Milliseconds())
+					assert.GreaterOrEqual(t, state.Cooldowns[entries[0].BindingID], before.NowMS+cooldown)
+					assert.LessOrEqual(t, state.Cooldowns[entries[0].BindingID], state.NowMS+cooldown)
+				}
+				assert.Equal(t, expected, state.Outcomes[0].Outcome.Outcome)
 				assert.Greater(t, state.Cooldowns[entries[0].BindingID], state.NowMS)
 				assert.Equal(t, "degraded", state.Health[entries[0].BindingID])
 				assert.Equal(t, 1, second.callCount())
 				requireRealSidecarBilling(t, user, 1, channel)
+				if scenario.diagnostic != "" {
+					log, _ := latestConsumeLog(t, user.Id)
+					var logged struct {
+						AdminInfo struct {
+							RequestPolicy []service.PolicyEvent `json:"request_policy"`
+						} `json:"admin_info"`
+					}
+					require.NoError(t, common.Unmarshal([]byte(log.Other), &logged))
+					var retries []service.PolicyEvent
+					for _, event := range logged.AdminInfo.RequestPolicy {
+						if event.Decision.Action == "retry" {
+							retries = append(retries, event)
+						}
+					}
+					require.Len(t, retries, 1, "both retry gates must agree in the recorded policy")
+					assert.Equal(t, service.PolicyDecision{Action: "retry", Reason: "subscription_expired", Source: "smart_router"}, retries[0].Decision)
+					expectedStatus := 400
+					if scenario.mapped {
+						expectedStatus = 500
+					}
+					assert.Equal(t, expectedStatus, retries[0].Status, "normalized status remains unchanged")
+				}
+				var failedChannel model.Channel
+				require.NoError(t, model.DB.First(&failedChannel, 7301).Error)
+				assert.Zero(t, failedChannel.UsedQuota, "failed subscription attempt is never charged")
 				require.Equal(t, http.StatusOK, performSmartRouterProtocolRequest(t, engine, protocol).Code)
 				next := fixture.state(t)
 				require.Len(t, next.Decisions, 2)
@@ -369,6 +437,14 @@ func TestSmartRouterRealSidecarEndToEnd(t *testing.T) {
 				paths, _ = second.requestSnapshot()
 				assert.Equal(t, []string{expectedPath, expectedPath}, paths)
 				requireRealSidecarBilling(t, user, 2, channel)
+				if scenario.diagnostic != "" {
+					_, sent := first.requestSnapshot()
+					var requestBody map[string]any
+					require.NoError(t, common.Unmarshal(sent[0], &requestBody))
+					if scenario.stream {
+						assert.Equal(t, true, requestBody["stream"], "preoutput 400 is accepted for an actual stream request")
+					}
+				}
 			})
 		}
 	}
@@ -1538,7 +1614,7 @@ func TestSmartRouterRegistryAuthorityTerminal(t *testing.T) {
 	}
 }
 
-func newSmartRouterProtocolUpstream(t *testing.T, protocol host.Protocol, status int, payload string) *failoverUpstream {
+func newSmartRouterProtocolUpstream(t *testing.T, protocol host.Protocol, status int, payload string, streamPayload ...string) *failoverUpstream {
 	t.Helper()
 	upstream := &failoverUpstream{name: string(protocol), statusCode: status}
 	upstream.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1551,12 +1627,22 @@ func newSmartRouterProtocolUpstream(t *testing.T, protocol host.Protocol, status
 		upstream.paths = append(upstream.paths, r.URL.Path)
 		upstream.bodies = append(upstream.bodies, body)
 		upstream.mu.Unlock()
+		responsePayload := payload
+		if len(streamPayload) > 0 {
+			var request struct {
+				Stream bool `json:"stream"`
+			}
+			require.NoError(t, common.Unmarshal(body, &request))
+			if request.Stream {
+				responsePayload = streamPayload[0]
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		if strings.HasPrefix(payload, "data:") {
+		if strings.HasPrefix(responsePayload, "data:") || strings.HasPrefix(responsePayload, "event:") {
 			w.Header().Set("Content-Type", "text/event-stream")
 		}
 		w.WriteHeader(status)
-		_, _ = io.WriteString(w, payload)
+		_, _ = io.WriteString(w, responsePayload)
 	}))
 	t.Cleanup(upstream.server.Close)
 	return upstream
@@ -2751,6 +2837,657 @@ func TestSmartRouterWriterInterfaces(t *testing.T) {
 	}
 }
 
+// Synthetic diagnostics exercise the public host observation boundary, not provider format coverage.
+const smartRouterSubscriptionDiagnostic = `{"error":{"code":"invalid_request","message":"Your AgentPlan subscription is invalid or expired."}}`
+
+func newSmartRouterSubscriptionState(t *testing.T, url string, invoke ...bool) (*gin.Context, *host.State) {
+	t.Helper()
+	client, err := host.NewClient(smartRouterConfig(url), nil)
+	require.NoError(t, err)
+	request, route := smartRouterRequest(), smartRouterResponse()
+	route.ExpiresAt = time.Now().Add(time.Minute).UnixMilli()
+	second := host.Binding{BindingID: smartRouterBindingB, ProtocolPlugin: "chat-v1", Rank: 2}
+	request.Bindings = append(request.Bindings, second)
+	route.Bindings = append(route.Bindings, second)
+	entry := smartRouterRegistry()[0]
+	backup := entry
+	backup.BindingID = smartRouterBindingB
+	state := host.NewState(client, request, route, []host.RegistryEntry{entry, backup})
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	host.Install(c, state)
+	require.NoError(t, state.Begin())
+	if len(invoke) == 0 || invoke[0] {
+		require.NoError(t, state.Invoke())
+	}
+	return c, state
+}
+
+type smartRouterSubscriptionBody struct {
+	reader     io.Reader
+	readError  error
+	closeError error
+	reads      int
+	closes     int
+}
+
+func (b *smartRouterSubscriptionBody) Read(p []byte) (int, error) {
+	b.reads++
+	n, err := b.reader.Read(p)
+	if err == io.EOF && b.readError != nil {
+		err = b.readError
+	}
+	return n, err
+}
+
+func (b *smartRouterSubscriptionBody) Close() error {
+	b.closes++
+	return b.closeError
+}
+
+func TestSmartRouterSubscriptionObservation(t *testing.T) {
+	for _, test := range []struct {
+		name, body string
+		positive   bool
+	}{
+		{"object_code", smartRouterSubscriptionDiagnostic, true},
+		{"object_reason", `{"error":{"reason":"invalid_request","message":"Your AgentPlan subscription has expired."}}`, true},
+		{"root_message", `{"code":"invalid_request","message":"Your AgentPlan subscription has expired."}`, true},
+		{"root_reason_message", `{"reason":"invalid_request","message":"Your AgentPlan subscription has expired."}`, true},
+		{"root_error", `{"code":"invalid_request","error":"Your AgentPlan subscription has expired."}`, true},
+		{"chinese_object", `{"error":{"reason":"invalid_request","message":"您的 AgentPlan 订阅已失效。"}}`, true},
+		{"chinese_root", `{"reason":"invalid_request","error":"AgentPlan 已过期，请续订后重试。"}`, true},
+		{"normalized", `{"error":{"code":"invalid_request","message":"  YOUR  AgentPlan subscription\nis invalid or expired. \t"}}`, true},
+		{"agreeing_discriminators", `{"error":{"code":"invalid_request","reason":"invalid_request","message":"Your AgentPlan subscription has expired."}}`, true},
+		{"exact_limit", smartRouterSubscriptionDiagnostic + strings.Repeat(" ", (16<<10)-len(smartRouterSubscriptionDiagnostic)), true},
+		{"over_limit", smartRouterSubscriptionDiagnostic + strings.Repeat(" ", (16<<10)+1-len(smartRouterSubscriptionDiagnostic)), false},
+		{"wrong_code", `{"error":{"code":"other","message":"Your AgentPlan subscription has expired."}}`, false},
+		{"numeric_code", `{"error":{"code":400,"message":"Your AgentPlan subscription has expired."}}`, false},
+		{"numeric_with_reason", `{"error":{"code":400,"reason":"invalid_request","message":"Your AgentPlan subscription has expired."}}`, false},
+		{"null_code", `{"error":{"code":null,"message":"Your AgentPlan subscription has expired."}}`, false},
+		{"code_case", `{"code":"INVALID_REQUEST","message":"Your AgentPlan subscription has expired."}`, false},
+		{"missing_code", `{"error":{"message":"Your AgentPlan subscription has expired."}}`, false},
+		{"type_only", `{"error":{"type":"invalid_request_error","message":"Your AgentPlan subscription has expired."}}`, false},
+		{"missing_message", `{"error":{"code":"invalid_request"}}`, false},
+		{"wrong_message_type", `{"code":"invalid_request","message":["Your AgentPlan subscription has expired."]}`, false},
+		{"conflicting_codes", `{"code":"invalid_request","reason":"other","message":"Your AgentPlan subscription has expired."}`, false},
+		{"conflicting_object_codes", `{"error":{"code":"invalid_request","reason":"other","message":"Your AgentPlan subscription has expired."}}`, false},
+		{"conflicting_messages", `{"code":"invalid_request","message":"Your AgentPlan subscription has expired.","error":"temperature invalid"}`, false},
+		{"mixed_envelopes", `{"code":"invalid_request","error":{"code":"invalid_request","message":"Your AgentPlan subscription has expired."}}`, false},
+		{"mixed_message", `{"message":"Your AgentPlan subscription has expired.","error":{"code":"invalid_request","message":"temperature invalid"}}`, false},
+		{"duplicate_code", `{"code":"other","code":"invalid_request","message":"Your AgentPlan subscription has expired."}`, false},
+		{"duplicate_message", `{"code":"invalid_request","message":"temperature invalid","message":"Your AgentPlan subscription has expired."}`, false},
+		{"negation", `{"code":"invalid_request","message":"Your AgentPlan subscription has not expired."}`, false},
+		{"hypothetical", `{"code":"invalid_request","message":"If your AgentPlan subscription has expired, renew it."}`, false},
+		{"quotation", `{"code":"invalid_request","message":"\"Your AgentPlan subscription has expired.\""}`, false},
+		{"quoted_parameter", `{"code":"invalid_request","message":"Invalid parameter: Your AgentPlan subscription has expired."}`, false},
+		{"other_plan", `{"code":"invalid_request","message":"Your OtherPlan subscription has expired."}`, false},
+		{"keyword_conjunction", `{"code":"invalid_request","message":"AgentPlan parameter subscription was invalid, cache expired."}`, false},
+		{"unrelated_field", `{"code":"invalid_request","message":"temperature invalid","detail":"Your AgentPlan subscription has expired."}`, false},
+		{"nested", `{"response":{"error":{"code":"invalid_request","message":"Your AgentPlan subscription has expired."}}}`, false},
+		{"recursive_string", `{"code":"invalid_request","error":"{\"code\":\"invalid_request\",\"message\":\"Your AgentPlan subscription has expired.\"}"}`, false},
+		{"trailing_json", smartRouterSubscriptionDiagnostic + `{}`, false},
+		{"trailing_text", smartRouterSubscriptionDiagnostic + `x`, false},
+		{"truncated", strings.TrimSuffix(smartRouterSubscriptionDiagnostic, "}"), false},
+		{"plain_text", "Your AgentPlan subscription has expired.", false},
+		{"root_string", `"Your AgentPlan subscription has expired."`, false},
+		{"array", "[" + smartRouterSubscriptionDiagnostic + "]", false},
+		{"null", "null", false},
+		{"empty", "", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sidecar := newSmartRouterHostSidecar(t, smartRouterBindingA, smartRouterBindingB)
+			c, state := newSmartRouterSubscriptionState(t, sidecar.server.URL)
+			body := &smartRouterSubscriptionBody{reader: strings.NewReader(test.body)}
+			response := &http.Response{StatusCode: 400, Header: http.Header{"X-Synthetic": {"unchanged"}}, Body: body}
+			host.ObserveTransport(c, response, nil)
+			assert.Zero(t, body.reads, "transport observation must not eagerly read")
+			assert.Zero(t, body.closes)
+			data, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+			assert.Equal(t, test.body, string(data), "all bytes, including oversized and malformed bodies, are preserved")
+			require.NoError(t, response.Body.Close())
+			assert.Equal(t, 400, response.StatusCode)
+			assert.Equal(t, http.Header{"X-Synthetic": {"unchanged"}}, response.Header)
+			assert.Equal(t, 1, body.closes)
+			assert.Equal(t, test.positive, state.Finish(c.Request.Context(), false, false))
+			reports := sidecar.outcomeSnapshot()
+			require.Len(t, reports, 1)
+			expected := host.OutcomeClient4xx
+			if test.positive {
+				expected = host.Outcome("subscription_expired")
+			}
+			assert.Equal(t, expected, reports[0].Outcome)
+			wire := smartRouterMarshal(t, reports[0])
+			assert.NotContains(t, wire, "AgentPlan")
+			assert.NotContains(t, wire, "invalid_request")
+			assert.False(t, state.Finish(c.Request.Context(), false, false))
+			assert.Equal(t, reports, sidecar.outcomeSnapshot(), "one frozen report per actual Invoke")
+		})
+	}
+}
+
+func TestSmartRouterSubscriptionBodyLifecycle(t *testing.T) {
+	for _, mode := range []string{"no_close", "early_close", "read_error", "close_error", "bytes_and_eof", "bytes_and_error", "repeat_close", "nil_body", "transport_error", "not_invoked", "http200", "http200_sse", "committed", "flush", "short_write", "error_write"} {
+		t.Run(mode, func(t *testing.T) {
+			sidecar := newSmartRouterHostSidecar(t, smartRouterBindingA, smartRouterBindingB)
+			c, state := newSmartRouterSubscriptionState(t, sidecar.server.URL, mode != "not_invoked")
+			body := &smartRouterSubscriptionBody{reader: strings.NewReader(smartRouterSubscriptionDiagnostic)}
+			if mode == "read_error" || mode == "bytes_and_error" {
+				body.readError = io.ErrUnexpectedEOF
+			}
+			if mode == "close_error" {
+				body.closeError = io.ErrClosedPipe
+			}
+			if mode == "bytes_and_eof" || mode == "bytes_and_error" {
+				body.reader = &smartRouterFinalRead{body: []byte(smartRouterSubscriptionDiagnostic), err: io.EOF}
+			}
+			response := &http.Response{StatusCode: 400, Body: body}
+			var transportErr error
+			switch mode {
+			case "nil_body":
+				response.Body = nil
+			case "transport_error":
+				transportErr = io.ErrUnexpectedEOF
+			case "http200":
+				response.StatusCode = 200
+			case "http200_sse":
+				response.StatusCode = 200
+				body.reader = strings.NewReader("data: " + smartRouterSubscriptionDiagnostic + "\n\n")
+			case "committed":
+				c.Writer.WriteHeaderNow()
+			case "flush":
+				c.Writer.Flush()
+			case "short_write", "error_write":
+				recorder := httptest.NewRecorder()
+				var err error
+				if mode == "error_write" {
+					err = io.ErrClosedPipe
+				}
+				c, _ = gin.CreateTestContext(&smartRouterFailingWriter{ResponseRecorder: recorder, err: err})
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+				host.Install(c, state)
+				_, _ = c.Writer.Write([]byte("synthetic"))
+			}
+			host.ObserveTransport(c, response, transportErr)
+			assert.Zero(t, body.reads)
+			if response.Body != nil {
+				if mode == "early_close" {
+					require.NoError(t, response.Body.Close())
+				} else {
+					data, err := io.ReadAll(response.Body)
+					assert.Equal(t, body.readError, err)
+					assert.Contains(t, string(data), smartRouterSubscriptionDiagnostic)
+					if mode != "no_close" {
+						assert.Equal(t, body.closeError, response.Body.Close())
+					}
+					if mode == "repeat_close" {
+						require.NoError(t, response.Body.Close())
+					}
+				}
+			}
+			positive := mode == "bytes_and_eof" || mode == "repeat_close"
+			assert.Equal(t, positive, state.Finish(c.Request.Context(), false, false))
+			reports := sidecar.outcomeSnapshot()
+			if mode == "not_invoked" {
+				assert.Empty(t, reports, "uninvoked Begin cannot report")
+				return
+			}
+			require.Len(t, reports, 1)
+			expected := host.OutcomeClient4xx
+			switch mode {
+			case "bytes_and_eof", "repeat_close":
+				expected = host.Outcome("subscription_expired")
+			case "transport_error", "http200", "http200_sse":
+				expected = host.OutcomeWriteUnknown
+			case "committed", "flush", "short_write", "error_write":
+				expected = host.OutcomeResponseCommitted
+			}
+			assert.Equal(t, expected, reports[0].Outcome)
+			if response.Body != nil && mode != "no_close" {
+				assert.Equal(t, body.closeError, response.Body.Close())
+				count := 2
+				if mode == "repeat_close" {
+					count++
+				}
+				assert.Equal(t, count, body.closes, "every Close delegates; ownership is not replaced")
+			}
+		})
+	}
+}
+
+type smartRouterFinalRead struct {
+	body []byte
+	err  error
+}
+
+func (r *smartRouterFinalRead) Read(p []byte) (int, error) {
+	n := copy(p, r.body)
+	r.body = r.body[n:]
+	if len(r.body) == 0 {
+		return n, r.err
+	}
+	return n, nil
+}
+
+func TestSmartRouterSubscriptionReadTransparency(t *testing.T) {
+	for _, terminal := range []error{io.EOF, io.ErrUnexpectedEOF} {
+		t.Run(terminal.Error(), func(t *testing.T) {
+			sidecar := newSmartRouterHostSidecar(t, smartRouterBindingA, smartRouterBindingB)
+			c, state := newSmartRouterSubscriptionState(t, sidecar.server.URL)
+			body := &smartRouterSubscriptionBody{reader: &smartRouterFinalRead{body: []byte(smartRouterSubscriptionDiagnostic), err: terminal}}
+			original := &smartRouterFinalRead{body: []byte(smartRouterSubscriptionDiagnostic), err: terminal}
+			response := &http.Response{StatusCode: 400, Body: body}
+			host.ObserveTransport(c, response, nil)
+			for {
+				want, got := make([]byte, 17), make([]byte, 17)
+				wantN, wantErr := original.Read(want)
+				gotN, gotErr := response.Body.Read(got)
+				require.Equal(t, wantN, gotN)
+				require.Equal(t, wantErr, gotErr, "preserve each (n, err), including bytes with a terminal error")
+				assert.Equal(t, want[:wantN], got[:gotN])
+				if wantErr != nil {
+					break
+				}
+			}
+			require.NoError(t, response.Body.Close())
+			assert.Equal(t, terminal == io.EOF, state.Finish(c.Request.Context(), false, false))
+		})
+	}
+}
+
+func TestSmartRouterSubscriptionRequestFactsPersist(t *testing.T) {
+	for _, mode := range []string{"commit", "failed_write", "expiry"} {
+		t.Run(mode, func(t *testing.T) {
+			sidecar := newSmartRouterHostSidecar(t, smartRouterBindingA, smartRouterBindingB)
+			c, state := newSmartRouterSubscriptionState(t, sidecar.server.URL)
+			response := &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(smartRouterSubscriptionDiagnostic))}
+			host.ObserveTransport(c, response, nil)
+			_, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+			require.NoError(t, response.Body.Close())
+			require.True(t, state.Finish(c.Request.Context(), false, false))
+			accessor, ok := any(state).(interface{ AcknowledgedSubscriptionRetry() bool })
+			require.True(t, ok)
+			require.True(t, accessor.AcknowledgedSubscriptionRetry())
+			if mode == "expiry" {
+				// Exercise the public signed-expiry guard with a deterministic host clock.
+				now := time.UnixMilli(1000)
+				client, err := host.NewClient(smartRouterConfig(sidecar.server.URL), func() time.Time { return now })
+				require.NoError(t, err)
+				route := smartRouterResponse()
+				route.Bindings = append(route.Bindings, host.Binding{BindingID: smartRouterBindingB, ProtocolPlugin: "chat-v1", Rank: 2})
+				entry := smartRouterRegistry()[0]
+				backup := entry
+				backup.BindingID = smartRouterBindingB
+				state = host.NewState(client, smartRouterRequest(), route, []host.RegistryEntry{entry, backup})
+				host.Install(c, state)
+				require.NoError(t, state.Begin())
+				require.NoError(t, state.Invoke())
+				response = &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(smartRouterSubscriptionDiagnostic))}
+				host.ObserveTransport(c, response, nil)
+				_, err = io.ReadAll(response.Body)
+				require.NoError(t, err)
+				require.NoError(t, response.Body.Close())
+				require.True(t, state.Finish(c.Request.Context(), false, false))
+				now = time.UnixMilli(2000)
+				require.ErrorIs(t, state.WaitRetry(c.Request.Context(), nil), host.ErrExpired)
+				assert.ErrorIs(t, state.Begin(), host.ErrExpired)
+				return
+			}
+			if mode == "commit" {
+				c.Writer.WriteHeaderNow()
+			} else {
+				c, _ = gin.CreateTestContext(&smartRouterFailingWriter{ResponseRecorder: httptest.NewRecorder(), err: io.ErrClosedPipe})
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+				host.Install(c, state)
+				_, _ = c.Writer.Write([]byte("synthetic"))
+			}
+			assert.False(t, accessor.AcknowledgedSubscriptionRetry())
+			require.NoError(t, state.Begin())
+			assert.False(t, accessor.AcknowledgedSubscriptionRetry(), "a prior event cannot authorize an active attempt")
+			require.NoError(t, state.Invoke())
+			response = &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(smartRouterSubscriptionDiagnostic))}
+			host.ObserveTransport(c, response, nil)
+			_, err = io.ReadAll(response.Body)
+			require.NoError(t, err)
+			require.NoError(t, response.Body.Close())
+			assert.False(t, state.Finish(c.Request.Context(), false, false))
+			reports := sidecar.outcomeSnapshot()
+			require.Len(t, reports, 2)
+			assert.Equal(t, host.OutcomeResponseCommitted, reports[1].Outcome, "Begin resets classification, not request safety facts")
+		})
+	}
+}
+
+type smartRouterBlockingBody struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *smartRouterBlockingBody) Read([]byte) (int, error) {
+	close(b.entered)
+	<-b.release
+	return 0, io.ErrClosedPipe
+}
+func (b *smartRouterBlockingBody) Close() error {
+	close(b.release)
+	return nil
+}
+
+func TestSmartRouterSubscriptionCloseUnblocksRead(t *testing.T) {
+	sidecar := newSmartRouterHostSidecar(t, smartRouterBindingA, smartRouterBindingB)
+	c, state := newSmartRouterSubscriptionState(t, sidecar.server.URL)
+	body := &smartRouterBlockingBody{entered: make(chan struct{}), release: make(chan struct{})}
+	response := &http.Response{StatusCode: 400, Body: body}
+	host.ObserveTransport(c, response, nil)
+	readDone, closeDone := make(chan error, 1), make(chan error, 1)
+	go func() { _, err := response.Body.Read(make([]byte, 64)); readDone <- err }()
+	<-body.entered
+	go func() { closeDone <- response.Body.Close() }()
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "observer must not hold a mutex across blocking Read")
+	}
+	require.ErrorIs(t, <-readDone, io.ErrClosedPipe)
+	assert.False(t, state.Finish(c.Request.Context(), false, false))
+	require.Len(t, sidecar.outcomeSnapshot(), 1)
+	assert.Equal(t, host.OutcomeClient4xx, sidecar.outcomeSnapshot()[0].Outcome)
+}
+
+func TestSmartRouterSubscriptionStaleAttempt(t *testing.T) {
+	for _, mode := range []string{"stale_read", "stale_close", "reset_classification"} {
+		t.Run(mode, func(t *testing.T) {
+			sidecar := newSmartRouterHostSidecar(t, smartRouterBindingA, smartRouterBindingB)
+			c, state := newSmartRouterSubscriptionState(t, sidecar.server.URL)
+			old := &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(smartRouterSubscriptionDiagnostic))}
+			host.ObserveTransport(c, old, nil)
+			if mode != "stale_read" {
+				_, err := io.ReadAll(old.Body)
+				require.NoError(t, err)
+			}
+			if mode == "reset_classification" {
+				require.NoError(t, old.Body.Close())
+			} else {
+				host.ObserveTransport(c, &http.Response{StatusCode: 500}, nil)
+			}
+			require.True(t, state.Finish(c.Request.Context(), false, false))
+			require.NoError(t, state.Begin())
+			require.NoError(t, state.Invoke())
+			current := &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"invalid_request","message":"temperature invalid"}}`))}
+			host.ObserveTransport(c, current, nil)
+			if mode == "stale_read" {
+				_, err := io.ReadAll(old.Body)
+				require.NoError(t, err)
+			}
+			require.NoError(t, old.Body.Close())
+			_, err := io.ReadAll(current.Body)
+			require.NoError(t, err)
+			require.NoError(t, current.Body.Close())
+			assert.False(t, state.Finish(c.Request.Context(), false, false))
+			reports := sidecar.outcomeSnapshot()
+			require.Len(t, reports, 2)
+			assert.Equal(t, host.OutcomeClient4xx, reports[1].Outcome)
+			assert.Equal(t, "req-1-attempt-2", reports[1].EventID)
+		})
+	}
+}
+
+func TestSmartRouterSubscriptionRetryGuards(t *testing.T) {
+	for _, mode := range []string{"accepted", "budget", "no_backup", "skip", "setup_forwarded", "pinned", "uncertain", "always_skip_code", "always_skip_status", "cancel", "deadline", "unacknowledged"} {
+		t.Run(mode, func(t *testing.T) {
+			sidecar := newSmartRouterHostSidecar(t, smartRouterBindingA, smartRouterBindingB)
+			c, state := newSmartRouterSubscriptionState(t, sidecar.server.URL)
+			if mode == "no_backup" {
+				state.LimitAttempts(1)
+			}
+			if mode == "unacknowledged" {
+				sidecar.mu.Lock()
+				sidecar.reportFail = true
+				sidecar.mu.Unlock()
+			}
+			response := &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(smartRouterSubscriptionDiagnostic))}
+			host.ObserveTransport(c, response, nil)
+			_, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+			require.NoError(t, response.Body.Close())
+			ack := state.Finish(c.Request.Context(), false, false)
+			assert.Equal(t, mode != "no_backup" && mode != "unacknowledged", ack)
+			accessor, ok := any(state).(interface{ AcknowledgedSubscriptionRetry() bool })
+			require.True(t, ok, "host must expose the mutex-protected acknowledged retry fact")
+			assert.Equal(t, ack, accessor.AcknowledgedSubscriptionRetry())
+			retryTimes := 1
+			apiErr := kittypes.NewErrorWithStatusCode(errors.New("synthetic"), kittypes.ErrorCodeInvalidRequest, 400)
+			switch mode {
+			case "budget":
+				retryTimes = 0
+			case "skip":
+				apiErr = kittypes.NewErrorWithStatusCode(errors.New("synthetic"), kittypes.ErrorCodeInvalidRequest, 400, kittypes.ErrOptionWithSkipRetry())
+			case "setup_forwarded":
+				common.SetContextKey(c, constant.ContextKeyRealtimeSetupForwarded, true)
+			case "pinned":
+				service.GetChannelConstraints(c).AddPin(dto.ChannelPin{ChannelId: 1, RetryMode: dto.PinRetrySingleAttempt})
+			case "uncertain":
+				common.SetContextKey(c, constant.ContextKeyManagedHealthPersistenceUncertain, true)
+			case "always_skip_code":
+				apiErr = kittypes.NewErrorWithStatusCode(errors.New("synthetic"), kittypes.ErrorCodeBadResponseBody, 400)
+			case "always_skip_status":
+				apiErr = kittypes.NewErrorWithStatusCode(errors.New("synthetic"), kittypes.ErrorCodeInvalidRequest, 504)
+			case "cancel", "deadline":
+				ctx, cancel := context.WithCancel(c.Request.Context())
+				if mode == "deadline" {
+					cancel()
+					ctx, cancel = context.WithDeadline(c.Request.Context(), time.Unix(0, 0))
+				} else {
+					cancel()
+				}
+				defer cancel()
+				c.Request = c.Request.WithContext(ctx)
+				require.Error(t, state.WaitRetry(ctx, nil))
+				assert.False(t, accessor.AcknowledgedSubscriptionRetry())
+				assert.ErrorIs(t, state.Begin(), host.ErrBudget)
+			}
+			decision := service.DecideRelayRetry(c, apiErr, retryTimes)
+			expected := "stop"
+			if mode == "accepted" {
+				expected = "retry"
+				assert.Equal(t, "subscription_expired", decision.Reason)
+				assert.Equal(t, "smart_router", decision.Source)
+			}
+			assert.Equal(t, expected, decision.Action)
+			assert.Equal(t, apiErr.StatusCode, map[bool]int{true: 504, false: 400}[mode == "always_skip_status"])
+			require.Len(t, sidecar.outcomeSnapshot(), 1)
+		})
+	}
+}
+
+func TestSmartRouterSubscriptionRealSidecarSafety(t *testing.T) {
+	for _, mode := range []string{"parameter", "parameter_mapped", "rejected", "unknown_before", "unknown_after", "lost_ack_mapped", "malformed204", "no_backup", "budget", "backup_reauthorization", "setup_forwarded", "uncertain_after_ack", "cancelled_after_persistence", "mapped_skip504"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture := startRealSidecarFixture(t)
+			engine, user := setupSmartRouterHostTest(t)
+			guarded := mode == "setup_forwarded" || mode == "uncertain_after_ack" || mode == "cancelled_after_persistence"
+			contexts, checked := make(chan *gin.Context, 1), make(chan *gin.Context, 1)
+			engine = gin.New()
+			engine.Use(func(c *gin.Context) { contexts <- c; c.Next() })
+			SetRelayRouter(engine)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var reports atomic.Int32
+			diagnostic := smartRouterSubscriptionDiagnostic
+			if strings.HasPrefix(mode, "parameter") {
+				diagnostic = `{"error":{"code":"invalid_request","message":"temperature invalid"},"detail":"Your AgentPlan subscription has expired."}`
+			}
+			first := newSmartRouterProtocolUpstream(t, host.ProtocolChat, 400, diagnostic)
+			second := newFailoverUpstream(t, "forbidden-backup", 200)
+			channel := addRelayFailoverChannel(t, 7301, 30, first)
+			if mode == "parameter_mapped" || mode == "lost_ack_mapped" {
+				require.NoError(t, model.DB.Model(&channel).Update("status_code_mapping", `{"400":"500"}`).Error)
+			} else if mode == "mapped_skip504" {
+				require.NoError(t, model.DB.Model(&channel).Update("status_code_mapping", `{"400":"504"}`).Error)
+			}
+			backup := addRelayFailoverChannel(t, 7302, 20, second)
+			if mode == "no_backup" || mode == "backup_reauthorization" {
+				require.NoError(t, model.DB.Model(&backup).Update("status", common.ChannelStatusAutoDisabled).Error)
+			}
+			initializeRelayFailoverChannels()
+			entries := configureRealSidecarHost(t, fixture, host.ProtocolChat)
+			if mode == "budget" {
+				originalRetries := common.RetryTimes
+				common.RetryTimes = 0
+				t.Cleanup(func() { common.RetryTimes = originalRetries })
+			}
+			// Mutate safety facts only after the real subscription invocation/report.
+			if mode == "malformed204" || mode == "backup_reauthorization" || guarded {
+				if mode == "backup_reauthorization" {
+					require.NoError(t, model.DB.Model(&backup).Update("status", common.ChannelStatusEnabled).Error)
+					initializeRelayFailoverChannels()
+				}
+				proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/v1/outcomes" {
+						reports.Add(1)
+					}
+					if r.URL.Path == "/v1/outcomes" && mode == "malformed204" {
+						var outcome host.AttemptOutcome
+						require.NoError(t, common.DecodeJson(r.Body, &outcome))
+						assert.Equal(t, host.Outcome("subscription_expired"), outcome.Outcome)
+						conn, buffer, err := w.(http.Hijacker).Hijack()
+						require.NoError(t, err)
+						defer conn.Close()
+						_, err = buffer.WriteString("HTTP/1.1 204 No Content\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx")
+						require.NoError(t, err)
+						require.NoError(t, buffer.Flush())
+						return
+					}
+					req, err := http.NewRequest(r.Method, fixture.url+r.URL.Path, r.Body)
+					require.NoError(t, err)
+					req.Header = r.Header.Clone()
+					resp, err := fixture.client.Do(req)
+					require.NoError(t, err)
+					defer resp.Body.Close()
+					if r.URL.Path == "/v1/outcomes" && mode == "backup_reauthorization" {
+						require.NoError(t, model.DB.Model(&backup).Update("status", common.ChannelStatusAutoDisabled).Error)
+						initializeRelayFailoverChannels()
+					}
+					if r.URL.Path == "/v1/outcomes" && guarded {
+						c := <-contexts
+						switch mode {
+						case "setup_forwarded":
+							common.SetContextKey(c, constant.ContextKeyRealtimeSetupForwarded, true)
+						case "uncertain_after_ack":
+							common.SetContextKey(c, constant.ContextKeyManagedHealthPersistenceUncertain, true)
+						case "cancelled_after_persistence":
+							cancel()
+						}
+						checked <- c
+					}
+					for name, values := range resp.Header {
+						w.Header()[name] = values
+					}
+					w.WriteHeader(resp.StatusCode)
+					_, err = io.Copy(w, resp.Body)
+					require.NoError(t, err)
+				}))
+				t.Cleanup(proxy.Close)
+				values := map[string]string{"NEWAPI_SMART_ROUTER_ENABLED": "true", "NEWAPI_SMART_ROUTER_SCOPE": "registry",
+					"NEWAPI_SMART_ROUTER_URL": proxy.URL, "NEWAPI_SMART_ROUTER_SIGNING_KEY": smartRouterTestKey,
+					"NEWAPI_SMART_ROUTER_BINDINGS": smartRouterMarshal(t, entries)}
+				require.NoError(t, service.ConfigureSmartRouter(func(name string) string { return values[name] }))
+			} else if mode == "rejected" || strings.HasPrefix(mode, "unknown_") {
+				fixture.exchange(t, http.MethodPost, "/fixture/control", map[string]any{"report_mode": mode})
+			} else if mode == "lost_ack_mapped" {
+				fixture.exchange(t, http.MethodPost, "/fixture/control", map[string]any{"report_mode": "unknown_after"})
+			}
+			if mode == "setup_forwarded" || mode == "uncertain_after_ack" || mode == "mapped_skip504" {
+				require.Positive(t, common.RetryTimes, "guard cases require an available controller budget")
+			}
+			var response *httptest.ResponseRecorder
+			if mode == "cancelled_after_persistence" {
+				request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+					strings.NewReader(`{"model":"gpt-3.5-turbo","messages":[{"role":"user","content":"ping"}]}`)).WithContext(ctx)
+				request.Header.Set("Authorization", "Bearer harelaytoken")
+				request.Header.Set("Content-Type", "application/json")
+				response = httptest.NewRecorder()
+				engine.ServeHTTP(response, request)
+			} else {
+				response = performRelayFailoverRequest(t, engine)
+			}
+			expectedStatus := 400
+			if mode == "parameter_mapped" || mode == "lost_ack_mapped" {
+				expectedStatus = 500
+			} else if mode == "mapped_skip504" {
+				expectedStatus = 504
+			}
+			if mode == "backup_reauthorization" {
+				assert.GreaterOrEqual(t, response.Code, 400)
+			} else {
+				assert.Equal(t, expectedStatus, response.Code)
+			}
+			assert.Equal(t, 1, first.callCount())
+			assert.Zero(t, second.callCount())
+			if mode == "malformed204" || mode == "backup_reauthorization" || guarded {
+				assert.EqualValues(t, 1, reports.Load(), "failed or uncertain reports never replay")
+			}
+			var c *gin.Context
+			if guarded {
+				c = <-checked
+			} else {
+				c = <-contexts
+			}
+			if mode == "setup_forwarded" || mode == "uncertain_after_ack" || mode == "mapped_skip504" {
+				expected := service.PolicyDecision{Action: "stop", Reason: "setup_forwarded", Source: "system"}
+				if mode == "uncertain_after_ack" {
+					expected = service.PolicyDecision{Action: "stop", Reason: "managed_health_persistence_uncertain", Source: "managed"}
+				} else if mode == "mapped_skip504" {
+					expected.Reason = "system_retry_exclusion"
+				}
+				assert.True(t, slices.ContainsFunc(service.RequestPolicy(c).Events(), func(event service.PolicyEvent) bool {
+					return event.Decision == expected
+				}), "the recorded stop must come from the intended policy guard")
+				assert.False(t, host.StateFor(c).AcknowledgedSubscriptionRetry(), "the final error response commits output")
+			}
+			if mode == "backup_reauthorization" {
+				assert.True(t, slices.ContainsFunc(service.RequestPolicy(c).Events(), func(event service.PolicyEvent) bool {
+					return event.Decision == (service.PolicyDecision{Action: "retry", Reason: "subscription_expired", Source: "smart_router"})
+				}), "backup authority must be rechecked after an acknowledged, budget-eligible retry")
+			}
+			if guarded || mode == "parameter_mapped" || mode == "lost_ack_mapped" {
+				for _, event := range service.RequestPolicy(c).Events() {
+					assert.NotEqual(t, "retry", event.Decision.Action, "safety guards cannot produce contradictory retry policy")
+				}
+			}
+			state := fixture.state(t)
+			require.Len(t, state.Decisions, 1)
+			if mode == "malformed204" {
+				assert.Empty(t, state.Reports)
+			} else {
+				require.Len(t, state.Reports, 1)
+				expected := host.Outcome("subscription_expired")
+				if strings.HasPrefix(mode, "parameter") {
+					expected = host.OutcomeClient4xx
+					assert.Zero(t, state.Cooldowns[entries[0].BindingID])
+				}
+				assert.Equal(t, expected, state.Reports[0].Outcome)
+			}
+			requireRelayRefunded(t, user.Id)
+			if mode == "unknown_after" || mode == "lost_ack_mapped" {
+				require.Len(t, state.Outcomes, 1, "lost ACK must not replay the persisted subscription event")
+			}
+			if strings.HasPrefix(mode, "parameter") {
+				assert.Equal(t, expectedStatus, performRelayFailoverRequest(t, engine).Code)
+				next := fixture.state(t)
+				require.Len(t, next.Decisions, 2)
+				assert.Equal(t, state.Decisions[0].BindingIDs, next.Decisions[1].BindingIDs)
+				assert.Equal(t, 2, first.callCount(), "ordinary parameter 400 does not isolate A")
+				assert.Zero(t, second.callCount())
+				requireRelayRefunded(t, user.Id)
+			}
+		})
+	}
+}
+
 func TestSmartRouterOriginalStatus(t *testing.T) {
 	engine, _ := setupSmartRouterHostTest(t)
 	first := newFailoverUpstream(t, "raw-client-error", 400)
@@ -3629,6 +4366,7 @@ func TestSmartRouterControlTransport(t *testing.T) {
 			for _, result := range []host.Outcome{
 				host.OutcomeSuccess, host.OutcomeAuth401, host.OutcomeRateLimited429, host.OutcomeUpstream5xx,
 				host.OutcomeClient4xx, host.OutcomeTransportPreWrite, host.OutcomeWriteUnknown, host.OutcomeResponseCommitted,
+				host.Outcome("subscription_expired"),
 			} {
 				value := outcome
 				value.Outcome = result

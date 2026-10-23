@@ -27,30 +27,31 @@ var (
 
 // State contains only verified routing and observation facts, never credentials.
 type State struct {
-	client            *Client
-	request           RouteRequest
-	route             RouteResponse
-	entries           []RegistryEntry
-	mu                sync.Mutex
-	limit             int
-	attempts          int
-	active            bool
-	invoked           bool
-	unknown           bool
-	rawStatus         int
-	started           time.Time
-	upstreamProtocol  Protocol
-	protocolObserved  bool
-	protocolCompleted bool
-	protocolFailed    bool
-	event             AttemptOutcome
-	retry             bool
-	downstreamFailed  bool
-	committed         bool
-	ttft              time.Duration
-	ttftObserved      bool
-	retryAfterMS      int64
-	retryAfterValid   bool
+	client              *Client
+	request             RouteRequest
+	route               RouteResponse
+	entries             []RegistryEntry
+	mu                  sync.Mutex
+	limit               int
+	attempts            int
+	active              bool
+	invoked             bool
+	unknown             bool
+	rawStatus           int
+	subscriptionExpired bool
+	started             time.Time
+	upstreamProtocol    Protocol
+	protocolObserved    bool
+	protocolCompleted   bool
+	protocolFailed      bool
+	event               AttemptOutcome
+	retry               bool
+	downstreamFailed    bool
+	committed           bool
+	ttft                time.Duration
+	ttftObserved        bool
+	retryAfterMS        int64
+	retryAfterValid     bool
 }
 
 func NewState(client *Client, request RouteRequest, route RouteResponse, entries []RegistryEntry) *State {
@@ -125,6 +126,7 @@ func (s *State) Begin() error {
 	}
 	s.active, s.invoked, s.unknown, s.retry = true, false, false, false
 	s.rawStatus = 0
+	s.subscriptionExpired = false
 	s.upstreamProtocol = s.request.Protocol
 	s.protocolObserved, s.protocolCompleted, s.protocolFailed = false, false, false
 	s.retryAfterMS, s.retryAfterValid, s.ttft = 0, true, 0
@@ -153,9 +155,16 @@ func ObserveTransport(c *gin.Context, response *http.Response, err error) {
 	if s := StateFor(c); s != nil {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		if !s.active || !s.invoked {
+			return
+		}
 		s.unknown = err != nil || response == nil
+		s.subscriptionExpired = false
 		if response != nil {
 			s.rawStatus = response.StatusCode
+			if err == nil && response.StatusCode == 400 && response.Body != nil {
+				response.Body = &subscriptionBody{body: response.Body, state: s, attempt: s.attempts}
+			}
 			if response.StatusCode == 429 || response.StatusCode >= 500 {
 				delay, parseErr := ParseRetryAfter(response.Header, s.client.now())
 				s.retryAfterMS, s.retryAfterValid = delay, parseErr == nil
@@ -318,6 +327,8 @@ func (s *State) Finish(ctx context.Context, completed, committed bool) bool {
 		outcome = OutcomeWriteUnknown
 	case s.rawStatus == 401:
 		outcome = OutcomeAuth401
+	case s.rawStatus == 400 && s.subscriptionExpired:
+		outcome = OutcomeSubscriptionExpired
 	case s.rawStatus >= 400 && s.rawStatus < 500 && s.rawStatus != 429:
 		outcome = OutcomeClient4xx
 	case s.rawStatus == 429 && s.retryAfterValid:
@@ -340,9 +351,23 @@ func (s *State) Finish(ctx context.Context, completed, committed bool) bool {
 	ack := s.client.ReportOutcome(ctx, event) == nil
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.retry = ack && (outcome == OutcomeRateLimited429 || outcome == OutcomeUpstream5xx) &&
-		s.retryAfterValid && s.attempts < s.limit && s.client.now().UnixMilli() < s.route.ExpiresAt
+	s.retry = ack && (outcome == OutcomeRateLimited429 || outcome == OutcomeUpstream5xx || outcome == OutcomeSubscriptionExpired) &&
+		s.retryAfterValid && !s.committed && !s.downstreamFailed && ctx.Err() == nil &&
+		s.attempts < s.limit && s.client.now().UnixMilli() < s.route.ExpiresAt
 	return s.retry
+}
+
+// AcknowledgedSubscriptionRetry authorizes only the matching frozen, accepted event.
+func (s *State) AcknowledgedSubscriptionRetry() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.retry && !s.active && s.attempts > 0 && s.attempts < s.limit &&
+		!s.unknown && !s.committed && !s.downstreamFailed &&
+		s.rawStatus == 400 && s.subscriptionExpired &&
+		s.event.Outcome == OutcomeSubscriptionExpired &&
+		s.event.EventID == s.request.RequestID+"-attempt-"+strconv.Itoa(s.attempts) &&
+		s.event.BindingID == s.route.Bindings[s.attempts-1].BindingID &&
+		s.client.now().UnixMilli() < s.route.ExpiresAt
 }
 
 // The wrapper retains Gin's interfaces and ResponseController's unwrap chain.

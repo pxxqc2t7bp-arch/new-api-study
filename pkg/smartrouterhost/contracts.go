@@ -16,14 +16,15 @@ type Outcome string
 const MaximumRetryAfterMS int64 = 24 * 60 * 60 * 1000
 
 const (
-	OutcomeSuccess           Outcome = "success"
-	OutcomeAuth401           Outcome = "auth_401"
-	OutcomeRateLimited429    Outcome = "rate_limited_429"
-	OutcomeUpstream5xx       Outcome = "upstream_5xx"
-	OutcomeClient4xx         Outcome = "client_4xx"
-	OutcomeTransportPreWrite Outcome = "transport_pre_write"
-	OutcomeWriteUnknown      Outcome = "write_unknown"
-	OutcomeResponseCommitted Outcome = "response_committed"
+	OutcomeSuccess             Outcome = "success"
+	OutcomeAuth401             Outcome = "auth_401"
+	OutcomeSubscriptionExpired Outcome = "subscription_expired"
+	OutcomeRateLimited429      Outcome = "rate_limited_429"
+	OutcomeUpstream5xx         Outcome = "upstream_5xx"
+	OutcomeClient4xx           Outcome = "client_4xx"
+	OutcomeTransportPreWrite   Outcome = "transport_pre_write"
+	OutcomeWriteUnknown        Outcome = "write_unknown"
+	OutcomeResponseCommitted   Outcome = "response_committed"
 )
 
 type ErrorCode string

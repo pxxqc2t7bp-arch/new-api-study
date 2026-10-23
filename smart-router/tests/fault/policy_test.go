@@ -29,6 +29,7 @@ func TestRetryableFailuresStopWhenAttemptBudgetIsExhausted(t *testing.T) {
 	for _, outcome := range []api.Outcome{
 		api.OutcomeRateLimited429,
 		api.OutcomeUpstream5xx,
+		api.Outcome("subscription_expired"),
 		api.OutcomeTransportPreWrite,
 	} {
 		action := routing.NextAction(outcome, 0, 5000)

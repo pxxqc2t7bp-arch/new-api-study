@@ -479,7 +479,7 @@ func (database *DB) RecordOutcomeAndApply(
 			outcome.Outcome, createdAt, outcome.RetryAfterMS, consecutiveFailures,
 		)
 		updateHealth = true
-	case api.OutcomeRateLimited429, api.OutcomeUpstream5xx:
+	case api.OutcomeRateLimited429, api.OutcomeUpstream5xx, api.OutcomeSubscriptionExpired:
 		health = routing.HealthDegraded
 		consecutiveFailures++
 		cooldownUntil = routing.CooldownUntil(
